@@ -217,6 +217,38 @@ aibyss-lab-lounge/
 
 ---
 
+## Step 6 スモークテスト — L2 の役割
+
+Step 6 では L2 エミッタを 1 回実行するだけで全イベントが流れる。
+
+```powershell
+cd aibyss-lab-lounge
+uv run python -m lab_lounge.emitter "今日の天気を教えて"
+```
+
+出力例：
+
+```
+stream_id  : 3fa85f64-5717-4562-b3fc-2c963f66afa6   ← これをコピーして C2 確認に使う
+session_id : 7c9e6679-7425-40de-944b-e07fc1f90ae7
+trace_id   : 4bf92f3577b34da6a3ce929d0e0e4736
+  published: type=utterance.final event_id=aaaaaaaa-...   seq=0
+  published: type=llm.final       event_id=bbbbbbbb-...   seq=1
+  published: type=tts.done        event_id=cccccccc-...   seq=2
+```
+
+`stream_id` をコピーして C2 タイムライン確認に使う:
+
+```powershell
+$sid = "3fa85f64-5717-4562-b3fc-2c963f66afa6"   # ← 上記出力から貼り付け
+Invoke-RestMethod "http://localhost:8100/timeline?stream_id=$sid" | ConvertTo-Json -Depth 5
+```
+
+**L2 の成功ログ**: `published: type=...` が 3 行出ること。  
+**V2 の成功**: ブラウザ `http://localhost:3200` の字幕エリアに `llm.final.payload.text` が表示されること（tts.done を V2 が受けて hud.caption を生成するため）。
+
+---
+
 ## 設計概要（詳細は設計ドキュメント参照）
 
 | ドキュメント | 場所 |
@@ -255,8 +287,9 @@ AITuberとの会話を **止めずに・速く・安定して**成立させる�
     - Web検索は「必要時のみ」＆タイムアウト短め
 - **短期記憶（実行状態）**
     - 直近Nターン、会話の一時状態、直前のツール結果など（LangGraph state）
-- **ローカル活用（速度/安定）**
+- **ローカル活用（速度/安定）** *(将来目標)*
     - VAD/録音制御、STT、TTS、Embedding生成などは可能な限りローカルで実行（LLMは外部）
+    - *v0.1 Walking Skeleton では開発用テキストエミッタで代替（本物の STT/TTS/Embedding は非スコープ）*
 
 ### 1.3 何が嬉しいのか（価値）
 
