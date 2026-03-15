@@ -104,3 +104,62 @@ class TestRunGraph:
         with patch.object(builtins, "__import__", side_effect=mock_import):
             with pytest.raises(ImportError, match="langgraph"):
                 _build_graph()
+
+
+class TestRunGraphWithMetadata:
+    """run_metadata を渡したとき config["metadata"] に反映されるテスト"""
+
+    def test_run_metadata_passed_to_invoke_config(self):
+        """run_metadata が graph.invoke の config["metadata"] に渡ること"""
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {
+            "text": "x",
+            "model": "m",
+            "provider": "openai",
+            "result": FAKE_RESULT,
+        }
+        meta = {"aibyss.trace_id": "t1", "aibyss.stream_id": "s1"}
+
+        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+            from lab_lounge.graph import run_graph
+            run_graph("x", model="m", run_metadata=meta)
+
+        positional_args = mock_graph.invoke.call_args[0]
+        config_arg = positional_args[1]
+        assert config_arg == {"metadata": meta}
+
+    def test_no_run_metadata_passes_none_config(self):
+        """run_metadata=None のとき config は None で invoke されること"""
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {
+            "text": "x",
+            "model": "m",
+            "provider": "openai",
+            "result": FAKE_RESULT,
+        }
+
+        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+            from lab_lounge.graph import run_graph
+            run_graph("x", model="m")
+
+        positional_args = mock_graph.invoke.call_args[0]
+        config_arg = positional_args[1]
+        assert config_arg is None
+
+    def test_run_metadata_does_not_affect_result(self):
+        """run_metadata を渡しても LLMResult の内容は変わらないこと"""
+        mock_graph = MagicMock()
+        mock_graph.invoke.return_value = {
+            "text": "x",
+            "model": "m",
+            "provider": "openai",
+            "result": FAKE_RESULT,
+        }
+        meta = {"aibyss.trace_id": "t1"}
+
+        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+            from lab_lounge.graph import run_graph
+            result = run_graph("x", model="m", run_metadata=meta)
+
+        assert result.text == FAKE_RESULT.text
+        assert result.model == FAKE_RESULT.model

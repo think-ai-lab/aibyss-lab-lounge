@@ -168,7 +168,10 @@ class TestRunPipelineRealMode:
         """run_graph に ENV から読んだ model/provider が渡る"""
         with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
             run_pipeline("テスト質問", **COMMON)
-        mock_graph.assert_called_once_with("テスト質問", model="gpt-4o-mini", provider="openai")
+        call_kw = mock_graph.call_args.kwargs
+        assert call_kw["model"] == "gpt-4o-mini"
+        assert call_kw["provider"] == "openai"
+        assert "run_metadata" in call_kw
 
     def test_real_mode_tts_text_matches_llm_text(self, mock_real_mode, mock_publish, fake_llm_result):
         """tts.done の text は real LLM 出力と一致する"""
@@ -378,3 +381,94 @@ class TestRunPipelineWithUtteranceMeta:
         )
         for ev in result.events:
             assert "stream_idx" not in ev
+
+
+class TestRunPipelineWithLangSmith:
+    """
+    LangSmith 観測関連のテスト。
+    実際の LangSmith API は呼ばない。モックで検証する。
+    """
+
+    @pytest.fixture()
+    def mock_real_llm(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_REAL_LLM", "true")
+        monkeypatch.setenv("L2_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("L2_LLM_MODEL", "gpt-4o-mini")
+
+    @pytest.fixture()
+    def fake_llm_result(self):
+        from lab_lounge.llm import LLMResult
+        return LLMResult(
+            text="LangSmith テスト応答",
+            model="gpt-4o-mini",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=200,
+            finish_reason="stop",
+        )
+
+    def test_run_graph_called_with_run_metadata_in_real_mode(
+        self, mock_real_llm, mock_publish, fake_llm_result
+    ):
+        """real LLM 時に run_graph に run_metadata が渡ること"""
+        with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
+            run_pipeline("テスト", **COMMON)
+        call_kw = mock_graph.call_args.kwargs
+        assert "run_metadata" in call_kw
+        assert call_kw["run_metadata"] is not None
+
+    def test_run_metadata_contains_correct_ids(
+        self, mock_real_llm, mock_publish, fake_llm_result
+    ):
+        """run_metadata に stream_id / session_id / trace_id が含まれること"""
+        with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
+            run_pipeline("テスト", **COMMON)
+        meta = mock_graph.call_args.kwargs["run_metadata"]
+        assert meta["aibyss.stream_id"] == COMMON["stream_id"]
+        assert meta["aibyss.session_id"] == COMMON["session_id"]
+        assert meta["aibyss.trace_id"] == COMMON["trace_id"]
+        assert meta["aibyss.source"] == "aibyss-lab-lounge"
+
+    def test_langsmith_tracing_on_does_not_change_events(
+        self, mock_real_llm, mock_publish, fake_llm_result, monkeypatch
+    ):
+        """LANGSMITH_TRACING=true でも発行されるイベントは変わらない"""
+        monkeypatch.setenv("LANGSMITH_TRACING", "true")
+        with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result):
+            result = run_pipeline("テスト", **COMMON)
+        assert len(result.events) == 3
+        types = [ev["type"] for ev in result.events]
+        assert types == ["utterance.final", "llm.final", "tts.done"]
+
+    def test_langsmith_tracing_off_still_passes_run_metadata(
+        self, mock_real_llm, mock_publish, fake_llm_result, monkeypatch
+    ):
+        """LANGSMITH_TRACING=false のときも run_metadata は渡される（副作用なし）"""
+        monkeypatch.setenv("LANGSMITH_TRACING", "false")
+        with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
+            run_pipeline("テスト", **COMMON)
+        assert "run_metadata" in mock_graph.call_args.kwargs
+
+    def test_audio_file_path_with_tracing_on(
+        self, mock_real_llm, mock_publish, fake_llm_result, monkeypatch
+    ):
+        """utterance_meta (audio-file 想定) + LANGSMITH_TRACING=true の組み合わせ"""
+        monkeypatch.setenv("LANGSMITH_TRACING", "true")
+        utterance_meta = {"lang": "ja", "confidence": 0.9, "duration_ms": 3049}
+        with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
+            result = run_pipeline(
+                "音声テスト", utterance_meta=utterance_meta, **COMMON
+            )
+        # イベントが正しく生成される
+        assert len(result.events) == 3
+        assert result.events[0]["payload"]["confidence"] == 0.9
+        # run_metadata に trace_id が入る
+        meta = mock_graph.call_args.kwargs["run_metadata"]
+        assert meta["aibyss.trace_id"] == COMMON["trace_id"]
+
+    def test_dummy_mode_does_not_call_run_graph(self, mock_publish, monkeypatch):
+        """dummy LLM モード局 run_graph が呼ばれないこと"""
+        monkeypatch.delenv("L2_USE_REAL_LLM", raising=False)
+        with patch("lab_lounge.graph.run_graph") as mock_graph:
+            run_pipeline("テスト", **COMMON)
+        mock_graph.assert_not_called()

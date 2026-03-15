@@ -25,6 +25,7 @@ from typing import Any
 
 from .bus import publish
 from .events import build_llm_final, build_tts_done, build_utterance_final
+from .observability import build_run_metadata
 
 
 # ─── LLM モード設定 ──────────────────────────────────────────────
@@ -110,7 +111,12 @@ def run_pipeline(
     if use_real:
         # real mode: graph.py 経由 (lazy import — ダミーモードでは langgraph 不要)
         from .graph import run_graph as _run_graph
-        _llm_result = _run_graph(text, model=llm_model, provider=provider)
+        _run_meta = build_run_metadata(
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+        )
+        _llm_result = _run_graph(text, model=llm_model, provider=provider, run_metadata=_run_meta)
         llm_text = _llm_result.text
         llm_meta: dict[str, Any] = dict(
             model=_llm_result.model,

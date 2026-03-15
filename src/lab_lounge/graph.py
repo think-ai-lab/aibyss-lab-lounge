@@ -68,14 +68,23 @@ def _build_graph():
 
 # ─── 公開 API ────────────────────────────────────────────────────
 
-def run_graph(text: str, *, model: str, provider: str = "openai") -> LLMResult:
+def run_graph(
+    text: str,
+    *,
+    model: str,
+    provider: str = "openai",
+    run_metadata: dict | None = None,
+) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
 
     Args:
-        text:     発話テキスト
-        model:    使用するモデル名
-        provider: LLM プロバイダ（"openai" など）
+        text:         発話テキスト
+        model:        使用するモデル名
+        provider:     LLM プロバイダ（"openai" など）
+        run_metadata: LangGraph config["metadata"] に渡す dict (optional)。
+                      LangSmith が有効なとき trace に添付される。
+                      無効のときは渡しても副作用なし。
 
     Returns:
         LLMResult
@@ -92,7 +101,8 @@ def run_graph(text: str, *, model: str, provider: str = "openai") -> LLMResult:
         "provider": provider,
         "result": None,
     }
-    final_state = graph.invoke(initial_state)
+    config = {"metadata": run_metadata} if run_metadata else None
+    final_state = graph.invoke(initial_state, config)
     result = final_state["result"]
     if result is None:
         raise RuntimeError("Graph が LLMResult を返しませんでした")

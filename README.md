@@ -8,6 +8,8 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 > Phase 1 real LLM 対応済み (llm.py / graph.py)。
 > Phase 2 real TTS 対応済み (tts.py)。
 > Phase 3 real STT 対応済み (stt.py)。
+> Phase 4 マイク入力・スピーカー出力対応済み (audio_io.py / run_once.py)。
+> Phase 5 LangSmith 観測対応済み (observability.py)。
 
 ---
 
@@ -62,6 +64,9 @@ cp .env.example .env
 | `L2_USE_REAL_STT` | `false` | `true` にすると `--audio-file` で real STT を呼ぶ |
 | `L2_STT_PROVIDER` | `openai` | STT プロバイダ（現在 `openai` Whisper API のみ） |
 | `L2_STT_LANG` | `ja` | 認識言語 (ISO 639-1) |
+| `LANGSMITH_TRACING` | `false` | `true` にすると LangChain / LangGraph 実行を LangSmith に送信する |
+| `LANGSMITH_API_KEY` | *(必須 / tracing on のみ)* | LangSmith API キー（`.env` に記載。コミット禁止） |
+| `LANGSMITH_PROJECT` | `aibyss-lab-lounge` | LangSmith プロジェクト名 |
 
 ---
 
@@ -172,6 +177,107 @@ trace_id   : 550e8400-e29b-41d4-a716-446655440000
 uv run python -m lab_lounge.emitter "テスト発話" --stream-id my-stream-002
 ```
 
+### LangSmith 観測（Phase 5）
+
+LangChain / LangGraph の内部 run / trace / latency を LangSmith で観測できる。  
+**C2 は system of record、LangSmith は system of observation** として役割分離を保つ。
+
+#### 有効化手順
+
+```powershell
+# 1. obs extra をインストール（初回のみ）
+uv sync --extra obs
+
+# 2. .env に追加
+#    LANGSMITH_TRACING=true
+#    LANGSMITH_API_KEY=lsv2_pt_...
+#    LANGSMITH_PROJECT=aibyss-lab-lounge
+```
+
+#### audio-file E2E を LangSmith で観測する最短手順
+
+**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` + `LANGSMITH_API_KEY` 設定済み。
+
+```powershell
+uv sync --extra stt --extra llm --extra tts --extra obs
+
+$env:LANGSMITH_TRACING  = "true"
+$env:LANGSMITH_PROJECT  = "aibyss-lab-lounge"
+$env:L2_USE_REAL_STT    = "true"
+$env:L2_USE_REAL_LLM    = "true"
+$env:L2_USE_REAL_TTS    = "true"
+$env:L2_TTS_PROVIDER    = "voicevox"
+$env:L2_TTS_VOICE       = "89"
+$env:L2_TTS_SPEAKER     = "Voidoll"
+$env:L2_TTS_OUTPUT_DIR  = "./data/audio"
+uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
+Remove-Item Env:\LANGSMITH_TRACING, Env:\LANGSMITH_PROJECT, `
+  Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, `
+  Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR
+```
+
+実行後、[https://smith.langchain.com](https://smith.langchain.com) → プロジェクト `aibyss-lab-lounge` を開くと  
+1 往復の run / latency / token 数が `aibyss.trace_id` / `aibyss.stream_id` で検索できる。
+
+> **tracing off のとき**: `LANGSMITH_TRACING=false`（既定）のままでも全機能が動く。  
+> `observability.py` は metadata を組み立てるが外部に送信しない。
+
+### マイク入力・スピーカー出力（Phase 4）
+
+`run_once.py` は 1 回録音 → STT → LLM → TTS → デバイス再生までを 1 往復で実行する最小ランタイム。  
+常時ストリーミングでなく、**1 往復終わると先に進む固定秒数録音方式**で実装している。
+
+#### インストール
+
+```powershell
+# mic extra (録音 + 再生) を含む全 extra を同時インストール
+uv sync --extra mic --extra stt --extra llm --extra tts
+```
+
+#### 実機確認手順 (LangSmith 無効)
+
+**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` 設定済み。
+
+```powershell
+# デフォルト 5 秒録音
+uv run python -m lab_lounge.run_once
+
+# 録音秒数を指定
+uv run python -m lab_lounge.run_once --record-seconds 10
+
+# TTS 再生をスキップ（ファイルパスのみ表示）
+uv run python -m lab_lounge.run_once --no-play
+```
+
+#### 実機確認手順 (LangSmith 有効)
+
+**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` + `LANGSMITH_API_KEY` 設定済み。
+
+```powershell
+uv sync --extra mic --extra stt --extra llm --extra tts --extra obs
+
+$env:LANGSMITH_TRACING = "true"
+uv run python -m lab_lounge.run_once --record-seconds 5
+Remove-Item Env:\LANGSMITH_TRACING
+```
+
+実行後、[https://smith.langchain.com](https://smith.langchain.com) → `aibyss-lab-lounge` で LLM run を確認できる。
+
+#### デバイス一覧確認
+
+```powershell
+uv run python -c "import sounddevice; print(sounddevice.query_devices())"
+```
+
+#### フォールバック動作
+
+| 事象 | 内容 |
+|---|---|
+| 無音検出 | `処理を中断しました。` と表示して終了 |
+| 録音デバイスエラー | 同上 |
+| STT 失敗 | `処理を中断しました。` と表示。LLM / TTS には進まない |
+| 再生失敗 (MP3 等) | 警告ログのみ。PipelineResult は返す |
+
 ---
 
 ## C2 と組み合わせた確認手順（Step 4 受け入れ条件）
@@ -280,6 +386,8 @@ uv run pytest -v
 | `tests/test_tts.py` | `synthesize` ・ provider ディスパッチ・ ImportError 確認 |
 | `tests/test_llm.py` | `call_llm` ・ provider ディスパッチ・ LLMResult フィールド |
 | `tests/test_graph.py` | `run_graph` ・ LangGraph ノード・ ImportError 確認 |
+| `tests/test_observability.py` | `is_langsmith_enabled` ・ `build_run_metadata` ・ tracing on/off 分岐 |
+| `tests/test_run_once.py` | 録音成功フロー・無音・録音失敗・ STT 失敗・ skip_playback・URI 変換 |
 
 ---
 
@@ -301,6 +409,9 @@ aibyss-lab-lounge/
       llm.py         # LLM アダプタ (OpenAI)
       graph.py       # LangGraph 1-node グラフ
       tts.py         # TTS アダプタ (edge-tts / VOICEVOX)
+      observability.py  # LangSmith 観測ヘルパー (tracing on/off 判定・run metadata 組み立て)
+      audio_io.py       # 録音・再生アダプタ (sounddevice/soundfile ラッパー)
+      run_once.py       # 1 往復会話 CLI (--mic / --record-seconds)
   tests/
     conftest.py
     test_events.py
@@ -310,6 +421,8 @@ aibyss-lab-lounge/
     test_llm.py
     test_graph.py
     test_tts.py
+    test_observability.py
+    test_run_once.py
 ```
 
 ---
