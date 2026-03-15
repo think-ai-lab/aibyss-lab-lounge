@@ -666,6 +666,10 @@ llm = [
     { name = "langgraph" },
     { name = "python-dotenv" },
 ]
+stt = [
+    { name = "openai" },
+    { name = "python-dotenv" },
+]
 tts = [
     { name = "edge-tts" },
     { name = "mutagen" },
@@ -679,13 +683,15 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'llm'", specifier = ">=0.2" },
     { name = "langgraph", marker = "extra == 'llm'", specifier = ">=0.2" },
     { name = "mutagen", marker = "extra == 'tts'", specifier = ">=1.47" },
+    { name = "openai", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-dotenv", marker = "extra == 'llm'", specifier = ">=1.0" },
+    { name = "python-dotenv", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'tts'", specifier = ">=1.0" },
     { name = "redis", extras = ["hiredis"], specifier = ">=5.0" },
 ]
-provides-extras = ["dev", "llm", "tts"]
+provides-extras = ["dev", "llm", "tts", "stt"]
 
 [[package]]
 name = "langchain-core"

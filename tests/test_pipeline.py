@@ -294,3 +294,87 @@ class TestRunPipelineRealTTSMode:
         result = run_pipeline("今日の天気を教えて", **COMMON)
         assert result.events[2]["payload"]["audio_url"] == "file://dummy/audio.opus"
         assert result.events[2]["payload"]["voice"] == "dummy-voice"
+
+
+class TestRunPipelineWithUtteranceMeta:
+    """utterance_meta を渡したとき utterance.final payload に反映されるテスト"""
+
+    def test_utterance_meta_confidence_reflected(self, mock_publish):
+        """utterance_meta.confidence が payload に反映される"""
+        result = run_pipeline(
+            "テスト", utterance_meta={"confidence": 0.87}, **COMMON
+        )
+        assert result.events[0]["payload"]["confidence"] == 0.87
+
+    def test_utterance_meta_lang_reflected(self, mock_publish):
+        """utterance_meta.lang が payload に反映される"""
+        result = run_pipeline(
+            "テスト", utterance_meta={"lang": "ja"}, **COMMON
+        )
+        assert result.events[0]["payload"]["lang"] == "ja"
+
+    def test_utterance_meta_duration_ms_reflected(self, mock_publish):
+        """utterance_meta.duration_ms が payload に反映される"""
+        result = run_pipeline(
+            "テスト", utterance_meta={"duration_ms": 3500}, **COMMON
+        )
+        assert result.events[0]["payload"]["duration_ms"] == 3500
+
+    def test_utterance_meta_words_reflected(self, mock_publish):
+        """utterance_meta.words が payload に反映される"""
+        words = [{"word": "テスト", "start": 0.0, "end": 0.5}]
+        result = run_pipeline(
+            "テスト", utterance_meta={"words": words}, **COMMON
+        )
+        assert result.events[0]["payload"]["words"] == words
+
+    def test_utterance_meta_none_uses_defaults(self, mock_publish):
+        """utterance_meta=None（省略時）はデフォルト値が使われる"""
+        result = run_pipeline("テスト", **COMMON)
+        payload = result.events[0]["payload"]
+        assert payload["lang"] == "ja-JP"
+        assert payload["confidence"] == 0.95
+        assert payload["duration_ms"] == 0
+        assert "words" not in payload
+
+    def test_utterance_meta_full_stt_fields(self, mock_publish):
+        """real STT 相当の全フィールドを渡してもスキーマ検証が通る"""
+        from lab_lounge.events import validate_event
+        words = [{"word": "こんにちは", "start": 0.0, "end": 0.6}]
+        meta = {
+            "lang": "ja",
+            "confidence": 0.0,
+            "duration_ms": 2800,
+            "words": words,
+        }
+        result = run_pipeline("こんにちは", utterance_meta=meta, **COMMON)
+        ev = result.events[0]
+        validate_event(ev)
+        assert ev["payload"]["duration_ms"] == 2800
+        assert ev["payload"]["words"] == words
+
+    def test_utterance_meta_does_not_affect_llm_tts(self, mock_publish):
+        """utterance_meta の STT 固有フィールドは llm.final / tts.done に漏れない"""
+        meta = {"confidence": 0.75, "duration_ms": 1000}
+        result = run_pipeline("テスト", utterance_meta=meta, **COMMON)
+        # confidence は STT 固有フィールド — llm.final にも tts.done にも存在しない
+        assert "confidence" not in result.events[1]["payload"]
+        assert "confidence" not in result.events[2]["payload"]
+        # tts.done は TTS 音声長としての duration_ms を持つが、
+        # STT の duration_ms (1000) とは別物。TTS のデフォルト値 (3000) のまま。
+        assert result.events[2]["payload"]["duration_ms"] == 3000
+
+    def test_still_three_events_with_meta(self, mock_publish):
+        """utterance_meta があっても 3 イベント publish される"""
+        result = run_pipeline(
+            "テスト", utterance_meta={"duration_ms": 1000}, **COMMON
+        )
+        assert len(result.events) == 3
+
+    def test_no_stream_idx_with_meta(self, mock_publish):
+        """Guardrail G-1: utterance_meta があっても stream_idx を含めない"""
+        result = run_pipeline(
+            "テスト", utterance_meta={"lang": "ja"}, **COMMON
+        )
+        for ev in result.events:
+            assert "stream_idx" not in ev

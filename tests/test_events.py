@@ -63,6 +63,39 @@ class TestUtteranceFinal:
         with pytest.raises(jsonschema.ValidationError):
             validate_event(ev)
 
+    def test_payload_duration_ms_default(self):
+        """duration_ms のデフォルト値は 0"""
+        ev = build_utterance_final(text="hello", **COMMON)
+        assert ev["payload"]["duration_ms"] == 0
+
+    def test_payload_lang_custom(self):
+        """lang 引数を渡すと payload に反映される"""
+        ev = build_utterance_final(text="hello", lang="en-US", **COMMON)
+        assert ev["payload"]["lang"] == "en-US"
+
+    def test_payload_confidence_custom(self):
+        """confidence 引数を渡すと payload に反映される"""
+        ev = build_utterance_final(text="hello", confidence=0.0, **COMMON)
+        assert ev["payload"]["confidence"] == 0.0
+
+    def test_payload_stt_fields_full(self):
+        """real STT レスポンスの全フィールドを渡すと payload に反映されスキーマ検証も通る"""
+        words = [{"word": "こんにちは", "start": 0.0, "end": 0.5}]
+        ev = build_utterance_final(
+            text="こんにちは",
+            lang="ja",
+            confidence=0.0,
+            duration_ms=3500,
+            words=words,
+            **COMMON,
+        )
+        payload = ev["payload"]
+        assert payload["lang"] == "ja"
+        assert payload["confidence"] == 0.0
+        assert payload["duration_ms"] == 3500
+        assert payload["words"] == words
+        validate_event(ev)
+
 
 class TestLlmFinal:
     def test_schema_valid(self):

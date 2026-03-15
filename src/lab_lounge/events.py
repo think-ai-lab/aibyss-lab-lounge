@@ -99,8 +99,29 @@ def build_utterance_final(
     session_id: str,
     trace_id: str,
     seq: int = 0,
+    lang: str = "ja-JP",
+    confidence: float = 0.95,
+    duration_ms: int = 0,
+    words: list | None = None,
 ) -> dict[str, Any]:
-    """utterance.final イベントを組み立てて検証する。"""
+    """utterance.final イベントを組み立てて検証する。
+
+    Args:
+        lang:        音声認識言語コード (デフォルト: "ja-JP")
+        confidence:  書き起こし信頼度 (デフォルト: 0.95)
+        duration_ms: 音声ファイルの時間長 [ms] (デフォルト: 0)
+        words:       単語タイムスタンプ (optional)
+                     [{"word": str, "start": float, "end": float}, ...]
+    """
+    payload: dict[str, Any] = {
+        "text": text,
+        "lang": lang,
+        "confidence": confidence,
+        "duration_ms": duration_ms,
+    }
+    if words is not None:
+        payload["words"] = words
+
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -111,11 +132,7 @@ def build_utterance_final(
         "type": "utterance.final",
         "source": "lab-lounge",
         "seq": seq,
-        "payload": {
-            "text": text,
-            "lang": "ja-JP",
-            "confidence": 0.95,
-        },
+        "payload": payload,
     }
     validate_event(event)
     return event

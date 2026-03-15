@@ -8,6 +8,8 @@ pipeline.py — 開発用テキストパイプライン
       llm.final.links   = [utterance.final.event_id]
       tts.done.links    = [llm.final.event_id]
   - publish 以外の副作用を持たない（C2 への HTTP 呼び出し禁止 Guardrail G-2）
+  - STT 呼び出しは emitter.py 側の責務。
+    音声から変換したテキスト + メタデータ (utterance_meta) を受け取るだけ。
 
 【パイプライン処理フロー】
   utterance.final  (seq=0, links=なし)
@@ -79,23 +81,28 @@ def run_pipeline(
     stream_id: str,
     session_id: str,
     trace_id: str,
+    utterance_meta: dict[str, Any] | None = None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
 
     Args:
-        text:       発話テキスト（utterance.final の payload.text）
-        stream_id:  ストリーム識別子
-        session_id: セッション識別子
-        trace_id:   トレース識別子
+        text:            発話テキスト（utterance.final の payload.text）
+        stream_id:       ストリーム識別子
+        session_id:      セッション識別子
+        trace_id:        トレース識別子
+        utterance_meta:  STT 結果から抽出したメタデータ (optional)。
+                         キー: confidence / lang / duration_ms / words
+                         省略時は build_utterance_final() のデフォルト値を使う。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
     """
     common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
 
-    # 1. utterance.final
-    utt = build_utterance_final(text=text, seq=0, **common)
+    # 1. utterance.final — STT メタデータがあれば反映する
+    utt_kwargs: dict[str, Any] = utterance_meta or {}
+    utt = build_utterance_final(text=text, seq=0, **utt_kwargs, **common)
     publish(utt)
 
     # 2. llm.final — utterance.final を links で参照

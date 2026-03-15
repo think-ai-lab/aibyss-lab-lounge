@@ -4,8 +4,10 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 `utterance.final` → `llm.final` → `tts.done` の 3 イベントを publish する。
 
 > **Walking Skeleton 実装状況**:
-> Step 4 完了 — 開発用テキストエミッタ実装済み。
-> 本物の STT / LLM / TTS は非スコープ（将来 Step で差し替え）。
+> Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ実装済み。
+> Phase 1 real LLM 対応済み (llm.py / graph.py)。
+> Phase 2 real TTS 対応済み (tts.py)。
+> Phase 3 real STT 対応済み (stt.py)。
 
 ---
 
@@ -55,18 +57,45 @@ cp .env.example .env
 | `L2_LLM_PROVIDER` | `openai` | LLM プロバイダ（現在 `openai` のみ対応） |
 | `L2_LLM_MODEL` | `gpt-4o-mini` | 使用するモデル名 |
 | `OPENAI_API_KEY` | *(必須 / real mode のみ)* | OpenAI API キー（`.env` に記載。リポジトリにコミット禁止） |
+| `L2_USE_REAL_TTS` | `false` | `true` にすると real TTS を呼ぶ |
+| `L2_TTS_PROVIDER` | `voicevox` | TTS プロバイダ (`edge_tts` / `voicevox`) |
+| `L2_USE_REAL_STT` | `false` | `true` にすると `--audio-file` で real STT を呼ぶ |
+| `L2_STT_PROVIDER` | `openai` | STT プロバイダ（現在 `openai` Whisper API のみ） |
+| `L2_STT_LANG` | `ja` | 認識言語 (ISO 639-1) |
 
 ---
 
-## 実行方法（開発用テキストエミッタ）
+## 実行方法（開発用エミッタ）
 
-### ダミーモード（デフォルト）
+### テキスト入力（ダミーモード・デフォルト）
 
-Redis に 3 イベントを publish する。LLM / TTS は呼ばない。
+Redis に 3 イベントを publish する。LLM / TTS / STT は呼ばない。
 
-```bash
+```powershell
 uv run python -m lab_lounge.emitter "今日の天気を教えて"
 ```
+
+### 音声ファイル入力（real STT モード）
+
+`--audio-file` で音声ファイルを指定する。`L2_USE_REAL_STT=true` のとき real STT API を呼ぶ。
+
+```powershell
+# 1. stt extra をインストール（初回のみ）
+uv sync --extra stt
+
+# 2. 環境変数をセット（OPENAI_API_KEY は LLM と共用）
+$env:L2_USE_REAL_STT  = "true"
+$env:L2_STT_PROVIDER  = "openai"
+$env:L2_STT_LANG      = "ja"
+
+# 3. 音声ファイルを指定して実行
+uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
+
+# 環境変数をリセット
+Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_STT_PROVIDER, Env:\L2_STT_LANG
+```
+
+> **ダミー STT モード** (`L2_USE_REAL_STT=false`): `--audio-file` を指定しても 警告ログを出してダミーテキストでパイプラインが続く。
 
 ### real LLM モード
 
@@ -82,6 +111,48 @@ echo "OPENAI_API_KEY=sk-..." >> .env  # 実際のキーに差し替える
 
 # 3. 実行
 uv run python -m lab_lounge.emitter "今日の天気を教えて"
+```
+
+**PowerShell からお試しの場合**:
+
+```powershell
+$env:L2_USE_REAL_LLM = "true"; $env:L2_LLM_MODEL = "gpt-4o-mini"
+uv run python -m lab_lounge.emitter "今日の天気を教えて"
+Remove-Item Env:\L2_USE_REAL_LLM, Env:\L2_LLM_MODEL
+```
+
+### real TTS モード
+
+```powershell
+# VOICEVOX Engine を起動した後（別ターミナル）:
+# docker run -p 50021:50021 voicevox/voicevox_engine:latest
+
+$env:L2_USE_REAL_TTS      = "true"
+$env:L2_TTS_PROVIDER      = "voicevox"
+$env:L2_TTS_VOICE         = "89"   # Voidoll
+$env:L2_TTS_SPEAKER       = "Voidoll"
+$env:L2_TTS_OUTPUT_DIR    = "./data/audio"
+$env:L2_TTS_VOICEVOX_URL  = "http://localhost:50021"
+uv run python -m lab_lounge.emitter "こんにちは"
+Remove-Item Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR, Env:\L2_TTS_VOICEVOX_URL
+```
+
+### real STT + real LLM + real TTS 最短手順
+
+**前提**: Redis + VOICEVOX Engine 起動済み、`OPENAI_API_KEY` 設定済み。
+
+```powershell
+uv sync --extra stt --extra llm --extra tts
+
+$env:L2_USE_REAL_STT      = "true"
+$env:L2_USE_REAL_LLM      = "true"
+$env:L2_USE_REAL_TTS      = "true"
+$env:L2_TTS_PROVIDER      = "voicevox"
+$env:L2_TTS_VOICE         = "89"
+$env:L2_TTS_SPEAKER       = "Voidoll"
+$env:L2_TTS_OUTPUT_DIR    = "./data/audio"
+uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
+Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR
 ```
 
 出力例:
@@ -202,9 +273,13 @@ uv run pytest -v
 
 | ファイル | 内容 |
 |---------|------|
-| `tests/test_events.py` | スキーマ検証・ビルダー・Guardrail G-1 確認 |
-| `tests/test_pipeline.py` | 3 イベント順序・links 因果関係・seq 連番 |
+| `tests/test_events.py` | スキーマ検証・ビルダー・それぞれの STT/LLM/TTS フィールド・ Guardrail G-1 確認 |
+| `tests/test_pipeline.py` | 3 イベント順序・links 因果関係・seq 連番・ utterance_meta パススルー |
 | `tests/test_bus.py` | XADD フィールド名・JSON 値・クライアント close |
+| `tests/test_stt.py` | `transcribe_audio_file` ・ `_file_duration_ms` ・ ImportError 確認 |
+| `tests/test_tts.py` | `synthesize` ・ provider ディスパッチ・ ImportError 確認 |
+| `tests/test_llm.py` | `call_llm` ・ provider ディスパッチ・ LLMResult フィールド |
+| `tests/test_graph.py` | `run_graph` ・ LangGraph ノード・ ImportError 確認 |
 
 ---
 
@@ -221,12 +296,20 @@ aibyss-lab-lounge/
       events.py      # Event Envelope ビルダー + スキーマ検証
       bus.py         # Redis Streams publisher (XADD)
       pipeline.py    # 3 イベントを順に作って publish
-      emitter.py     # CLI エントリポイント
+      emitter.py     # CLI エントリポイント (text / --audio-file)
+      stt.py         # STT アダプタ (OpenAI Whisper API)
+      llm.py         # LLM アダプタ (OpenAI)
+      graph.py       # LangGraph 1-node グラフ
+      tts.py         # TTS アダプタ (edge-tts / VOICEVOX)
   tests/
     conftest.py
     test_events.py
     test_pipeline.py
     test_bus.py
+    test_stt.py
+    test_llm.py
+    test_graph.py
+    test_tts.py
 ```
 
 ---

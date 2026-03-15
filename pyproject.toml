@@ -27,6 +27,10 @@ tts = [
     "mutagen>=1.47",
     "python-dotenv>=1.0",
 ]
+stt = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lab_lounge"]
