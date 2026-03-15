@@ -208,3 +208,6 @@ __marimo__/
 
 # porcupine
 porcupine/
+
+# audio files
+data/audio/*.wav

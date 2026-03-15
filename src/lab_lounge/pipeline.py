@@ -17,11 +17,52 @@ pipeline.py — 開発用テキストパイプライン
   tts.done         (seq=2)
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 from .bus import publish
 from .events import build_llm_final, build_tts_done, build_utterance_final
+
+
+# ─── LLM モード設定 ──────────────────────────────────────────────
+
+def _get_llm_mode() -> tuple[bool, str, str]:
+    """
+    環境変数から LLM 実行モードを読み取る。
+
+    Returns:
+        (use_real, provider, model)
+          use_real: True なら graph.py 経由で real LLM を呼ぶ
+          provider: "openai" など
+          model:    モデル名
+    """
+    use_real = os.environ.get("L2_USE_REAL_LLM", "false").lower() in ("true", "1", "yes")
+    provider = os.environ.get("L2_LLM_PROVIDER", "openai")
+    model = os.environ.get("L2_LLM_MODEL", "gpt-4o-mini")
+    return use_real, provider, model
+
+
+# ─── TTS モード設定 ──────────────────────────────────────────────
+
+def _get_tts_mode() -> tuple[bool, str, str, str, str]:
+    """
+    環境変数から TTS 実行モードを読み取る。
+
+    Returns:
+        (use_real, provider, voice, speaker, output_dir)
+          use_real:   True なら tts.py 経由で real TTS を呼ぶ
+          provider:   "edge_tts" など
+          voice:      音声識別子 (provider 依存)
+          speaker:    人可読スピーカー名（メタデータ用）
+          output_dir: 音声ファイル保存先
+    """
+    use_real = os.environ.get("L2_USE_REAL_TTS", "false").lower() in ("true", "1", "yes")
+    provider = os.environ.get("L2_TTS_PROVIDER", "edge_tts")
+    voice = os.environ.get("L2_TTS_VOICE", "ja-JP-NanamiNeural")
+    speaker = os.environ.get("L2_TTS_SPEAKER", "Nanami")
+    output_dir = os.environ.get("L2_TTS_OUTPUT_DIR", "./data/audio")
+    return use_real, provider, voice, speaker, output_dir
 
 
 @dataclass
@@ -58,12 +99,50 @@ def run_pipeline(
     publish(utt)
 
     # 2. llm.final — utterance.final を links で参照
-    llm_text = f"ダミー応答: {text}"
-    llm = build_llm_final(text=llm_text, seq=1, links=[utt["event_id"]], **common)
+    use_real, provider, llm_model = _get_llm_mode()
+    if use_real:
+        # real mode: graph.py 経由 (lazy import — ダミーモードでは langgraph 不要)
+        from .graph import run_graph as _run_graph
+        _llm_result = _run_graph(text, model=llm_model, provider=provider)
+        llm_text = _llm_result.text
+        llm_meta: dict[str, Any] = dict(
+            model=_llm_result.model,
+            input_tokens=_llm_result.input_tokens,
+            output_tokens=_llm_result.output_tokens,
+            latency_ms=_llm_result.latency_ms,
+            finish_reason=_llm_result.finish_reason,
+            rag_used=False,
+        )
+    else:
+        # dummy mode: 後方互換のため "ダミー応答: {text}" を維持する
+        llm_text = f"ダミー応答: {text}"
+        llm_meta = {}  # build_llm_final のデフォルト値を使う
+    llm = build_llm_final(text=llm_text, seq=1, links=[utt["event_id"]], **llm_meta, **common)
     publish(llm)
 
     # 3. tts.done — llm.final を links で参照
-    tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **common)
+    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+    if use_real_tts:
+        # real mode: tts.py 経由 (lazy import — ダミーモードでは edge-tts 不要)
+        from .tts import synthesize as _synthesize
+        _tts_result = _synthesize(
+            llm_text,
+            provider=tts_provider,
+            voice=tts_voice,
+            speaker=tts_speaker,
+            output_dir=tts_output_dir,
+        )
+        tts_meta: dict[str, Any] = dict(
+            audio_url=_tts_result.audio_url,
+            duration_ms=_tts_result.duration_ms,
+            voice=_tts_result.voice,
+            format=_tts_result.format,
+            sample_rate=_tts_result.sample_rate,
+            speaker=_tts_result.speaker,
+        )
+    else:
+        tts_meta = {}  # build_tts_done のデフォルト値を使う
+    tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **tts_meta, **common)
     publish(tts)
 
     return PipelineResult(

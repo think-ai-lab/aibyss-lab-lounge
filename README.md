@@ -51,12 +51,36 @@ cp .env.example .env
 | `REDIS_URL` | `redis://localhost:6379` | Redis 接続 URL |
 | `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー |
 | `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマファイルの絶対パス（省略で兄弟 workspace を探索） |
+| `L2_USE_REAL_LLM` | `false` | `true` にすると real LLM を呼ぶ（ダミー応答を無効化） |
+| `L2_LLM_PROVIDER` | `openai` | LLM プロバイダ（現在 `openai` のみ対応） |
+| `L2_LLM_MODEL` | `gpt-4o-mini` | 使用するモデル名 |
+| `OPENAI_API_KEY` | *(必須 / real mode のみ)* | OpenAI API キー（`.env` に記載。リポジトリにコミット禁止） |
 
 ---
 
 ## 実行方法（開発用テキストエミッタ）
 
+### ダミーモード（デフォルト）
+
+Redis に 3 イベントを publish する。LLM / TTS は呼ばない。
+
 ```bash
+uv run python -m lab_lounge.emitter "今日の天気を教えて"
+```
+
+### real LLM モード
+
+`L2_USE_REAL_LLM=true` を設定すると `llm.final` が OpenAI を実際に呼ぶ。
+
+```bash
+# 1. llm extra をインストール（初回のみ）
+uv sync --extra llm
+
+# 2. .env に API キーを設定
+echo "L2_USE_REAL_LLM=true" >> .env
+echo "OPENAI_API_KEY=sk-..." >> .env  # 実際のキーに差し替える
+
+# 3. 実行
 uv run python -m lab_lounge.emitter "今日の天気を教えて"
 ```
 

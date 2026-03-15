@@ -17,6 +17,16 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+llm = [
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+    "python-dotenv>=1.0",
+]
+tts = [
+    "edge-tts>=6.1",
+    "mutagen>=1.47",
+    "python-dotenv>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lab_lounge"]

@@ -129,6 +129,12 @@ def build_llm_final(
     trace_id: str,
     links: list[str],
     seq: int = 1,
+    model: str = "dummy-1.0",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    latency_ms: int = 0,
+    finish_reason: str = "stop",
+    rag_used: bool = False,
 ) -> dict[str, Any]:
     """llm.final イベントを組み立てて検証する。"""
     event: dict[str, Any] = {
@@ -144,7 +150,12 @@ def build_llm_final(
         "links": links,
         "payload": {
             "text": text,
-            "model": "dummy-1.0",
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "latency_ms": latency_ms,
+            "finish_reason": finish_reason,
+            "rag_used": rag_used,
         },
     }
     validate_event(event)
@@ -159,6 +170,12 @@ def build_tts_done(
     trace_id: str,
     links: list[str],
     seq: int = 2,
+    audio_url: str = "file://dummy/audio.opus",
+    duration_ms: int = 3000,
+    voice: str = "dummy-voice",
+    format: str = "opus",
+    sample_rate: int = 24000,
+    speaker: str = "dummy",
 ) -> dict[str, Any]:
     """tts.done イベントを組み立てて検証する。"""
     event: dict[str, Any] = {
@@ -174,8 +191,12 @@ def build_tts_done(
         "links": links,
         "payload": {
             "text": text,
-            "audio_url": "file://dummy/audio.opus",
-            "duration_ms": 3000,
+            "audio_url": audio_url,
+            "duration_ms": duration_ms,
+            "voice": voice,
+            "format": format,
+            "sample_rate": sample_rate,
+            "speaker": speaker,
         },
     }
     validate_event(event)
