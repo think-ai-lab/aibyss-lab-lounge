@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4.23",
     "redis[hiredis]>=5.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

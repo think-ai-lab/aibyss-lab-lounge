@@ -723,6 +723,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
+    { name = "python-dotenv" },
     { name = "redis", extra = ["hiredis"] },
 ]
 
@@ -766,6 +767,7 @@ requires-dist = [
     { name = "openai", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'llm'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'mic'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'obs'", specifier = ">=1.0" },

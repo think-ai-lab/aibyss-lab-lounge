@@ -41,6 +41,30 @@ uv sync
 uv sync --extra dev
 ```
 
+### optional extras
+
+機能ごとに extra を追加インストールする。複数同時指定可能。
+
+| extra | 含まれるパッケージ | 必要な機能 |
+|-------|-------------------|-----------|
+| `dev` | pytest, pytest-asyncio | テスト実行 |
+| `llm` | langgraph, langchain-openai, python-dotenv | real LLM (OpenAI) |
+| `tts` | edge-tts, mutagen, python-dotenv | real TTS (edge_tts) |
+| `stt` | openai, python-dotenv | real STT (Whisper API) |
+| `obs` | langsmith, python-dotenv | LangSmith tracing |
+| `mic` | sounddevice, soundfile, python-dotenv | マイク録音・スピーカー再生 |
+
+```powershell
+# real E2E 全部入り（VOICEVOX + OpenAI + LangSmith + マイク）
+uv sync --extra llm --extra tts --extra stt --extra obs --extra mic
+
+# audio-file path のみ（マイク不要）
+uv sync --extra stt --extra llm --extra tts
+
+# テストのみ
+uv sync --extra dev
+```
+
 ### 環境変数
 
 ```bash
@@ -280,7 +304,59 @@ uv run python -c "import sounddevice; print(sounddevice.query_devices())"
 
 ---
 
-## C2 と組み合わせた確認手順（Step 4 受け入れ条件）
+### よくある失敗例（トラブルシューティング）
+
+#### MP3 が再生できない（edge_tts 利用時）
+
+edge_tts は MP3 を出力するが `soundfile` は MP3 非対応。  
+再生時に `WARNING lab_lounge.audio_io: 再生失敗: *.mp3 (Error opening ...)` が出る。
+
+**解決策**: TTS provider を `voicevox` に切り替える（WAV 出力のため soundfile で再生可能）。
+
+```powershell
+# VOICEVOX Engine を起動してから
+docker run -p 50021:50021 voicevox/voicevox_engine:latest
+
+$env:L2_TTS_PROVIDER = "voicevox"
+uv run python -m lab_lounge.run_once
+```
+
+#### 無音検知で処理が中断する
+
+`SilenceError: 無音を検出しました (RMS=0.0023 < threshold=0.005)` が出る場合は、  
+`L2_SILENCE_THRESHOLD` を下げる（マイクの感度やノイズに応じて調整）。
+
+```powershell
+$env:L2_SILENCE_THRESHOLD = "0.001"
+uv run python -m lab_lounge.run_once
+Remove-Item Env:\L2_SILENCE_THRESHOLD
+```
+
+目安: 静かな環境 `0.001`–`0.003` / 騒がしい環境 `0.005` 以上 / デフォルト `0.005`
+
+#### 別のマイクやスピーカーを使いたい
+
+```powershell
+# デバイス番号の確認
+uv run python -c "import sounddevice; print(sounddevice.query_devices())"
+
+# デバイス番号 (例: 2) を指定して実行
+uv run python -m lab_lounge.run_once --device 2
+
+# 環境変数で固定する場合
+$env:L2_AUDIO_DEVICE = "2"
+uv run python -m lab_lounge.run_once
+Remove-Item Env:\L2_AUDIO_DEVICE
+```
+
+#### LANGSMITH_TRACING 未設定で 401 警告が出る
+
+`langsmith` パッケージは `langgraph` の依存として自動インストールされる。  
+`LANGSMITH_TRACING` を未設定のままにすると起動時に API キー検証を試みて警告ログが出ることがある。
+
+**解決策**: `.env` に `LANGSMITH_TRACING=false` を明示する（`.env.example` から引き継がれているはず）。
+
+---（Step 4 受け入れ条件）
 
 ### 1. Redis を起動する
 
