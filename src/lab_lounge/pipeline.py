@@ -11,21 +11,33 @@ pipeline.py — 開発用テキストパイプライン
   - STT 呼び出しは emitter.py 側の責務。
     音声から変換したテキスト + メタデータ (utterance_meta) を受け取るだけ。
 
-【パイプライン処理フロー】
+【パイプライン処理フロー（RAG オン時）】
   utterance.final  (seq=0, links=なし)
        ↓ links=[utterance.event_id]
-  llm.final        (seq=1)
+  [Retrieve: 知識ベース検索 — L2_ENABLE_RAG=true のときのみ実行]
+       ↓ 失敗/タイムアウト時は non-RAG で継続（fallback）
+  llm.final        (seq=1)  ← rag_used / answer_mode をメタデータに付与
        ↓ links=[llm.event_id]
   tts.done         (seq=2)
 """
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from .bus import publish
+from .debug import (
+    write_llm_prompt,
+    write_llm_response,
+    write_retrieval,
+    write_stt_output,
+)
 from .events import build_llm_final, build_tts_done, build_utterance_final
 from .observability import build_run_metadata
+
+logger = logging.getLogger(__name__)
 
 
 # ─── LLM モード設定 ──────────────────────────────────────────────
@@ -44,6 +56,24 @@ def _get_llm_mode() -> tuple[bool, str, str]:
     provider = os.environ.get("L2_LLM_PROVIDER", "openai")
     model = os.environ.get("L2_LLM_MODEL", "gpt-4o-mini")
     return use_real, provider, model
+
+
+# ─── RAG モード設定 ──────────────────────────────────────────────
+
+def _get_rag_mode() -> tuple[bool, int, str]:
+    """
+    環境変数から RAG 実行モードを読み取る。
+
+    Returns:
+        (enable_rag, top_k, kb_path)
+          enable_rag: True なら知識ベース検索を実行する
+          top_k:      取得する文書数
+          kb_path:    index ファイルの配置パス
+    """
+    enable_rag = os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
+    top_k = int(os.environ.get("L2_RAG_TOP_K", "3"))
+    kb_path = os.environ.get("L2_KB_PATH", "./data/index")
+    return enable_rag, top_k, kb_path
 
 
 # ─── TTS モード設定 ──────────────────────────────────────────────
@@ -105,8 +135,46 @@ def run_pipeline(
     utt_kwargs: dict[str, Any] = utterance_meta or {}
     utt = build_utterance_final(text=text, seq=0, **utt_kwargs, **common)
     publish(utt)
+    write_stt_output(text, utterance_meta)
 
-    # 2. llm.final — utterance.final を links で参照
+    # 2. Retrieve (optional) — L2_ENABLE_RAG=true のときのみ実行
+    rag_context: str | None = None
+    rag_used = False
+    retrieved_doc_ids: list[str] = []
+    retrieval_latency_ms = 0
+    answer_mode = "fallback"
+
+    enable_rag, top_k, kb_path = _get_rag_mode()
+    if enable_rag:
+        try:
+            from .retriever import LocalRetriever
+            _t0 = time.monotonic()
+            _retriever = LocalRetriever(kb_path)
+            _docs = _retriever.retrieve(text, top_k=top_k)
+            retrieval_latency_ms = int((time.monotonic() - _t0) * 1000)
+            if _docs:
+                rag_context = "\n\n---\n\n".join(d.text for d in _docs)
+                retrieved_doc_ids = [d.doc_id for d in _docs]
+                _retrieval_scores = [d.score for d in _docs]
+                rag_used = True
+                answer_mode = "grounded"
+                logger.info(
+                    "RAG 検索完了: latency_ms=%d docs=%d ids=%s",
+                    retrieval_latency_ms,
+                    len(_docs),
+                    retrieved_doc_ids,
+                )
+            else:
+                _retrieval_scores = []
+            write_retrieval(retrieved_doc_ids, _retrieval_scores, retrieval_latency_ms, rag_enabled=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RAG 検索失敗 (fallback): %s", exc)
+            rag_context = None
+            rag_used = False
+            answer_mode = "fallback"
+            write_retrieval([], [], retrieval_latency_ms, rag_enabled=True)
+
+    # 3. llm.final — utterance.final を links で参照
     use_real, provider, llm_model = _get_llm_mode()
     if use_real:
         # real mode: graph.py 経由 (lazy import — ダミーモードでは langgraph 不要)
@@ -115,8 +183,21 @@ def run_pipeline(
             stream_id=stream_id,
             session_id=session_id,
             trace_id=trace_id,
+            rag_used=rag_used,
+            answer_mode=answer_mode,
+            retrieval_latency_ms=retrieval_latency_ms,
+            retrieved_doc_count=len(retrieved_doc_ids),
+            retrieved_doc_ids=retrieved_doc_ids,
         )
-        _llm_result = _run_graph(text, model=llm_model, provider=provider, run_metadata=_run_meta)
+        write_llm_prompt(text, rag_context)
+        _llm_result = _run_graph(
+            text,
+            model=llm_model,
+            provider=provider,
+            context=rag_context,
+            run_metadata=_run_meta,
+        )
+        write_llm_response(_llm_result.text)
         llm_text = _llm_result.text
         llm_meta: dict[str, Any] = dict(
             model=_llm_result.model,
@@ -124,7 +205,11 @@ def run_pipeline(
             output_tokens=_llm_result.output_tokens,
             latency_ms=_llm_result.latency_ms,
             finish_reason=_llm_result.finish_reason,
-            rag_used=False,
+            rag_used=rag_used,
+            answer_mode=answer_mode,
+            retrieval_latency_ms=retrieval_latency_ms,
+            retrieved_doc_count=len(retrieved_doc_ids),
+            retrieved_doc_ids=retrieved_doc_ids,
         )
     else:
         # dummy mode: 後方互換のため "ダミー応答: {text}" を維持する
@@ -133,7 +218,7 @@ def run_pipeline(
     llm = build_llm_final(text=llm_text, seq=1, links=[utt["event_id"]], **llm_meta, **common)
     publish(llm)
 
-    # 3. tts.done — llm.final を links で参照
+    # 4. tts.done — llm.final を links で参照
     use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
     if use_real_tts:
         # real mode: tts.py 経由 (lazy import — ダミーモードでは edge-tts 不要)

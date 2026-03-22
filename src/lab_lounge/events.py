@@ -152,6 +152,10 @@ def build_llm_final(
     latency_ms: int = 0,
     finish_reason: str = "stop",
     rag_used: bool = False,
+    answer_mode: str = "fallback",
+    retrieval_latency_ms: int = 0,
+    retrieved_doc_count: int = 0,
+    retrieved_doc_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """llm.final イベントを組み立てて検証する。"""
     event: dict[str, Any] = {
@@ -173,6 +177,10 @@ def build_llm_final(
             "latency_ms": latency_ms,
             "finish_reason": finish_reason,
             "rag_used": rag_used,
+            "answer_mode": answer_mode,
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "retrieved_doc_count": retrieved_doc_count,
+            "retrieved_doc_ids": retrieved_doc_ids if retrieved_doc_ids is not None else [],
         },
     }
     validate_event(event)

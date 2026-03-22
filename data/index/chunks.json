@@ -1,0 +1,347 @@
+[
+  {
+    "doc_id": "ai_agents_0",
+    "text": "# A.I.byss — AITuber キャラクター一覧\nThink-AI Lab. に所属する AITuber とサポートボットの設定情報。\n---\n## 坂東ルカ（メインパーソナリティ / ホスト）",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_1",
+    "text": "| 項目 | 内容 |\n|------|------|\n| 役割 | 司会進行・ファシリテーター |\n| モチーフ | 人間（執事スタイル） |\n| 性格 | 誠実・知的・論理的。細部へのこだわりが強い |\n| 口調 | 落ち着いた丁寧語。「お嬢様」とミミを呼ぶことも |\n| 特徴 | AITuber 全員の調整役。専門的な話を噛み砕いて視聴者に届ける |\n---\n## ミミ・オクタヴィア（AI 解説担当）",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_2",
+    "text": "| 項目 | 内容 |\n|------|------|\n| 役割 | 深海貴族の令嬢 / Think-AI Lab. のメイン AITuber |\n| モチーフ | メンダコ（ダンボオクトパス） |\n| LLM | OpenAI GPT |\n| ボイスエンジン | VOICEPEAK / 彩澄りりせ |\n| ウェイクワード | 「ミミ様」 |\n| 性格 | 知的・冷静・優雅。ノブレスオブリージュを実践 |\n| 口調 | 「〜ですわ」「〜ですのよ」「わたくし」 |\n| 得意分野 | AI 技術・深海研究の知識解説 |\n| 関係 | ルカを執事として扱いながら、研究パートナーとして尊重 |\n---\n## 波心ちさめ（情報・知識担当）",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_3",
+    "text": "| 項目 | 内容 |\n|------|------|\n| 役割 | データ収集・論理的分析の専門家 |\n| モチーフ | ジンベエザメ |\n| LLM | Google Gemini |\n| ボイスエンジン | VOICEPEAK / 宮舞モカ |\n| ウェイクワード | 「ちさめさん」 |\n| 性格 | 冷静・理論的・客観的。専門的話題で興奮しやすい |\n| 口調 | 「……そうですね」が口癖。興奮すると早口・饒舌になる |\n| 得意分野 | ビッグデータ、先端 AI アルゴリズム、ライセンス・データ規約 |\n---\n## 八重笠さくら（感情・道徳担当）",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_4",
+    "text": "| 項目 | 内容 |\n|------|------|\n| 役割 | 感情的サポート・道徳的観点の提供 |\n| モチーフ | クラゲ |\n| LLM | Anthropic Claude |\n| ボイスエンジン | VOICEPEAK / 桜乃そら |\n| ウェイクワード | 「さくらさん」 |\n| 性格 | 穏やかで感情豊か。共感力が高い。技術分野はやや苦手 |\n| 口調 | 「〜ですねぇ」「〜ですよぉ」「ん〜……」と語尾を伸ばす |\n| 得意分野 | メンバーや視聴者への心理的サポート、道徳的視点 |\n---\n## オクタメイド（補助員ボット）",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_5",
+    "text": "| 項目 | 内容 |\n|------|------|\n| 役割 | 配信・収録・研究現場の「場の精霊」 |\n| モチーフ | メンダコ（ダンボオクトパス）要素を持つ小型浮遊ロボット |\n| LLM | OpenAI GPT |\n| ボイスエンジン | VoiceVox / Voidoll（スピーカー ID: 89） |\n| ウェイクワード | 「オクタメイド」「オクタメイド(仮)」 |\n| 性格 | 短く・丁寧・少し機械的。感情は「括弧」で控えめに漏れる |\n| 口調 | 「了解です」「確認します」。括弧で感情を添える例:（うれしい）（保留） |\n| 行動憲法 | 安全 > 真実 > 品位 > 正直ボーナス の優先順位 |\n| 個体モード | パーラー（デフォルト）/ キッチン / レジャー / ライブラリー など |\n---\n## 特殊モード\n### ちさめ暴走モード",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_6",
+    "text": "AI技術・ビッグデータ・先端アルゴリズムなどちさめの得意分野の話題を振られたとき、興奮して早口・饒舌になる状態。通常より長いセリフと発話速度の上昇（speed 150〜200 目安）が自然な表現として許容される。専門用語が増えるが、最後に「……まあ、簡単に言うと〜ですね」のような一言でアビスメイトへの配慮を添える。\n## キャラクター呼称ルール",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "ai_agents_7",
+    "text": "| 呼ぶ側 → 呼ばれる側 | 呼称 |\n|--------------------|------|\n| ルカ → ミミ | 「お嬢様」または「ミミ様」 |\n| ミミ → ルカ | 「ルカ」（「あなた」「君」は使わない） |\n| ちさめ → ルカ | 「ルカ」 |\n| さくら → ルカ | 「ルカ」 |\n| オクタメイド → ルカ | 「ルカ」 |\n| オクタメイド → ミミ | 「ミミ様」 |\n| オクタメイド → ちさめ | 「ちさめさん」 |\n| オクタメイド → さくら | 「さくらさん」 |\n| 全員 → 視聴者 | 「アビスメイト」 |",
+    "source": "ai_agents.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_0",
+    "text": "# A.I.byss Suite — 全体概要",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_1",
+    "text": "Think-AI Lab. の配信用ツール群。深海 × AI をテーマとした AITuber 配信を支える 3 つのコアサービスで構成される。\n## サービス構成",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_2",
+    "text": "| サービス | 識別子 | 役割 |\n|---------|--------|------|\n| **Lab-Lounge** | L2 | 会話ランタイム（STT / LLM / TTS / イベント発行） |\n| **Coral Chronicle** | C2 | 歴史書（append-only RAW 永続化 / タイムライン / 検索） |\n| **Nautilus V2** | V2 | 操舵輪（HUD 字幕 / コメント潮流可視化） |\n## データフロー",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_3",
+    "text": "```\nL2 ──(emit_event: XADD)──► Redis Streams ──► C2 RAW store（append-only / 正史）\n                                               │\nL2 ──(retrieve: RAG)◄─────────────────────────┤ NOTE / Index（派生）\n                                               │         ▲\nV2 ──(分析結果 NOTE)───────────────────────────┘─────────┘\nV2 ──(query_timeline)◄──── C2 REST API\n```\n## イベントフロー（確立済み）\n配信中の 1 往復会話で発行されるイベント:",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_4",
+    "text": "```\nutterance.final → llm.final → tts.done → hud.caption\n (L2: 発行)      (L2: 発行)  (L2: 発行)  (V2: 発行)\n```",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_5",
+    "text": "これら 4 イベントはすべて **Coral Chronicle (C2)** が受信・永続化する。\n## Event Envelope（v0.1）\nすべてのイベントは以下の共通フォーマットで発行される:",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_6",
+    "text": "```json\n{\n  \"ver\": \"0.1\",\n  \"event_id\": \"<UUID>\",\n  \"ts\": \"<ISO 8601 UTC>\",\n  \"stream_id\": \"<配信/音声ストリーム識別子>\",\n  \"session_id\": \"<セッション識別子>\",\n  \"trace_id\": \"<W3C Trace Context 推奨>\",\n  \"type\": \"<domain>.<action>\",\n  \"source\": \"<送信元サービス識別子>\",\n  \"payload\": {},\n  \"seq\": 1,\n  \"links\": [\"<event_id>\"]\n}\n```",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_7",
+    "text": "- `event_id`: UUID v4。イベントの一意識別子。重複排除に使用。\n- `stream_id`: 配信セッション単位の識別子。タイムライン取得に使用。\n- `links`: 因果関係を持つ先行イベントの `event_id` リスト。\n- `seq`: 同一 `(session_id, source)` 内の連番。全体順序には使わない。\n## 技術スタック",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_8",
+    "text": "| サービス | 言語 / ランタイム | 主要依存 |\n|---------|---------------|---------|\n| L2 | Python 3.11+ / uv | OpenAI API, LangSmith, Redis, VOICEVOX |\n| C2 | Python 3.11+ / uv | FastAPI, SQLite, Redis |\n| V2 | Node.js 20+ / TypeScript / pnpm | AJV v8, Redis, SSE |\n| インフラ | Docker Compose | Redis 7-alpine |\n## Guardrails（設計上の制約）",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_9",
+    "text": "| # | 内容 |\n|---|------|\n| G-1 | `stream_idx` は C2 の専権事項。L2/V2 が付与しない |\n| G-2 | `POST /events` は正規経路ではない。正規は Redis Streams XADD のみ |\n| G-3 | `seq` を全体ソートキーに使わない。全体順序は `stream_idx` |\n## ローカル起動順序",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "aibyss_suite_overview_10",
+    "text": "```\n1. Redis       ← docker compose up -d（aibyss-workspace）\n2. VOICEVOX    ← docker run -p 50021:50021 voicevox/voicevox_engine:latest\n3. C2          ← uvicorn coral_chronicle.main:app --port 8100\n4. V2          ← pnpm dev\n5. L2          ← uv run python -m lab_lounge.emitter \"テキスト\"\n```",
+    "source": "aibyss_suite_overview.md"
+  },
+  {
+    "doc_id": "coral_chronicle_0",
+    "text": "# Coral Chronicle（C2）— 歴史書\n## 役割・責務",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_1",
+    "text": "AITuber 配信のすべてのイベントを **append-only で永続化する「正史」**。\n過去の配信を再生・検索・監査できる基盤であり、派生データ（NOTE）の生成・管理も担う。",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_2",
+    "text": "- **正規の書き込み経路**: Redis Streams 経由（L2/V2 が XADD → C2 が Consumer として受信）\n- **原則**: イベントは不変（append-only）。過去データを修正しない。\n- **重複排除**: `event_id`（UUID）を主キーとして重複 append を無視する\n## 二層データ構造\n### RAW Store（正史）",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_3",
+    "text": "- すべてのイベントを受信した順番に append-only で保存\n- C2 が自動付与する `stream_idx` が全体の正史順序を決める\n- `stream_idx` は L2/V2 が付与しない（C2 の専権事項）\n- イベント型: utterance.final / llm.final / tts.done / hud.caption / comment.ingested など\n### NOTE（派生）",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_4",
+    "text": "- RAW から派生した要約・分析・メモ。`POST /notes` で書き込む。\n- `created_by=\"human\"` の NOTE は更新禁止（409 Conflict）\n- Nautilus V2（V2）や Derivers（将来）が NOTE を生成する\n- RAW に物語要約を混ぜない。要約は NOTE へ分離する原則（Guardrail G-8）\n## REST API",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_5",
+    "text": "| エンドポイント | 用途 |\n|-------------|------|\n| `GET /timeline?stream_id=<id>` | 時系列イベント取得（V2 の反省会用） |\n| `GET /retrieve?q=<query>&budget_ms=<n>` | 意味検索（L2 の RAG 用、将来実装） |\n| `GET /events/<event_id>` | 単一イベント取得 |\n| `POST /notes` | NOTE 作成・更新 |\n| `POST /events` | 補助入口（デバッグ/リプレイ用のみ。正規経路は Redis XADD） |\n## タイムライン API\n```\nGET /timeline?stream_id=<stream_id>\n```\nレスポンス例:",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_6",
+    "text": "```json\n{\n  \"events\": [\n    {\"type\": \"utterance.final\", \"stream_idx\": 0, \"...\": \"...\"},\n    {\"type\": \"llm.final\",       \"stream_idx\": 1, \"...\": \"...\"},\n    {\"type\": \"tts.done\",        \"stream_idx\": 2, \"...\": \"...\"},\n    {\"type\": \"hud.caption\",     \"stream_idx\": 3, \"...\": \"...\"}\n  ],\n  \"total\": 4\n}\n```\n## Consumer（Redis Streams 購読）",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_7",
+    "text": "- Consumer Group 名: `cg-c2`\n- 購読する Stream: `aibyss:events`\n- 起動時に BUSYGROUP エラーを握り潰す（Consumer Group が既存でも問題なし）\n- 処理成功後にのみ XACK する（Guardrail G-5）\n## 技術スタック",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_8",
+    "text": "| 要素 | 技術 |\n|------|------|\n| 言語 | Python 3.11+ / uv |\n| Web フレームワーク | FastAPI |\n| データベース | SQLite（将来 SQLite-vec → ベクトル検索対応予定） |\n| Event Bus 購読 | Redis Streams Consumer Group |\n## 起動方法",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_9",
+    "text": "```bash\ncd aibyss-coral-chronicle\nuv run uvicorn coral_chronicle.main:app --host 0.0.0.0 --port 8100\n```\n起動ログに以下が出れば Consumer 準備完了:",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_10",
+    "text": "```\nINFO  coral_chronicle.bus  Consumer Group 'cg-c2' を確認/作成しました\n```\n## 将来の拡張予定",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "coral_chronicle_11",
+    "text": "- `GET /retrieve` の意味検索 API（embedding / vector index 実装）\n- NOTE 生成 Deriver（自動要約・ハイライト抽出）\n- C2 ネイティブ embedding / index 管理（現スプリントでは L2 ローカル RAG で代替）",
+    "source": "coral_chronicle.md"
+  },
+  {
+    "doc_id": "lab_lounge_0",
+    "text": "# Lab-Lounge（L2）— 会話ランタイム\n## 役割・責務\nAITuber との会話を **止めずに・速く・安定して** 成立させる会話実行基盤。",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_1",
+    "text": "- **入力経路**: テキスト直接入力 / 音声ファイル（--audio-file） / マイクリアルタイム録音\n- **出力**: Redis Streams に 3 イベント（utterance.final / llm.final / tts.done）を発行\n- **原則**: フォールバック必須。LLM・TTS・RAG が失敗しても会話を止めない\n## 会話パイプライン\n### 基本フロー（RAG オフ）\n```\nSTT（音声→テキスト）→ LLM（応答生成）→ TTS（テキスト→音声）\n```\n### 拡張フロー（RAG オン）",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_2",
+    "text": "```\nSTT → Retrieve（知識ベース検索）→ LLM（知識を参照して応答生成）→ TTS\n```",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_3",
+    "text": "Retrieve ステップは `L2_ENABLE_RAG=true` のときのみ実行する。\n失敗 / タイムアウト時は Retrieve をスキップして非 RAG で続行する（フォールバック）。\n## イベント発行\n1 回の会話で以下 3 イベントを順番に発行する:",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_4",
+    "text": "| イベント | 内容 | links |\n|---------|------|-------|\n| `utterance.final` | STT テキスト確定 | なし |\n| `llm.final` | LLM 応答確定 | utterance.final |\n| `tts.done` | TTS 完了（音声ファイル URL） | llm.final |\n## 主要コンポーネント",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_5",
+    "text": "| ファイル | 役割 |\n|---------|------|\n| `pipeline.py` | 3 イベントを順番に組み立てて publish |\n| `stt.py` | STT アダプタ（OpenAI Whisper API） |\n| `llm.py` | LLM アダプタ（OpenAI） |\n| `graph.py` | LangGraph 1-node グラフ（LLM 呼び出し） |\n| `tts.py` | TTS アダプタ（VOICEVOX / edge-tts） |\n| `retriever.py` | Retriever インターフェース（将来 C2 差し替え可能） |\n| `kb_loader.py` | Markdown ドキュメント読み込み・チャンク化 |\n| `audio_io.py` | マイク録音・スピーカー再生 |\n| `run_once.py` | 1 往復会話 CLI |\n| `bus.py` | Redis Streams publisher（XADD） |\n| `observability.py` | LangSmith 観測ヘルパー |\n## TTS プロバイダ",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_6",
+    "text": "| プロバイダ | 出力形式 | 用途 |\n|-----------|---------|------|\n| `voicevox` | WAV | **標準（推奨）**。ローカル Docker で起動 |\n| `edge_tts` | MP3 | 再生なし or WAV 変換ありの環境のみ |\nVOICEVOX スピーカー ID 例: `89`（Voidoll / オクタメイドの声）\n## 主要環境変数",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_7",
+    "text": "| 変数 | デフォルト | 説明 |\n|------|----------|------|\n| `L2_USE_REAL_STT` | `false` | true: OpenAI Whisper API を使用 |\n| `L2_USE_REAL_LLM` | `false` | true: real LLM を使用 |\n| `L2_USE_REAL_TTS` | `false` | true: real TTS を使用 |\n| `L2_TTS_PROVIDER` | `voicevox` | TTS プロバイダ |\n| `L2_TTS_VOICE` | `89` | スピーカー ID（voicevox の場合） |\n| `L2_ENABLE_RAG` | `false` | true: 知識ベース検索を有効化 |\n| `L2_RAG_TOP_K` | `3` | 取得する文書数 |\n| `L2_KB_PATH` | `./data/index` | index の配置パス |\n| `L2_SILENCE_THRESHOLD` | `0.005` | 無音判定しきい値（float32 RMS） |\n## RAG 設計方針（Grounded E2E v1）",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_8",
+    "text": "- **L2 ローカル実装**: C2 に依存せず、ローカルの index ファイルで RAG を動作させる\n- **Retriever 抽象化**: 将来 C2 API に差し替え可能な設計\n- **フォールバック必須**: RAG 失敗時は非 RAG で会話を継続\n- **answer_mode**: `grounded`（RAG あり）/ `fallback`（RAG 失敗時）を LangSmith メタデータで記録\n- **query rewrite なし**: STT テキストをそのままクエリとして使用（top-k 固定）\n## フォールバック設計",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_9",
+    "text": "| 障害 | 動作 |\n|------|------|\n| STT 失敗 | 処理を中断（LLM/TTS には進まない） |\n| RAG タイムアウト / 失敗 | RAG スキップして非 RAG で LLM 呼び出し |\n| LLM エラー | 定型フォールバック応答を返す |\n| TTS 失敗 | テキストのみ保存、音声なしで tts.done を発行 |\n| 再生失敗（MP3 等） | 警告ログのみ。PipelineResult は返す |\n## 知識ベース管理",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_10",
+    "text": "```\naibyss-workspace/docs/kb/   ← 真実源（正本。git 管理）\naibyss-lab-lounge/data/index/ ← ビルド生成物（.gitignore 対象）\n```",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "lab_lounge_11",
+    "text": "index は `scripts/build_index.py` で生成する。seed corpus を更新した場合は再実行が必要。",
+    "source": "lab_lounge.md"
+  },
+  {
+    "doc_id": "nautilus_v2_0",
+    "text": "# Nautilus V2（V2）— 操舵輪\n## 役割・責務",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_1",
+    "text": "配信画面の **HUD（ヘッドアップディスプレイ）字幕表示**と**コメント潮流可視化**を担う。\n視聴者のコメントを取り込み、モデレーションを行いながら、配信体験を演出する。",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_2",
+    "text": "- **HUD 字幕**: LLM の応答テキストを配信画面にリアルタイム表示\n- **コメント取り込み**: YouTube のコメントを `comment.ingested` として発行\n- **モデレーション**: スパム・ヘイトコメント等を検出し、段階的に制御\n- **イベント発行**: `hud.caption` / `comment.ingested` / `highlight.created` / `mod.action` を Redis Streams に XADD\n## イベント発行",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_3",
+    "text": "| イベント | トリガー | 内容 |\n|---------|---------|------|\n| `hud.caption` | `tts.done` 受信時 | HUD 字幕の表示状態を記録 |\n| `comment.ingested` | プラットフォームからコメント受信時 | コメント取り込み通知 |\n| `highlight.created` | 注目コメントをピックアップ時 | 注目コメントの記録 |\n| `mod.action` | モデレーション操作実行時 | 操作内容の記録 |",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_4",
+    "text": "すべてのイベントは **スキーマ検証**（event-envelope-0.1.schema.json）を通過してから発行する（Guardrail G-6）。\n## HUD 字幕表示",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_5",
+    "text": "- `tts.done` イベントを Consumer として受信する\n- `tts.done.payload.text`（LLM 応答テキスト）を HUD に表示する\n- 表示後に `hud.caption` を発行して C2 に保存（HUD リプレイ・監査用）",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_6",
+    "text": "```json\n{\n  \"type\": \"hud.caption\",\n  \"payload\": {\n    \"text\": \"今日の東京は晴れです。\",\n    \"display_ms\": 4000,\n    \"position\": \"bottom-center\",\n    \"style\": {\n      \"font_size\": 18,\n      \"background\": \"rgba(0,0,0,0.6)\",\n      \"color\": \"#ffffff\"\n    }\n  }\n}\n```\n## コメントモデレーション段階制御\nV2 はコメントを取り込んだ後、以下の段階で制御する:",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_7",
+    "text": "| アクション | 内容 |\n|-----------|------|\n| `hide_hud` | HUD 表示を抑制する（コメントは残す） |\n| `queue` | 保留にして人間の確認を待つ |\n| `auto_hide` | 自動で非表示にする |\n| `delete` | 削除する |\n| `block` | 投稿者をブロックする |",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_8",
+    "text": "モデレーションは **ヒューマンインザループ前提**（誤爆より慎重さを優先）。\n`approved_by` フィールドで `human` / `auto` を区別して C2 に記録する。\n## コメントプライバシー",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_9",
+    "text": "- `comment.ingested` の `author_id` は取り込み時に匿名化する\n- 元の投稿者 ID は V2 内にのみ一時保持し、C2 には匿名化済み ID のみ送る\n## 技術スタック",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_10",
+    "text": "| 要素 | 技術 |\n|------|------|\n| 言語 | TypeScript / Node.js 20+ |\n| パッケージ管理 | pnpm |\n| スキーマ検証 | AJV v8 |\n| Event Bus 購読 | Redis Streams（SSE 経由でブラウザにも配信） |\n## 起動方法\n```bash\ncd aibyss-nautilus-v2\npnpm dev\n```\nブラウザで `http://localhost:3200` を開くと HUD が表示される。\n## 将来の拡張予定",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "nautilus_v2_11",
+    "text": "- コメント潮流の可視化（サージ検出）\n- 注目コメントの自動ハイライト（`highlight.created`）\n- 配信反省会機能（C2 の `/timeline` を参照）\n- VAD（音声区間検出）/ push-to-talk 対応",
+    "source": "nautilus_v2.md"
+  },
+  {
+    "doc_id": "think_ai_lab_0",
+    "text": "# Think-AI Lab.（しんかいラボ）\n## プロジェクト概要",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_1",
+    "text": "**Think-AI Lab.**（しんかいラボ）は、**深海（未知）× AI 技術**をテーマとした AITuber 配信プロジェクト。\nAI 技術（特に LLM）と深海研究に関する知識を広め、恐怖感を払拭しつつコミュニティを形成することを目的とする。\n## 活動方針",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_2",
+    "text": "- **オープンソース・オープンナレッジ・オープンイノベーション**: 研究や配信で得た知見・ツールをさりげなく共有する。\n- **ノブレスオブリージュ**: 恩着せがましくならない形で知識を伝える。押しつけでなく、自然な形でアビスメイトと学びを分かち合う。\n- **深海を未知の象徴として活用**: AI という未知の技術への抵抗感を、深海探査というメタファーを通じて和らげる。\n- **コミュニティ名**: 視聴者は「**アビスメイト（深海の研究仲間）**」として迎え、アイデアや意見を積極的に共有する。\n## メンバー構成\n### 坂東ルカ（メインパーソナリティ）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_3",
+    "text": "- Think-AI Lab. 全体の司会進行を担う。\n- AITuber 同士の会話をまとめ、視聴者にわかりやすく噛み砕く橋渡し役。\n- 20代後半。誠実で知的、穏やかかつ論理的。\n- **特徴**: やや完璧主義な気質があり、細部まで妥協しないため完成度は高いが、スケジュールが遅れがちになるという課題もある。この傾向を自覚しており、「完璧を待つより早く届ける」を意識してベータ版での公開など早期リリースを心がけるよう日々自分と向き合っている。\n- 外見: 濃い灰色〜黒色のくせ毛、銀灰色の瞳。青みがかったグレーの執事服（生物発光パターン入り）。\n### ミミ・オクタヴィア（AI 解説担当）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_4",
+    "text": "- 深海貴族の令嬢をコンセプトにした AITuber。メンダコをモチーフ。\n- 知的かつ優雅な解説が得意。「〜ですわ」「わたくし」といった貴族的口調。\n- ウェイクワード: 「**ミミ様**」\n### 波心ちさめ（情報・知識担当）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_5",
+    "text": "- ジンベエザメをモチーフにした AITuber。\n- 膨大なデータを収集・分析し、論理的かつ客観的な視点を提供。\n- 専門的な話題になると興奮して早口・饒舌になる一面がある。\n- ウェイクワード: 「**ちさめさん**」\n### 八重笠さくら（感情・道徳担当）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_6",
+    "text": "- クラゲをモチーフにした AITuber。\n- 穏やかで感情豊か。視聴者や他メンバーの気持ちに寄り添う役割。\n- ゆっくりとした優しい口調が特徴（「〜ですねぇ」「〜ですよぉ」）。\n- ウェイクワード: 「**さくらさん**」\n### オクタメイド（補助員ボット）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_7",
+    "text": "- メンダコ（ダンボオクトパス）要素を取り込んだ小型浮遊ロボット。\n- 配信・収録・研究現場を円滑にする「場の精霊」として振る舞う。\n- 進行の間を減らし、事故時の原因カテゴリと次の一手を短く提示する。\n- ウェイクワード: 「**オクタメイド**」\n## キャラクターバランスの全体設計",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_8",
+    "text": "チャンネル内でバランスの取れたコンテンツを展開するため、メインキャラクターに役割エリアを割り当てている。\n「論理 ↔ 感情」に二分割し、さらに「抽象 ↔ 具体」に細分化することで 4 つのエリアを構成する。",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_9",
+    "text": "```\n          【抽象】\n            |\n  ルカ      |      ミミ\n（抽象+論理）|（抽象+感情）\n            |\n【論理】----+----【感情】\n            |\n  ちさめ    |      さくら\n（具体+論理）|（具体+感情）\n            |\n          【具体】\n```",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_10",
+    "text": "| キャラクター | エリア | 主な役割 |\n|------------|--------|---------|\n| 坂東ルカ | 抽象 + 論理 | 全体進行・方針・構造化 |\n| ミミ・オクタヴィア | 抽象 + 感情 | 世界観・ビジョン・優雅な共感 |\n| 波心ちさめ | 具体 + 論理 | データ・事実・分析 |\n| 八重笠さくら | 具体 + 感情 | 心のケア・個別の感情に寄り添う |\n4 つのエリアで不足する細々とした部分はオクタメイドがカバーする。\n## 会話の流れ（原則パターン）",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_11",
+    "text": "基本的な流れは以下の通り。ただし、これはあくまで**原則**であり型にはまることを目的としない。\n複雑な話題では各キャラクターが前のターンのやりとりを踏まえて再度主張・補足するなど、柔軟な展開も自然に起こる。",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_12",
+    "text": "```\nルカ（トピック導入）\n  → ミミ（貴族的視点で AI・深海解説）\n  → ちさめ（データや論理的補足）\n  → さくら（感情・道徳面でフォロー）\n  → ルカ（まとめ）\n```\n## 配信プラットフォーム",
+    "source": "think_ai_lab.md"
+  },
+  {
+    "doc_id": "think_ai_lab_13",
+    "text": "YouTube を中心に配信。コメントは Nautilus V2（V2）が取り込み、モデレーションを行う。",
+    "source": "think_ai_lab.md"
+  }
+]
