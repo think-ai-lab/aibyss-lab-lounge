@@ -1,0 +1,18 @@
+{
+  "rag_enabled": true,
+  "latency_ms": 1594,
+  "results": [
+    {
+      "doc_id": "think_ai_lab_0",
+      "score": 0.628045380115509
+    },
+    {
+      "doc_id": "think_ai_lab_1",
+      "score": 0.5908924341201782
+    },
+    {
+      "doc_id": "aibyss_suite_overview_1",
+      "score": 0.568331241607666
+    }
+  ]
+}

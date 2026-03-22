@@ -746,6 +746,11 @@ obs = [
     { name = "langsmith" },
     { name = "python-dotenv" },
 ]
+rag = [
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "python-dotenv" },
+]
 stt = [
     { name = "openai" },
     { name = "python-dotenv" },
@@ -764,6 +769,8 @@ requires-dist = [
     { name = "langgraph", marker = "extra == 'llm'", specifier = ">=0.2" },
     { name = "langsmith", marker = "extra == 'obs'", specifier = ">=0.1" },
     { name = "mutagen", marker = "extra == 'tts'", specifier = ">=1.47" },
+    { name = "numpy", marker = "extra == 'rag'", specifier = ">=1.26" },
+    { name = "openai", marker = "extra == 'rag'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
@@ -771,13 +778,14 @@ requires-dist = [
     { name = "python-dotenv", marker = "extra == 'llm'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'mic'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'obs'", specifier = ">=1.0" },
+    { name = "python-dotenv", marker = "extra == 'rag'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'tts'", specifier = ">=1.0" },
     { name = "redis", extras = ["hiredis"], specifier = ">=5.0" },
     { name = "sounddevice", marker = "extra == 'mic'", specifier = ">=0.4" },
     { name = "soundfile", marker = "extra == 'mic'", specifier = ">=0.12" },
 ]
-provides-extras = ["dev", "llm", "tts", "stt", "obs", "mic"]
+provides-extras = ["dev", "llm", "tts", "stt", "obs", "mic", "rag"]
 
 [[package]]
 name = "langchain-core"

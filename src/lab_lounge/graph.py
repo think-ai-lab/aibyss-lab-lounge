@@ -32,6 +32,7 @@ class LLMGraphState(TypedDict):
     text: str
     model: str
     provider: str
+    context: str | None   # RAG で取得した参照テキスト（None = non-RAG）
     result: LLMResult | None
 
 
@@ -39,7 +40,12 @@ class LLMGraphState(TypedDict):
 
 def _llm_node(state: LLMGraphState) -> LLMGraphState:
     """LLM を呼び出してテキストを生成するノード。"""
-    result = call_llm(state["text"], model=state["model"], provider=state["provider"])
+    result = call_llm(
+        state["text"],
+        model=state["model"],
+        provider=state["provider"],
+        context=state.get("context"),
+    )
     return {**state, "result": result}
 
 
@@ -73,6 +79,7 @@ def run_graph(
     *,
     model: str,
     provider: str = "openai",
+    context: str | None = None,
     run_metadata: dict | None = None,
 ) -> LLMResult:
     """
@@ -82,6 +89,7 @@ def run_graph(
         text:         発話テキスト
         model:        使用するモデル名
         provider:     LLM プロバイダ（"openai" など）
+        context:      RAG で取得した参照テキスト（省略時は non-RAG 動作）
         run_metadata: LangGraph config["metadata"] に渡す dict (optional)。
                       LangSmith が有効なとき trace に添付される。
                       無効のときは渡しても副作用なし。
@@ -93,12 +101,13 @@ def run_graph(
         ImportError:  langgraph が未インストール
         RuntimeError: Graph が result を返さなかった場合（通常発生しない）
     """
-    logger.info("Graph 実行開始: model=%s provider=%s", model, provider)
+    logger.info("Graph 実行開始: model=%s provider=%s rag=%s", model, provider, context is not None)
     graph = _build_graph()
     initial_state: LLMGraphState = {
         "text": text,
         "model": model,
         "provider": provider,
+        "context": context,
         "result": None,
     }
     config = {"metadata": run_metadata} if run_metadata else None

@@ -40,15 +40,21 @@ class LLMResult:
 
 # ─── OpenAI adapter ───────────────────────────────────────────────
 
-def _call_openai(text: str, *, model: str, **kwargs) -> LLMResult:
+def _call_openai(text: str, *, model: str, context: str | None = None, **kwargs) -> LLMResult:
     """
     ChatOpenAI (langchain-openai) を使って LLM を呼び出す。
 
     langchain-openai が未インストールの場合は ImportError を送出する。
     OPENAI_API_KEY 環境変数が必要。
+
+    Args:
+        text:    ユーザー発話テキスト
+        model:   使用するモデル名
+        context: RAG で取得した参照テキスト（省略時は non-RAG 動作）
+        **kwargs: ChatOpenAI に渡す追加オプション
     """
     try:
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_openai import ChatOpenAI
     except ImportError as exc:
         raise ImportError(
@@ -58,7 +64,17 @@ def _call_openai(text: str, *, model: str, **kwargs) -> LLMResult:
 
     t0 = time.monotonic()
     llm = ChatOpenAI(model=model, **kwargs)
-    response = llm.invoke([HumanMessage(content=text)])
+
+    if context:
+        system_content = (
+            "以下の参照情報をもとに回答してください。\n\n"
+            f"{context}"
+        )
+        messages = [SystemMessage(content=system_content), HumanMessage(content=text)]
+    else:
+        messages = [HumanMessage(content=text)]
+
+    response = llm.invoke(messages)
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     usage = getattr(response, "usage_metadata", None) or {}
@@ -87,7 +103,14 @@ _PROVIDERS: dict = {
 
 # ─── 公開 API ────────────────────────────────────────────────────
 
-def call_llm(text: str, *, model: str, provider: str = "openai", **kwargs) -> LLMResult:
+def call_llm(
+    text: str,
+    *,
+    model: str,
+    provider: str = "openai",
+    context: str | None = None,
+    **kwargs,
+) -> LLMResult:
     """
     LLM を呼び出して LLMResult を返す。
 
@@ -95,6 +118,7 @@ def call_llm(text: str, *, model: str, provider: str = "openai", **kwargs) -> LL
         text:     入力テキスト（utterance.final の payload.text）
         model:    使用するモデル名
         provider: LLM プロバイダ（現在 "openai" のみ対応）
+        context:  RAG で取得した参照テキスト（省略時は non-RAG 動作）
         **kwargs: プロバイダ固有のオプション（temperature 等）
 
     Returns:
@@ -111,7 +135,12 @@ def call_llm(text: str, *, model: str, provider: str = "openai", **kwargs) -> LL
             f"未対応の provider: {provider!r}。対応プロバイダ: {supported}"
         )
 
-    logger.info("LLM 呼び出し開始: provider=%s model=%s", provider, model)
+    logger.info(
+        "LLM 呼び出し開始: provider=%s model=%s rag=%s",
+        provider, model, context is not None,
+    )
+    if context is not None:
+        kwargs["context"] = context
     result: LLMResult = fn(text, model=model, **kwargs)
     logger.info(
         "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s",
