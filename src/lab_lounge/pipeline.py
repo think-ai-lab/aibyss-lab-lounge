@@ -61,9 +61,9 @@ def _get_tts_mode() -> tuple[bool, str, str, str, str]:
           output_dir: 音声ファイル保存先
     """
     use_real = os.environ.get("L2_USE_REAL_TTS", "false").lower() in ("true", "1", "yes")
-    provider = os.environ.get("L2_TTS_PROVIDER", "edge_tts")
-    voice = os.environ.get("L2_TTS_VOICE", "ja-JP-NanamiNeural")
-    speaker = os.environ.get("L2_TTS_SPEAKER", "Nanami")
+    provider = os.environ.get("L2_TTS_PROVIDER", "voicevox")
+    voice = os.environ.get("L2_TTS_VOICE", "89")
+    speaker = os.environ.get("L2_TTS_SPEAKER", "Voidoll")
     output_dir = os.environ.get("L2_TTS_OUTPUT_DIR", "./data/audio")
     return use_real, provider, voice, speaker, output_dir
 

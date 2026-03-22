@@ -304,11 +304,57 @@ uv run python -c "import sounddevice; print(sounddevice.query_devices())"
 
 ---
 
+### セマンティックスモーク WAV の生成（初回セットアップ）
+
+STT 検証用の短い実発話 WAV を生成する。VOICEVOX Engine が必要。
+
+```powershell
+# VOICEVOX Engine を起動してから（別ターミナル）:
+# docker run -p 50021:50021 voicevox/voicevox_engine:latest
+
+uv run python scripts/generate_smoke_wav.py
+# -> samples/test_greeting.wav を生成
+
+# STT 検証:
+$env:L2_USE_REAL_STT = "true"; $env:L2_USE_REAL_LLM = "true"; $env:L2_USE_REAL_TTS = "true"
+$env:L2_TTS_PROVIDER = "voicevox"; $env:L2_TTS_VOICE = "89"
+uv run python -m lab_lounge.emitter --audio-file samples/test_greeting.wav --stream-id semantic-smoke
+Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE
+```
+
+utterance.final.payload.text に "こんにちは" 程度の内容が返れば OK。
+
+### silence threshold の校正
+
+マイク環境に合わせた `L2_SILENCE_THRESHOLD` の推奨値を測定する。
+
+```powershell
+# mic extra をインストール済みの場合:
+uv run python scripts/calibrate_silence.py
+
+# 測定秒数・デバイスを指定する場合:
+uv run python scripts/calibrate_silence.py --seconds 5 --device 2
+```
+
+出力された `L2_SILENCE_THRESHOLD=X.XXXX` を `.env` に追記する。
+
+---
+
 ### よくある失敗例（トラブルシューティング）
+
+#### TTS プロバイダの選択基準
+
+| プロバイダ | 出力形式 | 再生可否 | 用途 |
+|-----------|---------|---------|------|
+| `voicevox` | WAV | ✅ soundfile で再生可 | **標準（推奨）** |
+| `edge_tts` | MP3 | ❌ soundfile は MP3 非対応 | 再生なし or WAV 変換ありの環境のみ |
+
+**標準は `voicevox`。** VOICEVOX Engine がローカルで起動している場合は自動的に WAV で出力・再生できる。
+`edge_tts` は再生を伴わないバッチ生成（ファイル書き出しのみ）や、MP3→WAV 変換ツールがある環境での使用を想定している。
 
 #### MP3 が再生できない（edge_tts 利用時）
 
-edge_tts は MP3 を出力するが `soundfile` は MP3 非対応。  
+edge_tts は MP3 を出力するが `soundfile` は MP3 非対応。
 再生時に `WARNING lab_lounge.audio_io: 再生失敗: *.mp3 (Error opening ...)` が出る。
 
 **解決策**: TTS provider を `voicevox` に切り替える（WAV 出力のため soundfile で再生可能）。

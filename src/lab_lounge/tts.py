@@ -201,7 +201,7 @@ _PROVIDERS: dict = {
 def synthesize(
     text: str,
     *,
-    provider: str = "edge_tts",
+    provider: str = "voicevox",
     voice: str,
     output_dir: str = "./data/audio",
     **kwargs,
