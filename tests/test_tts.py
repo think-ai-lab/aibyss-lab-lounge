@@ -57,49 +57,49 @@ class TestSynthesize:
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert isinstance(result, TTSResult)
 
     def test_result_audio_url_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.audio_url == "file:///tmp/test-audio.mp3"
 
     def test_result_duration_ms_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.duration_ms == 2500
 
     def test_result_voice_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.voice == "ja-JP-NanamiNeural"
 
     def test_result_format_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.format == "mp3"
 
     def test_result_sample_rate_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.sample_rate == 24000
 
     def test_result_speaker_field(self):
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            result = synthesize("テスト", voice="ja-JP-NanamiNeural")
+            result = synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural")
         assert result.speaker == "Nanami"
 
     def test_output_dir_forwarded(self):
@@ -107,7 +107,7 @@ class TestSynthesize:
         mock_fn = _mock_provider(FAKE_TTS_RESULT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
-            synthesize("テスト", voice="ja-JP-NanamiNeural", output_dir="/custom/audio")
+            synthesize("テスト", provider="edge_tts", voice="ja-JP-NanamiNeural", output_dir="/custom/audio")
         mock_fn.assert_called_once_with(
             "テスト", voice="ja-JP-NanamiNeural", output_dir="/custom/audio"
         )
@@ -118,7 +118,7 @@ class TestSynthesize:
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(tts_mod._PROVIDERS, "edge_tts", mock_fn)
             synthesize(
-                "テスト", voice="ja-JP-NanamiNeural", speaker="Nanami"
+                "テスト", provider="edge_tts", voice="ja-JP-NanamiNeural", speaker="Nanami"
             )
         mock_fn.assert_called_once_with(
             "テスト",
