@@ -10,6 +10,8 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 > Phase 3 real STT 対応済み (stt.py)。
 > Phase 4 マイク入力・スピーカー出力対応済み (audio_io.py / run_once.py)。
 > Phase 5 LangSmith 観測対応済み (observability.py)。
+> **Grounded E2E v1 RAG 統合済み** (kb_loader.py / retriever.py / pipeline.py)。
+> `L2_ENABLE_RAG=true` で seed corpus を参照した応答が返る。fallback 設計・debug artifacts・47 件のテストを含む。
 
 ---
 
@@ -53,10 +55,14 @@ uv sync --extra dev
 | `stt` | openai, python-dotenv | real STT (Whisper API) |
 | `obs` | langsmith, python-dotenv | LangSmith tracing |
 | `mic` | sounddevice, soundfile, python-dotenv | マイク録音・スピーカー再生 |
+| `rag` | openai, numpy, python-dotenv | RAG（知識ベース検索） |
 
 ```powershell
 # real E2E 全部入り（VOICEVOX + OpenAI + LangSmith + マイク）
 uv sync --extra llm --extra tts --extra stt --extra obs --extra mic
+
+# RAG 込みで実行
+uv sync --extra llm --extra tts --extra stt --extra rag
 
 # audio-file path のみ（マイク不要）
 uv sync --extra stt --extra llm --extra tts
@@ -91,6 +97,11 @@ cp .env.example .env
 | `LANGSMITH_TRACING` | `false` | `true` にすると LangChain / LangGraph 実行を LangSmith に送信する |
 | `LANGSMITH_API_KEY` | *(必須 / tracing on のみ)* | LangSmith API キー（`.env` に記載。コミット禁止） |
 | `LANGSMITH_PROJECT` | `aibyss-lab-lounge` | LangSmith プロジェクト名 |
+| `L2_ENABLE_RAG` | `false` | `true` にすると知識ベース検索（RAG）を有効化する |
+| `L2_RAG_TOP_K` | `3` | RAG で取得する文書数 |
+| `L2_KB_PATH` | `./data/index` | index ファイル（chunks.json / embeddings.npy）の配置パス |
+| `L2_DEBUG_ARTIFACTS` | `false` | `true` にすると `logs/` 以下に STT/RAG/LLM の中間ファイルを出力する |
+| `L2_DEBUG_LOG_DIR` | `./logs` | debug artifacts の出力ディレクトリ |
 
 ---
 
@@ -200,6 +211,56 @@ trace_id   : 550e8400-e29b-41d4-a716-446655440000
 ```bash
 uv run python -m lab_lounge.emitter "テスト発話" --stream-id my-stream-002
 ```
+
+### RAG モード（Grounded E2E v1）
+
+知識ベースを参照して応答を生成する RAG モード。seed corpus から index を作成しておく必要がある。
+
+#### 初回セットアップ（index ビルド）
+
+```powershell
+# rag extra をインストール（初回のみ）
+uv sync --extra rag
+
+# seed corpus（aibyss-workspace/docs/kb/）から index を生成
+uv run python scripts/build_index.py
+# -> data/index/chunks.json, data/index/embeddings.npy を生成
+```
+
+#### RAG on で実行
+
+```powershell
+$env:L2_USE_REAL_LLM = "true"
+$env:L2_ENABLE_RAG   = "true"
+$env:L2_KB_PATH      = "./data/index"
+$env:L2_RAG_TOP_K    = "3"
+uv run python -m lab_lounge.emitter "Think-AI Lab.のメンバーを教えてください"
+Remove-Item Env:\L2_USE_REAL_LLM, Env:\L2_ENABLE_RAG, Env:\L2_KB_PATH, Env:\L2_RAG_TOP_K
+```
+
+#### debug artifacts の確認
+
+```powershell
+$env:L2_DEBUG_ARTIFACTS = "true"
+$env:L2_DEBUG_LOG_DIR   = "./logs"
+# 実行後 logs/ 以下に以下のファイルが生成される:
+#   stt_output.json   - STT 結果
+#   retrieval.json    - 検索結果 (doc_ids / scores / latency)
+#   llm_prompt.txt    - LLM に渡したプロンプト全文
+#   llm_response.txt  - LLM の応答全文
+```
+
+`llm.final.payload` の RAG 関連フィールド:
+
+| フィールド | 説明 |
+|-----------|------|
+| `rag_used` | RAG を使ったか（`true` / `false`） |
+| `answer_mode` | `grounded`（RAG 使用）/ `fallback`（非 RAG） |
+| `retrieval_latency_ms` | 検索にかかった時間 [ms] |
+| `retrieved_doc_count` | 取得した文書数 |
+| `retrieved_doc_ids` | 取得した文書の ID リスト |
+
+---
 
 ### LangSmith 観測（Phase 5）
 
@@ -510,6 +571,8 @@ uv run pytest -v
 | `tests/test_graph.py` | `run_graph` ・ LangGraph ノード・ ImportError 確認 |
 | `tests/test_observability.py` | `is_langsmith_enabled` ・ `build_run_metadata` ・ tracing on/off 分岐 |
 | `tests/test_run_once.py` | 録音成功フロー・無音・録音失敗・ STT 失敗・ skip_playback・URI 変換 |
+| `tests/test_retriever.py` | kb_loader / LocalRetriever ユニットテスト（22 件） |
+| `tests/test_rag_pipeline.py` | RAG on/off・fallback・debug artifacts 統合テスト（25 件） |
 
 ---
 
@@ -534,6 +597,13 @@ aibyss-lab-lounge/
       observability.py  # LangSmith 観測ヘルパー (tracing on/off 判定・run metadata 組み立て)
       audio_io.py       # 録音・再生アダプタ (sounddevice/soundfile ラッパー)
       run_once.py       # 1 往復会話 CLI (--mic / --record-seconds)
+      kb_loader.py      # Markdown 読み込み + チャンク化 (RAG 用)
+      retriever.py      # LocalRetriever (numpy コサイン類似度 + OpenAI embeddings)
+      debug.py          # debug artifacts 書き出し (L2_DEBUG_ARTIFACTS=true のときのみ)
+  scripts/
+    build_index.py      # seed corpus → chunks.json + embeddings.npy 生成
+    generate_smoke_wav.py
+    calibrate_silence.py
   tests/
     conftest.py
     test_events.py
@@ -545,6 +615,8 @@ aibyss-lab-lounge/
     test_tts.py
     test_observability.py
     test_run_once.py
+    test_retriever.py   # kb_loader / LocalRetriever ユニットテスト
+    test_rag_pipeline.py  # RAG パイプライン統合テスト
 ```
 
 ---
