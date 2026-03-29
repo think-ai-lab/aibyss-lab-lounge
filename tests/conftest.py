@@ -35,6 +35,7 @@ def reset_l2_mode_vars(monkeypatch):
     (dummy mode) で動作させる。real mode が必要なテストは各 fixture で明示的に
     setenv する。
     """
-    for var in ("L2_USE_REAL_LLM", "L2_USE_REAL_TTS", "L2_USE_REAL_STT"):
+    for var in ("L2_USE_REAL_LLM", "L2_USE_REAL_TTS", "L2_USE_REAL_STT",
+                "L2_DEFAULT_SPEAKER", "L2_WAKE_BACKEND"):
         monkeypatch.delenv(var, raising=False)
 

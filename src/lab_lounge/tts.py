@@ -8,8 +8,9 @@ tts.py — TTS アダプタ
   - pipeline.py から呼ばれる
 
 【対応 provider】
-  "edge_tts" : Microsoft Edge TTS (edge-tts パッケージ必要)
+  "edge_tts"  : Microsoft Edge TTS (edge-tts パッケージ必要)
   "voicevox"  : VOICEVOX Engine HTTP API (ローカルサーバ必要)
+  "voicepeak" : VOICEPEAK CLI (voicepeak コマンドが PATH に必要)
 
 【前提パッケージ (real mode)】
   edge_tts:
@@ -47,6 +48,7 @@ class TTSResult:
     format: str
     sample_rate: int
     speaker: str = ""
+    chunk_audio_urls: list[str] = field(default_factory=list)
 
 
 # ─── Edge TTS adapter ────────────────────────────────────────────
@@ -188,11 +190,308 @@ def _call_voicevox(
     )
 
 
+# ─── VOICEPEAK adapter ──────────────────────────────────────────
+
+# VOICEPEAK が "bad exception" を起こしやすい半角ASCII記号 → 全角変換テーブル
+_VOICEPEAK_NORMALIZE: dict[str, str] = {
+    "?": "？",
+    "!": "！",
+    "(": "（",
+    ")": "）",
+    "[": "［",
+    "]": "］",
+    "{": "｛",
+    "}": "｝",
+    "<": "＜",
+    ">": "＞",
+    '"': "＂",
+    "&": "＆",
+    "/": "／",
+    "\\": "￥",
+}
+
+
+def _normalize_for_voicepeak(text: str) -> str:
+    """VOICEPEAK に渡す前に半角ASCII記号を全角に変換する。"""
+    for src, dst in _VOICEPEAK_NORMALIZE.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def _parse_voicepeak_json(text: str) -> tuple[str, dict[str, int] | None, int | None]:
+    """
+    LLM 応答が JSON 構造の場合、response / emotion / speed を分離する。
+
+    対応する JSON 形式:
+        {"emotion": {"happy": 50, ...}, "speed": 100, "response": "テキスト"}
+
+    全角記号に正規化済みの JSON も半角に戻してからパースを試みる。
+
+    Returns:
+        (say_text, emotion_dict_or_None, speed_or_None)
+        JSON でない場合は (text, None, None) をそのまま返す。
+    """
+    import json as _json
+
+    # 全角→半角の逆変換テーブル（正規化済み JSON のパース用）
+    _REVERSE_NORMALIZE: dict[str, str] = {v: k for k, v in _VOICEPEAK_NORMALIZE.items()}
+
+    raw = text
+    for src, dst in _REVERSE_NORMALIZE.items():
+        raw = raw.replace(src, dst)
+    raw = raw.strip()
+
+    try:
+        obj = _json.loads(raw)
+    except (ValueError, TypeError):
+        return text, None, None
+
+    if not isinstance(obj, dict) or "response" not in obj:
+        return text, None, None
+
+    say_text = str(obj["response"])
+    emotion = obj.get("emotion")
+    if isinstance(emotion, dict):
+        emotion = {str(k): int(v) for k, v in emotion.items()}
+    else:
+        emotion = None
+    speed_val = obj.get("speed")
+    if speed_val is not None:
+        speed_val = int(speed_val)
+
+    return say_text, emotion, speed_val
+
+
+# ─── VOICEPEAK テキスト分割 ──────────────────────────────────────
+
+_VOICEPEAK_MAX_CHARS = 140
+
+
+def _split_text_for_voicepeak(
+    text: str,
+    max_chars: int = _VOICEPEAK_MAX_CHARS,
+) -> list[str]:
+    """
+    VOICEPEAK の文字数制限 (140字) に合わせてテキストを自然な句読点で分割する。
+
+    なるべく max_chars ギリギリまで活用しつつ、以下の優先順位で分割点を選ぶ:
+      1. 句点・感嘆符・疑問符 (。！？!?\n) — 文末
+      2. 読点・カンマ・セミコロン等 (、,，;；:： ) — 節の切れ目
+      3. 上記なし → max_chars で強制カット
+
+    140字以内のテキストは分割せずそのまま返す。
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    primary = set("。！？!?\n")
+    secondary = set("、,，;；:： ")
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunk = remaining.strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        window = remaining[:max_chars]
+
+        # 後方スキャンで最適な分割点を探す (max_chars ギリギリまで活用)
+        best = -1
+        for i in range(len(window) - 1, -1, -1):
+            if window[i] in primary:
+                best = i + 1
+                break
+
+        if best <= 0:
+            for i in range(len(window) - 1, -1, -1):
+                if window[i] in secondary:
+                    best = i + 1
+                    break
+
+        if best <= 0:
+            best = max_chars
+
+        chunk = remaining[:best].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[best:].lstrip()
+
+    return chunks if chunks else [text]
+
+
+def _generate_voicepeak_single_file(
+    text: str,
+    *,
+    voice: str,
+    filepath: Path,
+    speed: int | None = None,
+    emotion: dict[str, int] | None = None,
+) -> tuple[int, int]:
+    """
+    VOICEPEAK CLI で 1 チャンク分の WAV を生成する。
+
+    Returns:
+        (duration_ms, sample_rate)
+    """
+    import subprocess
+    import wave
+
+    voicepeak_cmd = os.environ.get("L2_TTS_VOICEPEAK_PATH", "voicepeak")
+
+    normalized_text = _normalize_for_voicepeak(text)
+    if normalized_text != text:
+        logger.debug("VOICEPEAK テキスト正規化: %r → %r", text, normalized_text)
+
+    # VOICEPEAK CLI は --say / --narrator の値をダブルクォートで囲む必要がある。
+    # subprocess.list2cmdline はスペースを含まない日本語テキスト等をクォートしないため、
+    # 明示的にダブルクォートを付与してコマンド文字列を構築する。
+    safe_text = normalized_text.replace('"', "'")
+    safe_voice = voice.replace('"', "'")
+
+    cmd_str = (
+        f'{subprocess.list2cmdline([voicepeak_cmd])}'
+        f' --say "{safe_text}"'
+        f' --narrator "{safe_voice}"'
+        f' --out {subprocess.list2cmdline([str(filepath)])}'
+    )
+    if speed is not None:
+        cmd_str += f" --speed {speed}"
+    if emotion:
+        emotion_expr = ",".join(f"{k}={v}" for k, v in emotion.items())
+        cmd_str += f" --emotion {emotion_expr}"
+
+    logger.info("VOICEPEAK コマンド: %s", cmd_str)
+
+    try:
+        subprocess.run(cmd_str, check=True, capture_output=True, text=True, shell=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"VOICEPEAK コマンドが見つかりません: {voicepeak_cmd!r}。"
+            " L2_TTS_VOICEPEAK_PATH でパスを設定するか、PATH に追加してください。"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"VOICEPEAK 実行エラー: {exc.stderr or exc.stdout}"
+        ) from exc
+
+    with wave.open(str(filepath)) as wf:
+        duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)
+        sample_rate = wf.getframerate()
+
+    return duration_ms, sample_rate
+
+
+def _concatenate_wavs(input_paths: list[Path], output_path: Path) -> None:
+    """複数の WAV ファイルを 1 つに結合する。"""
+    import wave
+
+    with wave.open(str(input_paths[0]), "rb") as first:
+        params = first.getparams()
+        all_frames = first.readframes(first.getnframes())
+
+    for p in input_paths[1:]:
+        with wave.open(str(p), "rb") as wf:
+            all_frames += wf.readframes(wf.getnframes())
+
+    with wave.open(str(output_path), "wb") as out:
+        out.setparams(params)
+        out.writeframes(all_frames)
+
+
+def _call_voicepeak(
+    text: str,
+    *,
+    voice: str,
+    output_dir: str,
+    speaker: str = "",
+    speed: int | None = None,
+    on_chunk_ready=None,
+    **kwargs,
+) -> TTSResult:
+    """
+    VOICEPEAK CLI を使って音声合成する。
+
+    voice にはナレーター名（例: "彩澄りりせ"）を渡す。
+    VOICEPEAK コマンドのパスは環境変数 L2_TTS_VOICEPEAK_PATH で変更可能
+    (デフォルト: "voicepeak")
+
+    text が JSON 構造 (response/emotion/speed) の場合は自動的に分解し、
+    --say / --emotion / --speed パラメーターに振り分ける。
+
+    140字超のテキストは自然な句読点で分割し、チャンクごとに生成する。
+    on_chunk_ready コールバックが渡された場合、各チャンク生成直後に
+    audio_url を通知する（ストリーミング再生用）。
+
+    Args:
+        voice:           ナレーター名
+        speed:           発話速度（50〜200。省略時は VOICEPEAK デフォルト）
+        on_chunk_ready:  チャンク生成完了時コールバック (audio_url: str) -> None
+    """
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON 構造のパース（emotion / speed / response の分離）
+    say_text, json_emotion, json_speed = _parse_voicepeak_json(text)
+    effective_speed = json_speed if json_speed is not None else speed
+
+    # テキスト分割
+    chunks = _split_text_for_voicepeak(say_text)
+    logger.info("VOICEPEAK チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(say_text))
+
+    chunk_paths: list[Path] = []
+    chunk_durations: list[int] = []
+    sample_rate = 24000
+
+    for i, chunk_text in enumerate(chunks):
+        filepath = out_dir / f"{uuid.uuid4()}.wav"
+        dur, sr = _generate_voicepeak_single_file(
+            chunk_text,
+            voice=voice,
+            filepath=filepath,
+            speed=effective_speed,
+            emotion=json_emotion,
+        )
+        chunk_paths.append(filepath)
+        chunk_durations.append(dur)
+        sample_rate = sr
+        logger.info(
+            "VOICEPEAK チャンク %d/%d 生成完了: %d ms (%d 文字)",
+            i + 1, len(chunks), dur, len(chunk_text),
+        )
+        if on_chunk_ready:
+            on_chunk_ready(filepath.as_uri())
+
+    # 複数チャンクの場合は結合 WAV を作る（イベントの audio_url 用）
+    if len(chunk_paths) > 1:
+        combined_path = out_dir / f"{uuid.uuid4()}.wav"
+        _concatenate_wavs(chunk_paths, combined_path)
+        audio_url = combined_path.as_uri()
+    else:
+        audio_url = chunk_paths[0].as_uri() if chunk_paths else ""
+
+    total_duration = sum(chunk_durations)
+
+    return TTSResult(
+        audio_url=audio_url,
+        duration_ms=total_duration,
+        voice=voice,
+        format="wav",
+        sample_rate=sample_rate,
+        speaker=speaker or voice,
+        chunk_audio_urls=[p.as_uri() for p in chunk_paths],
+    )
+
+
 # ─── プロバイダ登録テーブル ─────────────────────────────────────────
 
 _PROVIDERS: dict = {
     "edge_tts": _call_edge_tts,
     "voicevox": _call_voicevox,
+    "voicepeak": _call_voicepeak,
 }
 
 

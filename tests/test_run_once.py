@@ -53,6 +53,7 @@ FAKE_RESULT = PipelineResult(
     stream_id="test-stream",
     session_id="test-session",
     trace_id="test-trace",
+    speaker="octamaid",
     events=FAKE_EVENTS,
 )
 

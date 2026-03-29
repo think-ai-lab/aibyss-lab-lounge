@@ -269,18 +269,20 @@ class TestRunPipelineRealTTSMode:
         for ev in result.events:
             assert "stream_idx" not in ev
 
-    def test_real_tts_synthesize_called_with_env_args(
+    def test_real_tts_synthesize_called_with_character_args(
         self, mock_real_tts_mode, mock_publish, fake_tts_result
     ):
-        """synthesize に ENV から読んだ provider/voice/speaker/output_dir が渡る"""
+        """synthesize にデフォルトキャラクターの TTS 設定が渡る"""
         with patch("lab_lounge.tts.synthesize", return_value=fake_tts_result) as mock_synth:
             run_pipeline("テスト", **COMMON)
+        # デフォルトキャラクター (octamaid) の設定が使われる
         mock_synth.assert_called_once_with(
             "ダミー応答: テスト",
-            provider="edge_tts",
-            voice="ja-JP-NanamiNeural",
-            speaker="Nanami",
+            provider="voicevox",
+            voice="89",
+            speaker="octamaid",
             output_dir="./data/audio",
+            on_chunk_ready=None,
         )
 
     def test_real_tts_text_matches_llm_text(

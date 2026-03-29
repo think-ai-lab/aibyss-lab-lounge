@@ -3,7 +3,7 @@
 A.I.byss Suite の「会話ランタイム」。発話テキストを受け取り、Event Bus (Redis Streams) に
 `utterance.final` → `llm.final` → `tts.done` の 3 イベントを publish する。
 
-> **Walking Skeleton 実装状況**:
+> **実装状況**:
 > Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ実装済み。
 > Phase 1 real LLM 対応済み (llm.py / graph.py)。
 > Phase 2 real TTS 対応済み (tts.py)。
@@ -12,6 +12,8 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 > Phase 5 LangSmith 観測対応済み (observability.py)。
 > **Grounded E2E v1 RAG 統合済み** (kb_loader.py / retriever.py / pipeline.py)。
 > `L2_ENABLE_RAG=true` で seed corpus を参照した応答が返る。fallback 設計・debug artifacts・47 件のテストを含む。
+> **Axis A: マルチキャラクター対応済み** (characters.py / router.py / wake_word.py / run_loop.py / VOICEPEAK アダプタ)。
+> ウェイクワード検知 → キャラクター呼び分け → キャラクター別システムプロンプト・TTS ボイスで応答。245 件のテスト。
 
 ---
 
@@ -56,6 +58,7 @@ uv sync --extra dev
 | `obs` | langsmith, python-dotenv | LangSmith tracing |
 | `mic` | sounddevice, soundfile, python-dotenv | マイク録音・スピーカー再生 |
 | `rag` | openai, numpy, python-dotenv | RAG（知識ベース検索） |
+| `wake` | pvporcupine>=3.0, python-dotenv | Porcupine ウェイクワード検知 |
 
 ```powershell
 # real E2E 全部入り（VOICEVOX + OpenAI + LangSmith + マイク）
@@ -102,6 +105,11 @@ cp .env.example .env
 | `L2_KB_PATH` | `./data/index` | index ファイル（chunks.json / embeddings.npy）の配置パス |
 | `L2_DEBUG_ARTIFACTS` | `false` | `true` にすると `logs/` 以下に STT/RAG/LLM の中間ファイルを出力する |
 | `L2_DEBUG_LOG_DIR` | `./logs` | debug artifacts の出力ディレクトリ |
+| `L2_DEFAULT_SPEAKER` | `octamaid` | デフォルトキャラクター slug（name_hint / text_match なし時） |
+| `L2_PORCUPINE_ACCESS_KEY` | *(wake word 使用時必須)* | Picovoice アクセスキー |
+| `L2_PORCUPINE_MODEL_DIR` | `./porcupine/` | .ppn / .pv ファイル配置先 |
+| `L2_TTS_VOICEPEAK_PATH` | `voicepeak` | VOICEPEAK コマンドパス（PATH 非通過環境で指定） |
+| `L2_WAKE_TIMEOUT` | `30` | ウェイクワード待機秒数 |
 
 ---
 
@@ -362,6 +370,45 @@ uv run python -c "import sounddevice; print(sounddevice.query_devices())"
 | 録音デバイスエラー | 同上 |
 | STT 失敗 | `処理を中断しました。` と表示。LLM / TTS には進まない |
 | 再生失敗 (MP3 等) | 警告ログのみ。PipelineResult は返す |
+
+---
+
+### ウェイクワード連続ループ（Axis A）
+
+`run_loop.py` はウェイクワード検知 → 録音 → STT → Pipeline → TTS → 再生 のループを繰り返す本番向けランタイム。
+
+#### 前提
+
+- `pvporcupine` がインストール済み（`uv sync --extra wake --extra mic --extra stt --extra llm --extra tts`）
+- `porcupine/` ディレクトリに `.ppn` モデルファイルと `porcupine_params_ja.pv` が配置済み
+- `L2_PORCUPINE_ACCESS_KEY` が設定済み（[Picovoice Console](https://console.picovoice.ai/) で取得）
+
+#### 実行
+
+```powershell
+# ループ起動（Ctrl+C で終了）
+uv run python -m lab_lounge.run_loop
+
+# 1 ターンで停止（テスト用）
+uv run python -m lab_lounge.run_loop --max-turns 1
+
+# TTS 再生をスキップ
+uv run python -m lab_lounge.run_loop --no-play
+
+# 録音秒数 / ウェイクワード待機時間を指定
+uv run python -m lab_lounge.run_loop --record-seconds 10 --wake-timeout 60
+```
+
+> **フォールバック**: `L2_PORCUPINE_ACCESS_KEY` が未設定の場合、Enter キーで手動トリガーするモードに自動切替。
+
+#### キャラクター別ウェイクワード
+
+| キャラクター | ウェイクワード | TTS ボイス |
+|-------------|--------------|-----------|
+| ミミ・オクタヴィア | 「ミミ様」 | 彩澄りりせ (VOICEPEAK) |
+| 波心ちさめ | 「ちさめさん」 | 宮舞モカ (VOICEPEAK) |
+| 八重笠さくら | 「さくらさん」 | 桜乃そら (VOICEPEAK) |
+| オクタメイド | 「オクタメイド」 | Voidoll/89 (VOICEVOX) |
 
 ---
 

@@ -39,11 +39,20 @@ obs = [
 mic = [
     "sounddevice>=0.4",
     "soundfile>=0.12",
+    "numpy>=1.26",
     "python-dotenv>=1.0",
 ]
 rag = [
     "openai>=1.0",
     "numpy>=1.26",
+    "python-dotenv>=1.0",
+]
+wake = [
+    "pvporcupine>=3.0",
+    "python-dotenv>=1.0",
+]
+stt-local = [
+    "faster-whisper>=1.0",
     "python-dotenv>=1.0",
 ]
 
