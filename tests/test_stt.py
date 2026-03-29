@@ -50,7 +50,7 @@ class TestTranscribeAudioFile:
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(stt_mod._PROVIDERS, "openai", mock_fn)
             result = transcribe_audio_file(str(dummy), provider="openai", lang="ja")
-        mock_fn.assert_called_once_with(str(dummy), lang="ja")
+        mock_fn.assert_called_once_with(str(dummy), lang="ja", prompt=None)
         assert result == FAKE_STT_RESULT
 
     def test_returns_stt_result_instance(self, tmp_path):
@@ -116,7 +116,7 @@ class TestTranscribeAudioFile:
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(stt_mod._PROVIDERS, "openai", mock_fn)
             transcribe_audio_file(str(dummy), lang="ja", model="whisper-1")
-        mock_fn.assert_called_once_with(str(dummy), lang="ja", model="whisper-1")
+        mock_fn.assert_called_once_with(str(dummy), lang="ja", prompt=None, model="whisper-1")
 
     def test_openai_import_error_without_package(self, tmp_path):
         """openai パッケージが未インストールの場合 ImportError を送出する"""

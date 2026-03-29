@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .bus import publish
+from .characters import get_character, load_system_prompt
 from .debug import (
     write_llm_prompt,
     write_llm_response,
@@ -36,6 +37,7 @@ from .debug import (
 )
 from .events import build_llm_final, build_tts_done, build_utterance_final
 from .observability import build_run_metadata
+from .router import route
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,7 @@ class PipelineResult:
     stream_id: str
     session_id: str
     trace_id: str
+    speaker: str  # ルーティングされたキャラクター slug
     events: list[dict[str, Any]]  # publish した順に格納
 
 
@@ -113,6 +116,8 @@ def run_pipeline(
     session_id: str,
     trace_id: str,
     utterance_meta: dict[str, Any] | None = None,
+    speaker_hint: str | None = None,
+    on_tts_chunk_ready=None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -125,11 +130,25 @@ def run_pipeline(
         utterance_meta:  STT 結果から抽出したメタデータ (optional)。
                          キー: confidence / lang / duration_ms / words
                          省略時は build_utterance_final() のデフォルト値を使う。
+        speaker_hint:    ウェイクワード検知結果のキャラクター slug / 名前 (optional)。
+                         Router に渡され、応答キャラクターを決定する。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
     """
     common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
+
+    # 0. ルーティング — どのキャラクターが応答するか決定
+    decision = route(text, name_hint=speaker_hint)
+    character = get_character(decision.speaker)
+    try:
+        system_prompt = load_system_prompt(character)
+    except FileNotFoundError:
+        logger.warning(
+            "システムプロンプトが見つかりません: %s。プロンプトなしで続行。",
+            character.system_prompt_file,
+        )
+        system_prompt = None
 
     # 1. utterance.final — STT メタデータがあれば反映する
     utt_kwargs: dict[str, Any] = utterance_meta or {}
@@ -195,6 +214,7 @@ def run_pipeline(
             model=llm_model,
             provider=provider,
             context=rag_context,
+            system_prompt=system_prompt,
             run_metadata=_run_meta,
         )
         write_llm_response(_llm_result.text)
@@ -219,7 +239,11 @@ def run_pipeline(
     publish(llm)
 
     # 4. tts.done — llm.final を links で参照
-    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+    use_real_tts, _env_tts_provider, _env_tts_voice, _env_tts_speaker, tts_output_dir = _get_tts_mode()
+    # キャラクター設定を優先。env は fallback
+    tts_provider = character.tts_provider
+    tts_voice = character.tts_voice
+    tts_speaker = character.slug
     if use_real_tts:
         # real mode: tts.py 経由 (lazy import — ダミーモードでは edge-tts 不要)
         from .tts import synthesize as _synthesize
@@ -229,6 +253,7 @@ def run_pipeline(
             voice=tts_voice,
             speaker=tts_speaker,
             output_dir=tts_output_dir,
+            on_chunk_ready=on_tts_chunk_ready,
         )
         tts_meta: dict[str, Any] = dict(
             audio_url=_tts_result.audio_url,
@@ -239,7 +264,7 @@ def run_pipeline(
             speaker=_tts_result.speaker,
         )
     else:
-        tts_meta = {}  # build_tts_done のデフォルト値を使う
+        tts_meta = dict(speaker=tts_speaker)  # ダミーモードでも speaker slug を記録
     tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **tts_meta, **common)
     publish(tts)
 
@@ -247,5 +272,6 @@ def run_pipeline(
         stream_id=stream_id,
         session_id=session_id,
         trace_id=trace_id,
+        speaker=character.slug,
         events=[utt, llm, tts],
     )

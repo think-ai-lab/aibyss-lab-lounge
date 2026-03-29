@@ -8,12 +8,20 @@ stt.py — STT アダプタ
   - emitter.py から呼ばれる（pipeline.py は STT を直接呼ばない）
 
 【対応 provider】
-  "openai" : OpenAI Whisper API (openai パッケージ必要)
-             同じ OPENAI_API_KEY で LLM / STT 両方使える
+  "openai"        : OpenAI Whisper API (openai パッケージ必要)
+                    同じ OPENAI_API_KEY で LLM / STT 両方使える
+  "faster-whisper": ローカル Whisper (faster-whisper パッケージ必要)
+                    uv sync --extra stt-local
+
+【prompt / initial_prompt について】
+  transcribe_audio_file(path, prompt="ミミ様、ちさめさん、...") のように渡すと
+  OpenAI Whisper では prompt パラメータ、faster-whisper では initial_prompt に
+  転送される。キャラクター固有名詞を含めると転写精度が向上する。
 
 【前提パッケージ (real mode)】
-  uv sync --extra stt
-  環境変数: OPENAI_API_KEY=sk-...
+  uv sync --extra stt              → OpenAI Whisper API
+  uv sync --extra stt-local        → faster-whisper (ローカル)
+  環境変数: OPENAI_API_KEY=sk-...  (openai プロバイダのみ)
 
 【STTResult の各フィールド】
   text         : 書き起こしテキスト
@@ -22,10 +30,6 @@ stt.py — STT アダプタ
   duration_ms  : 音声ファイルの時間長 [ms]
   words        : 単語タイムスタンプ (optional)
                  [{"word": str, "start": float, "end": float}, ...]
-
-【audio_query の形式】
-  将来 timestamp_granularities=["word"] を有効化すると words が埋まる。
-  現在は response_format="verbose_json" のみ使用し words は None のまま。
 """
 
 import logging
@@ -56,6 +60,7 @@ def _call_openai_whisper(
     *,
     lang: str,
     model: str = "whisper-1",
+    prompt: str | None = None,
     **kwargs,
 ) -> STTResult:
     """
@@ -83,13 +88,17 @@ def _call_openai_whisper(
 
     client = openai.OpenAI()  # OPENAI_API_KEY を環境変数から自動取得
 
+    create_kwargs: dict = dict(
+        model=model,
+        language=lang,
+        response_format="verbose_json",
+    )
+    if prompt:
+        create_kwargs["prompt"] = prompt
+
     with audio_path.open("rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model=model,
-            file=audio_file,
-            language=lang,
-            response_format="verbose_json",
-        )
+        create_kwargs["file"] = audio_file
+        transcript = client.audio.transcriptions.create(**create_kwargs)
 
     duration_raw = getattr(transcript, "duration", None)
     duration_ms = int(float(duration_raw) * 1000) if duration_raw is not None else _file_duration_ms(path)
@@ -137,10 +146,85 @@ def _file_duration_ms(path: str) -> int:
     return 0
 
 
+# ─── faster-whisper ローカル provider ────────────────────────────────
+
+# モデルインスタンスを process 内でキャッシュする
+_faster_whisper_cache: dict = {}
+
+
+def _get_faster_whisper_model(model_name: str, device: str, compute_type: str):
+    """WhisperModel をキャッシュして返す。初回のみダウンロード+ロードが発生する。"""
+    key = (model_name, device, compute_type)
+    if key not in _faster_whisper_cache:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise ImportError(
+                "faster-whisper が必要です。"
+                " uv sync --extra stt-local でインストールしてください。"
+            ) from exc
+        logger.info(
+            "faster-whisper モデルをロード中: model=%s device=%s compute_type=%s",
+            model_name, device, compute_type,
+        )
+        _faster_whisper_cache[key] = WhisperModel(
+            model_name, device=device, compute_type=compute_type
+        )
+    return _faster_whisper_cache[key]
+
+
+def _call_faster_whisper(
+    path: str,
+    *,
+    lang: str,
+    model: str = "large-v3",
+    device: str | None = None,
+    compute_type: str | None = None,
+    prompt: str | None = None,
+    beam_size: int = 5,
+    **kwargs,
+) -> STTResult:
+    """
+    faster-whisper (ローカル) で音声ファイルを文字起こしする。
+
+    Args:
+        path:         音声ファイルのパス
+        lang:         言語コード (例: "ja", "en")
+        model:        Whisper モデル名 (デフォルト: "large-v3")
+                      "large-v3" が最高精度。速度優先なら "medium" / "small"。
+        device:       "cuda" (default) または "cpu"。L2_STT_DEVICE env で上書き可能。
+        compute_type: GPU 時は "float16" 推奨。L2_STT_COMPUTE_TYPE env で上書き可能。
+                      CPU 時は "int8"、GPU 時は "float16" が自動選択される。
+        prompt:       初期プロンプト (固有名詞等)。initial_prompt に転送。
+        beam_size:    ビームサーチ幅 (大きいほど精度向上・速度低下)
+    """
+    resolved_device = device or os.environ.get("L2_STT_DEVICE", "cuda")
+    default_compute = "float16" if resolved_device == "cuda" else "int8"
+    resolved_compute = compute_type or os.environ.get("L2_STT_COMPUTE_TYPE", default_compute)
+    wmodel = _get_faster_whisper_model(model, resolved_device, resolved_compute)
+
+    segments, info = wmodel.transcribe(
+        path,
+        language=lang,
+        initial_prompt=prompt or None,
+        beam_size=beam_size,
+    )
+    text = "".join(seg.text for seg in segments)
+    duration_ms = int(info.duration * 1000) if info.duration else _file_duration_ms(path)
+
+    return STTResult(
+        text=text,
+        confidence=None,
+        lang=info.language or lang,
+        duration_ms=duration_ms,
+    )
+
+
 # ─── プロバイダ登録テーブル ─────────────────────────────────────────
 
 _PROVIDERS: dict = {
     "openai": _call_openai_whisper,
+    "faster-whisper": _call_faster_whisper,
 }
 
 
@@ -151,6 +235,7 @@ def transcribe_audio_file(
     *,
     provider: str = "openai",
     lang: str = "ja",
+    prompt: str | None = None,
     **kwargs,
 ) -> STTResult:
     """
@@ -158,9 +243,11 @@ def transcribe_audio_file(
 
     Args:
         path:     音声ファイルのパス
-        provider: STT プロバイダ（"openai"）
+        provider: STT プロバイダ（"openai" | "faster-whisper"）
         lang:     認識言語 (ISO 639-1, 例: "ja", "en")
-        **kwargs: provider 固有のオプション（model 等）
+        prompt:   転写ヒント文字列。固有名詞を含めると精度向上。
+                  openai → prompt パラメータ、faster-whisper → initial_prompt に転送。
+        **kwargs: provider 固有のオプション（model / device / compute_type 等）
 
     Returns:
         STTResult
@@ -184,7 +271,7 @@ def transcribe_audio_file(
         "STT 開始: provider=%s lang=%s path=%s",
         provider, lang, path,
     )
-    result: STTResult = fn(path, lang=lang, **kwargs)
+    result: STTResult = fn(path, lang=lang, prompt=prompt, **kwargs)
     logger.info(
         "STT 完了: text_len=%d duration_ms=%d lang=%s",
         len(result.text), result.duration_ms, result.lang,

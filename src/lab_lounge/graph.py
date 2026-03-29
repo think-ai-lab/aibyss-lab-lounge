@@ -32,7 +32,8 @@ class LLMGraphState(TypedDict):
     text: str
     model: str
     provider: str
-    context: str | None   # RAG で取得した参照テキスト（None = non-RAG）
+    context: str | None          # RAG で取得した参照テキスト（None = non-RAG）
+    system_prompt: str | None    # キャラクター別システムプロンプト（None = 従来動作）
     result: LLMResult | None
 
 
@@ -45,6 +46,7 @@ def _llm_node(state: LLMGraphState) -> LLMGraphState:
         model=state["model"],
         provider=state["provider"],
         context=state.get("context"),
+        system_prompt=state.get("system_prompt"),
     )
     return {**state, "result": result}
 
@@ -80,19 +82,21 @@ def run_graph(
     model: str,
     provider: str = "openai",
     context: str | None = None,
+    system_prompt: str | None = None,
     run_metadata: dict | None = None,
 ) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
 
     Args:
-        text:         発話テキスト
-        model:        使用するモデル名
-        provider:     LLM プロバイダ（"openai" など）
-        context:      RAG で取得した参照テキスト（省略時は non-RAG 動作）
-        run_metadata: LangGraph config["metadata"] に渡す dict (optional)。
-                      LangSmith が有効なとき trace に添付される。
-                      無効のときは渡しても副作用なし。
+        text:          発話テキスト
+        model:         使用するモデル名
+        provider:      LLM プロバイダ（"openai" など）
+        context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
+        system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
+        run_metadata:  LangGraph config["metadata"] に渡す dict (optional)。
+                       LangSmith が有効なとき trace に添付される。
+                       無効のときは渡しても副作用なし。
 
     Returns:
         LLMResult
@@ -108,6 +112,7 @@ def run_graph(
         "model": model,
         "provider": provider,
         "context": context,
+        "system_prompt": system_prompt,
         "result": None,
     }
     config = {"metadata": run_metadata} if run_metadata else None

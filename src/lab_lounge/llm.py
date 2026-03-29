@@ -40,7 +40,14 @@ class LLMResult:
 
 # ─── OpenAI adapter ───────────────────────────────────────────────
 
-def _call_openai(text: str, *, model: str, context: str | None = None, **kwargs) -> LLMResult:
+def _call_openai(
+    text: str,
+    *,
+    model: str,
+    context: str | None = None,
+    system_prompt: str | None = None,
+    **kwargs,
+) -> LLMResult:
     """
     ChatOpenAI (langchain-openai) を使って LLM を呼び出す。
 
@@ -48,10 +55,11 @@ def _call_openai(text: str, *, model: str, context: str | None = None, **kwargs)
     OPENAI_API_KEY 環境変数が必要。
 
     Args:
-        text:    ユーザー発話テキスト
-        model:   使用するモデル名
-        context: RAG で取得した参照テキスト（省略時は non-RAG 動作）
-        **kwargs: ChatOpenAI に渡す追加オプション
+        text:          ユーザー発話テキスト
+        model:         使用するモデル名
+        context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
+        system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
+        **kwargs:      ChatOpenAI に渡す追加オプション
     """
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -65,12 +73,15 @@ def _call_openai(text: str, *, model: str, context: str | None = None, **kwargs)
     t0 = time.monotonic()
     llm = ChatOpenAI(model=model, **kwargs)
 
+    # SystemMessage の組み立て: system_prompt + RAG context を結合
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(system_prompt)
     if context:
-        system_content = (
-            "以下の参照情報をもとに回答してください。\n\n"
-            f"{context}"
-        )
-        messages = [SystemMessage(content=system_content), HumanMessage(content=text)]
+        parts.append(f"## 参照情報\n\n{context}")
+
+    if parts:
+        messages = [SystemMessage(content="\n\n---\n\n".join(parts)), HumanMessage(content=text)]
     else:
         messages = [HumanMessage(content=text)]
 
@@ -109,17 +120,19 @@ def call_llm(
     model: str,
     provider: str = "openai",
     context: str | None = None,
+    system_prompt: str | None = None,
     **kwargs,
 ) -> LLMResult:
     """
     LLM を呼び出して LLMResult を返す。
 
     Args:
-        text:     入力テキスト（utterance.final の payload.text）
-        model:    使用するモデル名
-        provider: LLM プロバイダ（現在 "openai" のみ対応）
-        context:  RAG で取得した参照テキスト（省略時は non-RAG 動作）
-        **kwargs: プロバイダ固有のオプション（temperature 等）
+        text:          入力テキスト（utterance.final の payload.text）
+        model:         使用するモデル名
+        provider:      LLM プロバイダ（現在 "openai" のみ対応）
+        context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
+        system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
+        **kwargs:      プロバイダ固有のオプション（temperature 等）
 
     Returns:
         LLMResult
@@ -141,6 +154,8 @@ def call_llm(
     )
     if context is not None:
         kwargs["context"] = context
+    if system_prompt is not None:
+        kwargs["system_prompt"] = system_prompt
     result: LLMResult = fn(text, model=model, **kwargs)
     logger.info(
         "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s",
