@@ -145,11 +145,10 @@ class TestListenOnceCharacterDetection:
         assert result is not None
         assert result.character_slug == "sakura"
 
-    def test_no_name_routes_to_default(self):
+    def test_no_name_returns_none(self):
+        """名前ゲート: キャラクター名なしは None を返す（応答しない）。"""
         result = self._run("今日の天気は？")
-        assert result is not None
-        assert isinstance(result.character_slug, str)
-        assert len(result.character_slug) > 0
+        assert result is None
 
     def test_transcript_field_populated(self):
         text = "ミミ様、こんにちは"
@@ -200,7 +199,8 @@ class TestListenOnceTimeout:
 # ─── TestListenOnceEdgeCases ────────────────────────────────────────
 
 class TestListenOnceEdgeCases:
-    def test_empty_transcript_routes_to_default(self):
+    def test_empty_transcript_returns_none(self):
+        """名前ゲート: 空の転写は名前なしとして None を返す。"""
         listener = SpeechActivatedListener(vad_threshold=0.005)
         mock_sd = _make_sd_mock(_detection_frames())
         mock_sf = MagicMock()
@@ -214,9 +214,7 @@ class TestListenOnceEdgeCases:
              patch("time.monotonic", return_value=0.0):
             result = listener.listen_once(timeout_seconds=30.0)
 
-        assert result is not None
-        assert isinstance(result.character_slug, str)
-        assert result.transcript == ""
+        assert result is None
 
     def test_stt_exception_propagates(self):
         listener = SpeechActivatedListener(vad_threshold=0.005)

@@ -3,16 +3,18 @@ router.py — 発話ルーティング
 
 責務:
   - 発話テキストやウェイクワード検知結果から、どのキャラクターが応答すべきかを決定する
-  - LLM 呼び出しの前に実行される軽量なモジュール（LLM は呼ばない）
+  - LLM 呼び出しの前に実行される軽量なモジュール
   - LangGraph ノードではなく独立モジュールとして実装
 
 【ルーティング優先順位】
   1. name_hint (ウェイクワード検知結果) → 一致するキャラクターを選択
-  2. テキスト内のキャラクター名マッチ (wake_word, display_name, aliases)
-  3. デフォルトキャラクター (L2_DEFAULT_SPEAKER)
+  2. テキスト内のキャラクター名マッチ (単一名 → 即確定)
+  3. 複数キャラクター名検出 → LLM ルーティング (L2_USE_LLM_ROUTER=true 時)
+  4. デフォルトキャラクター (L2_DEFAULT_SPEAKER)
 """
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -24,13 +26,15 @@ from .characters import (
 
 logger = logging.getLogger(__name__)
 
+_LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
 
 @dataclass(frozen=True)
 class RoutingDecision:
     """ルーティング結果。"""
 
     speaker: str  # character slug
-    reason: str   # "name_hint" | "text_match" | "default"
+    reason: str   # "name_hint" | "text_match" | "llm_router" | "default"
 
 
 def _match_by_hint(name_hint: str, characters: list[CharacterConfig]) -> CharacterConfig | None:
@@ -52,6 +56,31 @@ def _match_by_hint(name_hint: str, characters: list[CharacterConfig]) -> Charact
     return None
 
 
+def _all_names(c: CharacterConfig) -> list[str]:
+    """キャラクターの全呼称リストを返す（wake_word, display_name, aliases）。"""
+    names: list[str] = []
+    if c.wake_word:
+        names.append(c.wake_word)
+    names.append(c.display_name)
+    names.extend(c.aliases)
+    return names
+
+
+def _find_all_matches(text: str, characters: list[CharacterConfig]) -> list[CharacterConfig]:
+    """テキスト内で名前が出現するキャラクターを全て返す（重複なし、出現順）。"""
+    seen: set[str] = set()
+    result: list[CharacterConfig] = []
+    for c in characters:
+        if c.slug in seen:
+            continue
+        for name in _all_names(c):
+            if name in text:
+                seen.add(c.slug)
+                result.append(c)
+                break
+    return result
+
+
 def _match_by_text(text: str, characters: list[CharacterConfig]) -> CharacterConfig | None:
     """テキスト内のキャラクター名を検索する。最初にマッチしたキャラクターを返す。"""
     for c in characters:
@@ -71,6 +100,71 @@ def _match_by_text(text: str, characters: list[CharacterConfig]) -> CharacterCon
                 return c
 
     return None
+
+
+def _is_llm_router_enabled() -> bool:
+    """LLM ルーター機能が有効かどうか。"""
+    return os.environ.get("L2_USE_LLM_ROUTER", "").lower() in ("1", "true", "yes")
+
+
+def _route_by_llm(
+    text: str,
+    candidates: list[CharacterConfig],
+) -> CharacterConfig | None:
+    """
+    LLM に「誰に話しかけていますか？」と聞いて判定する。
+
+    gpt-4.1-nano 等の高速・低コストモデルを想定。
+    応答は slug のみを返すよう指示し、パース失敗時は None を返す。
+    """
+    try:
+        import openai
+    except ImportError:
+        logger.warning("openai パッケージなし。LLM ルーター無効。")
+        return None
+
+    slug_to_names = {
+        c.slug: _all_names(c) for c in candidates
+    }
+    candidates_desc = "\n".join(
+        f"- {slug}: {', '.join(names)}" for slug, names in slug_to_names.items()
+    )
+    valid_slugs = [c.slug for c in candidates]
+
+    system_prompt = (
+        "あなたは発話ルーティングの判定器です。\n"
+        "ユーザーの発話テキストを読み、話しかけている相手のキャラクターを判定してください。\n"
+        "「言及」ではなく「呼びかけ」の対象を選んでください。\n"
+        f"候補:\n{candidates_desc}\n\n"
+        f"回答は slug のみを1つ返してください（{', '.join(valid_slugs)} のいずれか）。"
+    )
+
+    model = os.environ.get("L2_LLM_ROUTER_MODEL", _LLM_ROUTER_MODEL)
+    try:
+        client = openai.OpenAI()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            max_completion_tokens=20,
+            temperature=0,
+        )
+        answer = resp.choices[0].message.content.strip().lower()
+        logger.info("LLM ルーター応答: %r (model=%s)", answer, model)
+
+        # slug として有効か検証
+        for c in candidates:
+            if answer == c.slug:
+                return c
+
+        logger.warning("LLM ルーター応答 %r が候補に一致しない。", answer)
+        return None
+
+    except Exception as exc:
+        logger.error("LLM ルーター呼び出し失敗: %s", exc)
+        return None
 
 
 def route(
@@ -101,12 +195,35 @@ def route(
         logger.warning("name_hint=%r に一致するキャラクターなし。テキストマッチへ。", name_hint)
 
     # 2. テキスト内のキャラクター名マッチ
-    matched = _match_by_text(text, characters)
-    if matched:
-        logger.info("ルーティング: テキストマッチ → %s", matched.slug)
+    all_matches = _find_all_matches(text, characters)
+
+    if len(all_matches) == 1:
+        # 単一名 → 即確定
+        matched = all_matches[0]
+        logger.info("ルーティング: テキストマッチ(単一) → %s", matched.slug)
         return RoutingDecision(speaker=matched.slug, reason="text_match")
 
-    # 3. デフォルト
+    if len(all_matches) >= 2 and _is_llm_router_enabled():
+        # 3. 複数名検出 → LLM ルーティング
+        logger.info(
+            "複数キャラクター検出: %s → LLM ルーターへ委譲",
+            [c.slug for c in all_matches],
+        )
+        llm_result = _route_by_llm(text, all_matches)
+        if llm_result:
+            logger.info("ルーティング: LLM ルーター → %s", llm_result.slug)
+            return RoutingDecision(speaker=llm_result.slug, reason="llm_router")
+        # LLM 失敗 → 従来パターンマッチでフォールバック
+        logger.warning("LLM ルーター失敗。パターンマッチへフォールバック。")
+
+    # 複数名でも LLM 無効/失敗時、または 0 マッチ時 → 従来ロジック
+    if all_matches:
+        matched = _match_by_text(text, characters)
+        if matched:
+            logger.info("ルーティング: テキストマッチ → %s", matched.slug)
+            return RoutingDecision(speaker=matched.slug, reason="text_match")
+
+    # 4. デフォルト
     default = get_default_character()
     logger.info("ルーティング: デフォルト → %s", default.slug)
     return RoutingDecision(speaker=default.slug, reason="default")

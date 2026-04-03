@@ -453,6 +453,12 @@ class SpeechActivatedListener:
 
         # キャラクター判定
         decision = _router.route(transcript)
+
+        # Phase 0 名前ゲート: キャラクター名が検出されなかった場合は無視
+        if decision.reason == "default":
+            logger.info("名前ゲート: キャラクター名未検出。無視します: %r", transcript)
+            return None
+
         char_slug = decision.speaker
 
         # キャラクター設定から wake_word を取得
