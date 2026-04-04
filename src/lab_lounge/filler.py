@@ -356,19 +356,84 @@ _FILLER_DEFAULT_PROMPT = (
 )
 
 
+def _detect_provider(model: str) -> str:
+    """モデル名からプロバイダーを自動判定する。"""
+    m = model.lower()
+    if m.startswith("claude") or m.startswith("anthropic"):
+        return "anthropic"
+    if m.startswith("gemini") or m.startswith("models/gemini"):
+        return "google"
+    return "openai"
+
+
+def _call_filler_llm(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+) -> str | None:
+    """
+    フィラー用 LLM 呼び出し。モデル名からプロバイダーを自動判定。
+    """
+    provider = _detect_provider(model)
+
+    try:
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=model,
+                max_tokens=60,
+                temperature=0.9,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            return resp.content[0].text.strip()
+
+        elif provider == "google":
+            import google.genai as genai
+            client = genai.Client()
+            resp = client.models.generate_content(
+                model=model,
+                contents=user_text,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=60,
+                    temperature=0.9,
+                ),
+            )
+            return resp.text.strip()
+
+        else:
+            import openai
+            client = openai.OpenAI()
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                max_completion_tokens=60,
+                temperature=0.9,
+            )
+            content = resp.choices[0].message.content
+            return content.strip() if content else None
+
+    except ImportError as exc:
+        logger.warning("LLM フィラー: %s パッケージなし: %s", provider, exc)
+        return None
+    except Exception as exc:
+        logger.warning("LLM フィラー呼び出し失敗: [%s] %s", provider, exc)
+        return None
+
+
 def _generate_filler_text(slug: str) -> str | None:
     """
     LLM でキャラクターらしいフィラー独り言を生成する。
 
-    キャラクターのシステムプロンプトを使い、考え中の独り言を生成。
+    キャラクターの filler_model を使用。未設定なら L2_LLM_FILLER_MODEL env。
+    モデル名からプロバイダー（OpenAI / Anthropic / Google）を自動判定。
     エラー時は None を返す（呼び出し元でフォールバック処理）。
     """
-    try:
-        import openai
-    except ImportError:
-        logger.debug("openai 未インストール。LLM フィラー生成スキップ。")
-        return None
-
     from .characters import get_character
 
     try:
@@ -377,29 +442,22 @@ def _generate_filler_text(slug: str) -> str | None:
         return None
 
     system_prompt = _FILLER_PROMPTS.get(slug, _FILLER_DEFAULT_PROMPT)
-    model = os.environ.get("L2_LLM_FILLER_MODEL", "gpt-5.4-nano")
 
-    try:
-        client = openai.OpenAI()
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "（独り言）"},
-            ],
-            max_completion_tokens=60,
-            temperature=0.9,
-        )
-        content = resp.choices[0].message.content
-        if content is None:
-            logger.warning("LLM フィラー: content が None: [%s]", slug)
-            return None
-        text = content.strip().strip('"').strip("「」")
-        logger.info("LLM フィラー生成: [%s] %r", slug, text)
+    # キャラクター設定 > 環境変数 > デフォルト
+    if char.filler_model:
+        model = char.filler_model
+    else:
+        model = os.environ.get("L2_LLM_FILLER_MODEL", "gpt-5.4-nano")
+
+    text = _call_filler_llm(model, system_prompt, "（独り言）")
+
+    if text:
+        text = text.strip('"').strip("「」")
+        logger.info("LLM フィラー生成: [%s] %r (model=%s)", slug, text, model)
         return text if text else None
-    except Exception as exc:
-        logger.warning("LLM フィラー生成失敗: [%s] %s", slug, exc)
-        return None
+
+    logger.warning("LLM フィラー生成: 空応答 [%s] (model=%s)", slug, model)
+    return None
 
 
 def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
