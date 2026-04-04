@@ -26,7 +26,7 @@ from .characters import (
 
 logger = logging.getLogger(__name__)
 
-_LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+_LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5-20251001")
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,79 @@ def _is_llm_router_enabled() -> bool:
     return os.environ.get("L2_USE_LLM_ROUTER", "").lower() in ("1", "true", "yes")
 
 
+def _detect_provider(model: str) -> str:
+    """モデル名からプロバイダーを自動判定する。"""
+    m = model.lower()
+    if m.startswith("claude") or m.startswith("anthropic"):
+        return "anthropic"
+    if m.startswith("gemini") or m.startswith("models/gemini"):
+        return "google"
+    return "openai"
+
+
+def _call_router_llm(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+) -> str | None:
+    """
+    ルーター用の軽量 LLM 呼び出し。
+
+    モデル名からプロバイダーを自動判定し、適切なクライアントを使用する。
+    将来モデルを変更しても、モデル名の変更だけで対応可能。
+    """
+    provider = _detect_provider(model)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+
+    try:
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=model,
+                max_tokens=20,
+                temperature=0,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            return resp.content[0].text.strip().lower()
+
+        elif provider == "google":
+            import google.genai as genai
+            client = genai.Client()
+            resp = client.models.generate_content(
+                model=model,
+                contents=user_text,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=20,
+                    temperature=0,
+                ),
+            )
+            return resp.text.strip().lower()
+
+        else:
+            import openai
+            client = openai.OpenAI()
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_completion_tokens=20,
+                temperature=0,
+            )
+            return resp.choices[0].message.content.strip().lower()
+
+    except ImportError as exc:
+        logger.warning("LLM ルーター: %s パッケージなし: %s", provider, exc)
+        return None
+    except Exception as exc:
+        logger.error("LLM ルーター呼び出し失敗: %s", exc)
+        return None
+
+
 def _route_by_llm(
     text: str,
     candidates: list[CharacterConfig],
@@ -114,15 +187,10 @@ def _route_by_llm(
     """
     LLM に「誰に話しかけていますか？」と聞いて判定する。
 
-    gpt-4.1-nano 等の高速・低コストモデルを想定。
+    L2_LLM_ROUTER_MODEL でモデルを指定可能。
+    モデル名からプロバイダー（OpenAI / Anthropic / Google）を自動判定する。
     応答は slug のみを返すよう指示し、パース失敗時は None を返す。
     """
-    try:
-        import openai
-    except ImportError:
-        logger.warning("openai パッケージなし。LLM ルーター無効。")
-        return None
-
     slug_to_names = {
         c.slug: _all_names(c) for c in candidates
     }
@@ -140,31 +208,19 @@ def _route_by_llm(
     )
 
     model = os.environ.get("L2_LLM_ROUTER_MODEL", _LLM_ROUTER_MODEL)
-    try:
-        client = openai.OpenAI()
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            max_completion_tokens=20,
-            temperature=0,
-        )
-        answer = resp.choices[0].message.content.strip().lower()
-        logger.info("LLM ルーター応答: %r (model=%s)", answer, model)
+    answer = _call_router_llm(model, system_prompt, text)
 
-        # slug として有効か検証
-        for c in candidates:
-            if answer == c.slug:
-                return c
-
-        logger.warning("LLM ルーター応答 %r が候補に一致しない。", answer)
+    if answer is None:
         return None
 
-    except Exception as exc:
-        logger.error("LLM ルーター呼び出し失敗: %s", exc)
-        return None
+    logger.info("LLM ルーター応答: %r (model=%s)", answer, model)
+
+    for c in candidates:
+        if answer == c.slug:
+            return c
+
+    logger.warning("LLM ルーター応答 %r が候補に一致しない。", answer)
+    return None
 
 
 def route(

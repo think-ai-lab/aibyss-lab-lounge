@@ -40,7 +40,8 @@ class CharacterConfig:
     tts_voice: str
     system_prompt_file: str
     llm_provider: str = "openai"
-    llm_model: str = ""   # 空文字 = 環境変数 L2_LLM_MODEL のデフォルトを使用
+    llm_model: str = ""          # 空文字 = 環境変数 L2_LLM_MODEL のデフォルトを使用
+    filler_model: str = ""       # 空文字 = 環境変数 L2_LLM_FILLER_MODEL のデフォルトを使用
     porcupine_model: str | None = None
     aliases: list[str] = field(default_factory=list)
 
@@ -57,6 +58,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         system_prompt_file="system_mimi.txt",
         llm_provider="openai",
         llm_model="gpt-5.4",
+        filler_model="gpt-5.4-mini",
         porcupine_model="mimi-sama_ja_windows_v4_0_0.ppn",
         aliases=["ミミ", "お嬢様"],
     ),
@@ -69,6 +71,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         system_prompt_file="system_chisame.txt",
         llm_provider="google",
         llm_model="gemini-3.1-pro-preview",
+        filler_model="gemini-3.1-flash-lite-preview",
         porcupine_model="chisame-san_ja_windows_v3_0_0.ppn",
         aliases=["ちさめ"],
     ),
@@ -81,6 +84,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         system_prompt_file="system_sakura.txt",
         llm_provider="anthropic",
         llm_model="claude-sonnet-4-6",
+        filler_model="claude-haiku-4-5-20251001",
         porcupine_model="sakura-san_ja_windows_v3_0_0.ppn",
         aliases=["さくら", "桜さん", "桜"],
     ),

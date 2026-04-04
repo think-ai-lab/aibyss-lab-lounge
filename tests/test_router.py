@@ -124,7 +124,9 @@ class TestLLMRouter:
         resp.choices = [choice]
         return resp
 
-    def test_llm_returns_correct_slug(self):
+    def test_llm_returns_correct_slug(self, monkeypatch):
+        monkeypatch.setenv("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
         chars = get_all_characters()
         candidates = [c for c in chars if c.slug in ("mimi", "chisame")]
 
@@ -142,7 +144,9 @@ class TestLLMRouter:
         assert result is not None
         assert result.slug == "chisame"
 
-    def test_llm_returns_invalid_slug(self):
+    def test_llm_returns_invalid_slug(self, monkeypatch):
+        monkeypatch.setenv("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
         chars = get_all_characters()
         candidates = [c for c in chars if c.slug in ("mimi", "chisame")]
 
@@ -156,7 +160,9 @@ class TestLLMRouter:
 
         assert result is None
 
-    def test_llm_api_failure_returns_none(self):
+    def test_llm_api_failure_returns_none(self, monkeypatch):
+        monkeypatch.setenv("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
         chars = get_all_characters()
         candidates = [c for c in chars if c.slug in ("mimi", "chisame")]
 
