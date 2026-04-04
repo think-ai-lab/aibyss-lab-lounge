@@ -105,10 +105,142 @@ def _call_openai(
     )
 
 
+# ─── Google Gemini adapter ────────────────────────────────────────
+
+def _call_google(
+    text: str,
+    *,
+    model: str,
+    context: str | None = None,
+    system_prompt: str | None = None,
+    **kwargs,
+) -> LLMResult:
+    """
+    ChatGoogleGenerativeAI (langchain-google-genai) を使って LLM を呼び出す。
+
+    GOOGLE_API_KEY 環境変数が必要。
+    """
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-google-genai が必要です。"
+            " uv sync --extra llm-google でインストールしてください。"
+        ) from exc
+
+    t0 = time.monotonic()
+    llm = ChatGoogleGenerativeAI(model=model, **kwargs)
+
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(system_prompt)
+    if context:
+        parts.append(f"## 参照情報\n\n{context}")
+
+    if parts:
+        messages = [SystemMessage(content="\n\n---\n\n".join(parts)), HumanMessage(content=text)]
+    else:
+        messages = [HumanMessage(content=text)]
+
+    response = llm.invoke(messages)
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    usage = getattr(response, "usage_metadata", None) or {}
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    finish_reason = (
+        (getattr(response, "response_metadata", None) or {}).get("finish_reason", "stop")
+    )
+
+    # Gemini は content をリスト形式で返すことがある
+    # [{'type': 'text', 'text': '...', 'extras': {...}}]
+    content = response.content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                text_parts.append(part)
+        response_text = "".join(text_parts)
+    else:
+        response_text = str(content)
+
+    return LLMResult(
+        text=response_text,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+        finish_reason=finish_reason,
+    )
+
+
+# ─── Anthropic Claude adapter ────────────────────────────────────
+
+def _call_anthropic(
+    text: str,
+    *,
+    model: str,
+    context: str | None = None,
+    system_prompt: str | None = None,
+    **kwargs,
+) -> LLMResult:
+    """
+    ChatAnthropic (langchain-anthropic) を使って LLM を呼び出す。
+
+    ANTHROPIC_API_KEY 環境変数が必要。
+    """
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_anthropic import ChatAnthropic
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-anthropic が必要です。"
+            " uv sync --extra llm-anthropic でインストールしてください。"
+        ) from exc
+
+    t0 = time.monotonic()
+    llm = ChatAnthropic(model=model, **kwargs)
+
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(system_prompt)
+    if context:
+        parts.append(f"## 参照情報\n\n{context}")
+
+    if parts:
+        messages = [SystemMessage(content="\n\n---\n\n".join(parts)), HumanMessage(content=text)]
+    else:
+        messages = [HumanMessage(content=text)]
+
+    response = llm.invoke(messages)
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    usage = getattr(response, "usage_metadata", None) or {}
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    finish_reason = (
+        (getattr(response, "response_metadata", None) or {}).get("finish_reason", "stop")
+    )
+
+    return LLMResult(
+        text=str(response.content),
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+        finish_reason=finish_reason,
+    )
+
+
 # ─── プロバイダ登録テーブル ─────────────────────────────────────────
 
 _PROVIDERS: dict = {
     "openai": _call_openai,
+    "google": _call_google,
+    "anthropic": _call_anthropic,
 }
 
 

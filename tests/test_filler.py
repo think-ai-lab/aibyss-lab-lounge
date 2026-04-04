@@ -383,7 +383,9 @@ class TestGenerateFillerText:
         assert result is None
 
     def test_returns_none_for_unknown_slug(self):
+        # get_character() raises KeyError for unknown slugs
         result = _generate_filler_text("nonexistent_character")
+        # _generate_filler_text catches the exception and returns None
         assert result is None
 
     def test_returns_none_on_empty_response(self):

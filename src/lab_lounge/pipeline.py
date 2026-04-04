@@ -44,9 +44,11 @@ logger = logging.getLogger(__name__)
 
 # ─── LLM モード設定 ──────────────────────────────────────────────
 
-def _get_llm_mode() -> tuple[bool, str, str]:
+def _get_llm_mode(character=None) -> tuple[bool, str, str]:
     """
-    環境変数から LLM 実行モードを読み取る。
+    LLM 実行モードを返す。キャラクター設定があればそちらを優先。
+
+    優先順位: キャラクター設定 > 環境変数 > デフォルト
 
     Returns:
         (use_real, provider, model)
@@ -55,8 +57,14 @@ def _get_llm_mode() -> tuple[bool, str, str]:
           model:    モデル名
     """
     use_real = os.environ.get("L2_USE_REAL_LLM", "false").lower() in ("true", "1", "yes")
-    provider = os.environ.get("L2_LLM_PROVIDER", "openai")
-    model = os.environ.get("L2_LLM_MODEL", "gpt-4o-mini")
+
+    if character and getattr(character, "llm_model", ""):
+        provider = character.llm_provider
+        model = character.llm_model
+    else:
+        provider = os.environ.get("L2_LLM_PROVIDER", "openai")
+        model = os.environ.get("L2_LLM_MODEL", "gpt-5.4-mini")
+
     return use_real, provider, model
 
 
@@ -194,7 +202,7 @@ def run_pipeline(
             write_retrieval([], [], retrieval_latency_ms, rag_enabled=True)
 
     # 3. llm.final — utterance.final を links で参照
-    use_real, provider, llm_model = _get_llm_mode()
+    use_real, provider, llm_model = _get_llm_mode(character)
     if use_real:
         # real mode: graph.py 経由 (lazy import — ダミーモードでは langgraph 不要)
         from .graph import run_graph as _run_graph

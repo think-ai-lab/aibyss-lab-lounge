@@ -242,6 +242,17 @@ def _parse_voicepeak_json(text: str) -> tuple[str, dict[str, int] | None, int | 
         raw = raw.replace(src, dst)
     raw = raw.strip()
 
+    # マークダウンコードブロック (```json ... ```) を除去
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        # 先頭の ```json や ``` を除去
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        # 末尾の ``` を除去
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+
     try:
         obj = _json.loads(raw)
     except (ValueError, TypeError):
