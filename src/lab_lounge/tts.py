@@ -29,6 +29,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -323,6 +324,9 @@ def _split_text_for_voicepeak(
     return chunks if chunks else [text]
 
 
+_voicepeak_lock = threading.Lock()
+
+
 def _generate_voicepeak_single_file(
     text: str,
     *,
@@ -333,6 +337,9 @@ def _generate_voicepeak_single_file(
 ) -> tuple[int, int]:
     """
     VOICEPEAK CLI で 1 チャンク分の WAV を生成する。
+
+    voicepeak.exe は同時に 1 プロセスしか実行できないため、
+    スレッドロックで排他制御する。
 
     Returns:
         (duration_ms, sample_rate)
@@ -366,17 +373,18 @@ def _generate_voicepeak_single_file(
 
     logger.info("VOICEPEAK コマンド: %s", cmd_str)
 
-    try:
-        subprocess.run(cmd_str, check=True, capture_output=True, text=True, shell=True)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"VOICEPEAK コマンドが見つかりません: {voicepeak_cmd!r}。"
-            " L2_TTS_VOICEPEAK_PATH でパスを設定するか、PATH に追加してください。"
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"VOICEPEAK 実行エラー: {exc.stderr or exc.stdout}"
-        ) from exc
+    with _voicepeak_lock:
+        try:
+            subprocess.run(cmd_str, check=True, capture_output=True, text=True, shell=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"VOICEPEAK コマンドが見つかりません: {voicepeak_cmd!r}。"
+                " L2_TTS_VOICEPEAK_PATH でパスを設定するか、PATH に追加してください。"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"VOICEPEAK 実行エラー: {exc.stderr or exc.stdout}"
+            ) from exc
 
     with wave.open(str(filepath)) as wf:
         duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)

@@ -96,6 +96,30 @@ def _init_listener(
                 raise
             logger.warning("Porcupine 初期化失敗。speech バックエンドへフォールバック: %s", exc)
 
+    # continuous バックエンド (明示指定のみ)
+    if requested == "continuous":
+        try:
+            from .wake_word import ContinuousListener
+            listener = ContinuousListener(
+                device=audio_device,
+                tmp_dir=tmp_dir,
+                stt_provider=stt_provider,
+            )
+            logger.info("ウェイクワードバックエンド: continuous (常時文字起こし + バッファ)")
+            return listener, "continuous"
+        except Exception as exc:
+            raise
+
+    # sherpa バックエンド (明示指定のみ)
+    if requested == "sherpa":
+        try:
+            from .wake_word import SherpaStreamingListener
+            listener = SherpaStreamingListener(device=audio_device)
+            logger.info("ウェイクワードバックエンド: sherpa (Sherpa-ONNX)")
+            return listener, "sherpa"
+        except Exception as exc:
+            raise
+
     # speech バックエンド
     if requested in (None, "speech"):
         try:
@@ -123,6 +147,21 @@ def _wait_for_enter() -> None:
         input("Enter を押して話しかけてください (q で終了): ")
     except EOFError:
         pass
+
+
+def _is_filler_enabled() -> bool:
+    """フィラー音声が有効かどうかを返す。"""
+    from .filler import is_filler_enabled
+    return is_filler_enabled()
+
+
+def _run_filler_safe(slug: str, stop_event: threading.Event) -> None:
+    """フィラー再生ループ（例外を握り潰してログに出す）。"""
+    try:
+        from .filler import run_filler_loop
+        run_filler_loop(slug, stop_event)
+    except Exception as exc:
+        logger.warning("フィラー再生エラー: %s", exc)
 
 
 def run_loop(
@@ -158,6 +197,8 @@ def run_loop(
     mode_msg = {
         "porcupine": "ウェイクワードモード (Porcupine)。キャラクター名を呼んでください。",
         "speech": "音声認識モード (VAD + STT)。キャラクター名を含めて話しかけてください。",
+        "sherpa": "音声認識モード (Sherpa-ONNX)。キャラクター名を含めて話しかけてください。",
+        "continuous": "常時文字起こしモード。会話の文脈を含めてキャラクター名で呼びかけてください。",
         "keyboard": "Enter キーモードで起動しました。",
     }
     print(mode_msg.get(effective_backend, "起動しました。"))
@@ -170,7 +211,7 @@ def run_loop(
             input_text: str | None = None
             utterance_meta = None
 
-            if effective_backend in ("porcupine", "speech"):
+            if effective_backend in ("porcupine", "speech", "sherpa", "continuous"):
                 wake_result = listener.listen_once(timeout_seconds=wake_timeout)
                 if wake_result is None:
                     # タイムアウト → 再度待機
@@ -178,8 +219,8 @@ def run_loop(
                 speaker_hint = wake_result.character_slug
                 print(f"ウェイクワード検知: {speaker_hint}")
 
-                # speech バックエンドは transcript がそのまま発話テキスト
-                if effective_backend == "speech" and wake_result.transcript:
+                # speech / sherpa / continuous バックエンドは transcript がそのまま発話テキスト
+                if effective_backend in ("speech", "sherpa", "continuous") and wake_result.transcript:
                     input_text = wake_result.transcript
                     print(f"認識結果: {input_text}")
             else:
@@ -214,10 +255,12 @@ def run_loop(
 
                 print(f"認識結果: {input_text}")
 
-            # ─── 4. Pipeline（ストリーミング TTS 再生）─────────────
+            # ─── 4. Pipeline（フィラー + ストリーミング TTS 再生）────
             _chunk_count = [0]
             _playback_queue: queue.Queue[str | None] | None = None
             _playback_thread: threading.Thread | None = None
+            _filler_stop = threading.Event()
+            _filler_thread: threading.Thread | None = None
 
             if not skip_playback:
                 _playback_queue = queue.Queue()
@@ -234,7 +277,24 @@ def run_loop(
                 )
                 _playback_thread.start()
 
+                # フィラー再生開始
+                if speaker_hint and _is_filler_enabled():
+                    _filler_thread = threading.Thread(
+                        target=_run_filler_safe,
+                        args=(speaker_hint, _filler_stop),
+                        daemon=True,
+                    )
+                    _filler_thread.start()
+
             def _on_tts_chunk(url: str) -> None:
+                # フィラーを停止してから本編を再生
+                # フレーズ完了まで待ち、間を持たせてから本編を開始
+                if _filler_thread is not None and _filler_thread.is_alive():
+                    _filler_stop.set()
+                    _filler_thread.join(timeout=30)
+                    # フィラーと本編の間に少し間を持たせる
+                    import time
+                    time.sleep(0.5)
                 _chunk_count[0] += 1
                 if _playback_queue is not None:
                     _playback_queue.put(url)
@@ -251,6 +311,9 @@ def run_loop(
                 )
             except Exception as exc:
                 logger.error("Pipeline 失敗: %s", exc)
+                _filler_stop.set()
+                if _filler_thread is not None:
+                    _filler_thread.join(timeout=0.5)
                 if _playback_queue is not None:
                     _playback_queue.put(None)
                 if _playback_thread is not None:
@@ -331,7 +394,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--wake-backend",
-        choices=["porcupine", "speech", "keyboard"],
+        choices=["porcupine", "speech", "sherpa", "continuous", "keyboard"],
         default=None,
         metavar="BACKEND",
         help="ウェイクワードバックエンド: porcupine / speech / keyboard (省略時は自動選択)",

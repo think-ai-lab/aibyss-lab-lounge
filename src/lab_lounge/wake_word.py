@@ -477,3 +477,545 @@ class SpeechActivatedListener:
 
     def cleanup(self) -> None:
         """no-op。PorcupineListener との互換性のため存在する。"""
+
+
+# ─── SherpaStreamingListener ──────────────────────────────────────
+
+_DEFAULT_SHERPA_MODEL_DIR = Path(__file__).resolve().parent.parent.parent / "sherpa-models"
+
+
+def _find_sherpa_model_files(
+    model_dir: Path,
+    quantized: bool,
+) -> tuple[Path, Path, Path]:
+    """
+    Sherpa モデルディレクトリからエンコーダ・デコーダ・ジョイナーを自動検出する。
+
+    エポック番号はモデルによって異なる (epoch-99, epoch-35 等) ため、
+    glob で自動検出する。quantized=True の場合は .int8.onnx を優先。
+    """
+    suffix = ".int8" if quantized else ""
+    pattern = f"encoder-epoch-*-avg-*{suffix}.onnx"
+    candidates = sorted(model_dir.glob(pattern))
+
+    if not candidates:
+        # quantized 指定でも見つからなければ fp16 → fp32 の順で探す
+        for fallback in (".fp16", ""):
+            fb_pattern = f"encoder-epoch-*-avg-*{fallback}.onnx"
+            candidates = sorted(model_dir.glob(fb_pattern))
+            if candidates:
+                suffix = fallback
+                break
+
+    if not candidates:
+        return (
+            model_dir / f"encoder-epoch-99-avg-1{suffix}.onnx",
+            model_dir / f"decoder-epoch-99-avg-1{suffix}.onnx",
+            model_dir / f"joiner-epoch-99-avg-1{suffix}.onnx",
+        )
+
+    # エポック部分を抽出して decoder/joiner にも適用
+    encoder = candidates[0]
+    stem = encoder.name.replace("encoder-", "").replace(".onnx", "")
+    # stem = "epoch-35-avg-1.int8" etc.
+    decoder = model_dir / f"decoder-{stem}.onnx"
+    joiner = model_dir / f"joiner-{stem}.onnx"
+
+    return encoder, decoder, joiner
+
+
+class SherpaStreamingListener:
+    """
+    Sherpa-ONNX OfflineRecognizer + VAD によるリスナー。
+
+    Sherpa-ONNX の日本語 Zipformer (ReazonSpeech) モデルを使い、
+    VAD で発話区間を検出 → 即座にローカル認識 → router.route() で
+    キャラクターを決定する。WAV ファイル I/O なし・API コールなし。
+
+    注: 日本語モデルは Offline モデルのため、発話区間が完了してから
+    認識を実行する (真のストリーミングではない)。
+    """
+
+    def __init__(
+        self,
+        *,
+        vad_threshold: float | None = None,
+        device: int | str | None = None,
+        model_dir: str | None = None,
+        provider: str | None = None,
+        quantized: bool = True,
+        max_record_seconds: float = _DEFAULT_MAX_RECORD_SECONDS,
+    ) -> None:
+        """
+        Args:
+            vad_threshold:      RMS 閾値。省略時は L2_SILENCE_THRESHOLD env。
+            device:             マイクデバイス。
+            model_dir:          Sherpa モデルディレクトリ。省略時は L2_SHERPA_MODEL_DIR env。
+            provider:           ONNX Runtime provider ("cuda" / "cpu")。省略時は L2_SHERPA_PROVIDER env。
+            quantized:          True=int8 モデル、False=fp32 モデル。
+            max_record_seconds: 1 発話の最大録音秒数。
+        """
+        try:
+            import sherpa_onnx as _sherpa
+        except ImportError as exc:
+            raise ImportError(
+                "sherpa-onnx が必要です。"
+                " uv sync --extra stt-sherpa でインストールしてください。"
+            ) from exc
+
+        self._vad_threshold = vad_threshold if vad_threshold is not None else float(
+            os.environ.get("L2_SILENCE_THRESHOLD", "0.01")
+        )
+        self._device = device
+        self._max_record_seconds = max_record_seconds
+
+        # モデルパス解決
+        mdir = Path(
+            model_dir
+            or os.environ.get("L2_SHERPA_MODEL_DIR")
+            or str(_DEFAULT_SHERPA_MODEL_DIR)
+        )
+        # サブディレクトリにモデルが配置されている場合を自動検出
+        if not (mdir / "tokens.txt").is_file():
+            subdirs = [d for d in mdir.iterdir() if d.is_dir() and (d / "tokens.txt").is_file()]
+            if len(subdirs) == 1:
+                mdir = subdirs[0]
+                logger.info("Sherpa モデルサブディレクトリ検出: %s", mdir.name)
+
+        encoder, decoder, joiner = _find_sherpa_model_files(mdir, quantized)
+        tokens = mdir / "tokens.txt"
+
+        for p in (encoder, decoder, joiner, tokens):
+            if not p.is_file():
+                raise FileNotFoundError(
+                    f"Sherpa モデルファイルが見つかりません: {p}"
+                )
+
+        prov = provider or os.environ.get("L2_SHERPA_PROVIDER", "cuda")
+
+        logger.info(
+            "Sherpa-ONNX 初期化: provider=%s encoder=%s",
+            prov,
+            encoder.name,
+        )
+        self._recognizer = _sherpa.OfflineRecognizer.from_transducer(
+            encoder=str(encoder),
+            decoder=str(decoder),
+            joiner=str(joiner),
+            tokens=str(tokens),
+            num_threads=2,
+            sample_rate=_DEFAULT_SAMPLE_RATE,
+            feature_dim=80,
+            provider=prov,
+        )
+        logger.info("Sherpa-ONNX 初期化完了")
+
+    def listen_once(self, timeout_seconds: float = 30.0) -> "WakeWordResult | None":
+        """
+        発話を 1 回検知して WakeWordResult を返す。
+
+        Phase 1: RMS ベース VAD で発話開始検知 (onset pre-buffer 付き)
+        Phase 2: 無音検知で録音終了
+        Phase 3: Sherpa-ONNX で認識 → route() → 名前ゲート
+
+        WAV ファイルの書き出しは行わない。
+        """
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise ImportError(
+                "sounddevice が必要です。"
+                " uv sync --extra mic でインストールしてください。"
+            ) from exc
+
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise ImportError(
+                "numpy が必要です。"
+                " uv sync --extra mic でインストールしてください。"
+            ) from exc
+
+        import time
+
+        sample_rate = _DEFAULT_SAMPLE_RATE
+        frame_samples = _DEFAULT_FRAME_SAMPLES
+        threshold = self._vad_threshold
+
+        deadline = time.monotonic() + timeout_seconds
+        max_record_frames = int(self._max_record_seconds * sample_rate / frame_samples)
+
+        logger.info(
+            "Sherpa 音声待機開始 (timeout=%.0fs threshold=%.4f)",
+            timeout_seconds,
+            threshold,
+        )
+
+        onset_count = 0
+        silence_count = 0
+        recording: list = []
+        recording_started = False
+        onset_buffer: deque = deque(maxlen=_DEFAULT_VAD_HOLD_FRAMES)
+
+        with sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=frame_samples,
+            device=self._device,
+        ) as stream:
+            while time.monotonic() < deadline:
+                pcm, overflowed = stream.read(frame_samples)
+                if overflowed:
+                    logger.debug("オーディオバッファオーバーフロー")
+
+                frame = pcm[:, 0]
+                rms = float(np.sqrt(np.mean(frame ** 2)))
+
+                if not recording_started:
+                    onset_buffer.append(frame.copy())
+
+                    if rms >= threshold:
+                        onset_count += 1
+                    else:
+                        onset_count = 0
+
+                    if onset_count >= _DEFAULT_VAD_HOLD_FRAMES:
+                        recording_started = True
+                        silence_count = 0
+                        recording = list(onset_buffer)
+                        logger.info("発話開始検知")
+                else:
+                    recording.append(frame.copy())
+
+                    if rms < threshold:
+                        silence_count += 1
+                    else:
+                        silence_count = 0
+
+                    if (
+                        silence_count >= _DEFAULT_SILENCE_FRAMES
+                        or len(recording) >= max_record_frames
+                    ):
+                        logger.info(
+                            "発話終了検知 (frames=%d silence=%d)",
+                            len(recording),
+                            silence_count,
+                        )
+                        break
+            else:
+                logger.info("Sherpa 音声待機タイムアウト")
+                return None
+
+        if not recording:
+            logger.info("録音データなし")
+            return None
+
+        # Sherpa-ONNX で認識 (WAV ファイル不要)
+        audio_data = np.concatenate(recording)
+        s = self._recognizer.create_stream()
+        s.accept_waveform(sample_rate, audio_data)
+        self._recognizer.decode_stream(s)
+        transcript = s.result.text.strip()
+
+        logger.info("Sherpa 転写結果: %r", transcript)
+
+        # キャラクター判定 (名前ゲート付き)
+        decision = _router.route(transcript)
+
+        if decision.reason == "default":
+            logger.info("名前ゲート: キャラクター名未検出。無視します: %r", transcript)
+            return None
+
+        char_slug = decision.speaker
+
+        from .characters import get_all_characters as _get_chars
+        chars = {c.slug: c for c in _get_chars()}
+        char = chars.get(char_slug)
+        keyword = (char.wake_word if char and char.wake_word else None) or char_slug
+
+        logger.info("Sherpa ルーティング: %r → %s", transcript, char_slug)
+        return WakeWordResult(
+            keyword=keyword,
+            character_slug=char_slug,
+            keyword_index=0,
+            transcript=transcript,
+        )
+
+    def cleanup(self) -> None:
+        """Sherpa-ONNX リソースを解放する。"""
+        if hasattr(self, "_recognizer"):
+            self._recognizer = None
+            logger.info("Sherpa-ONNX リソース解放完了")
+
+
+# ─── ContinuousListener ──────────────────────────────────────────
+
+
+class ContinuousListener:
+    """
+    常時文字起こし + 循環バッファによるリスナー。
+
+    SpeechActivatedListener と異なり、キャラクター名が検出されない
+    発話もバッファに保持し、名前検出時に直前の文脈として活用する。
+    faster-whisper でセグメント単位に transcript を生成する。
+    """
+
+    def __init__(
+        self,
+        *,
+        vad_threshold: float | None = None,
+        device: int | str | None = None,
+        stt_provider: str = "faster-whisper",
+        stt_lang: str = "ja",
+        stt_prompt: str | None = None,
+        tmp_dir: str | None = None,
+        max_record_seconds: float = _DEFAULT_MAX_RECORD_SECONDS,
+        context_window_sec: float | None = None,
+        context_max_chars: int | None = None,
+    ) -> None:
+        from .transcript_buffer import TranscriptBuffer
+
+        self._vad_threshold = vad_threshold if vad_threshold is not None else float(
+            os.environ.get("L2_SILENCE_THRESHOLD", "0.01")
+        )
+        self._device = device
+        self._stt_provider = stt_provider
+        self._stt_lang = stt_lang
+        self._stt_prompt = stt_prompt if stt_prompt is not None else _build_character_prompt()
+        self._tmp_dir = tmp_dir
+        self._max_record_seconds = max_record_seconds
+
+        window = context_window_sec if context_window_sec is not None else float(
+            os.environ.get("L2_CONTEXT_WINDOW_SEC", "30")
+        )
+        max_ch = context_max_chars if context_max_chars is not None else int(
+            os.environ.get("L2_CONTEXT_MAX_CHARS", "2000")
+        )
+        self._buffer = TranscriptBuffer(window_sec=window, max_chars=max_ch)
+
+    def _record_one_segment(
+        self,
+        stream,
+        remaining_sec: float,
+        *,
+        np_module,
+        sf_module,
+    ):
+        """
+        1 発話セグメントを録音・転写して TranscriptSegment を返す。
+
+        Phase 1: RMS onset 検知 (onset_buffer 付き)
+        Phase 2: 無音検知で録音終了
+        Phase 3: temp WAV → STT → 削除
+
+        Args:
+            stream:        開いている sd.InputStream
+            remaining_sec: 残りタイムアウト秒数
+            np_module:     numpy モジュール
+            sf_module:     soundfile モジュール
+
+        Returns:
+            TranscriptSegment or None (タイムアウト or 空録音)
+        """
+        from .transcript_buffer import TranscriptSegment
+        import time
+
+        np = np_module
+        sf = sf_module
+        sample_rate = _DEFAULT_SAMPLE_RATE
+        frame_samples = _DEFAULT_FRAME_SAMPLES
+        threshold = self._vad_threshold
+        max_record_frames = int(self._max_record_seconds * sample_rate / frame_samples)
+
+        deadline = time.monotonic() + remaining_sec
+
+        onset_count = 0
+        silence_count = 0
+        recording: list = []
+        recording_started = False
+        onset_buffer: deque = deque(maxlen=_DEFAULT_VAD_HOLD_FRAMES)
+
+        while time.monotonic() < deadline:
+            pcm, overflowed = stream.read(frame_samples)
+            if overflowed:
+                logger.debug("オーディオバッファオーバーフロー")
+
+            frame = pcm[:, 0].astype(np.float32)
+            if frame.dtype == np.int16:
+                frame = frame / 32768.0
+            rms = float(np.sqrt(np.mean(frame ** 2)))
+
+            if not recording_started:
+                onset_buffer.append(pcm[:, 0].copy())
+
+                if rms >= threshold:
+                    onset_count += 1
+                else:
+                    onset_count = 0
+
+                if onset_count >= _DEFAULT_VAD_HOLD_FRAMES:
+                    recording_started = True
+                    silence_count = 0
+                    recording = list(onset_buffer)
+                    logger.info("発話開始検知 (continuous)")
+            else:
+                recording.append(pcm[:, 0].copy())
+
+                if rms < threshold:
+                    silence_count += 1
+                else:
+                    silence_count = 0
+
+                if (
+                    silence_count >= _DEFAULT_SILENCE_FRAMES
+                    or len(recording) >= max_record_frames
+                ):
+                    logger.info(
+                        "発話終了検知 (continuous, frames=%d)",
+                        len(recording),
+                    )
+                    break
+
+        if not recording:
+            return None
+
+        # WAV 書き出し → STT → 削除
+        audio_data = np.concatenate(recording)
+        tmp_file = tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            dir=self._tmp_dir,
+            delete=False,
+        )
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        try:
+            sf.write(tmp_path, audio_data, sample_rate, subtype="PCM_16")
+
+            stt_result = _stt.transcribe_audio_file(
+                tmp_path,
+                provider=self._stt_provider,
+                lang=self._stt_lang,
+                prompt=self._stt_prompt or None,
+            )
+            transcript = stt_result.text.strip()
+            duration_ms = stt_result.duration_ms
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        if not transcript:
+            logger.debug("空の転写結果。スキップします。")
+            return None
+
+        import time as _time
+        return TranscriptSegment(
+            text=transcript,
+            timestamp=_time.monotonic(),
+            duration_ms=duration_ms,
+        )
+
+    def listen_once(self, timeout_seconds: float = 30.0) -> "WakeWordResult | None":
+        """
+        常時文字起こしで発話を蓄積し、キャラクター名が検出されたら
+        文脈付きで WakeWordResult を返す。
+
+        内部ループで複数セグメントを処理する。名前が検出されない
+        セグメントはバッファに蓄積され、次のセグメントの文脈となる。
+        """
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise ImportError(
+                "sounddevice が必要です。"
+                " uv sync --extra mic でインストールしてください。"
+            ) from exc
+
+        try:
+            import soundfile as sf
+        except ImportError as exc:
+            raise ImportError(
+                "soundfile が必要です。"
+                " uv sync --extra mic でインストールしてください。"
+            ) from exc
+
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise ImportError(
+                "numpy が必要です。"
+                " uv sync --extra mic でインストールしてください。"
+            ) from exc
+
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+
+        logger.info(
+            "常時文字起こし開始 (timeout=%.0fs threshold=%.4f buffer=%d segments)",
+            timeout_seconds,
+            self._vad_threshold,
+            len(self._buffer),
+        )
+
+        with sd.InputStream(
+            samplerate=_DEFAULT_SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=_DEFAULT_FRAME_SAMPLES,
+            device=self._device,
+        ) as stream:
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                segment = self._record_one_segment(
+                    stream,
+                    remaining,
+                    np_module=np,
+                    sf_module=sf,
+                )
+                if segment is None:
+                    continue
+
+                self._buffer.add(segment)
+                logger.info(
+                    "バッファ蓄積: %r (segments=%d chars=%d)",
+                    segment.text,
+                    len(self._buffer),
+                    self._buffer.total_chars,
+                )
+
+                # バッファ全文でキャラクター判定
+                decision = _router.route(self._buffer.full_text())
+
+                if decision.reason != "default":
+                    context = self._buffer.extract_context()
+                    char_slug = decision.speaker
+                    self._buffer.clear()
+
+                    from .characters import get_all_characters as _get_chars
+                    chars = {c.slug: c for c in _get_chars()}
+                    char = chars.get(char_slug)
+                    keyword = (char.wake_word if char and char.wake_word else None) or char_slug
+
+                    logger.info(
+                        "文脈付きルーティング: %s (context=%d chars)",
+                        char_slug,
+                        len(context),
+                    )
+                    return WakeWordResult(
+                        keyword=keyword,
+                        character_slug=char_slug,
+                        keyword_index=0,
+                        transcript=context,
+                    )
+
+                logger.info("名前ゲート: バッファ蓄積のみ: %r", segment.text)
+
+        logger.info("常時文字起こしタイムアウト")
+        return None
+
+    def cleanup(self) -> None:
+        """バッファをクリアする。"""
+        self._buffer.clear()

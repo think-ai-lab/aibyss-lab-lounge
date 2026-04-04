@@ -209,5 +209,8 @@ __marimo__/
 # porcupine
 porcupine/
 
+# sherpa-onnx models
+sherpa-models/
+
 # audio files
 data/audio/*.wav

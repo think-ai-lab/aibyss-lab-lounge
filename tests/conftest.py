@@ -36,6 +36,9 @@ def reset_l2_mode_vars(monkeypatch):
     setenv する。
     """
     for var in ("L2_USE_REAL_LLM", "L2_USE_REAL_TTS", "L2_USE_REAL_STT",
-                "L2_DEFAULT_SPEAKER", "L2_WAKE_BACKEND"):
+                "L2_DEFAULT_SPEAKER", "L2_WAKE_BACKEND",
+                "L2_SHERPA_MODEL_DIR", "L2_SHERPA_PROVIDER",
+                "L2_CONTEXT_WINDOW_SEC", "L2_CONTEXT_MAX_CHARS",
+                "L2_FILLER_ENABLED", "L2_LLM_FILLER_MODEL"):
         monkeypatch.delenv(var, raising=False)
 
