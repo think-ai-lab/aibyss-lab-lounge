@@ -371,8 +371,9 @@ def _generate_filler_text(slug: str) -> str | None:
 
     from .characters import get_character
 
-    char = get_character(slug)
-    if char is None:
+    try:
+        char = get_character(slug)
+    except KeyError:
         return None
 
     system_prompt = _FILLER_PROMPTS.get(slug, _FILLER_DEFAULT_PROMPT)

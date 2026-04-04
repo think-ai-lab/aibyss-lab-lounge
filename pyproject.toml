@@ -23,6 +23,14 @@ llm = [
     "langchain-openai>=0.2",
     "python-dotenv>=1.0",
 ]
+llm-google = [
+    "langchain-google-genai>=2.0",
+    "python-dotenv>=1.0",
+]
+llm-anthropic = [
+    "langchain-anthropic>=0.3",
+    "python-dotenv>=1.0",
+]
 tts = [
     "edge-tts>=6.1",
     "mutagen>=1.47",
