@@ -67,6 +67,12 @@ stt-sherpa = [
     "sherpa-onnx>=1.10",
     "python-dotenv>=1.0",
 ]
+tools = [
+    "fastmcp>=2.0",
+    "langchain-mcp-adapters>=0.2",
+    "langchain-tavily>=0.1",
+    "python-dotenv>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lab_lounge"]
