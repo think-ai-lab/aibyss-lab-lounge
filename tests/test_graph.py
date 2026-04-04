@@ -24,7 +24,7 @@ FAKE_RESULT = LLMResult(
 
 class TestRunGraph:
     def test_run_graph_returns_llm_result(self):
-        """_build_graph をモックして run_graph が LLMResult を返すことを確認する"""
+        """_build_simple_graph をモックして run_graph が LLMResult を返すことを確認する"""
         mock_graph = MagicMock()
         mock_graph.invoke.return_value = {
             "text": "テスト",
@@ -33,7 +33,7 @@ class TestRunGraph:
             "result": FAKE_RESULT,
         }
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             result = run_graph("テスト", model="gpt-4o-mini", provider="openai")
 
@@ -50,7 +50,7 @@ class TestRunGraph:
             "result": FAKE_RESULT,
         }
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             run_graph("テスト入力", model="gpt-4o-mini", provider="openai")
 
@@ -69,7 +69,7 @@ class TestRunGraph:
             "result": FAKE_RESULT,
         }
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             result = run_graph("x", model="m")
 
@@ -86,12 +86,12 @@ class TestRunGraph:
             "result": None,
         }
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             with pytest.raises(RuntimeError):
                 run_graph("テスト", model="gpt-4o-mini")
 
-    def test_build_graph_raises_import_error_without_langgraph(self):
+    def test_build_simple_graph_raises_import_error_without_langgraph(self):
         """langgraph が未インストールの場合、ImportError を送出する"""
         real_import = builtins.__import__
 
@@ -100,10 +100,10 @@ class TestRunGraph:
                 raise ImportError(f"mocked missing: {name}")
             return real_import(name, *args, **kwargs)
 
-        from lab_lounge.graph import _build_graph
+        from lab_lounge.graph import _build_simple_graph
         with patch.object(builtins, "__import__", side_effect=mock_import):
             with pytest.raises(ImportError, match="langgraph"):
-                _build_graph()
+                _build_simple_graph()
 
 
 class TestRunGraphWithMetadata:
@@ -120,7 +120,7 @@ class TestRunGraphWithMetadata:
         }
         meta = {"aibyss.trace_id": "t1", "aibyss.stream_id": "s1"}
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             run_graph("x", model="m", run_metadata=meta)
 
@@ -138,7 +138,7 @@ class TestRunGraphWithMetadata:
             "result": FAKE_RESULT,
         }
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             run_graph("x", model="m")
 
@@ -157,7 +157,7 @@ class TestRunGraphWithMetadata:
         }
         meta = {"aibyss.trace_id": "t1"}
 
-        with patch("lab_lounge.graph._build_graph", return_value=mock_graph):
+        with patch("lab_lounge.graph._build_simple_graph", return_value=mock_graph):
             from lab_lounge.graph import run_graph
             result = run_graph("x", model="m", run_metadata=meta)
 
