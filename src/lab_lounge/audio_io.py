@@ -179,6 +179,62 @@ def play_audio_file(path_or_url: str) -> bool:
         return False
 
 
+def play_audio_interruptible(
+    path_or_url: str,
+    stop_event: "threading.Event",
+    poll_interval: float = 0.05,
+) -> bool:
+    """
+    音声を再生する。stop_event が set されたら即座に停止する。
+
+    sounddevice.play() + ポーリングループで stop_event を監視。
+    sd.stop() で再生を中断する。
+
+    Args:
+        path_or_url:    ローカルファイルパスまたは file:// URI
+        stop_event:     このイベントが set されたら再生を中断
+        poll_interval:  ポーリング間隔（秒）
+
+    Returns:
+        True:  再生完了（中断なし）
+        False: 中断された、またはエラー
+    """
+    import time
+
+    if not path_or_url:
+        return False
+
+    path = _uri_to_path(path_or_url)
+
+    try:
+        import sounddevice as sd
+        import soundfile as sf
+    except ImportError:
+        logger.warning("sounddevice/soundfile が未インストールのため再生をスキップします。")
+        return False
+
+    if not Path(path).exists():
+        logger.debug("再生スキップ: ファイルが存在しません: %s", path_or_url)
+        return False
+
+    try:
+        data, samplerate = sf.read(path, dtype="float32")
+        sd.play(data, samplerate)
+
+        # ポーリングで stop_event を監視
+        while sd.get_stream() and sd.get_stream().active:
+            if stop_event.is_set():
+                sd.stop()
+                logger.debug("フィラー再生中断: %s", path)
+                return False
+            time.sleep(poll_interval)
+
+        return True
+    except Exception as exc:
+        logger.warning("再生失敗: %s  (%s)", path, exc)
+        return False
+
+
 # ─── ヘルパー ────────────────────────────────────────────────────
 
 def _uri_to_path(path_or_url: str) -> str:
