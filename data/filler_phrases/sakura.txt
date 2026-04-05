@@ -6,6 +6,11 @@
 うんうん、そうですよねぇ	happy=50
 へぇ、それはですねぇ	happy=50
 
+[bridge]
+んー……	happy=50
+えっとぉ……	happy=50
+あのぉ……	happy=50
+
 [continue]
 んーと、そうですねぇ……	happy=50
 さくらが思うにはぁ……	happy=50
