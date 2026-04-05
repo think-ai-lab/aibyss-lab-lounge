@@ -426,9 +426,12 @@ def _call_filler_llm(
         return None
 
 
-def _generate_filler_text(slug: str) -> str | None:
+def _generate_filler_text(slug: str, *, user_text: str = "") -> str | None:
     """
     LLM でキャラクターらしいフィラー独り言を生成する。
+
+    ユーザーの入力テキストが提供された場合、それに応じた文脈的な
+    独り言を生成する。
 
     キャラクターの filler_model を使用。未設定なら L2_LLM_FILLER_MODEL env。
     モデル名からプロバイダー（OpenAI / Anthropic / Google）を自動判定。
@@ -449,7 +452,12 @@ def _generate_filler_text(slug: str) -> str | None:
     else:
         model = os.environ.get("L2_LLM_FILLER_MODEL", "gpt-5.4-nano")
 
-    text = _call_filler_llm(model, system_prompt, "（独り言）")
+    if user_text:
+        user_msg = f"ユーザーが「{user_text}」と聞いています。（独り言）"
+    else:
+        user_msg = "（独り言）"
+
+    text = _call_filler_llm(model, system_prompt, user_msg)
 
     if text:
         text = text.strip('"').strip("「」")
@@ -460,7 +468,7 @@ def _generate_filler_text(slug: str) -> str | None:
     return None
 
 
-def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
+def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = "") -> None:
     """
     ハイブリッドフィラー再生。
 
@@ -471,6 +479,11 @@ def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
 
     フレーズは最後まで再生する（途中中断しない）。
     LLM フィラーは 1 回のみ（繰り返さない）。
+
+    Args:
+        slug: キャラクター slug
+        stop_event: 停止シグナル
+        user_text: ユーザーの入力テキスト（文脈的フィラー生成に使用）
     """
     from .audio_io import play_audio_file
     from .characters import get_character
@@ -493,7 +506,7 @@ def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
 
     # Phase 2: LLM フィラー 1 回のみ
     char = get_character(slug)
-    filler_text = _generate_filler_text(slug)
+    filler_text = _generate_filler_text(slug, user_text=user_text)
 
     if filler_text and char:
         logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)

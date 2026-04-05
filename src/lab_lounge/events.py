@@ -226,3 +226,45 @@ def build_tts_done(
     }
     validate_event(event)
     return event
+
+
+def build_bubble_update(
+    *,
+    character: str,
+    step: str,
+    text: str,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    links: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    bubble.update イベントを組み立てて検証する。
+
+    パイプライン実行中の進捗を視聴者に伝えるイベント。
+    キャラ口調の短い一言を OBS 吹き出しに表示する。
+
+    Args:
+        character: キャラクター slug (e.g., "mimi")
+        step:      進捗ステップ ("searching" / "thinking" / "answering" / "done")
+        text:      表示テキスト（キャラクター口調の固定文字列）
+    """
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "bubble.update",
+        "source": "lab-lounge",
+        "payload": {
+            "character": character,
+            "step": step,
+            "text": text,
+        },
+    }
+    if links:
+        event["links"] = links
+    validate_event(event)
+    return event

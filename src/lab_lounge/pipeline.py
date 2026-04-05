@@ -25,6 +25,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .bus import publish
@@ -35,11 +36,54 @@ from .debug import (
     write_retrieval,
     write_stt_output,
 )
-from .events import build_llm_final, build_tts_done, build_utterance_final
+from .events import build_bubble_update, build_llm_final, build_tts_done, build_utterance_final
 from .observability import build_run_metadata
 from .router import route
 
 logger = logging.getLogger(__name__)
+
+# ─── 吹き出しメッセージ ──────────────────────────────────────────
+
+_BUBBLE_MESSAGES: dict | None = None
+
+
+def _load_bubble_messages() -> dict:
+    """data/bubble_messages.json を読み込む（キャッシュ付き）。"""
+    global _BUBBLE_MESSAGES
+    if _BUBBLE_MESSAGES is None:
+        import json
+        msg_path = Path(__file__).resolve().parent.parent.parent / "data" / "bubble_messages.json"
+        if msg_path.is_file():
+            _BUBBLE_MESSAGES = json.loads(msg_path.read_text(encoding="utf-8"))
+        else:
+            logger.warning("bubble_messages.json が見つかりません: %s", msg_path)
+            _BUBBLE_MESSAGES = {}
+    return _BUBBLE_MESSAGES
+
+
+def _publish_bubble(
+    step: str,
+    character_slug: str,
+    common: dict,
+    links: list[str] | None = None,
+) -> None:
+    """bubble.update イベントを発行する。"""
+    messages = _load_bubble_messages()
+    char_msgs = messages.get(character_slug, {})
+    text = char_msgs.get(step, "")
+
+    try:
+        bubble = build_bubble_update(
+            character=character_slug,
+            step=step,
+            text=text,
+            links=links,
+            **common,
+        )
+        publish(bubble)
+        logger.info("bubble.update published: step=%s character=%s", step, character_slug)
+    except Exception as exc:
+        logger.warning("bubble.update 発行失敗: %s", exc)
 
 
 # ─── LLM モード設定 ──────────────────────────────────────────────
@@ -164,6 +208,9 @@ def run_pipeline(
     publish(utt)
     write_stt_output(text, utterance_meta)
 
+    # ─── bubble: searching ───
+    _publish_bubble("searching", character.slug, common, links=[utt["event_id"]])
+
     # 2. Retrieve (optional) — L2_ENABLE_RAG=true のときのみ実行
     rag_context: str | None = None
     rag_used = False
@@ -200,6 +247,9 @@ def run_pipeline(
             rag_used = False
             answer_mode = "fallback"
             write_retrieval([], [], retrieval_latency_ms, rag_enabled=True)
+
+    # ─── bubble: thinking ───
+    _publish_bubble("thinking", character.slug, common, links=[utt["event_id"]])
 
     # 3. llm.final — utterance.final を links で参照
     use_real, provider, llm_model = _get_llm_mode(character)
@@ -246,6 +296,9 @@ def run_pipeline(
     llm = build_llm_final(text=llm_text, seq=1, links=[utt["event_id"]], **llm_meta, **common)
     publish(llm)
 
+    # ─── bubble: answering ───
+    _publish_bubble("answering", character.slug, common, links=[llm["event_id"]])
+
     # 4. tts.done — llm.final を links で参照
     use_real_tts, _env_tts_provider, _env_tts_voice, _env_tts_speaker, tts_output_dir = _get_tts_mode()
     # キャラクター設定を優先。env は fallback
@@ -275,6 +328,9 @@ def run_pipeline(
         tts_meta = dict(speaker=tts_speaker)  # ダミーモードでも speaker slug を記録
     tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **tts_meta, **common)
     publish(tts)
+
+    # ─── bubble: done ───
+    _publish_bubble("done", character.slug, common, links=[tts["event_id"]])
 
     return PipelineResult(
         stream_id=stream_id,

@@ -335,7 +335,77 @@ def _split_text_for_voicepeak(
     return chunks if chunks else [text]
 
 
-_voicepeak_lock = threading.Lock()
+# ─── VOICEPEAK FIFO キュー ───────────────────────────────────────
+#
+# voicepeak.exe は同時に 1 プロセスしか実行できない。
+# threading.Lock だと投入順序が保証されないため、FIFO キューで
+# 先に投入されたジョブを先に実行する。
+#
+# フィラースレッドとメインスレッドが同時に VOICEPEAK を要求しても、
+# 先に submit した方が先に合成される。
+
+import concurrent.futures
+import queue as _queue_mod
+
+_voicepeak_queue: _queue_mod.Queue | None = None
+_voicepeak_worker_thread: threading.Thread | None = None
+
+
+def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
+    """VOICEPEAK キューワーカー。キューからジョブを取り出し順次実行する。"""
+    import subprocess as _sp
+
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        cmd_str, future = item
+        try:
+            result = _sp.run(cmd_str, capture_output=True, text=True, shell=True)
+            future.set_result(result)
+        except Exception as exc:
+            future.set_exception(exc)
+
+
+def _ensure_voicepeak_worker() -> _queue_mod.Queue:
+    """VOICEPEAK ワーカースレッドを初回利用時に起動する。"""
+    global _voicepeak_queue, _voicepeak_worker_thread
+    if _voicepeak_queue is None:
+        _voicepeak_queue = _queue_mod.Queue()
+        _voicepeak_worker_thread = threading.Thread(
+            target=_voicepeak_worker_fn,
+            args=(_voicepeak_queue,),
+            daemon=True,
+        )
+        _voicepeak_worker_thread.start()
+        logger.info("VOICEPEAK FIFO ワーカー起動")
+    return _voicepeak_queue
+
+
+def _submit_voicepeak(cmd_str: str) -> None:
+    """
+    VOICEPEAK コマンドをキューに投入し、完了を待つ。
+
+    FIFO 順序が保証される。先に投入されたジョブが先に実行される。
+
+    Raises:
+        FileNotFoundError: VOICEPEAK コマンドが見つからない
+        RuntimeError: VOICEPEAK 実行エラー
+    """
+    q = _ensure_voicepeak_worker()
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    q.put((cmd_str, future))
+
+    try:
+        result = future.result()  # ブロック: 完了まで待つ
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"VOICEPEAK 実行エラー: {exc}") from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr or result.stdout or ""
+        raise RuntimeError(f"VOICEPEAK 実行エラー: {stderr}")
 
 
 def _generate_voicepeak_single_file(
@@ -349,8 +419,7 @@ def _generate_voicepeak_single_file(
     """
     VOICEPEAK CLI で 1 チャンク分の WAV を生成する。
 
-    voicepeak.exe は同時に 1 プロセスしか実行できないため、
-    スレッドロックで排他制御する。
+    FIFO キューで排他制御される。投入順序が合成順序になる。
 
     Returns:
         (duration_ms, sample_rate)
@@ -364,9 +433,6 @@ def _generate_voicepeak_single_file(
     if normalized_text != text:
         logger.debug("VOICEPEAK テキスト正規化: %r → %r", text, normalized_text)
 
-    # VOICEPEAK CLI は --say / --narrator の値をダブルクォートで囲む必要がある。
-    # subprocess.list2cmdline はスペースを含まない日本語テキスト等をクォートしないため、
-    # 明示的にダブルクォートを付与してコマンド文字列を構築する。
     safe_text = normalized_text.replace('"', "'")
     safe_voice = voice.replace('"', "'")
 
@@ -384,18 +450,7 @@ def _generate_voicepeak_single_file(
 
     logger.info("VOICEPEAK コマンド: %s", cmd_str)
 
-    with _voicepeak_lock:
-        try:
-            subprocess.run(cmd_str, check=True, capture_output=True, text=True, shell=True)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"VOICEPEAK コマンドが見つかりません: {voicepeak_cmd!r}。"
-                " L2_TTS_VOICEPEAK_PATH でパスを設定するか、PATH に追加してください。"
-            ) from exc
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"VOICEPEAK 実行エラー: {exc.stderr or exc.stdout}"
-            ) from exc
+    _submit_voicepeak(cmd_str)
 
     with wave.open(str(filepath)) as wf:
         duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)
