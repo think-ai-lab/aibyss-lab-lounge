@@ -155,11 +155,11 @@ def _is_filler_enabled() -> bool:
     return is_filler_enabled()
 
 
-def _run_filler_safe(slug: str, stop_event: threading.Event) -> None:
+def _run_filler_safe(slug: str, stop_event: threading.Event, user_text: str = "") -> None:
     """フィラー再生ループ（例外を握り潰してログに出す）。"""
     try:
         from .filler import run_filler_loop
-        run_filler_loop(slug, stop_event)
+        run_filler_loop(slug, stop_event, user_text=user_text)
     except Exception as exc:
         logger.warning("フィラー再生エラー: %s", exc)
 
@@ -281,7 +281,7 @@ def run_loop(
                 if speaker_hint and _is_filler_enabled():
                     _filler_thread = threading.Thread(
                         target=_run_filler_safe,
-                        args=(speaker_hint, _filler_stop),
+                        args=(speaker_hint, _filler_stop, input_text or ""),
                         daemon=True,
                     )
                     _filler_thread.start()

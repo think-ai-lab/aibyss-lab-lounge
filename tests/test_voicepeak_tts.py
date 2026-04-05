@@ -97,12 +97,14 @@ class TestCallVoicepeak:
         assert "150" in captured_cmd
 
     def test_command_not_found_raises(self, tmp_path):
-        """voicepeak コマンドが見つからない場合 FileNotFoundError。"""
-        def mock_run(cmd, **kwargs):
-            raise FileNotFoundError("voicepeak not found")
+        """voicepeak コマンドが見つからない場合 RuntimeError。"""
+        from lab_lounge.tts import _submit_voicepeak
 
-        with patch.object(subprocess, "run", side_effect=mock_run):
-            with pytest.raises(FileNotFoundError, match="VOICEPEAK"):
+        def mock_submit(cmd_str):
+            raise RuntimeError("VOICEPEAK 実行エラー: voicepeak not found")
+
+        with patch("lab_lounge.tts._submit_voicepeak", side_effect=mock_submit):
+            with pytest.raises(RuntimeError, match="VOICEPEAK"):
                 _call_voicepeak(
                     "テスト",
                     voice="彩澄りりせ",

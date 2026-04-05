@@ -36,9 +36,10 @@ class TestRunPipeline:
         types = [ev["type"] for ev in result.events]
         assert types == ["utterance.final", "llm.final", "tts.done"]
 
-    def test_publish_called_three_times(self, mock_publish):
+    def test_publish_called_seven_times(self, mock_publish):
+        """3 メインイベント + 4 bubble.update = 7 回。"""
         run_pipeline("hello", **COMMON)
-        assert mock_publish.call_count == 3
+        assert mock_publish.call_count == 7
 
     def test_llm_links_utterance(self, mock_publish):
         result = run_pipeline("hello", **COMMON)
