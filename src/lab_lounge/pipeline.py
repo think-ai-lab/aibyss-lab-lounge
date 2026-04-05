@@ -174,6 +174,9 @@ def run_pipeline(
     """
     テキストを受け取り 3 イベントを publish する。
 
+    langgraph がインストール済みの場合は LangGraph 4 ノードグラフを使用。
+    未インストール時は _run_pipeline_legacy() にフォールバック。
+
     Args:
         text:            発話テキスト（utterance.final の payload.text）
         stream_id:       ストリーム識別子
@@ -187,6 +190,103 @@ def run_pipeline(
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
+    """
+    try:
+        return _run_pipeline_graph(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+        )
+    except ImportError:
+        logger.info("langgraph 未インストール。レガシーパイプラインにフォールバック。")
+        return _run_pipeline_legacy(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+        )
+
+
+def _run_pipeline_graph(
+    text: str,
+    *,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    utterance_meta: dict[str, Any] | None = None,
+    speaker_hint: str | None = None,
+    on_tts_chunk_ready=None,
+) -> PipelineResult:
+    """LangGraph パイプライングラフ経由で実行する。"""
+    from .graph import run_pipeline_graph, PipelineGraphState
+
+    common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
+
+    # 設定読み取り (キャラクター未確定 → routing ノードがキャラ別に上書き)
+    use_real_llm, llm_provider, llm_model = _get_llm_mode()
+    enable_rag, rag_top_k, kb_path = _get_rag_mode()
+    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+
+    initial_state: PipelineGraphState = {
+        "text": text,
+        "common": common,
+        "speaker_hint": speaker_hint,
+        "utterance_meta": utterance_meta,
+        "use_real_llm": use_real_llm,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "enable_rag": enable_rag,
+        "rag_top_k": rag_top_k,
+        "kb_path": kb_path,
+        "use_real_tts": use_real_tts,
+        "tts_provider": tts_provider,
+        "tts_voice": tts_voice,
+        "tts_speaker": tts_speaker,
+        "tts_output_dir": tts_output_dir,
+        "system_prompt": None,
+        "on_tts_chunk_ready": on_tts_chunk_ready,
+        "character_slug": "",
+        "rag_context": None,
+        "rag_used": False,
+        "retrieved_doc_ids": [],
+        "retrieval_latency_ms": 0,
+        "answer_mode": "fallback",
+        "llm_text": "",
+        "llm_meta": {},
+        "tts_meta": {},
+        "events": [],
+    }
+
+    final_state = run_pipeline_graph(initial_state)
+
+    return PipelineResult(
+        stream_id=stream_id,
+        session_id=session_id,
+        trace_id=trace_id,
+        speaker=final_state["character_slug"],
+        events=final_state["events"],
+    )
+
+
+def _run_pipeline_legacy(
+    text: str,
+    *,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    utterance_meta: dict[str, Any] | None = None,
+    speaker_hint: str | None = None,
+    on_tts_chunk_ready=None,
+) -> PipelineResult:
+    """
+    レガシーパイプライン（モノリシック）。langgraph 未インストール時のフォールバック。
     """
     common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
 

@@ -19,8 +19,9 @@ graph.py — LangGraph state graph（Agent 対応）
 """
 
 import logging
+import operator
 import os
-from typing import TypedDict
+from typing import Annotated, Any, TypedDict
 
 from .llm import LLMResult, call_llm
 
@@ -283,3 +284,291 @@ def _run_agent(
             context=context,
             system_prompt=system_prompt,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Pipeline Graph (マルチノード) — routing → retrieval → generation → tts
+# ═══════════════════════════════════════════════════════════════════
+
+
+class PipelineGraphState(TypedDict):
+    """パイプライングラフの状態。4 ノード間でデータを引き継ぐ。"""
+
+    # 入力
+    text: str
+    common: dict                   # stream_id, session_id, trace_id
+    speaker_hint: str | None
+    utterance_meta: dict | None
+
+    # 設定 (orchestrator が初期値を設定, routing ノードがキャラ別に上書き)
+    use_real_llm: bool
+    llm_provider: str
+    llm_model: str
+    enable_rag: bool
+    rag_top_k: int
+    kb_path: str
+    use_real_tts: bool
+    tts_provider: str
+    tts_voice: str
+    tts_speaker: str
+    tts_output_dir: str
+    system_prompt: str | None
+    on_tts_chunk_ready: Any
+
+    # ノード出力
+    character_slug: str
+    rag_context: str | None
+    rag_used: bool
+    retrieved_doc_ids: list[str]
+    retrieval_latency_ms: int
+    answer_mode: str
+    llm_text: str
+    llm_meta: dict
+    tts_meta: dict
+    events: Annotated[list[dict], operator.add]  # 各ノードで蓄積
+
+
+# ─── ノード実装 ──────────────────────────────────────────────────
+
+
+def _routing_node(state: PipelineGraphState) -> dict:
+    """ルーティングノード: キャラクター決定 + utterance.final 発行。"""
+    from .pipeline import publish, _publish_bubble
+    from .router import route
+    from .characters import get_character, load_system_prompt
+    from .events import build_utterance_final
+    from .debug import write_stt_output
+
+    text = state["text"]
+    common = state["common"]
+
+    # キャラクター決定
+    decision = route(text, name_hint=state["speaker_hint"])
+    character = get_character(decision.speaker)
+    try:
+        system_prompt = load_system_prompt(character)
+    except FileNotFoundError:
+        logger.warning(
+            "システムプロンプトが見つかりません: %s。プロンプトなしで続行。",
+            character.system_prompt_file,
+        )
+        system_prompt = None
+
+    updates: dict = {
+        "character_slug": character.slug,
+        "system_prompt": system_prompt,
+        "tts_provider": character.tts_provider,
+        "tts_voice": character.tts_voice,
+        "tts_speaker": character.slug,
+    }
+    # キャラクター固有の LLM 設定があれば上書き
+    if getattr(character, "llm_model", ""):
+        updates["llm_provider"] = character.llm_provider
+        updates["llm_model"] = character.llm_model
+
+    # utterance.final 発行
+    utt_kwargs: dict[str, Any] = state["utterance_meta"] or {}
+    utt = build_utterance_final(text=text, seq=0, **utt_kwargs, **common)
+    publish(utt)
+    write_stt_output(text, state["utterance_meta"])
+
+    # bubble: searching
+    _publish_bubble("searching", character.slug, common, links=[utt["event_id"]])
+
+    updates["events"] = [utt]
+    return updates
+
+
+def _retrieval_node(state: PipelineGraphState) -> dict:
+    """検索ノード: RAG 検索 (無効時はスキップ)。"""
+    import time
+    from .pipeline import _publish_bubble
+    from .debug import write_retrieval
+
+    common = state["common"]
+    utt_event_id = state["events"][0]["event_id"]
+
+    if not state["enable_rag"]:
+        _publish_bubble("thinking", state["character_slug"], common, links=[utt_event_id])
+        return {
+            "rag_context": None,
+            "rag_used": False,
+            "retrieved_doc_ids": [],
+            "retrieval_latency_ms": 0,
+            "answer_mode": "fallback",
+        }
+
+    # RAG 有効
+    rag_context: str | None = None
+    rag_used = False
+    retrieved_doc_ids: list[str] = []
+    retrieval_latency_ms = 0
+    answer_mode = "fallback"
+
+    try:
+        from .retriever import LocalRetriever
+        t0 = time.monotonic()
+        retriever = LocalRetriever(state["kb_path"])
+        docs = retriever.retrieve(state["text"], top_k=state["rag_top_k"])
+        retrieval_latency_ms = int((time.monotonic() - t0) * 1000)
+        if docs:
+            rag_context = "\n\n---\n\n".join(d.text for d in docs)
+            retrieved_doc_ids = [d.doc_id for d in docs]
+            retrieval_scores = [d.score for d in docs]
+            rag_used = True
+            answer_mode = "grounded"
+            logger.info(
+                "RAG 検索完了: latency_ms=%d docs=%d ids=%s",
+                retrieval_latency_ms, len(docs), retrieved_doc_ids,
+            )
+        else:
+            retrieval_scores = []
+        write_retrieval(retrieved_doc_ids, retrieval_scores, retrieval_latency_ms, rag_enabled=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RAG 検索失敗 (fallback): %s", exc)
+        write_retrieval([], [], retrieval_latency_ms, rag_enabled=True)
+
+    _publish_bubble("thinking", state["character_slug"], common, links=[utt_event_id])
+
+    return {
+        "rag_context": rag_context,
+        "rag_used": rag_used,
+        "retrieved_doc_ids": retrieved_doc_ids,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "answer_mode": answer_mode,
+    }
+
+
+def _generation_node(state: PipelineGraphState) -> dict:
+    """生成ノード: LLM 呼び出し + llm.final 発行。"""
+    from .pipeline import publish, _publish_bubble
+    from .events import build_llm_final
+    from .observability import build_run_metadata
+    from .debug import write_llm_prompt, write_llm_response
+
+    text = state["text"]
+    common = state["common"]
+    utt_event_id = state["events"][0]["event_id"]
+
+    if state["use_real_llm"]:
+        _run_meta = build_run_metadata(
+            stream_id=common["stream_id"],
+            session_id=common["session_id"],
+            trace_id=common["trace_id"],
+            rag_used=state["rag_used"],
+            answer_mode=state["answer_mode"],
+            retrieval_latency_ms=state["retrieval_latency_ms"],
+            retrieved_doc_count=len(state["retrieved_doc_ids"]),
+            retrieved_doc_ids=state["retrieved_doc_ids"],
+        )
+        write_llm_prompt(text, state["rag_context"])
+        _llm_result = run_graph(
+            text,
+            model=state["llm_model"],
+            provider=state["llm_provider"],
+            context=state["rag_context"],
+            system_prompt=state["system_prompt"],
+            run_metadata=_run_meta,
+        )
+        write_llm_response(_llm_result.text)
+        llm_text = _llm_result.text
+        llm_meta: dict[str, Any] = dict(
+            model=_llm_result.model,
+            input_tokens=_llm_result.input_tokens,
+            output_tokens=_llm_result.output_tokens,
+            latency_ms=_llm_result.latency_ms,
+            finish_reason=_llm_result.finish_reason,
+            rag_used=state["rag_used"],
+            answer_mode=state["answer_mode"],
+            retrieval_latency_ms=state["retrieval_latency_ms"],
+            retrieved_doc_count=len(state["retrieved_doc_ids"]),
+            retrieved_doc_ids=state["retrieved_doc_ids"],
+        )
+    else:
+        llm_text = f"ダミー応答: {text}"
+        llm_meta = {}
+
+    llm = build_llm_final(text=llm_text, seq=1, links=[utt_event_id], **llm_meta, **common)
+    publish(llm)
+
+    _publish_bubble("answering", state["character_slug"], common, links=[llm["event_id"]])
+
+    return {
+        "llm_text": llm_text,
+        "llm_meta": llm_meta,
+        "events": [llm],
+    }
+
+
+def _tts_node(state: PipelineGraphState) -> dict:
+    """TTS ノード: 音声合成 + tts.done 発行。"""
+    from .pipeline import publish, _publish_bubble
+    from .events import build_tts_done
+
+    common = state["common"]
+    llm_text = state["llm_text"]
+    llm_event_id = state["events"][1]["event_id"]
+
+    if state["use_real_tts"]:
+        from .tts import synthesize as _synthesize
+        _tts_result = _synthesize(
+            llm_text,
+            provider=state["tts_provider"],
+            voice=state["tts_voice"],
+            speaker=state["tts_speaker"],
+            output_dir=state["tts_output_dir"],
+            on_chunk_ready=state["on_tts_chunk_ready"],
+        )
+        tts_meta: dict[str, Any] = dict(
+            audio_url=_tts_result.audio_url,
+            duration_ms=_tts_result.duration_ms,
+            voice=_tts_result.voice,
+            format=_tts_result.format,
+            sample_rate=_tts_result.sample_rate,
+            speaker=_tts_result.speaker,
+        )
+    else:
+        tts_meta = dict(speaker=state["tts_speaker"])
+
+    tts = build_tts_done(text=llm_text, seq=2, links=[llm_event_id], **tts_meta, **common)
+    publish(tts)
+
+    _publish_bubble("done", state["character_slug"], common, links=[tts["event_id"]])
+
+    return {
+        "tts_meta": tts_meta,
+        "events": [tts],
+    }
+
+
+# ─── パイプライングラフ構築 ──────────────────────────────────────
+
+
+def _build_pipeline_graph():
+    """4 ノードパイプライングラフを構築する。
+
+    langgraph が未インストールの場合は ImportError を送出する。
+    """
+    from langgraph.graph import END, StateGraph
+
+    builder = StateGraph(PipelineGraphState)
+    builder.add_node("routing", _routing_node)
+    builder.add_node("retrieval", _retrieval_node)
+    builder.add_node("generation", _generation_node)
+    builder.add_node("tts", _tts_node)
+    builder.set_entry_point("routing")
+    builder.add_edge("routing", "retrieval")
+    builder.add_edge("retrieval", "generation")
+    builder.add_edge("generation", "tts")
+    builder.add_edge("tts", END)
+    return builder.compile()
+
+
+def run_pipeline_graph(initial_state: PipelineGraphState) -> PipelineGraphState:
+    """パイプライングラフを実行し、最終状態を返す。
+
+    Raises:
+        ImportError: langgraph が未インストール
+    """
+    graph = _build_pipeline_graph()
+    return graph.invoke(initial_state)
