@@ -498,7 +498,7 @@ def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
     if filler_text and char:
         logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)
         try:
-            tmp_dir = Path(tempfile.gettempdir()) / "filler_runtime"
+            tmp_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
             tmp_dir.mkdir(parents=True, exist_ok=True)
 
             tts_result = synthesize(
@@ -509,28 +509,25 @@ def run_filler_loop(slug: str, stop_event: threading.Event) -> None:
             )
             audio_path = tts_result.audio_url.replace("file:///", "").replace("file://", "")
 
-            if not stop_event.is_set():
-                # 間を持たせる（機械っぽさ防止）
-                time.sleep(0.3)
-                play_audio_file(audio_path)
+            # 生成済みフィラーは常に最後まで再生する（ぶつ切り防止）
+            time.sleep(0.3)
+            play_audio_file(audio_path)
 
             Path(audio_path).unlink(missing_ok=True)
 
         except Exception as exc:
             logger.warning("フィラー TTS 失敗: [%s] %s", slug, exc)
             # フォールバック
-            if not stop_event.is_set():
-                path, _ = select_filler_path(slug, "continue")
-                if path:
-                    time.sleep(0.3)
-                    play_audio_file(str(path))
-    else:
-        # LLM 失敗 → 事前生成 continue を 1 つ再生
-        if not stop_event.is_set():
             path, _ = select_filler_path(slug, "continue")
             if path:
-                logger.info("フィラー continue (cached): [%s] %s", slug, path.name)
                 time.sleep(0.3)
                 play_audio_file(str(path))
+    else:
+        # LLM 失敗 → 事前生成 continue を 1 つ再生
+        path, _ = select_filler_path(slug, "continue")
+        if path:
+            logger.info("フィラー continue (cached): [%s] %s", slug, path.name)
+            time.sleep(0.3)
+            play_audio_file(str(path))
 
     logger.debug("フィラー終了: %s", slug)
