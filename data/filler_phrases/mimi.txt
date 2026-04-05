@@ -7,6 +7,11 @@
 うふふ、なるほどですわ	happy=50
 まぁ、興味深いですわねぇ	happy=50
 
+[bridge]
+んー……	happy=50
+えーと……	happy=50
+そうですわねぇ……	happy=50
+
 [continue]
 えーと、そうですわねぇ……	happy=50
 わたくしの考えでは……	happy=50

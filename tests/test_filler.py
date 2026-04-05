@@ -228,6 +228,9 @@ class TestRunFillerLoop:
 
         def mock_play(path):
             played.append(str(path))
+            # 2 回再生後に stop（Phase 4 のブロック防止）
+            if len(played) >= 2:
+                stop.set()
             return True
 
         mock_tts_result = MagicMock()
@@ -256,6 +259,8 @@ class TestRunFillerLoop:
 
         def mock_play(path):
             played.append(Path(path).name)
+            if len(played) >= 2:
+                stop.set()
             return True
 
         with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path), \
@@ -279,6 +284,7 @@ class TestRunFillerLoop:
 
         def mock_play(path):
             played.append(Path(path).name)
+            stop.set()  # Phase 4 ブロック防止
             return True
 
         with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path), \
@@ -300,6 +306,8 @@ class TestRunFillerLoop:
 
         def mock_play(path):
             played.append(str(path))
+            if len(played) >= 2:
+                stop.set()  # Phase 4 ブロック防止
             return True
 
         mock_tts_result = MagicMock()
@@ -313,7 +321,7 @@ class TestRunFillerLoop:
              patch("time.sleep"):
             run_filler_loop("mimi", stop)
 
-        # opener + LLM continue の計 2 回のみ（ループしない）
+        # opener + LLM continue の計 2 回のみ
         assert len(played) == 2
 
 
@@ -325,7 +333,7 @@ class TestGetCachedFillerPaths:
         cache_dir.mkdir()
         with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
             result = get_cached_filler_paths("test")
-            assert result == {"opener": [], "continue": [], "closer": []}
+            assert result == {"opener": [], "continue": [], "bridge": [], "closer": []}
 
     def test_returns_categorized_paths(self, tmp_path):
         cache_dir = tmp_path / "test"

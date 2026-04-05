@@ -214,4 +214,4 @@ sherpa-models/
 
 # audio files
 data/audio/*.wav
-data/filler_cache/*.wav
+data/filler_cache/**/*.wav

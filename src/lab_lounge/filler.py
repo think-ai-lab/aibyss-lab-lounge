@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 _FILLER_PHRASES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_phrases"
 _FILLER_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_cache"
 
-_VALID_SECTIONS = {"opener", "continue", "closer"}
+_VALID_SECTIONS = {"opener", "continue", "bridge", "closer"}
 
 
 def is_filler_enabled() -> bool:
@@ -70,6 +70,7 @@ class FillerPhraseSet:
     """カテゴリ別に分類されたフィラーフレーズセット。"""
     opener: list[FillerPhrase] = field(default_factory=list)
     continue_: list[FillerPhrase] = field(default_factory=list)
+    bridge: list[FillerPhrase] = field(default_factory=list)
     closer: list[FillerPhrase] = field(default_factory=list)
 
     @property
@@ -78,13 +79,14 @@ class FillerPhraseSet:
         items: list[tuple[str, FillerPhrase]] = []
         for cat, lst in [("opener", self.opener),
                          ("continue", self.continue_),
+                         ("bridge", self.bridge),
                          ("closer", self.closer)]:
             for p in lst:
                 items.append((cat, p))
         return items
 
     def __len__(self) -> int:
-        return len(self.opener) + len(self.continue_) + len(self.closer)
+        return len(self.opener) + len(self.continue_) + len(self.bridge) + len(self.closer)
 
 
 def _parse_emotion(emotion_str: str) -> dict[str, int]:
@@ -148,6 +150,8 @@ def load_filler_phrases(slug: str) -> FillerPhraseSet:
             result.opener.append(phrase)
         elif current_section == "continue":
             result.continue_.append(phrase)
+        elif current_section == "bridge":
+            result.bridge.append(phrase)
         elif current_section == "closer":
             result.closer.append(phrase)
 
@@ -186,7 +190,7 @@ def get_cached_filler_paths(slug: str) -> dict[str, list[Path]]:
     """
     cache_dir = _FILLER_CACHE_DIR / slug
     result: dict[str, list[Path]] = {}
-    for cat in ("opener", "continue", "closer"):
+    for cat in ("opener", "continue", "bridge", "closer"):
         if cache_dir.is_dir():
             result[cat] = sorted(cache_dir.glob(f"{cat}_*.wav"))
         else:
@@ -211,12 +215,12 @@ def ensure_filler_cache(
     phrase_set = load_filler_phrases(slug)
     if len(phrase_set) == 0:
         logger.warning("フィラーフレーズが定義されていません: %s", slug)
-        return {"opener": [], "continue": [], "closer": []}
+        return {"opener": [], "continue": [], "bridge": [], "closer": []}
 
     char = get_character(slug)
     if char is None:
         logger.warning("キャラクターが見つかりません: %s", slug)
-        return {"opener": [], "continue": [], "closer": []}
+        return {"opener": [], "continue": [], "bridge": [], "closer": []}
 
     cache_dir = _FILLER_CACHE_DIR / slug
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -226,8 +230,8 @@ def ensure_filler_cache(
         for old_file in cache_dir.glob("*.wav"):
             old_file.unlink()
 
-    result_paths: dict[str, list[Path]] = {"opener": [], "continue": [], "closer": []}
-    counters: dict[str, int] = {"opener": 0, "continue": 0, "closer": 0}
+    result_paths: dict[str, list[Path]] = {"opener": [], "continue": [], "bridge": [], "closer": []}
+    counters: dict[str, int] = {"opener": 0, "continue": 0, "bridge": 0, "closer": 0}
 
     for cat, entry in phrase_set.all_phrases:
         idx = counters[cat]
@@ -470,12 +474,11 @@ def _generate_filler_text(slug: str, *, user_text: str = "") -> str | None:
 
 def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = "") -> None:
     """
-    ハイブリッドフィラー再生。
+    ハイブリッドフィラー再生（並行 LLM+TTS）。
 
-    Phase 1: 事前生成 opener を即再生（ゼロレイテンシ）
-    Phase 2: LLM で 1 回だけフィラーテキスト生成 → TTS → 再生
-             （opener 再生中に LLM 呼び出しが並行で走る）
-             LLM/TTS 失敗時は事前生成 continue を 1 つ再生
+    Phase 1: opener 再生と同時に LLM+TTS を並行準備
+    Phase 2: opener 終了後、準備済みなら即再生 / 未完了なら bridge 再生で待機
+    Phase 3: LLM 生成フィラーを再生
 
     フレーズは最後まで再生する（途中中断しない）。
     LLM フィラーは 1 回のみ（繰り返さない）。
@@ -488,14 +491,48 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
     from .audio_io import play_audio_file
     from .characters import get_character
     from .tts import synthesize
-    import tempfile
     import time
 
-    # Phase 1: 事前生成 opener を即再生
     opener_path, _ = select_filler_path(slug, "opener")
     if opener_path is None:
         logger.warning("フィラー opener なし: %s。終了。", slug)
         return
+
+    # LLM+TTS を並行準備するスレッド
+    filler_ready = threading.Event()
+    filler_audio = [None]  # [0] = audio_path or None
+
+    def _prepare_filler():
+        char = get_character(slug)
+        filler_text = _generate_filler_text(slug, user_text=user_text)
+
+        if filler_text and char:
+            logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)
+            try:
+                out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                tts_result = synthesize(
+                    filler_text,
+                    provider=char.tts_provider,
+                    voice=char.tts_voice,
+                    output_dir=str(out_dir),
+                )
+                filler_audio[0] = tts_result.audio_url.replace("file:///", "").replace("file://", "")
+            except Exception as exc:
+                logger.warning("フィラー TTS 失敗: [%s] %s", slug, exc)
+                path, _ = select_filler_path(slug, "continue")
+                if path:
+                    filler_audio[0] = str(path)
+        else:
+            path, _ = select_filler_path(slug, "continue")
+            if path:
+                logger.info("フィラー continue (cached): [%s] %s", slug, path.name)
+                filler_audio[0] = str(path)
+        filler_ready.set()
+
+    # Phase 1: opener 再生 + LLM+TTS 並行開始
+    prep_thread = threading.Thread(target=_prepare_filler, daemon=True)
+    prep_thread.start()
 
     logger.info("フィラー opener 再生: [%s] %s", slug, opener_path.name)
     play_audio_file(str(opener_path))
@@ -504,43 +541,48 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
         logger.debug("フィラー終了（opener 後）: %s", slug)
         return
 
-    # Phase 2: LLM フィラー 1 回のみ
-    char = get_character(slug)
-    filler_text = _generate_filler_text(slug, user_text=user_text)
+    # Phase 2: opener 終了後、LLM+TTS が準備できていなければ bridge で待機
+    if not filler_ready.is_set():
+        last_bridge_idx = -1
+        while not filler_ready.is_set() and not stop_event.is_set():
+            bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx)
+            if bridge_path is None:
+                filler_ready.wait(timeout=0.5)
+                continue
+            last_bridge_idx = idx
+            logger.info("フィラー bridge 再生: [%s] %s", slug, bridge_path.name)
+            play_audio_file(str(bridge_path))
+            # bridge 間に間を空ける（立て続けの再生を防止）
+            if not filler_ready.is_set():
+                filler_ready.wait(timeout=3.0)
 
-    if filler_text and char:
-        logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)
-        try:
-            tmp_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
+    if stop_event.is_set():
+        logger.debug("フィラー終了（bridge 後）: %s", slug)
+        return
 
-            tts_result = synthesize(
-                filler_text,
-                provider=char.tts_provider,
-                voice=char.tts_voice,
-                output_dir=str(tmp_dir),
-            )
-            audio_path = tts_result.audio_url.replace("file:///", "").replace("file://", "")
+    # Phase 3: LLM 生成フィラーを再生
+    if filler_audio[0]:
+        time.sleep(0.3)
+        play_audio_file(filler_audio[0])
 
-            # 生成済みフィラーは常に最後まで再生する（ぶつ切り防止）
-            time.sleep(0.3)
-            play_audio_file(audio_path)
+    if stop_event.is_set():
+        logger.debug("フィラー終了（continue 後）: %s", slug)
+        return
 
-            Path(audio_path).unlink(missing_ok=True)
+    # Phase 4: 本命到着まで bridge で待機（最大 60 秒）
+    last_bridge_idx2 = -1
+    phase4_deadline = time.monotonic() + 60.0
 
-        except Exception as exc:
-            logger.warning("フィラー TTS 失敗: [%s] %s", slug, exc)
-            # フォールバック
-            path, _ = select_filler_path(slug, "continue")
-            if path:
-                time.sleep(0.3)
-                play_audio_file(str(path))
-    else:
-        # LLM 失敗 → 事前生成 continue を 1 つ再生
-        path, _ = select_filler_path(slug, "continue")
-        if path:
-            logger.info("フィラー continue (cached): [%s] %s", slug, path.name)
-            time.sleep(0.3)
-            play_audio_file(str(path))
+    while not stop_event.is_set() and time.monotonic() < phase4_deadline:
+        bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx2)
+        if bridge_path is None:
+            stop_event.wait(timeout=0.5)
+            continue
+        last_bridge_idx2 = idx
+        stop_event.wait(timeout=3.0)
+        if stop_event.is_set():
+            break
+        logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
+        play_audio_file(str(bridge_path))
 
     logger.debug("フィラー終了: %s", slug)
