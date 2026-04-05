@@ -333,6 +333,13 @@ def run_loop(
 
             # ストリーミング未使用時のフォールバック再生（voicevox / edge_tts 等）
             if _chunk_count[0] == 0 and not skip_playback:
+                # フィラースレッドの完了を待つ（sounddevice 競合防止）
+                if _filler_thread is not None and _filler_thread.is_alive():
+                    _filler_stop.set()
+                    _filler_thread.join(timeout=30)
+                    import time
+                    time.sleep(0.5)
+
                 tts_ev = next((ev for ev in result.events if ev["type"] == "tts.done"), None)
                 if tts_ev:
                     audio_url = tts_ev["payload"].get("audio_url", "")

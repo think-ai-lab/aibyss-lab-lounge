@@ -244,10 +244,55 @@ class PorcupineListener:
 # ─── SpeechActivatedListener ─────────────────────────────────────
 
 _DEFAULT_VAD_HOLD_FRAMES = 8      # 発話開始に必要な連続超閾値フレーム数
-_DEFAULT_SILENCE_FRAMES = 24      # 録音終了に必要な連続無音フレーム数 (~1.5秒)
+_DEFAULT_SILENCE_FRAMES = 24      # RMS 用: 録音終了に必要な連続無音フレーム数 (~768ms at 32ms/frame)
+_WEBRTC_SILENCE_FRAMES = 75       # WebRTC 用: ~1.5秒 (75 × 20ms)
 _DEFAULT_SAMPLE_RATE = 16000      # サンプルレート (Hz)
 _DEFAULT_FRAME_SAMPLES = 512      # 1フレームのサンプル数 (~32ms)
 _DEFAULT_MAX_RECORD_SECONDS = 30.0
+
+# WebRTC VAD は 10ms/20ms/30ms のフレームのみ対応。
+# 16kHz × 20ms = 320 サンプル。512 サンプル (32ms) は非対応のため、
+# WebRTC 使用時はフレームサイズを 320 に変更する。
+_WEBRTC_FRAME_SAMPLES = 320       # 20ms at 16kHz
+
+
+def _get_vad_backend() -> str:
+    """VAD バックエンドを返す。"""
+    return os.environ.get("L2_VAD_BACKEND", "rms")
+
+
+def _create_vad_checker(backend: str, threshold: float):
+    """
+    VAD 判定関数を返すファクトリ。
+
+    Returns:
+        (is_speech(pcm_int16_mono) -> bool, frame_samples, silence_frames)
+    """
+    if backend == "webrtc":
+        try:
+            import webrtcvad
+        except ImportError as exc:
+            logger.warning("webrtcvad 未インストール。RMS にフォールバック: %s", exc)
+            return _create_vad_checker("rms", threshold)
+
+        aggressiveness = int(os.environ.get("L2_VAD_AGGRESSIVENESS", "2"))
+        vad = webrtcvad.Vad(aggressiveness)
+        logger.info("WebRTC VAD 初期化 (aggressiveness=%d)", aggressiveness)
+
+        def _check_webrtc(pcm_int16_mono) -> bool:
+            return vad.is_speech(pcm_int16_mono.tobytes(), sample_rate=_DEFAULT_SAMPLE_RATE)
+
+        return _check_webrtc, _WEBRTC_FRAME_SAMPLES, _WEBRTC_SILENCE_FRAMES
+
+    # デフォルト: RMS
+    import numpy as np
+
+    def _check_rms(pcm_int16_mono) -> bool:
+        frame = pcm_int16_mono.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(frame ** 2)))
+        return rms >= threshold
+
+    return _check_rms, _DEFAULT_FRAME_SAMPLES, _DEFAULT_SILENCE_FRAMES
 
 
 def _build_character_prompt() -> str:
@@ -352,20 +397,21 @@ class SpeechActivatedListener:
         import time
 
         sample_rate = _DEFAULT_SAMPLE_RATE
-        frame_samples = _DEFAULT_FRAME_SAMPLES
-        threshold = self._vad_threshold
+        vad_backend = _get_vad_backend()
+        is_speech, frame_samples, silence_frames = _create_vad_checker(vad_backend, self._vad_threshold)
 
         deadline = time.monotonic() + timeout_seconds
         max_record_frames = int(self._max_record_seconds * sample_rate / frame_samples)
 
-        logger.info("音声待機開始 (timeout=%.0fs threshold=%.4f)", timeout_seconds, threshold)
+        logger.info(
+            "音声待機開始 (timeout=%.0fs vad=%s threshold=%.4f)",
+            timeout_seconds, vad_backend, self._vad_threshold,
+        )
 
         onset_count = 0
         silence_count = 0
         recording: list = []
         recording_started = False
-        # onset フレームをプリバッファ: 検知確定時に録音先頭に含める
-        # → 発話の冒頭が欠落するのを防ぐ
         onset_buffer: deque = deque(maxlen=_DEFAULT_VAD_HOLD_FRAMES)
 
         with sd.InputStream(
@@ -380,15 +426,13 @@ class SpeechActivatedListener:
                 if overflowed:
                     logger.debug("オーディオバッファオーバーフロー")
 
-                # RMS 計算 (int16 → float 正規化)
-                frame = pcm[:, 0].astype(np.float32) / 32768.0
-                rms = float(np.sqrt(np.mean(frame ** 2)))
+                mono = pcm[:, 0]
+                speech = is_speech(mono)
 
                 if not recording_started:
-                    # Phase 1: 発話開始検知
-                    onset_buffer.append(pcm[:, 0].copy())  # 常にバッファ
+                    onset_buffer.append(mono.copy())
 
-                    if rms >= threshold:
+                    if speech:
                         onset_count += 1
                     else:
                         onset_count = 0
@@ -396,20 +440,18 @@ class SpeechActivatedListener:
                     if onset_count >= _DEFAULT_VAD_HOLD_FRAMES:
                         recording_started = True
                         silence_count = 0
-                        # onset フレームを録音先頭に含める（冒頭欠落防止）
                         recording = list(onset_buffer)
                         logger.info("発話開始検知")
                 else:
-                    # Phase 2: 録音中
-                    recording.append(pcm[:, 0].copy())
+                    recording.append(mono.copy())
 
-                    if rms < threshold:
+                    if not speech:
                         silence_count += 1
                     else:
                         silence_count = 0
 
                     if (
-                        silence_count >= _DEFAULT_SILENCE_FRAMES
+                        silence_count >= silence_frames
                         or len(recording) >= max_record_frames
                     ):
                         logger.info(
@@ -794,6 +836,12 @@ class ContinuousListener:
         )
         self._buffer = TranscriptBuffer(window_sec=window, max_chars=max_ch)
 
+        # VAD チェッカーの初期化（listen_once / _record_one_segment で再利用）
+        vad_backend = _get_vad_backend()
+        self._is_speech, self._vad_frame_samples, self._silence_frames = _create_vad_checker(
+            vad_backend, self._vad_threshold
+        )
+
     def _record_one_segment(
         self,
         stream,
@@ -820,12 +868,12 @@ class ContinuousListener:
         """
         from .transcript_buffer import TranscriptSegment
         import time
+        import numpy as np
 
-        np = np_module
         sf = sf_module
         sample_rate = _DEFAULT_SAMPLE_RATE
-        frame_samples = _DEFAULT_FRAME_SAMPLES
-        threshold = self._vad_threshold
+        is_speech = self._is_speech
+        frame_samples = self._vad_frame_samples
         max_record_frames = int(self._max_record_seconds * sample_rate / frame_samples)
 
         deadline = time.monotonic() + remaining_sec
@@ -841,15 +889,13 @@ class ContinuousListener:
             if overflowed:
                 logger.debug("オーディオバッファオーバーフロー")
 
-            frame = pcm[:, 0].astype(np.float32)
-            if frame.dtype == np.int16:
-                frame = frame / 32768.0
-            rms = float(np.sqrt(np.mean(frame ** 2)))
+            mono = pcm[:, 0]
+            speech = is_speech(mono)
 
             if not recording_started:
-                onset_buffer.append(pcm[:, 0].copy())
+                onset_buffer.append(mono.copy())
 
-                if rms >= threshold:
+                if speech:
                     onset_count += 1
                 else:
                     onset_count = 0
@@ -860,15 +906,15 @@ class ContinuousListener:
                     recording = list(onset_buffer)
                     logger.info("発話開始検知 (continuous)")
             else:
-                recording.append(pcm[:, 0].copy())
+                recording.append(mono.copy())
 
-                if rms < threshold:
+                if not speech:
                     silence_count += 1
                 else:
                     silence_count = 0
 
                 if (
-                    silence_count >= _DEFAULT_SILENCE_FRAMES
+                    silence_count >= self._silence_frames
                     or len(recording) >= max_record_frames
                 ):
                     logger.info(
@@ -961,7 +1007,7 @@ class ContinuousListener:
             samplerate=_DEFAULT_SAMPLE_RATE,
             channels=1,
             dtype="int16",
-            blocksize=_DEFAULT_FRAME_SAMPLES,
+            blocksize=self._vad_frame_samples,
             device=self._device,
         ) as stream:
             while time.monotonic() < deadline:
