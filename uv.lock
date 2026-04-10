@@ -1339,6 +1339,10 @@ obs = [
     { name = "langsmith" },
     { name = "python-dotenv" },
 ]
+obsws = [
+    { name = "obsws-python" },
+    { name = "python-dotenv" },
+]
 rag = [
     { name = "numpy" },
     { name = "openai" },
@@ -1392,6 +1396,7 @@ requires-dist = [
     { name = "mutagen", marker = "extra == 'tts'", specifier = ">=1.47" },
     { name = "numpy", marker = "extra == 'mic'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'rag'", specifier = ">=1.26" },
+    { name = "obsws-python", marker = "extra == 'obsws'", specifier = ">=1.7" },
     { name = "openai", marker = "extra == 'rag'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "pvporcupine", marker = "extra == 'wake'", specifier = ">=3.0" },
@@ -1403,6 +1408,7 @@ requires-dist = [
     { name = "python-dotenv", marker = "extra == 'llm-google'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'mic'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'obs'", specifier = ">=1.0" },
+    { name = "python-dotenv", marker = "extra == 'obsws'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'rag'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'stt-local'", specifier = ">=1.0" },
@@ -1417,7 +1423,7 @@ requires-dist = [
     { name = "soundfile", marker = "extra == 'mic'", specifier = ">=0.12" },
     { name = "webrtcvad-wheels", marker = "extra == 'vad-webrtc'", specifier = ">=2.0" },
 ]
-provides-extras = ["dev", "llm", "llm-google", "llm-anthropic", "tts", "stt", "obs", "mic", "rag", "wake", "vad-webrtc", "stt-local", "stt-sherpa", "tools"]
+provides-extras = ["dev", "llm", "llm-google", "llm-anthropic", "tts", "stt", "obs", "mic", "rag", "wake", "vad-webrtc", "stt-local", "stt-sherpa", "tools", "obsws"]
 
 [[package]]
 name = "langchain"
@@ -1867,6 +1873,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/58/ad/1100d7229bb248394939a12a8074d485b655e8ed44207d328fdd7fcebc7b/numpy-2.4.3-pp311-pypy311_pp73-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7e58765ad74dcebd3ef0208a5078fba32dc8ec3578fe84a604432950cd043d79", size = 15800434, upload-time = "2026-03-09T07:58:44.837Z" },
     { url = "https://files.pythonhosted.org/packages/0c/fd/16d710c085d28ba4feaf29ac60c936c9d662e390344f94a6beaa2ac9899b/numpy-2.4.3-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8e236dbda4e1d319d681afcbb136c0c4a8e0f1a5c58ceec2adebb547357fe857", size = 16729409, upload-time = "2026-03-09T07:58:47.972Z" },
     { url = "https://files.pythonhosted.org/packages/57/a7/b35835e278c18b85206834b3aa3abe68e77a98769c59233d1f6300284781/numpy-2.4.3-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:4b42639cdde6d24e732ff823a3fa5b701d8acad89c4142bc1d0bd6dc85200ba5", size = 12504685, upload-time = "2026-03-09T07:58:50.525Z" },
+]
+
+[[package]]
+name = "obsws-python"
+version = "1.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "websocket-client" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d6/2f/624af34a5b0f09fbf858bf6743521a8626d712671ac49573e625ad1c97d3/obsws_python-1.8.0.tar.gz", hash = "sha256:e082894f80deb0836861fdc3c222e497308c8f66328da6075baba5b456a20971", size = 28727, upload-time = "2025-07-01T08:24:11.652Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/97/4b/537f3d372f065b2aeeac3812228066eb70f47436adf88aaacc94eb5fd4e1/obsws_python-1.8.0-py3-none-any.whl", hash = "sha256:537bde416e149b6f59e0b2f31761d4a40329feafec171bde6fc1346ab8516e28", size = 30819, upload-time = "2025-07-01T08:24:10.086Z" },
 ]
 
 [[package]]
@@ -3358,6 +3376,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/6e/0cd49b425ee9ccba2acd8451cbd96e6318081abcde6d9d6caa2083e53fab/webrtcvad_wheels-2.0.14-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:34b315326dd6c8529221492ebf28fc649d96b1a49ce49bf649eca60aabc70a2d", size = 86979, upload-time = "2024-09-05T10:15:35.045Z" },
     { url = "https://files.pythonhosted.org/packages/77/36/52e8998f8421c746defa8f8b509cab4aac984ef39a2cd5818f664901d245/webrtcvad_wheels-2.0.14-cp313-cp313-win32.whl", hash = "sha256:ff2a7eb4fe2189a7766726d6122b319df3e727c4cfed86409e2802fed1b459d3", size = 17368, upload-time = "2024-09-05T10:15:35.973Z" },
     { url = "https://files.pythonhosted.org/packages/f9/7c/73b9dd022c835e19180aad8aafd2f33863c02cbbafd5bc599dd54f6c1111/webrtcvad_wheels-2.0.14-cp313-cp313-win_amd64.whl", hash = "sha256:561f87975930833a5b77135fb6f15e6df430bfc000c327dc517a175aef15a707", size = 19901, upload-time = "2024-09-05T10:15:36.877Z" },
+]
+
+[[package]]
+name = "websocket-client"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz", hash = "sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98", size = 70576, upload-time = "2025-10-07T21:16:36.495Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl", hash = "sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef", size = 82616, upload-time = "2025-10-07T21:16:34.951Z" },
 ]
 
 [[package]]

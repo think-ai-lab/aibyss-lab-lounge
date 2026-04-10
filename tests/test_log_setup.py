@@ -163,3 +163,66 @@ class TestSetupLoggingErrorHandling:
             if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
         ]
         assert len(stream_handlers) >= 1
+
+
+class TestSensitiveLoggerSuppression:
+    """配信中の機密情報漏洩を防ぐため、第三者ライブラリ logger が抑制される。"""
+
+    @pytest.fixture(autouse=True)
+    def _save_third_party_logger_levels(self):
+        """テスト前後で第三者 logger の level を保存・復元する。"""
+        from lab_lounge.log_setup import _SENSITIVE_LIBRARY_LOGGERS
+        saved = {
+            name: logging.getLogger(name).level
+            for name in _SENSITIVE_LIBRARY_LOGGERS
+        }
+        # テスト前は NOTSET (継承) に戻す
+        for name in _SENSITIVE_LIBRARY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        yield
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+
+    def test_obsws_python_logger_set_to_warning(self, tmp_path, monkeypatch):
+        """obsws_python の logger が WARNING 以上に抑制される (host/port/password 漏洩防止)。"""
+        monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
+        setup_logging(session_name="test_obsws")
+        assert logging.getLogger("obsws_python").level == logging.WARNING
+        assert logging.getLogger("obsws_python.baseclient").level == logging.WARNING
+        assert logging.getLogger("obsws_python.reqs").level == logging.WARNING
+
+    def test_httpx_logger_set_to_warning(self, tmp_path, monkeypatch):
+        """httpx の logger が WARNING 以上に抑制される (API URL 漏洩防止)。"""
+        monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
+        setup_logging(session_name="test_httpx")
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+
+    def test_llm_provider_loggers_set_to_warning(self, tmp_path, monkeypatch):
+        """OpenAI / Anthropic / Google GenAI の logger が WARNING 以上に抑制される。"""
+        monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
+        setup_logging(session_name="test_llm")
+        assert logging.getLogger("openai._base_client").level == logging.WARNING
+        assert logging.getLogger("anthropic._base_client").level == logging.WARNING
+        assert logging.getLogger("google_genai.models").level == logging.WARNING
+        assert logging.getLogger("google.genai").level == logging.WARNING
+
+    def test_suppression_applies_when_file_logging_disabled(self, monkeypatch):
+        """L2_LOG_TO_FILE=false のときも第三者 logger 抑制が機能する。"""
+        monkeypatch.setenv("L2_LOG_TO_FILE", "false")
+        setup_logging(session_name="test_no_file")
+        assert logging.getLogger("obsws_python").level == logging.WARNING
+        assert logging.getLogger("httpx").level == logging.WARNING
+
+    def test_warning_messages_still_pass_through(self, tmp_path, monkeypatch):
+        """WARNING / ERROR メッセージは抑制されず流れることを確認。"""
+        monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
+        setup_logging(session_name="test_warn")
+
+        logger = logging.getLogger("obsws_python")
+        # 直接 logger の判定を確認 (caplog は setup_logging 後の handler 構成と相性が悪い)
+        # WARNING は通る、INFO はブロックされる
+        assert logger.isEnabledFor(logging.WARNING) is True
+        assert logger.isEnabledFor(logging.ERROR) is True
+        assert logger.isEnabledFor(logging.INFO) is False
+        assert logger.isEnabledFor(logging.DEBUG) is False

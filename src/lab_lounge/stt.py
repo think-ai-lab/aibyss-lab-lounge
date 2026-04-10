@@ -267,10 +267,13 @@ def transcribe_audio_file(
     if not Path(path).is_file():
         raise FileNotFoundError(f"音声ファイルが見つかりません: {path}")
 
+    # 配信中のコンソール表示でユーザーディレクトリ (例: C:\Users\xxx\AppData\Local\Temp)
+    # を漏らさないため、ファイル名のみ出力。完全パスは debug レベルへ。
     logger.info(
-        "STT 開始: provider=%s lang=%s path=%s",
-        provider, lang, path,
+        "STT 開始: provider=%s lang=%s file=%s",
+        provider, lang, Path(path).name,
     )
+    logger.debug("STT 開始 path (full): %s", path)
     result: STTResult = fn(path, lang=lang, prompt=prompt, **kwargs)
     logger.info(
         "STT 完了: text_len=%d duration_ms=%d lang=%s",

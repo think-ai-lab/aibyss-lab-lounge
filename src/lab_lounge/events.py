@@ -268,3 +268,5 @@ def build_bubble_update(
         event["links"] = links
     validate_event(event)
     return event
+
+

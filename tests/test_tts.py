@@ -148,3 +148,60 @@ class TestSynthesize:
             tts_mod._call_voicevox(
                 "テスト", voice="not-a-number", output_dir="/tmp"
             )
+
+
+class TestParseVoicepeakJson:
+    """_parse_voicepeak_json の pose 抽出テスト (4-tuple return)。"""
+
+    def test_json_with_pose(self):
+        """pose フィールド付き JSON → pose が抽出される。"""
+        text = '{"emotion": {"happy": 50}, "speed": 100, "pose": "happy", "response": "テスト"}'
+        say, emotion, speed, pose = tts_mod._parse_voicepeak_json(text)
+        assert say == "テスト"
+        assert emotion == {"happy": 50}
+        assert speed == 100
+        assert pose == "happy"
+
+    def test_json_without_pose(self):
+        """pose フィールドなし → pose が None。"""
+        text = '{"emotion": {"happy": 50}, "speed": 100, "response": "テスト"}'
+        _, _, _, pose = tts_mod._parse_voicepeak_json(text)
+        assert pose is None
+
+    def test_pose_normalized_to_lowercase(self):
+        """pose 値は小文字化される。"""
+        text = '{"pose": "HAPPY", "response": "テスト"}'
+        _, _, _, pose = tts_mod._parse_voicepeak_json(text)
+        assert pose == "happy"
+
+    def test_pose_whitespace_stripped(self):
+        """pose 値の前後空白は除去される。"""
+        text = '{"pose": "  sad  ", "response": "テスト"}'
+        _, _, _, pose = tts_mod._parse_voicepeak_json(text)
+        assert pose == "sad"
+
+    def test_pose_empty_string_becomes_none(self):
+        """pose が空文字 → None。"""
+        text = '{"pose": "", "response": "テスト"}'
+        _, _, _, pose = tts_mod._parse_voicepeak_json(text)
+        assert pose is None
+
+    def test_non_json_returns_all_none(self):
+        """非 JSON テキスト → 4-tuple (text, None, None, None)。"""
+        text = "ただのテキストです"
+        say, emotion, speed, pose = tts_mod._parse_voicepeak_json(text)
+        assert say == text
+        assert emotion is None
+        assert speed is None
+        assert pose is None
+
+    def test_json_with_markdown_block(self):
+        """マークダウンコードブロック付き JSON でも pose 抽出できる。"""
+        text = '```json\n{"pose": "fun", "response": "テスト"}\n```'
+        _, _, _, pose = tts_mod._parse_voicepeak_json(text)
+        assert pose == "fun"
+
+    def test_returns_4_tuple(self):
+        """戻り値は 4-tuple である。"""
+        result = tts_mod._parse_voicepeak_json('{"response": "x"}')
+        assert len(result) == 4

@@ -77,6 +77,10 @@ tools = [
     "langchain-tavily>=0.1",
     "python-dotenv>=1.0",
 ]
+obsws = [
+    "obsws-python>=1.7",
+    "python-dotenv>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lab_lounge"]

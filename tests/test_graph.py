@@ -273,6 +273,77 @@ class TestPipelineGraphNodes:
         assert result["events"][0]["type"] == "tts.done"
         assert result["tts_meta"]["speaker"] == "octamaid"
 
+    def test_tts_node_calls_set_pose_with_pose_from_json(
+        self, mock_publish, base_state
+    ):
+        """LLM JSON に pose=happy が含まれれば set_pose が happy で呼ばれる。"""
+        from lab_lounge.graph import _tts_node
+        base_state["character_slug"] = "mimi"
+        base_state["tts_speaker"] = "mimi"
+        base_state["llm_text"] = (
+            '{"emotion": {"happy": 80}, "speed": 100, "pose": "happy",'
+            ' "response": "うれしいですわ"}'
+        )
+        base_state["events"] = [
+            {"event_id": "utt-1", "type": "utterance.final"},
+            {"event_id": "llm-1", "type": "llm.final"},
+        ]
+        with patch("lab_lounge.obs.set_pose") as mock_set_pose:
+            _tts_node(base_state)
+        mock_set_pose.assert_called_once_with("mimi", "happy")
+
+    def test_tts_node_calls_set_pose_neutral_when_json_missing_pose(
+        self, mock_publish, base_state
+    ):
+        """LLM JSON に pose フィールドがなければ set_pose が neutral で呼ばれる。"""
+        from lab_lounge.graph import _tts_node
+        base_state["character_slug"] = "mimi"
+        base_state["tts_speaker"] = "mimi"
+        base_state["llm_text"] = '{"emotion": {"happy": 50}, "response": "テスト"}'
+        base_state["events"] = [
+            {"event_id": "utt-1", "type": "utterance.final"},
+            {"event_id": "llm-1", "type": "llm.final"},
+        ]
+        with patch("lab_lounge.obs.set_pose") as mock_set_pose:
+            _tts_node(base_state)
+        mock_set_pose.assert_called_once_with("mimi", "neutral")
+
+    def test_tts_node_calls_set_pose_neutral_for_non_json_text(
+        self, mock_publish, base_state
+    ):
+        """ダミーモード（非 JSON テキスト）でも neutral で set_pose が呼ばれる。"""
+        from lab_lounge.graph import _tts_node
+        base_state["character_slug"] = "octamaid"
+        base_state["tts_speaker"] = "octamaid"
+        base_state["llm_text"] = "ダミー応答: テスト"
+        base_state["events"] = [
+            {"event_id": "utt-1", "type": "utterance.final"},
+            {"event_id": "llm-1", "type": "llm.final"},
+        ]
+        with patch("lab_lounge.obs.set_pose") as mock_set_pose:
+            _tts_node(base_state)
+        mock_set_pose.assert_called_once_with("octamaid", "neutral")
+
+    def test_tts_node_does_not_publish_pose_update_event(
+        self, mock_publish, base_state
+    ):
+        """pose.update Redis イベントは発行されない (L2 単独で OBS 制御するため)。"""
+        from lab_lounge.graph import _tts_node
+        base_state["character_slug"] = "mimi"
+        base_state["tts_speaker"] = "mimi"
+        base_state["llm_text"] = '{"pose": "happy", "response": "テスト"}'
+        base_state["events"] = [
+            {"event_id": "utt-1", "type": "utterance.final"},
+            {"event_id": "llm-1", "type": "llm.final"},
+        ]
+        with patch("lab_lounge.obs.set_pose"):
+            _tts_node(base_state)
+        # publish 呼び出しに pose.update が含まれないことを確認
+        published_types = [
+            call.args[0].get("type") for call in mock_publish.call_args_list
+        ]
+        assert "pose.update" not in published_types
+
 
 class TestPipelineGraphFullInvoke:
     """run_pipeline_graph の統合テスト（ダミーモード）。"""

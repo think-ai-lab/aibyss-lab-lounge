@@ -4,6 +4,7 @@ test_voicepeak_tts.py — VOICEPEAK TTS アダプタのテスト
 subprocess をモックして voicepeak コマンド呼び出しを検証する。
 """
 
+import logging
 import shlex
 import subprocess
 import wave
@@ -386,3 +387,324 @@ class TestVoicepeakChunking:
         assert len(say_texts) > 1
         for t in say_texts:
             assert len(t) <= 140, f"チャンクが 140 字超: {len(t)} 字"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# _voicepeak_worker_fn: 並列実行リトライ + クールダウン
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestVoicepeakWorker:
+    """VOICEPEAK FIFO ワーカーの動作検証。"""
+
+    def _run_worker_once(self, run_side_effect):
+        """ワーカーを 1 ジョブ分実行して結果を返す。
+
+        run_side_effect: subprocess.run のモック side_effect
+                         (CompletedProcess もしくは Exception)
+        """
+        import concurrent.futures
+        import queue as _queue_mod
+        from lab_lounge import tts as tts_mod
+
+        q = _queue_mod.Queue()
+        future = concurrent.futures.Future()
+        q.put(("voicepeak.exe --say test", future))
+        q.put(None)  # ワーカー終了シグナル
+
+        with patch("subprocess.run", side_effect=run_side_effect):
+            tts_mod._voicepeak_worker_fn(q)
+
+        return future
+
+    def test_worker_success_returns_result(self):
+        """成功時は future に CompletedProcess がセットされる。"""
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b"",
+        )
+        future = self._run_worker_once(lambda *a, **k: mock_result)
+        assert future.result() is mock_result
+
+    def test_worker_no_sleep_on_success(self):
+        """通常成功時は time.sleep が呼ばれない (固定クールダウンなし)。
+
+        レイテンシに直結する固定待機を入れない設計を保証する。
+        """
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b"",
+        )
+        with patch("lab_lounge.tts.time.sleep") as mock_sleep:
+            self._run_worker_once(lambda *a, **k: mock_result)
+        # 成功時は sleep 一切なし
+        mock_sleep.assert_not_called()
+
+    def test_worker_sleep_only_on_busy_retry(self, monkeypatch):
+        """並列実行エラー検知時のみ time.sleep が呼ばれる (リトライ前の待機)。
+
+        retry_wait > 0 のときに、busy エラー → sleep → リトライ の順を検証する。
+        """
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0.05")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "1")
+
+        call_count = [0]
+        def side_effect(*a, **k):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # 1 回目: 並列実行エラー
+                return subprocess.CompletedProcess(
+                    args=[], returncode=1,
+                    stdout=b"",
+                    stderr=b"In this version, up to 1 command line instance "
+                           b"can be executed at same time.",
+                )
+            # 2 回目: 成功
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b"",
+            )
+
+        with patch("lab_lounge.tts.time.sleep") as mock_sleep:
+            future = self._run_worker_once(side_effect)
+
+        # リトライで成功
+        assert future.result().returncode == 0
+        assert call_count[0] == 2
+        # sleep が 1 回だけ呼ばれる (リトライ前の wait)
+        assert mock_sleep.call_count == 1
+        assert mock_sleep.call_args.args[0] == 0.05
+
+    def test_worker_retries_on_busy_error(self, monkeypatch):
+        """並列実行エラー検出時にリトライする。"""
+        monkeypatch.setenv("L2_VOICEPEAK_COOLDOWN_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "2")
+
+        call_count = [0]
+        def side_effect(*a, **k):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                # 最初 2 回は busy エラー
+                return subprocess.CompletedProcess(
+                    args=[], returncode=1,
+                    stdout=b"",
+                    stderr="VOICEPEAK is already running".encode("cp932"),
+                )
+            # 3 回目で成功
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b"",
+            )
+
+        future = self._run_worker_once(side_effect)
+        result = future.result()
+        assert result.returncode == 0
+        assert call_count[0] == 3  # 2 回リトライ + 1 回成功
+
+    def test_worker_no_retry_on_other_errors(self, monkeypatch):
+        """busy 以外のエラーはリトライしない。"""
+        monkeypatch.setenv("L2_VOICEPEAK_COOLDOWN_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "2")
+
+        call_count = [0]
+        def side_effect(*a, **k):
+            call_count[0] += 1
+            return subprocess.CompletedProcess(
+                args=[], returncode=1,
+                stdout=b"",
+                stderr=b"invalid text encoding",
+            )
+
+        future = self._run_worker_once(side_effect)
+        result = future.result()
+        assert result.returncode == 1
+        assert call_count[0] == 1  # リトライなし
+
+    def test_worker_stops_retry_at_max(self, monkeypatch):
+        """リトライ回数が上限に達したら諦める。"""
+        monkeypatch.setenv("L2_VOICEPEAK_COOLDOWN_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "2")
+
+        call_count = [0]
+        def side_effect(*a, **k):
+            call_count[0] += 1
+            return subprocess.CompletedProcess(
+                args=[], returncode=1,
+                stdout=b"",
+                stderr="VOICEPEAK is already running".encode("cp932"),
+            )
+
+        future = self._run_worker_once(side_effect)
+        result = future.result()
+        assert result.returncode == 1
+        assert call_count[0] == 3  # 初回 + 2 回リトライ
+
+
+class TestIsVoicepeakBusyError:
+    """_is_voicepeak_busy_error のパターンマッチ検証。"""
+
+    # 実際の VOICEPEAK 並列実行エラーメッセージ
+    # (scripts/test_voicepeak_parallel_error.py で確認済み)
+    REAL_BUSY_MESSAGE = (
+        "In this version, up to 1 command line instance "
+        "can be executed at same time."
+    )
+
+    def test_real_voicepeak_error_message(self):
+        """実際の VOICEPEAK 並列実行エラーメッセージを検出する。"""
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error(self.REAL_BUSY_MESSAGE, "") is True
+
+    def test_real_message_case_insensitive(self):
+        """大文字小文字を区別せず検出する。"""
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error(self.REAL_BUSY_MESSAGE.upper(), "") is True
+        assert _is_voicepeak_busy_error(self.REAL_BUSY_MESSAGE.lower(), "") is True
+
+    def test_english_already_running(self):
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("VOICEPEAK is already running", "") is True
+
+    def test_english_another_instance(self):
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("another instance detected", "") is True
+
+    def test_japanese_sudeni(self):
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("VOICEPEAK はすでに実行されています", "") is True
+
+    def test_unrelated_error(self):
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("invalid text encoding", "") is False
+
+    def test_empty_strings(self):
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("", "") is False
+
+    def test_stdout_also_checked(self):
+        """stdout 側にエラーメッセージがあっても検出する。"""
+        from lab_lounge.tts import _is_voicepeak_busy_error
+        assert _is_voicepeak_busy_error("", self.REAL_BUSY_MESSAGE) is True
+
+    def test_real_message_in_worker_retry_flow(self, monkeypatch):
+        """実エラーメッセージで _voicepeak_worker_fn のリトライが動作する。"""
+        import concurrent.futures
+        import queue as _queue_mod
+        from lab_lounge import tts as tts_mod
+
+        monkeypatch.setenv("L2_VOICEPEAK_COOLDOWN_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "2")
+
+        call_count = [0]
+        def side_effect(*a, **k):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # 1 回目: 実エラーメッセージで失敗 (ASCII なので cp932 と一致)
+                return subprocess.CompletedProcess(
+                    args=[], returncode=1,
+                    stdout=b"",
+                    stderr=self.REAL_BUSY_MESSAGE.encode("cp932"),
+                )
+            # 2 回目で成功
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b"",
+            )
+
+        q = _queue_mod.Queue()
+        future = concurrent.futures.Future()
+        q.put(("voicepeak.exe --say test", future))
+        q.put(None)
+
+        with patch("subprocess.run", side_effect=side_effect):
+            tts_mod._voicepeak_worker_fn(q)
+
+        result = future.result()
+        assert result.returncode == 0
+        assert call_count[0] == 2  # リトライで成功
+
+
+class TestDecodeVoicepeakOutput:
+    """_decode_voicepeak_output のエンコーディング処理検証。"""
+
+    def test_cp932_bytes(self):
+        from lab_lounge.tts import _decode_voicepeak_output
+        text = "エラーが発生しました"
+        result = _decode_voicepeak_output(text.encode("cp932"))
+        assert result == text
+
+    def test_utf8_fallback_when_cp932_fails(self):
+        from lab_lounge.tts import _decode_voicepeak_output
+        # 意図的に cp932 decode に失敗する byte 列を作り、UTF-8 フォールバックを検証
+        # b"\xe3\x81\x82" は UTF-8 の "あ" だが、cp932 では "縺?" など別の文字になる or decode 成功
+        # ここでは CP932 で decode 不能な invalid byte を含ませる
+        raw = b"\x81\x00hello"  # cp932 で invalid sequence
+        result = _decode_voicepeak_output(raw)
+        # cp932 で失敗 → utf-8 フォールバック (replace でエラー吸収)
+        assert "hello" in result
+
+    def test_empty_bytes(self):
+        from lab_lounge.tts import _decode_voicepeak_output
+        assert _decode_voicepeak_output(b"") == ""
+
+    def test_none(self):
+        from lab_lounge.tts import _decode_voicepeak_output
+        assert _decode_voicepeak_output(None) == ""
+
+    def test_whitespace_stripped(self):
+        from lab_lounge.tts import _decode_voicepeak_output
+        result = _decode_voicepeak_output(b"  test  \r\n")
+        assert result == "test"
+
+
+class TestVoicepeakLogSanitization:
+    """配信中の機密情報漏洩を防ぐ: VOICEPEAK ログがファイルパスを含まない。"""
+
+    def test_voicepeak_info_log_does_not_contain_full_path(self, tmp_path, caplog):
+        """INFO レベルのログに完全パスが含まれない (ファイル名のみ)。"""
+        from lab_lounge.tts import _call_voicepeak
+
+        captured_cmd = []
+        def mock_run(cmd, **kwargs):
+            tokens = _parse_cmd(cmd)
+            out = _extract_arg(tokens, "--out")
+            captured_cmd.append(out)
+            if out:
+                _create_dummy_wav(Path(out))
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with caplog.at_level("INFO", logger="lab_lounge.tts"):
+                _call_voicepeak(
+                    "テスト", voice="Asumi Ririse", output_dir=str(tmp_path),
+                )
+
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        all_info = " ".join(info_messages)
+        # 完全パス (tmp_path のような長いパス) が INFO に含まれない
+        assert str(tmp_path) not in all_info
+        # ファイル名 (.wav) は含まれてよい
+        assert ".wav" in all_info
+
+    def test_voicepeak_debug_log_contains_full_command(self, tmp_path, caplog):
+        """DEBUG レベルでは完全コマンドが記録される (デバッグ用途)。"""
+        from lab_lounge.tts import _call_voicepeak
+
+        def mock_run(cmd, **kwargs):
+            tokens = _parse_cmd(cmd)
+            out = _extract_arg(tokens, "--out")
+            if out:
+                _create_dummy_wav(Path(out))
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with caplog.at_level("DEBUG", logger="lab_lounge.tts"):
+                _call_voicepeak(
+                    "テスト", voice="Asumi Ririse", output_dir=str(tmp_path),
+                )
+
+        debug_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+        ]
+        # DEBUG レベルには完全コマンド (パス含む) が出力される
+        assert any("VOICEPEAK コマンド (full)" in m for m in debug_messages)

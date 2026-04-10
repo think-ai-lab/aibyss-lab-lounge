@@ -501,13 +501,21 @@ def _generation_node(state: PipelineGraphState) -> dict:
 
 
 def _tts_node(state: PipelineGraphState) -> dict:
-    """TTS ノード: 音声合成 + tts.done 発行。"""
+    """TTS ノード: OBS 立ち絵切り替え + 音声合成 + tts.done 発行。"""
     from .pipeline import publish, _publish_bubble
     from .events import build_tts_done
+    from .tts import _parse_voicepeak_json
+    from .obs import set_pose
 
     common = state["common"]
     llm_text = state["llm_text"]
     llm_event_id = state["events"][1]["event_id"]
+    character_slug = state["character_slug"]
+
+    # LLM JSON 応答から pose を抽出して OBS 立ち絵を切り替え
+    # (tts.done の直前に実行。未設定 or 不明値は set_pose 内で "neutral" にフォールバック)
+    _, _, _, pose_value = _parse_voicepeak_json(llm_text)
+    set_pose(character_slug, pose_value or "neutral")
 
     if state["use_real_tts"]:
         from .tts import synthesize as _synthesize

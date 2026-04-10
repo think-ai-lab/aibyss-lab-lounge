@@ -399,6 +399,12 @@ def _run_pipeline_legacy(
     # ─── bubble: answering ───
     _publish_bubble("answering", character.slug, common, links=[llm["event_id"]])
 
+    # ─── OBS 立ち絵切り替え（直接制御、tts.done の直前に実行）───
+    from .tts import _parse_voicepeak_json as _parse_llm_json
+    from .obs import set_pose as _set_pose
+    _, _, _, _pose_value = _parse_llm_json(llm_text)
+    _set_pose(character.slug, _pose_value or "neutral")
+
     # 4. tts.done — llm.final を links で参照
     use_real_tts, _env_tts_provider, _env_tts_voice, _env_tts_speaker, tts_output_dir = _get_tts_mode()
     # キャラクター設定を優先。env は fallback

@@ -388,3 +388,91 @@ class TestContinuousListenerIntentGate:
         assert "ねぇミミ様、聞いていい？" in result.transcript
         # 意図ゲートは 2 回呼ばれた（1 回目 mention, 2 回目 callout）
         assert mock_check.call_count == 2
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TestContinuousListenerWebRTC — WebRTC VAD バックエンド統合テスト
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_mock_webrtcvad(*, is_speech_returns: bool = True) -> MagicMock:
+    """webrtcvad モジュールのモックを作成する。"""
+    mock_vad_instance = MagicMock()
+    mock_vad_instance.is_speech.return_value = is_speech_returns
+
+    mock_webrtcvad = MagicMock()
+    mock_webrtcvad.Vad = MagicMock(return_value=mock_vad_instance)
+    return mock_webrtcvad
+
+
+class TestContinuousListenerWebRTC:
+    """L2_VAD_BACKEND=webrtc 設定下で ContinuousListener が
+    WebRTC 用のフレームパラメータで初期化されることを検証する。"""
+
+    def test_init_sets_320_frame_samples(self, monkeypatch):
+        """L2_VAD_BACKEND=webrtc で _vad_frame_samples == 320。"""
+        monkeypatch.setenv("L2_VAD_BACKEND", "webrtc")
+        mock_webrtcvad = _make_mock_webrtcvad()
+        from lab_lounge.wake_word import (
+            _WEBRTC_FRAME_SAMPLES,
+            ContinuousListener,
+        )
+        with patch.dict(sys.modules, {"webrtcvad": mock_webrtcvad}):
+            listener = ContinuousListener()
+        assert listener._vad_frame_samples == _WEBRTC_FRAME_SAMPLES
+        assert listener._vad_frame_samples == 320
+
+    def test_init_sets_75_silence_frames(self, monkeypatch):
+        """L2_VAD_BACKEND=webrtc で _silence_frames == 75。"""
+        monkeypatch.setenv("L2_VAD_BACKEND", "webrtc")
+        mock_webrtcvad = _make_mock_webrtcvad()
+        from lab_lounge.wake_word import (
+            _WEBRTC_SILENCE_FRAMES,
+            ContinuousListener,
+        )
+        with patch.dict(sys.modules, {"webrtcvad": mock_webrtcvad}):
+            listener = ContinuousListener()
+        assert listener._silence_frames == _WEBRTC_SILENCE_FRAMES
+        assert listener._silence_frames == 75
+
+    def test_init_with_rms_default(self, monkeypatch):
+        """env 未設定 (RMS) で 512 / 24 になる回帰テスト。"""
+        monkeypatch.delenv("L2_VAD_BACKEND", raising=False)
+        from lab_lounge.wake_word import (
+            _DEFAULT_FRAME_SAMPLES,
+            _DEFAULT_SILENCE_FRAMES,
+            ContinuousListener,
+        )
+        listener = ContinuousListener()
+        assert listener._vad_frame_samples == _DEFAULT_FRAME_SAMPLES
+        assert listener._vad_frame_samples == 512
+        assert listener._silence_frames == _DEFAULT_SILENCE_FRAMES
+        assert listener._silence_frames == 24
+
+    def test_init_falls_back_when_webrtcvad_missing(self, monkeypatch):
+        """L2_VAD_BACKEND=webrtc でも webrtcvad import 失敗時に
+        RMS パラメータ (512/24) にフォールバックする。"""
+        import builtins
+        monkeypatch.setenv("L2_VAD_BACKEND", "webrtc")
+
+        from lab_lounge.wake_word import (
+            _DEFAULT_FRAME_SAMPLES,
+            _DEFAULT_SILENCE_FRAMES,
+            ContinuousListener,
+        )
+
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "webrtcvad":
+                raise ImportError("mocked: webrtcvad not installed")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=mock_import):
+            listener = ContinuousListener()
+
+        # RMS パラメータにフォールバック
+        assert listener._vad_frame_samples == _DEFAULT_FRAME_SAMPLES
+        assert listener._vad_frame_samples == 512
+        assert listener._silence_frames == _DEFAULT_SILENCE_FRAMES
+        assert listener._silence_frames == 24
