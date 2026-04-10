@@ -41,6 +41,9 @@ def reset_l2_mode_vars(monkeypatch):
                 "L2_CONTEXT_WINDOW_SEC", "L2_CONTEXT_MAX_CHARS",
                 "L2_FILLER_ENABLED", "L2_LLM_FILLER_MODEL",
                 "L2_ENABLE_TOOLS", "TAVILY_API_KEY",
-                "L2_VAD_BACKEND", "L2_VAD_AGGRESSIVENESS"):
+                "L2_VAD_BACKEND", "L2_VAD_AGGRESSIVENESS",
+                "L2_USE_LLM_ROUTER", "L2_LLM_ROUTER_MODEL",
+                "L2_USE_INTENT_GATE", "L2_INTENT_GATE_MODEL",
+                "L2_LOG_TO_FILE", "L2_LOG_DIR", "L2_LOG_LEVEL"):
         monkeypatch.delenv(var, raising=False)
 

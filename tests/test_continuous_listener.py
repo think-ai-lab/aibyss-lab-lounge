@@ -274,3 +274,117 @@ class TestContinuousListenOnceEdgeCases:
              patch("time.monotonic", return_value=0.0):
             with pytest.raises(RuntimeError, match="STT failed"):
                 listener.listen_once(timeout_seconds=30.0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LLM 意図ゲート (呼び出しゲート Phase 2) 統合テスト
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestContinuousListenerIntentGate:
+    """ContinuousListener と意図ゲートの統合テスト。"""
+
+    def _run_single_with_env(self, transcript: str, env: dict | None = None, monkeypatch=None):
+        """1 セグメントで listen_once を実行する（環境変数設定可能）。"""
+        if env and monkeypatch:
+            for k, v in env.items():
+                monkeypatch.setenv(k, v)
+
+        from lab_lounge.wake_word import ContinuousListener
+        listener = ContinuousListener(vad_threshold=0.005, stt_provider="openai")
+        mock_sd = _make_sd_mock(_one_utterance_frames())
+        mock_sf = MagicMock()
+        mock_ntf = MagicMock()
+        mock_ntf.return_value.name = "/tmp/fake_test.wav"
+
+        with patch.dict(sys.modules, {"sounddevice": mock_sd, "soundfile": mock_sf}), \
+             patch("lab_lounge.wake_word.tempfile.NamedTemporaryFile", mock_ntf), \
+             patch.object(Path, "unlink"), \
+             patch.object(_stt, "transcribe_audio_file", return_value=_stt_result(transcript)), \
+             patch("time.monotonic", return_value=0.0):
+            return listener.listen_once(timeout_seconds=30.0)
+
+    def test_intent_gate_disabled_skips_check(self, monkeypatch):
+        """L2_USE_INTENT_GATE 未設定時は check_intent が呼ばれない。"""
+        monkeypatch.delenv("L2_USE_INTENT_GATE", raising=False)
+        with patch("lab_lounge.router.check_intent") as mock_check:
+            result = self._run_single_with_env("ミミ様、テスト")
+        assert result is not None
+        assert result.character_slug == "mimi"
+        mock_check.assert_not_called()
+
+    def test_intent_gate_callout_returns_result(self, monkeypatch):
+        """意図ゲートが 'callout' → 通常通り結果を返す。"""
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
+        with patch("lab_lounge.router.check_intent", return_value="callout") as mock_check:
+            result = self._run_single_with_env("ねぇミミ様、これどう思う？")
+        assert result is not None
+        assert result.character_slug == "mimi"
+        mock_check.assert_called_once()
+
+    def test_intent_gate_unknown_proceeds_fail_open(self, monkeypatch):
+        """意図ゲートが 'unknown' → fail-open で通常通り返す。"""
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
+        with patch("lab_lounge.router.check_intent", return_value="unknown") as mock_check:
+            result = self._run_single_with_env("ミミ様、テスト")
+        assert result is not None
+        assert result.character_slug == "mimi"
+        mock_check.assert_called_once()
+
+    def test_intent_gate_mention_continues_loop(self, monkeypatch):
+        """意図ゲートが 'mention' → バッファ保持で次のセグメント待ち → タイムアウトで None。"""
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
+
+        from lab_lounge.wake_word import ContinuousListener
+        listener = ContinuousListener(vad_threshold=0.005, stt_provider="openai")
+        mock_sd = _make_sd_mock(_one_utterance_frames())
+        mock_sf = MagicMock()
+        mock_ntf = MagicMock()
+        mock_ntf.return_value.name = "/tmp/fake_test.wav"
+
+        # 1回目: 言及と判定 → loop continue → タイムアウト
+        monotonic_calls = [0.0] * 50 + [100.0] * 10
+        with patch.dict(sys.modules, {"sounddevice": mock_sd, "soundfile": mock_sf}), \
+             patch("lab_lounge.wake_word.tempfile.NamedTemporaryFile", mock_ntf), \
+             patch.object(Path, "unlink"), \
+             patch.object(_stt, "transcribe_audio_file", return_value=_stt_result("ミミ様の仕組みはすごいですね")), \
+             patch("lab_lounge.router.check_intent", return_value="mention"), \
+             patch("time.monotonic", side_effect=monotonic_calls):
+            result = listener.listen_once(timeout_seconds=30.0)
+
+        assert result is None
+        # バッファは保持されている（クリアされていない）
+        assert len(listener._buffer) == 1
+
+    def test_intent_gate_mention_then_callout(self, monkeypatch):
+        """1 セグメント目 mention → 2 セグメント目 callout → バッファ累積で return。"""
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
+
+        from lab_lounge.wake_word import ContinuousListener
+        listener = ContinuousListener(vad_threshold=0.005, stt_provider="openai")
+        mock_sd = _make_sd_mock(_two_utterance_frames())
+        mock_sf = MagicMock()
+        mock_ntf = MagicMock()
+        mock_ntf.return_value.name = "/tmp/fake_test.wav"
+
+        stt_results = [
+            _stt_result("ミミ様って可愛いよね"),       # 1 回目: 言及
+            _stt_result("ねぇミミ様、聞いていい？"),  # 2 回目: 呼びかけ
+        ]
+        intent_results = ["mention", "callout"]
+
+        with patch.dict(sys.modules, {"sounddevice": mock_sd, "soundfile": mock_sf}), \
+             patch("lab_lounge.wake_word.tempfile.NamedTemporaryFile", mock_ntf), \
+             patch.object(Path, "unlink"), \
+             patch.object(_stt, "transcribe_audio_file", side_effect=stt_results), \
+             patch("lab_lounge.router.check_intent", side_effect=intent_results) as mock_check, \
+             patch("time.monotonic", return_value=0.0):
+            result = listener.listen_once(timeout_seconds=30.0)
+
+        assert result is not None
+        assert result.character_slug == "mimi"
+        # 両方のセグメントが文脈に含まれる
+        assert "ミミ様って可愛いよね" in result.transcript
+        assert "ねぇミミ様、聞いていい？" in result.transcript
+        # 意図ゲートは 2 回呼ばれた（1 回目 mention, 2 回目 callout）
+        assert mock_check.call_count == 2

@@ -54,12 +54,10 @@ load_dotenv()
 
 from .audio_io import RecordError, SilenceError, play_audio_file, record_to_file
 from .emitter import _transcribe_audio
+from .log_setup import setup_logging
 from .pipeline import PipelineResult, run_pipeline
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-)
+setup_logging(session_name="run_loop")
 
 logger = logging.getLogger(__name__)
 
