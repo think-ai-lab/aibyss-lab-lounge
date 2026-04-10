@@ -209,3 +209,5 @@ class TestTtsDone:
         assert payload["speaker"] == "Nanami"
         # スキーマ検証も通る
         validate_event(ev)
+
+

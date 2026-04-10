@@ -30,6 +30,7 @@ import concurrent.futures
 import logging
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -219,18 +220,20 @@ def _normalize_for_voicepeak(text: str) -> str:
     return text
 
 
-def _parse_voicepeak_json(text: str) -> tuple[str, dict[str, int] | None, int | None]:
+def _parse_voicepeak_json(
+    text: str,
+) -> tuple[str, dict[str, int] | None, int | None, str | None]:
     """
-    LLM 応答が JSON 構造の場合、response / emotion / speed を分離する。
+    LLM 応答が JSON 構造の場合、response / emotion / speed / pose を分離する。
 
     対応する JSON 形式:
-        {"emotion": {"happy": 50, ...}, "speed": 100, "response": "テキスト"}
+        {"emotion": {"happy": 50, ...}, "speed": 100, "pose": "happy", "response": "テキスト"}
 
     全角記号に正規化済みの JSON も半角に戻してからパースを試みる。
 
     Returns:
-        (say_text, emotion_dict_or_None, speed_or_None)
-        JSON でない場合は (text, None, None) をそのまま返す。
+        (say_text, emotion_dict_or_None, speed_or_None, pose_or_None)
+        JSON でない場合は (text, None, None, None) をそのまま返す。
     """
     import json as _json
 
@@ -256,10 +259,10 @@ def _parse_voicepeak_json(text: str) -> tuple[str, dict[str, int] | None, int | 
     try:
         obj = _json.loads(raw)
     except (ValueError, TypeError):
-        return text, None, None
+        return text, None, None, None
 
     if not isinstance(obj, dict) or "response" not in obj:
-        return text, None, None
+        return text, None, None, None
 
     say_text = str(obj["response"])
     emotion = obj.get("emotion")
@@ -270,8 +273,13 @@ def _parse_voicepeak_json(text: str) -> tuple[str, dict[str, int] | None, int | 
     speed_val = obj.get("speed")
     if speed_val is not None:
         speed_val = int(speed_val)
+    pose_val = obj.get("pose")
+    if pose_val is not None:
+        pose_val = str(pose_val).strip().lower()
+        if not pose_val:
+            pose_val = None
 
-    return say_text, emotion, speed_val
+    return say_text, emotion, speed_val, pose_val
 
 
 # ─── VOICEPEAK テキスト分割 ──────────────────────────────────────
@@ -351,8 +359,70 @@ _voicepeak_queue: _queue_mod.Queue | None = None
 _voicepeak_worker_thread: threading.Thread | None = None
 
 
+def _decode_voicepeak_output(b: bytes | None) -> str:
+    """VOICEPEAK の stdout/stderr bytes を安全にデコードする。
+
+    Windows では CP932 が多いが、将来のバージョン変更に備えて複数エンコーディングを試す。
+    """
+    if not b:
+        return ""
+    for enc in ("cp932", "utf-8"):
+        try:
+            return b.decode(enc).strip()
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", errors="replace").strip()
+
+
+# VOICEPEAK 並列実行エラーのシグネチャ (stderr に小文字化して部分一致でチェック)
+#
+# 実際のエラーメッセージ (確認済み):
+#   "In this version, up to 1 command line instance can be executed at same time."
+#
+# scripts/test_voicepeak_parallel_error.py で再現確認可能:
+#   - returncode=1 / stderr に上記文字列 / wav 未生成
+#   - 連続実行 (Test 4) では発生せず、真の並列実行 (Test 2/3) でのみ発生
+_VOICEPEAK_BUSY_SIGNATURES = (
+    # 公式エラーメッセージの特徴的部分 (将来バージョンで微変更しても拾えるように複数候補)
+    "command line instance can be executed",
+    "up to 1 command line instance",
+    # 将来の VOICEPEAK バージョン or 別ロケール想定の候補
+    "already running",
+    "another instance",
+    "instance is running",
+    "すでに実行",
+    "起動中",
+    "実行中",
+)
+
+
+def _is_voicepeak_busy_error(stderr: str, stdout: str) -> bool:
+    """VOICEPEAK の並列実行エラーかどうかを判定する。"""
+    text = (stderr + " " + stdout).lower()
+    return any(sig in text for sig in _VOICEPEAK_BUSY_SIGNATURES)
+
+
+def _get_voicepeak_retry_wait_sec() -> float:
+    """並列実行エラー発生時のリトライ待機時間（秒）を返す。
+
+    並列実行エラー検知時のみ挿入される (通常成功時は待機しない)。
+    環境変数 L2_VOICEPEAK_RETRY_WAIT_SEC で上書き可能 (デフォルト: 2.0)。
+    """
+    return float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "2.0"))
+
+
+def _get_voicepeak_max_retries() -> int:
+    """並列実行エラー発生時の最大リトライ回数を返す。"""
+    return int(os.environ.get("L2_VOICEPEAK_MAX_RETRIES", "2"))
+
+
 def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
-    """VOICEPEAK キューワーカー。キューからジョブを取り出し順次実行する。"""
+    """VOICEPEAK キューワーカー。キューからジョブを取り出し順次実行する。
+
+    並列実行エラー (`In this version, up to 1 command line instance ...`) を
+    検出したら短い待機後にリトライする。通常成功時は無待機で次のジョブへ進む
+    (固定クールダウンは入れない: レイテンシに直結するため)。
+    """
     import subprocess as _sp
 
     while True:
@@ -360,11 +430,57 @@ def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
         if item is None:
             break
         cmd_str, future = item
-        try:
-            result = _sp.run(cmd_str, capture_output=True, text=True, shell=True)
+
+        max_retries = _get_voicepeak_max_retries()
+        retry_wait = _get_voicepeak_retry_wait_sec()
+
+        result = None
+        last_exc: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                # text=False (bytes) で取得してから手動で UTF-8 / CP932 試行
+                # Windows では VOICEPEAK 出力エンコーディングが不定のため、
+                # decode 失敗を捕捉するより bytes のまま扱う
+                result = _sp.run(cmd_str, capture_output=True, shell=True)
+            except Exception as exc:
+                last_exc = exc
+                logger.error(
+                    "VOICEPEAK subprocess 例外 (attempt %d/%d): %s",
+                    attempt + 1, max_retries + 1, exc,
+                )
+                break  # subprocess 起動失敗は再試行しない
+
+            if result.returncode == 0:
+                break  # 成功 → 即 next ジョブへ (待機なし)
+
+            # 非ゼロ exit: 並列実行エラーかチェック
+            stderr_text = _decode_voicepeak_output(result.stderr)
+            stdout_text = _decode_voicepeak_output(result.stdout)
+            is_busy = _is_voicepeak_busy_error(stderr_text, stdout_text)
+
+            logger.warning(
+                "VOICEPEAK 非ゼロ終了 (attempt %d/%d): returncode=%d busy=%s"
+                "\n  stderr: %s\n  stdout: %s",
+                attempt + 1, max_retries + 1,
+                result.returncode, is_busy,
+                stderr_text or "(empty)",
+                stdout_text or "(empty)",
+            )
+
+            if is_busy and attempt < max_retries:
+                logger.info(
+                    "VOICEPEAK 並列実行エラー検出 → %.1f 秒待機してリトライ",
+                    retry_wait,
+                )
+                time.sleep(retry_wait)
+                continue
+            break  # それ以外のエラー or リトライ上限到達
+
+        if last_exc is not None:
+            future.set_exception(last_exc)
+        else:
             future.set_result(result)
-        except Exception as exc:
-            future.set_exception(exc)
 
 
 def _ensure_voicepeak_worker() -> _queue_mod.Queue:
@@ -401,11 +517,23 @@ def _submit_voicepeak(cmd_str: str) -> None:
     except FileNotFoundError:
         raise
     except Exception as exc:
-        raise RuntimeError(f"VOICEPEAK 実行エラー: {exc}") from exc
+        logger.error("VOICEPEAK 実行中に例外: %s", exc)
+        logger.debug("VOICEPEAK 実行中に例外 cmd (full): %s", cmd_str)
+        raise RuntimeError(f"VOICEPEAK 実行エラー: {type(exc).__name__}: {exc}") from exc
 
     if result.returncode != 0:
-        stderr = result.stderr or result.stdout or ""
-        raise RuntimeError(f"VOICEPEAK 実行エラー: {stderr}")
+        # ワーカー側で既に詳細ログは出力済み。ここでは例外メッセージのみ組み立てる
+        stderr_text = _decode_voicepeak_output(result.stderr) or "(empty)"
+        stdout_text = _decode_voicepeak_output(result.stdout) or "(empty)"
+        logger.error(
+            "VOICEPEAK 実行最終失敗: returncode=%d stderr: %s stdout: %s",
+            result.returncode, stderr_text, stdout_text,
+        )
+        logger.debug("VOICEPEAK 実行最終失敗 cmd (full): %s", cmd_str)
+        raise RuntimeError(
+            f"VOICEPEAK 実行エラー: returncode={result.returncode} "
+            f"stderr={stderr_text!r} stdout={stdout_text!r}"
+        )
 
 
 def _generate_voicepeak_single_file(
@@ -448,7 +576,13 @@ def _generate_voicepeak_single_file(
         emotion_expr = ",".join(f"{k}={v}" for k, v in emotion.items())
         cmd_str += f" --emotion {emotion_expr}"
 
-    logger.info("VOICEPEAK コマンド: %s", cmd_str)
+    # 配信中のコンソール表示でファイルパス (ユーザーディレクトリ等) を漏らさないよう、
+    # ログにはファイル名・narrator・テキスト長のみを出す。完全なコマンドは debug レベルへ。
+    logger.info(
+        "VOICEPEAK 投入: narrator=%s text_len=%d out=%s",
+        voice, len(safe_text), filepath.name,
+    )
+    logger.debug("VOICEPEAK コマンド (full): %s", cmd_str)
 
     _submit_voicepeak(cmd_str)
 
@@ -508,8 +642,9 @@ def _call_voicepeak(
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # JSON 構造のパース（emotion / speed / response の分離）
-    say_text, json_emotion, json_speed = _parse_voicepeak_json(text)
+    # JSON 構造のパース（emotion / speed / pose / response の分離）
+    # pose は TTS 内では使用しない（pose.update は graph.py / pipeline.py 側で発行）
+    say_text, json_emotion, json_speed, _json_pose = _parse_voicepeak_json(text)
     effective_speed = json_speed if json_speed is not None else speed
 
     # テキスト分割
@@ -608,8 +743,12 @@ def synthesize(
         provider, voice, len(text),
     )
     result: TTSResult = fn(text, voice=voice, output_dir=output_dir, **kwargs)
+    # audio_url は file:///T:/Users/... のような絶対パスになるため、配信中の
+    # コンソール表示でユーザーディレクトリが漏れないようファイル名のみログ
+    audio_filename = result.audio_url.rsplit("/", 1)[-1] if result.audio_url else ""
     logger.info(
-        "TTS 完了: duration_ms=%d audio_url=%s",
-        result.duration_ms, result.audio_url,
+        "TTS 完了: duration_ms=%d audio=%s",
+        result.duration_ms, audio_filename,
     )
+    logger.debug("TTS 完了 audio_url (full): %s", result.audio_url)
     return result

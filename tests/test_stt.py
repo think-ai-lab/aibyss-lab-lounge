@@ -155,3 +155,33 @@ class TestFileDurationMs:
         """存在しないファイルは 0 を返す（例外を送出しない）"""
         duration = stt_mod._file_duration_ms(str(tmp_path / "nonexistent.wav"))
         assert duration == 0
+
+
+class TestSttLogSanitization:
+    """配信中の機密情報漏洩を防ぐ: STT ログがファイルパスを含まない。"""
+
+    def test_stt_info_log_does_not_contain_full_path(self, tmp_path, caplog):
+        """INFO レベルのログに完全パス (一時ディレクトリ) が含まれない。"""
+        import logging
+        # ダミー WAV ファイル
+        dummy = tmp_path / "speech_input.wav"
+        dummy.write_bytes(b"\x00" * 100)
+
+        # _PROVIDERS をモック
+        original_providers = stt_mod._PROVIDERS.copy()
+        stt_mod._PROVIDERS["openai"] = _mock_provider(FAKE_STT_RESULT)
+        try:
+            with caplog.at_level(logging.INFO, logger="lab_lounge.stt"):
+                transcribe_audio_file(str(dummy), provider="openai", lang="ja")
+        finally:
+            stt_mod._PROVIDERS.clear()
+            stt_mod._PROVIDERS.update(original_providers)
+
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        all_info = " ".join(info_messages)
+        # 完全パス (tmp_path) は INFO に含まれない
+        assert str(tmp_path) not in all_info
+        # ファイル名は含まれてよい
+        assert "speech_input.wav" in all_info

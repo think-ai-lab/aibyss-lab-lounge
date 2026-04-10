@@ -192,6 +192,10 @@ def run_loop(
         stt_provider=stt_provider,
     )
 
+    # OBS WebSocket 初期化（L2_OBS_WS_URL 未設定時は no-op）
+    from .obs import init_obs as _init_obs
+    _init_obs()
+
     mode_msg = {
         "porcupine": "ウェイクワードモード (Porcupine)。キャラクター名を呼んでください。",
         "speech": "音声認識モード (VAD + STT)。キャラクター名を含めて話しかけてください。",

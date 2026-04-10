@@ -5,6 +5,7 @@ log_setup.py — ログ設定の集約
   - コンソール + ファイル出力の両方を設定する
   - セッションごとに新しいログファイルを作成（タイムスタンプ付き）
   - 環境変数でファイル出力・ログディレクトリ・ログレベルを制御
+  - 第三者ライブラリの機密情報漏洩を抑制（配信中のコンソール表示対策）
 
 【環境変数】
   L2_LOG_TO_FILE  — ファイル出力を有効化 (デフォルト: "true")
@@ -14,6 +15,13 @@ log_setup.py — ログ設定の集約
 【出力ファイル】
   {L2_LOG_DIR}/run_loop_YYYYMMDD_HHMMSS.log
   セッション（プロセス）ごとに新規作成。ローテーションは行わない。
+
+【機密情報抑制】
+  以下の第三者ライブラリは INFO レベルでパスワード/host/port/URL を出力するため、
+  WARNING 以上のみ表示するように制限する:
+    - obsws_python  : OBS WebSocket の host/port/password を平文出力
+    - httpx         : HTTP リクエストの URL 全文を出力 (API キーが含まれる可能性)
+    - openai/anthropic/google : API リクエストの詳細
 """
 
 import logging
@@ -22,6 +30,30 @@ from datetime import datetime
 from pathlib import Path
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+
+# 機密情報を出力する第三者ライブラリ — INFO 以下を抑制
+# (配信中のコンソール表示で password / host / port / API URL が漏れることを防ぐ)
+_SENSITIVE_LIBRARY_LOGGERS = (
+    "obsws_python",                # host / port / password を INFO で出力
+    "obsws_python.baseclient",     # 同上
+    "obsws_python.reqs",           # RPC バージョン情報
+    "httpx",                        # HTTP リクエスト URL を INFO で出力
+    "httpcore",                     # httpx の下位レイヤ
+    "openai._base_client",          # API エンドポイント URL
+    "anthropic._base_client",       # 同上
+    "google_genai.models",          # AFC 設定など
+    "google.genai",                 # 同上
+)
+
+
+def _suppress_sensitive_loggers() -> None:
+    """機密情報を出力する第三者ライブラリの logger を WARNING に設定する。
+
+    INFO 以下のメッセージ (host/port/password/URL を含む) が出力されなくなる。
+    エラーや警告は引き続き表示される。
+    """
+    for name in _SENSITIVE_LIBRARY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _is_file_logging_enabled() -> bool:
@@ -70,6 +102,9 @@ def setup_logging(
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
+
+    # 第三者ライブラリの機密情報出力を抑制（ファイル出力の有無に関わらず）
+    _suppress_sensitive_loggers()
 
     # ファイルハンドラー（オプション）
     if not _is_file_logging_enabled():

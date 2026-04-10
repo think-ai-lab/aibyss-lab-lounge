@@ -44,6 +44,25 @@ def reset_l2_mode_vars(monkeypatch):
                 "L2_VAD_BACKEND", "L2_VAD_AGGRESSIVENESS",
                 "L2_USE_LLM_ROUTER", "L2_LLM_ROUTER_MODEL",
                 "L2_USE_INTENT_GATE", "L2_INTENT_GATE_MODEL",
-                "L2_LOG_TO_FILE", "L2_LOG_DIR", "L2_LOG_LEVEL"):
+                "L2_LOG_TO_FILE", "L2_LOG_DIR", "L2_LOG_LEVEL",
+                "L2_OBS_WS_URL", "L2_OBS_WS_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
+
+    # VOICEPEAK 関連: テスト時は待機・リトライなしに強制
+    # (デフォルトの 2s リトライ wait × テスト数で遅くなるため)
+    monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
+    monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "0")
+
+
+@pytest.fixture(autouse=True)
+def reset_obs_module_state():
+    """
+    obs モジュールのグローバル状態をテスト前後でリセットする。
+
+    set_pose / init_obs がテスト間で状態を持ち越さないようにする。
+    """
+    from lab_lounge.obs import _reset_for_tests
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
 
