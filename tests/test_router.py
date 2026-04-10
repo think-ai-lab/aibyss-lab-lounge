@@ -176,6 +176,44 @@ class TestLLMRouter:
 
         assert result is None
 
+    def test_llm_returns_none_for_no_callout(self, monkeypatch):
+        """LLM が 'none' を返したら string 'none' を返す（呼びかけなし）。"""
+        monkeypatch.setenv("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
+        chars = get_all_characters()
+        candidates = [c for c in chars if c.slug in ("mimi", "chisame")]
+
+        mock_openai = MagicMock()
+        mock_client = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_completion("none")
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            result = _route_by_llm("ミミ様の仕組みは、ちさめさんが解説してましたね", candidates)
+
+        assert result == "none"
+
+    def test_llm_prompt_mentions_none_option(self, monkeypatch):
+        """LLM ルータープロンプトに 'none' オプションが含まれる。"""
+        monkeypatch.setenv("L2_LLM_ROUTER_MODEL", "gpt-5.4-nano")
+
+        chars = get_all_characters()
+        candidates = [c for c in chars if c.slug in ("mimi", "chisame")]
+
+        mock_openai = MagicMock()
+        mock_client = MagicMock()
+        mock_openai.OpenAI.return_value = mock_client
+        mock_client.chat.completions.create.return_value = self._mock_completion("none")
+
+        with patch.dict("sys.modules", {"openai": mock_openai}):
+            _route_by_llm("テスト", candidates)
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        messages = call_kwargs["messages"]
+        system_msg = next(m for m in messages if m["role"] == "system")
+        assert "none" in system_msg["content"]
+        assert "呼びかけが存在しない" in system_msg["content"]
+
 
 class TestHybridRouting:
     """ハイブリッドルーティング統合テスト。"""
@@ -233,3 +271,128 @@ class TestHybridRouting:
 
         assert result.reason == "default"
         mock_llm.assert_not_called()
+
+    def test_multiple_names_llm_returns_none_becomes_default(self, monkeypatch):
+        """
+        複数キャラ検出 + LLM ルーターが 'none'（呼びかけなし）を返したら
+        reason="default" になる。意図ゲートは呼ばれない。
+        """
+        monkeypatch.setenv("L2_USE_LLM_ROUTER", "true")
+
+        with patch("lab_lounge.router._route_by_llm", return_value="none") as mock_llm:
+            result = route("ミミ様の仕組みは、ちさめさんが解説してましたね")
+
+        assert result.reason == "default"
+        mock_llm.assert_called_once()
+
+    def test_multiple_names_llm_returns_none_uses_default_speaker(self, monkeypatch):
+        """'none' 判定時のデフォルトキャラクターが L2_DEFAULT_SPEAKER を尊重する。"""
+        monkeypatch.setenv("L2_USE_LLM_ROUTER", "true")
+        monkeypatch.setenv("L2_DEFAULT_SPEAKER", "octamaid")
+
+        with patch("lab_lounge.router._route_by_llm", return_value="none"):
+            result = route("ミミ様とちさめさんについての話ですね")
+
+        assert result.reason == "default"
+        assert result.speaker == "octamaid"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LLM 意図ゲート (呼び出しゲート Phase 2)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestIsIntentGateEnabled:
+    """is_intent_gate_enabled() のテスト。"""
+
+    def test_default_false(self, monkeypatch):
+        monkeypatch.delenv("L2_USE_INTENT_GATE", raising=False)
+        from lab_lounge.router import is_intent_gate_enabled
+        assert is_intent_gate_enabled() is False
+
+    def test_true_string(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
+        from lab_lounge.router import is_intent_gate_enabled
+        assert is_intent_gate_enabled() is True
+
+    def test_one_string(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "1")
+        from lab_lounge.router import is_intent_gate_enabled
+        assert is_intent_gate_enabled() is True
+
+    def test_yes_string(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "yes")
+        from lab_lounge.router import is_intent_gate_enabled
+        assert is_intent_gate_enabled() is True
+
+    def test_false_string(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_INTENT_GATE", "false")
+        from lab_lounge.router import is_intent_gate_enabled
+        assert is_intent_gate_enabled() is False
+
+
+class TestCheckIntent:
+    """check_intent() のテスト。_call_router_llm をモックして LLM 呼び出しを回避する。"""
+
+    def test_callout_response(self):
+        """LLM が 'callout' を返したら 'callout'。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="callout"):
+            result = check_intent("ねぇ、ミミ様、どう思う？", "mimi")
+        assert result == "callout"
+
+    def test_mention_response(self):
+        """LLM が 'mention' を返したら 'mention'。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="mention"):
+            result = check_intent("ミミ様の仕組みは、すごいですね", "mimi")
+        assert result == "mention"
+
+    def test_unknown_on_llm_error(self):
+        """LLM 呼び出し失敗 (None) → 'unknown' (fail-open)。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value=None):
+            result = check_intent("テスト", "mimi")
+        assert result == "unknown"
+
+    def test_unknown_on_invalid_response(self):
+        """LLM が予期しない応答を返したら 'unknown'。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="maybe"):
+            result = check_intent("テスト", "mimi")
+        assert result == "unknown"
+
+    def test_uses_env_model(self, monkeypatch):
+        """L2_INTENT_GATE_MODEL が _call_router_llm に渡される。"""
+        from lab_lounge.router import check_intent
+        monkeypatch.setenv("L2_INTENT_GATE_MODEL", "gpt-5.4-nano")
+        with patch("lab_lounge.router._call_router_llm", return_value="callout") as mock_llm:
+            check_intent("テスト", "mimi")
+        # 第1引数が model
+        assert mock_llm.call_args.args[0] == "gpt-5.4-nano"
+
+    def test_default_model_when_env_not_set(self, monkeypatch):
+        """L2_INTENT_GATE_MODEL 未設定時はデフォルトモデルが使われる。"""
+        from lab_lounge.router import check_intent
+        monkeypatch.delenv("L2_INTENT_GATE_MODEL", raising=False)
+        with patch("lab_lounge.router._call_router_llm", return_value="callout") as mock_llm:
+            check_intent("テスト", "mimi")
+        # デフォルトモデル (claude-haiku-4-5-20251001) が使われる
+        assert "claude" in mock_llm.call_args.args[0].lower()
+
+    def test_prompt_includes_character_slug(self):
+        """system_prompt にキャラクター slug が含まれる。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="callout") as mock_llm:
+            check_intent("テスト", "chisame")
+        system_prompt = mock_llm.call_args.args[1]
+        assert "chisame" in system_prompt
+
+    def test_context_passed_as_user_text(self):
+        """context が _call_router_llm に user_text として渡される。"""
+        from lab_lounge.router import check_intent
+        context = "今日はいい天気ですね。ミミ様、お出かけされますか？"
+        with patch("lab_lounge.router._call_router_llm", return_value="callout") as mock_llm:
+            check_intent(context, "mimi")
+        # 第3引数が user_text
+        assert mock_llm.call_args.args[2] == context

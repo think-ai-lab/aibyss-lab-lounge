@@ -1038,6 +1038,21 @@ class ContinuousListener:
                 if decision.reason != "default":
                     context = self._buffer.extract_context()
                     char_slug = decision.speaker
+
+                    # LLM 意図ゲート (Phase 2) — L2_USE_INTENT_GATE=true のときのみ
+                    # 「言及」と判定された場合はバッファを保持して次のセグメントを待つ
+                    # (跨ぎ発話への対応: 「ミミ様のことなんだけど…聞いていい？」)
+                    if _router.is_intent_gate_enabled():
+                        intent = _router.check_intent(context, char_slug)
+                        if intent == "mention":
+                            logger.info(
+                                "意図ゲート: 言及と判定してスキップ: char=%s (バッファ保持)",
+                                char_slug,
+                            )
+                            continue  # バッファは保持したまま次のセグメント待ち
+                        # "callout" or "unknown" → fall through (fail-open)
+                        logger.info("意図ゲート: %s (char=%s) → 通過", intent, char_slug)
+
                     self._buffer.clear()
 
                     from .characters import get_all_characters as _get_chars
