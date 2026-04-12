@@ -205,6 +205,19 @@ def run_loop(
     }
     print(mode_msg.get(effective_backend, "起動しました。"))
 
+    # ─── セッション識別子を run_loop 全体で 1 回だけ生成 ──────────────────
+    # stream_id:  音声ストリーム (= この run_loop 実行全体で 1 つ、全ターン共有)
+    #             RecentC2Retriever が同一ストリーム内の過去発話を取得するため
+    #             ターンごとに再生成すると会話履歴が全て別セッションに分散してしまう
+    # session_id: ユーザーセッション (= ここでも同様に run_loop 単位で 1 つ)
+    # trace_id:   分散トレース (= ターンごとに再生成、個々のリクエストを追跡)
+    session_stream_id = _new_uuid()
+    session_id_root = _new_uuid()
+    logger.info(
+        "run_loop セッション開始: stream_id=%s session_id=%s",
+        session_stream_id, session_id_root,
+    )
+
     turn = 0
     try:
         while max_turns is None or turn < max_turns:
@@ -219,11 +232,13 @@ def run_loop(
                     # タイムアウト → 再度待機
                     continue
                 speaker_hint = wake_result.character_slug
+                logger.info("ウェイクワード検知: %s", speaker_hint)
                 print(f"ウェイクワード検知: {speaker_hint}")
 
                 # speech / sherpa / continuous バックエンドは transcript がそのまま発話テキスト
                 if effective_backend in ("speech", "sherpa", "continuous") and wake_result.transcript:
                     input_text = wake_result.transcript
+                    logger.info("STT 認識結果: %s", input_text)
                     print(f"認識結果: {input_text}")
             else:
                 # keyboard モード
@@ -231,6 +246,7 @@ def run_loop(
 
             # ─── 2. マイク録音 (porcupine / keyboard のみ) ───────
             if input_text is None:
+                logger.info("マイク録音開始 (record_seconds=%d)", record_seconds)
                 print("録音中...")
                 try:
                     recorded_path = record_to_file(
@@ -304,8 +320,11 @@ def run_loop(
             try:
                 result = run_pipeline(
                     input_text,
-                    stream_id=_new_uuid(),
-                    session_id=_new_uuid(),
+                    # stream_id / session_id は run_loop セッション全体で固定
+                    # (RecentC2Retriever が同一ストリーム内の過去発話を引けるように)
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    # trace_id はリクエスト単位 (分散トレース用、個々のターンを識別)
                     trace_id=_new_uuid(),
                     utterance_meta=utterance_meta,
                     speaker_hint=speaker_hint,
@@ -322,10 +341,12 @@ def run_loop(
                     _playback_thread.join(timeout=5)
                 continue
 
-            # LLM 応答を表示
+            # LLM 応答を表示 + ログ記録
             llm_ev = next((ev for ev in result.events if ev["type"] == "llm.final"), None)
             if llm_ev:
-                print(f"[{result.speaker}] {llm_ev['payload']['text']}")
+                _resp = llm_ev["payload"]["text"]
+                logger.info("LLM 応答 [%s]: %s", result.speaker, _resp)
+                print(f"[{result.speaker}] {_resp}")
 
             # ─── 5. TTS 再生完了待機 ────────────────────────────
             if _playback_queue is not None:

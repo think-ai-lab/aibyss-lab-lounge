@@ -96,6 +96,7 @@ def _call_edge_tts(
 
     # duration: mutagen があれば実測値、なければ文字数ヒューリスティック
     duration_ms = _mp3_duration_ms(filepath) or max(1000, int(len(text) / 5 * 1000))
+    logger.info("Edge TTS 生成完了: %s (%d bytes)", filepath.name, filepath.stat().st_size)
 
     return TTSResult(
         audio_url=filepath.as_uri(),
@@ -181,6 +182,7 @@ def _call_voicevox(
     out_dir.mkdir(parents=True, exist_ok=True)
     filepath = out_dir / f"{uuid.uuid4()}.wav"
     filepath.write_bytes(wav_bytes)
+    logger.info("VOICEVOX WAV 生成完了: %s (%d bytes)", filepath.name, len(wav_bytes))
 
     return TTSResult(
         audio_url=filepath.as_uri(),
@@ -678,6 +680,7 @@ def _call_voicepeak(
     if len(chunk_paths) > 1:
         combined_path = out_dir / f"{uuid.uuid4()}.wav"
         _concatenate_wavs(chunk_paths, combined_path)
+        logger.info("WAV 結合完了: %s (%d chunks)", combined_path.name, len(chunk_paths))
         audio_url = combined_path.as_uri()
     else:
         audio_url = chunk_paths[0].as_uri() if chunk_paths else ""

@@ -227,9 +227,22 @@ def _run_agent(
     t0 = time.monotonic()
 
     # Agent への入力メッセージを組み立て
+    # TD-2 対策: 参照情報があっても ReAct Agent がツール呼び出しを省略しないよう、
+    # 「参照情報は過去の参考データ」「最新情報が必要ならツールを使え」を明示する。
+    # 注: キャラクター system_prompt は変更せず、ここでラップすることで
+    # キャラクター音声トーンに影響を与えないようにする。
     messages = []
     if context:
-        text_with_context = f"{text}\n\n---\n## 参照情報\n\n{context}"
+        text_with_context = (
+            f"{text}\n\n"
+            f"---\n"
+            f"## 参照情報 (過去の会話や知識ベースから抽出)\n\n"
+            f"{context}\n\n"
+            f"---\n"
+            f"**注意**: 上記の参照情報は過去の参考データです。"
+            f"最新の情報 (天気・ニュース・時刻・今日の出来事など) が必要な場合は、"
+            f"必ず利用可能なツール (web_search 等) を呼び出して確認してください。"
+        )
     else:
         text_with_context = text
 
@@ -265,7 +278,7 @@ def _run_agent(
                     usage = getattr(msg, "usage_metadata", None) or {}
                     break
 
-        logger.info("Agent 実行完了: latency_ms=%d", latency_ms)
+        logger.info("Agent 実行完了: latency_ms=%d text=%s", latency_ms, response_text)
         return LLMResult(
             text=response_text,
             model=model,
@@ -379,6 +392,142 @@ def _routing_node(state: PipelineGraphState) -> dict:
     return updates
 
 
+def _build_retriever_from_env(
+    kb_path: str,
+    stream_id: str | None = None,
+    exclude_event_ids: list[str] | None = None,
+):
+    """
+    env 変数に応じて Retriever を構築する。
+
+    - L2_USE_C2_RETRIEVER=false (default) → LocalRetriever 単独 (既存動作)
+    - L2_USE_C2_RETRIEVER=true →
+        CompositeRetriever([
+            LocalRetriever,                          # seed corpus
+            C2Retriever(primary),                    # LIKE 検索 (L2_C2_URL)
+            RecentC2Retriever(primary, scope),       # 時系列リコール (L2_USE_C2_RECENT=true)
+            C2Retriever(readonly),                   # LIKE 検索 (L2_C2_URL_READONLY, optional)
+        ])
+
+    【プロファイル分離設計】
+    dev プロファイルから prod のデータを read-only で参照するための仕組み。
+    - prod モード: L2_C2_URL のみ設定 → 書き込む先 = 読む先 = prod C2 (1 本)
+    - dev モード:  L2_C2_URL=dev-c2 + L2_C2_URL_READONLY=prod-c2
+                   → 書き込みは dev のみ、読みは dev+prod 両方
+
+    【RecentC2Retriever のスコープ】 (L2_C2_RECENT_SCOPE)
+    - global (default): stream_id を渡さず全ストリーム横断で直近 N 件を取得。
+      新しい run_loop セッションでも過去セッションの会話を参照できる
+      (セッションまたぎメモリ)。
+    - session: 現ターンの stream_id に限定。同じ run_loop 内の発話のみ参照
+      (セッション内メモリ)。
+
+    【RecentC2Retriever は primary のみ】
+    RecentC2Retriever は readonly C2 には呼ばない
+    (readonly は prod を想定しており、dev セッションのデータが存在しないため)。
+
+    【exclude_event_ids】
+    現ターンの utterance.final.event_id を渡すことで、
+    自己参照 (ナルシシスティック RAG) を防止する。
+    C2Retriever / RecentC2Retriever 両方に同じ list を渡す。
+
+    関連 env:
+        L2_USE_C2_RETRIEVER        — C2Retriever を Composite に組み込むか (default: false)
+        L2_C2_URL                  — 主 C2 のベース URL (default: http://localhost:8100)
+        L2_C2_URL_READONLY         — 副 C2 のベース URL (dev プロファイル用、空なら無効)
+        L2_C2_RETRIEVER_TOP_K      — C2Retriever 単独の取得件数 (default: 3)
+        L2_C2_RETRIEVER_BUDGET_MS  — C2 HTTP タイムアウト ms (default: 600)
+        L2_USE_C2_RECENT           — RecentC2Retriever を追加するか (default: true)
+        L2_C2_RECENT_TOP_K         — RecentC2Retriever の取得件数 (default: 5)
+        L2_C2_RECENT_SCOPE         — 検索範囲 (default: global)
+                                      global  = 全ストリーム横断 (セッションまたぎメモリ)
+                                      session = 現ストリームのみ (セッション内メモリ)
+
+    詳細: docs/design/lab-lounge-retriever.md
+    """
+    from .retriever import LocalRetriever
+
+    use_c2 = os.environ.get("L2_USE_C2_RETRIEVER", "false").lower() == "true"
+    if not use_c2:
+        return LocalRetriever(kb_path)
+
+    from .retriever import C2Retriever, CompositeRetriever, RecentC2Retriever
+    c2_url = os.environ.get("L2_C2_URL", "http://localhost:8100")
+    c2_url_readonly = os.environ.get("L2_C2_URL_READONLY", "").strip()
+    c2_top_k = int(os.environ.get("L2_C2_RETRIEVER_TOP_K", "3"))
+    c2_budget_s = float(os.environ.get("L2_C2_RETRIEVER_BUDGET_MS", "600")) / 1000
+    use_recent = os.environ.get("L2_USE_C2_RECENT", "true").lower() == "true"
+    recent_top_k = int(os.environ.get("L2_C2_RECENT_TOP_K", "10"))  # TD-8: 5→10 (会話メモリは高リコール必要)
+    recent_scope = os.environ.get("L2_C2_RECENT_SCOPE", "global").strip().lower()
+    if recent_scope not in ("global", "session"):
+        logger.warning(
+            "L2_C2_RECENT_SCOPE に未知の値 '%s' を指定、global にフォールバック",
+            recent_scope,
+        )
+        recent_scope = "global"
+
+    retrievers: list = [
+        LocalRetriever(kb_path),
+        C2Retriever(
+            c2_url,
+            top_k=c2_top_k,
+            timeout_s=c2_budget_s,
+            exclude_event_ids=exclude_event_ids,
+        ),
+    ]
+
+    # RecentC2Retriever のスコープ決定
+    if use_recent:
+        if recent_scope == "session":
+            # セッション内メモリ: stream_id 指定。なければ追加しない
+            if stream_id:
+                retrievers.append(
+                    RecentC2Retriever(
+                        c2_url,
+                        stream_id=stream_id,
+                        top_k=recent_top_k,
+                        timeout_s=c2_budget_s,
+                        exclude_event_ids=exclude_event_ids,
+                    )
+                )
+                recent_marker = "+Recent(session)"
+            else:
+                recent_marker = ""
+        else:
+            # global: stream_id を渡さず全ストリーム横断
+            retrievers.append(
+                RecentC2Retriever(
+                    c2_url,
+                    stream_id=None,
+                    top_k=recent_top_k,
+                    timeout_s=c2_budget_s,
+                    exclude_event_ids=exclude_event_ids,
+                )
+            )
+            recent_marker = "+Recent(global)"
+    else:
+        recent_marker = ""
+
+    if c2_url_readonly:
+        retrievers.append(
+            C2Retriever(
+                c2_url_readonly,
+                top_k=c2_top_k,
+                timeout_s=c2_budget_s,
+                exclude_event_ids=exclude_event_ids,
+            )
+        )
+        # readonly に対する Recent は呼ばない (別 C2 インスタンスのスコープのため)
+
+    readonly_marker = f" + C2(readonly={c2_url_readonly})" if c2_url_readonly else ""
+    logger.info(
+        "CompositeRetriever 構築: Local + C2(primary=%s%s)%s (top_k=%d/recent=%d budget_s=%.3f)",
+        c2_url, recent_marker, readonly_marker, c2_top_k, recent_top_k, c2_budget_s,
+    )
+
+    return CompositeRetriever(retrievers)
+
+
 def _retrieval_node(state: PipelineGraphState) -> dict:
     """検索ノード: RAG 検索 (無効時はスキップ)。"""
     import time
@@ -406,9 +555,13 @@ def _retrieval_node(state: PipelineGraphState) -> dict:
     answer_mode = "fallback"
 
     try:
-        from .retriever import LocalRetriever
+        # 現ターンの utterance.final.event_id を exclude に渡してナルシシスティック RAG を防ぐ
+        retriever = _build_retriever_from_env(
+            state["kb_path"],
+            stream_id=common.get("stream_id"),
+            exclude_event_ids=[utt_event_id] if utt_event_id else None,
+        )
         t0 = time.monotonic()
-        retriever = LocalRetriever(state["kb_path"])
         docs = retriever.retrieve(state["text"], top_k=state["rag_top_k"])
         retrieval_latency_ms = int((time.monotonic() - t0) * 1000)
         if docs:

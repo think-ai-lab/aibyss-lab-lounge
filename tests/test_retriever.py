@@ -212,3 +212,547 @@ class TestLocalRetrieverRetrieve:
         with self._mock_embed([1.0, 0.0, 0.0]):
             results = retriever.retrieve("テスト", top_k=1)
         assert abs(results[0].score - 1.0) < 1e-5
+
+
+# ═══════════════════════════════════════════════════════════════════
+# C2Retriever tests (Sprint Axis B Block 4 / CR-D)
+# ═══════════════════════════════════════════════════════════════════
+
+import logging  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+from lab_lounge.retriever import (  # noqa: E402
+    C2Retriever,
+    CompositeRetriever,
+    _rrf_merge,
+)
+
+
+def _mock_c2_response(results: list[dict], timed_out: bool = False, elapsed_ms: int = 10) -> MagicMock:
+    """httpx.Client.get の戻り値モック。"""
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock(return_value=None)
+    mock_resp.json = MagicMock(return_value={
+        "results": results,
+        "timed_out": timed_out,
+        "elapsed_ms": elapsed_ms,
+    })
+    return mock_resp
+
+
+class TestC2Retriever:
+    """C2Retriever の HTTP クライアント動作を httpx モックで検証する。"""
+
+    def test_returns_empty_on_connection_error(self, caplog):
+        """httpx.ConnectError → 空リスト + warning ログ (fail-open)。"""
+        import httpx
+
+        retriever = C2Retriever("http://localhost:8100")
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(side_effect=httpx.ConnectError("connection refused"))
+
+        with patch("httpx.Client", return_value=mock_client):
+            with caplog.at_level(logging.WARNING, logger="lab_lounge.retriever"):
+                result = retriever.retrieve("テスト", top_k=3)
+
+        assert result == []
+        assert any("C2Retriever" in r.getMessage() for r in caplog.records)
+
+    def test_returns_empty_on_timeout(self, caplog):
+        """httpx.TimeoutException → 空リスト + warning ログ。"""
+        import httpx
+
+        retriever = C2Retriever("http://localhost:8100", timeout_s=0.1)
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(side_effect=httpx.TimeoutException("timed out"))
+
+        with patch("httpx.Client", return_value=mock_client):
+            with caplog.at_level(logging.WARNING, logger="lab_lounge.retriever"):
+                result = retriever.retrieve("テスト", top_k=3)
+
+        assert result == []
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("タイムアウト" in m for m in warning_msgs)
+
+    def test_parses_c2_response(self):
+        """モックレスポンスを正しく RetrievedDoc にマッピングする。"""
+        retriever = C2Retriever("http://localhost:8100")
+        mock_resp = _mock_c2_response([
+            {
+                "event_id": "uuid-1",
+                "type": "utterance.final",
+                "ts": "2026-04-11T01:00:00Z",
+                "stream_id": "s-1",
+                "score": 1.0,
+                "excerpt": "ミミ様、今日の天気は?",
+            },
+            {
+                "event_id": "uuid-2",
+                "type": "llm.final",
+                "ts": "2026-04-11T01:00:02Z",
+                "stream_id": "s-1",
+                "score": 1.0,
+                "excerpt": "晴れですわ",
+            },
+        ])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            docs = retriever.retrieve("天気", top_k=3)
+
+        assert len(docs) == 2
+        assert docs[0].doc_id == "uuid-1"
+        assert docs[0].text == "ミミ様、今日の天気は?"
+        assert docs[0].score == 1.0
+        assert docs[0].source == "c2:utterance.final"
+        assert docs[1].doc_id == "uuid-2"
+        assert docs[1].source == "c2:llm.final"
+
+    def test_passes_top_k_param(self):
+        """top_k が HTTP query の k パラメータに渡される。"""
+        retriever = C2Retriever("http://localhost:8100")
+        mock_resp = _mock_c2_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("テスト", top_k=7)
+
+        # call_args をチェック
+        call_kwargs = mock_client.get.call_args.kwargs
+        assert call_kwargs.get("params", {}).get("k") == 7
+        assert call_kwargs.get("params", {}).get("q") == "テスト"
+
+    def test_source_prefix_c2_utterance(self):
+        """source が 'c2:utterance.final' 形式になる。"""
+        retriever = C2Retriever("http://localhost:8100")
+        mock_resp = _mock_c2_response([
+            {
+                "event_id": "uuid-1",
+                "type": "utterance.final",
+                "ts": "2026-04-11T01:00:00Z",
+                "stream_id": "s-1",
+                "score": 1.0,
+                "excerpt": "hello",
+            },
+        ])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            docs = retriever.retrieve("x")
+
+        assert docs[0].source == "c2:utterance.final"
+
+    def test_base_url_trailing_slash_stripped(self):
+        """base_url の末尾 / は取り除かれる。"""
+        retriever = C2Retriever("http://localhost:8100/")
+        assert retriever._base_url == "http://localhost:8100"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CompositeRetriever tests (Sprint Axis B Block 4 / CR-D)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class _StubRetriever:
+    """CompositeRetriever テスト用のスタブ。"""
+    def __init__(self, docs: list[RetrievedDoc] | Exception):
+        self._docs_or_exc = docs
+
+    def retrieve(self, query: str, top_k: int = 3) -> list[RetrievedDoc]:
+        if isinstance(self._docs_or_exc, Exception):
+            raise self._docs_or_exc
+        return self._docs_or_exc[:top_k]
+
+
+class TestCompositeRetriever:
+    """CompositeRetriever の RRF マージ動作を検証する (TD-6 で min-max → RRF)。"""
+
+    def test_requires_at_least_one_retriever(self):
+        with pytest.raises(ValueError, match="最低 1 つ"):
+            CompositeRetriever([])
+
+    def test_merges_results_from_multiple_retrievers(self):
+        """2 retriever の結果が結合される。"""
+        local = _StubRetriever([
+            RetrievedDoc(doc_id="l1", text="ローカル 1", score=0.9, source="kb:a.md"),
+            RetrievedDoc(doc_id="l2", text="ローカル 2", score=0.7, source="kb:a.md"),
+        ])
+        c2 = _StubRetriever([
+            RetrievedDoc(doc_id="c1", text="C2 1", score=0.8, source="c2:utterance.final"),
+            RetrievedDoc(doc_id="c2", text="C2 2", score=0.6, source="c2:llm.final"),
+        ])
+        composite = CompositeRetriever([local, c2])
+
+        docs = composite.retrieve("テスト", top_k=10)
+
+        ids = {d.doc_id for d in docs}
+        assert ids == {"l1", "l2", "c1", "c2"}
+
+    def test_sorts_by_rrf_score_descending(self):
+        """RRF マージ後にスコア降順でソートされる。"""
+        local = _StubRetriever([
+            RetrievedDoc(doc_id="l1", text="l1", score=0.9, source="kb"),
+            RetrievedDoc(doc_id="l2", text="l2", score=0.7, source="kb"),
+        ])
+        c2 = _StubRetriever([
+            RetrievedDoc(doc_id="c1", text="c1", score=0.8, source="c2"),
+            RetrievedDoc(doc_id="c2", text="c2", score=0.6, source="c2"),
+        ])
+        composite = CompositeRetriever([local, c2])
+
+        docs = composite.retrieve("テスト", top_k=10)
+
+        # スコア降順に並ぶ
+        scores = [d.score for d in docs]
+        assert scores == sorted(scores, reverse=True)
+        # top 2 は l1 と c1 (各 Retriever の rank 1 同士)
+        top_ids = {docs[0].doc_id, docs[1].doc_id}
+        assert top_ids == {"l1", "c1"}
+
+    def test_caps_at_top_k(self):
+        """結果が top_k 件を超えない。"""
+        local = _StubRetriever([
+            RetrievedDoc(doc_id=f"l{i}", text=f"l{i}", score=1.0 - i * 0.1, source="kb")
+            for i in range(5)
+        ])
+        c2 = _StubRetriever([
+            RetrievedDoc(doc_id=f"c{i}", text=f"c{i}", score=0.9 - i * 0.1, source="c2")
+            for i in range(5)
+        ])
+        composite = CompositeRetriever([local, c2])
+
+        docs = composite.retrieve("テスト", top_k=3)
+
+        assert len(docs) == 3
+
+    def test_one_retriever_failing_does_not_break_all(self, caplog):
+        """1 つの retriever が例外を投げても他方の結果は返る。"""
+        failing = _StubRetriever(RuntimeError("intentional failure"))
+        working = _StubRetriever([
+            RetrievedDoc(doc_id="w1", text="working", score=0.8, source="kb"),
+        ])
+        composite = CompositeRetriever([failing, working])
+
+        with caplog.at_level(logging.WARNING, logger="lab_lounge.retriever"):
+            docs = composite.retrieve("テスト", top_k=10)
+
+        assert len(docs) == 1
+        assert docs[0].doc_id == "w1"
+        # warning ログに例外が記録される
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("_StubRetriever" in m or "intentional" in m for m in warning_msgs)
+
+
+class TestRRFMerge:
+    """_rrf_merge (Reciprocal Rank Fusion) の動作を直接検証。TD-6 で min-max から切替。"""
+
+    def test_empty_input(self):
+        """入力なしは空リスト。"""
+        assert _rrf_merge([], top_k=3) == []
+
+    def test_single_retriever_ranks(self):
+        """1 Retriever × 3 docs: RRF スコアが rank 順に降順。"""
+        docs = [
+            RetrievedDoc("a", "a", 0.9, "s"),
+            RetrievedDoc("b", "b", 0.5, "s"),
+            RetrievedDoc("c", "c", 0.1, "s"),
+        ]
+        merged = _rrf_merge([docs], top_k=3)
+        assert len(merged) == 3
+        assert merged[0].doc_id == "a"
+        assert merged[1].doc_id == "b"
+        assert merged[2].doc_id == "c"
+        # RRF スコアが降順
+        assert merged[0].score > merged[1].score > merged[2].score
+        # 具体値: 1/(60+1) ≈ 0.01639
+        assert abs(merged[0].score - 1.0 / 61) < 1e-6
+
+    def test_two_retrievers_no_overlap(self):
+        """2 Retriever が全く異なる doc を返す: 各 Retriever の rank 1 が上位に。"""
+        r1 = [RetrievedDoc("a", "a", 0.9, "s1"), RetrievedDoc("b", "b", 0.5, "s1")]
+        r2 = [RetrievedDoc("c", "c", 0.8, "s2"), RetrievedDoc("d", "d", 0.4, "s2")]
+        merged = _rrf_merge([r1, r2], top_k=4)
+        # a と c はどちらも rank 1 (同じ RRF score) → 安定ソートで出現順
+        assert merged[0].doc_id in ("a", "c")
+        assert merged[1].doc_id in ("a", "c")
+        assert {merged[0].doc_id, merged[1].doc_id} == {"a", "c"}
+
+    def test_dedup_boosts_shared_doc(self):
+        """同一 doc_id が 2 Retriever から返された場合: RRF スコアが合算される。"""
+        # Retriever 1: shared at rank 1, unique_a at rank 2
+        # Retriever 2: unique_b at rank 1, shared at rank 2
+        r1 = [RetrievedDoc("shared", "shared", 0.9, "s1"), RetrievedDoc("a", "a", 0.5, "s1")]
+        r2 = [RetrievedDoc("b", "b", 0.8, "s2"), RetrievedDoc("shared", "shared", 0.4, "s2")]
+        merged = _rrf_merge([r1, r2], top_k=3)
+        # shared: 1/(60+1) + 1/(60+2) = 0.01639 + 0.01613 = 0.03252
+        # a: 1/(60+2) = 0.01613
+        # b: 1/(60+1) = 0.01639
+        # → shared > b > a
+        assert merged[0].doc_id == "shared"
+        assert merged[0].score > merged[1].score
+
+    def test_top_k_caps_output(self):
+        """結果件数は top_k で制限される。"""
+        r1 = [RetrievedDoc(f"d{i}", f"d{i}", 0.9 - i * 0.1, "s") for i in range(5)]
+        merged = _rrf_merge([r1], top_k=2)
+        assert len(merged) == 2
+
+    def test_insertion_order_does_not_dominate(self):
+        """
+        min-max 時代の回帰テスト: Local が先に来ても、
+        複数 Retriever が合意した doc は Local の top よりも上位に来る。
+        """
+        local = [RetrievedDoc("local_top", "local", 0.95, "kb")]
+        semantic = [RetrievedDoc("c2_top", "c2", 0.12, "c2")]
+        recent = [RetrievedDoc("c2_top", "c2", 1.0, "c2:recent")]
+        # c2_top は semantic + recent の 2 Retriever から rank 1 で返される
+        # → 合算スコア 2/(60+1) ≈ 0.0328 > local_top の 1/(60+1) ≈ 0.0164
+        merged = _rrf_merge([local, semantic, recent], top_k=2)
+        assert merged[0].doc_id == "c2_top"
+        assert merged[1].doc_id == "local_top"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# C2Retriever exclude_event_ids (Block 5 / TD-1)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestC2RetrieverExcludeEventIds:
+    """C2Retriever の exclude_event_ids パラメータが HTTP query に渡ることを検証。"""
+
+    def test_passes_exclude_event_ids_to_http_params(self):
+        """コンストラクタの exclude_event_ids が HTTP query に反映される。"""
+        retriever = C2Retriever(
+            "http://localhost:8100",
+            exclude_event_ids=["uuid-aaa", "uuid-bbb"],
+        )
+        mock_resp = _mock_c2_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("テスト", top_k=3)
+
+        call_kwargs = mock_client.get.call_args.kwargs
+        assert call_kwargs["params"]["exclude_event_ids"] == "uuid-aaa,uuid-bbb"
+
+    def test_empty_exclude_list_not_sent(self):
+        """exclude_event_ids が None または [] のときはパラメータが付かない。"""
+        retriever = C2Retriever("http://localhost:8100")
+        mock_resp = _mock_c2_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("テスト")
+
+        call_kwargs = mock_client.get.call_args.kwargs
+        assert "exclude_event_ids" not in call_kwargs.get("params", {})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RecentC2Retriever (Block 5 / TD-1)
+# ═══════════════════════════════════════════════════════════════════
+
+
+from lab_lounge.retriever import RecentC2Retriever  # noqa: E402
+
+
+def _mock_recent_response(results: list[dict]) -> MagicMock:
+    """httpx.Client.get の戻り値モック (recent 形式)。"""
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock(return_value=None)
+    mock_resp.json = MagicMock(return_value={
+        "results": results,
+        "timed_out": False,
+        "elapsed_ms": 8,
+    })
+    return mock_resp
+
+
+class TestRecentC2Retriever:
+    """RecentC2Retriever の HTTP クライアント動作を httpx モックで検証する。"""
+
+    def test_accepts_none_stream_id_for_global_scope(self):
+        """stream_id=None は許容される (global scope、セッションまたぎメモリ)。"""
+        retriever = RecentC2Retriever("http://localhost:8100")
+        assert retriever._stream_id is None
+
+    def test_empty_stream_id_treated_as_none(self):
+        """空文字列の stream_id も None 扱い (env から空文字が渡る可能性への防御)。"""
+        retriever = RecentC2Retriever("http://localhost:8100", stream_id="")
+        assert retriever._stream_id is None
+
+    def test_explicit_stream_id_stored(self):
+        """stream_id 明示指定は保持される (session scope)。"""
+        retriever = RecentC2Retriever("http://localhost:8100", stream_id="sess-1")
+        assert retriever._stream_id == "sess-1"
+
+    def test_global_scope_omits_stream_id_param(self):
+        """stream_id=None のとき HTTP query に stream_id パラメータが付かない。"""
+        retriever = RecentC2Retriever("http://localhost:8100")
+        mock_resp = _mock_recent_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("ignored")
+
+        call_kwargs = mock_client.get.call_args.kwargs
+        params = call_kwargs.get("params", {})
+        assert "stream_id" not in params
+        assert "k" in params  # k は常に送られる
+
+    def test_returns_empty_on_connection_error(self, caplog):
+        """httpx.ConnectError → 空リスト + warning (fail-open)。"""
+        import httpx
+
+        retriever = RecentC2Retriever("http://localhost:8100", stream_id="stream-1")
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(side_effect=httpx.ConnectError("refused"))
+
+        with patch("httpx.Client", return_value=mock_client):
+            with caplog.at_level(logging.WARNING, logger="lab_lounge.retriever"):
+                result = retriever.retrieve("query ignored", top_k=3)
+
+        assert result == []
+        assert any("RecentC2Retriever" in r.getMessage() for r in caplog.records)
+
+    def test_returns_empty_on_timeout(self, caplog):
+        """タイムアウト → 空リスト + warning。"""
+        import httpx
+
+        retriever = RecentC2Retriever(
+            "http://localhost:8100", stream_id="stream-1", timeout_s=0.1
+        )
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(side_effect=httpx.TimeoutException("timed out"))
+
+        with patch("httpx.Client", return_value=mock_client):
+            with caplog.at_level(logging.WARNING, logger="lab_lounge.retriever"):
+                result = retriever.retrieve("q")
+
+        assert result == []
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("タイムアウト" in m for m in warning_msgs)
+
+    def test_parses_recent_response(self):
+        """モックレスポンスを正しく RetrievedDoc にマッピングする。"""
+        retriever = RecentC2Retriever("http://localhost:8100", stream_id="stream-1")
+        mock_resp = _mock_recent_response([
+            {
+                "event_id": "uuid-1",
+                "type": "utterance.final",
+                "ts": "2026-04-11T14:50:00Z",
+                "stream_id": "stream-1",
+                "stream_idx": 5,
+                "score": 1.0,
+                "excerpt": "ミミ様、今日の天気は?",
+            },
+            {
+                "event_id": "uuid-2",
+                "type": "llm.final",
+                "ts": "2026-04-11T14:50:02Z",
+                "stream_id": "stream-1",
+                "stream_idx": 4,
+                "score": 1.0,
+                "excerpt": "晴れですわ",
+            },
+        ])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            docs = retriever.retrieve("query ignored")
+
+        assert len(docs) == 2
+        assert docs[0].doc_id == "uuid-1"
+        assert docs[0].source == "c2-recent:utterance.final"
+        assert docs[1].source == "c2-recent:llm.final"
+
+    def test_passes_stream_id_param(self):
+        """stream_id が HTTP query に渡される。"""
+        retriever = RecentC2Retriever(
+            "http://localhost:8100", stream_id="my-stream-xyz", top_k=7
+        )
+        mock_resp = _mock_recent_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("ignored", top_k=3)
+
+        call_kwargs = mock_client.get.call_args.kwargs
+        assert call_kwargs["params"]["stream_id"] == "my-stream-xyz"
+        # top_k と default_top_k の大きい方 = 7
+        assert call_kwargs["params"]["k"] == 7
+
+    def test_passes_exclude_event_ids_param(self):
+        """exclude_event_ids が HTTP query にカンマ区切りで渡される。"""
+        retriever = RecentC2Retriever(
+            "http://localhost:8100",
+            stream_id="stream-1",
+            exclude_event_ids=["uuid-current"],
+        )
+        mock_resp = _mock_recent_response([])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            retriever.retrieve("ignored")
+
+        call_kwargs = mock_client.get.call_args.kwargs
+        assert call_kwargs["params"]["exclude_event_ids"] == "uuid-current"
+
+    def test_source_prefix_c2_recent(self):
+        """source が 'c2-recent:<type>' 形式になる。"""
+        retriever = RecentC2Retriever("http://localhost:8100", stream_id="stream-1")
+        mock_resp = _mock_recent_response([
+            {
+                "event_id": "uuid-1",
+                "type": "utterance.final",
+                "ts": "2026-04-11T00:00:00Z",
+                "stream_id": "stream-1",
+                "stream_idx": 0,
+                "score": 1.0,
+                "excerpt": "hello",
+            },
+        ])
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get = MagicMock(return_value=mock_resp)
+
+        with patch("httpx.Client", return_value=mock_client):
+            docs = retriever.retrieve("q")
+
+        assert docs[0].source == "c2-recent:utterance.final"
