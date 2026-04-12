@@ -385,8 +385,9 @@ def _build_filler_prompt(slug: str) -> str:
     return (
         base + "\n"
         f'出力は以下の JSON で返してください:\n'
-        f'{{"response": "独り言テキスト(30文字以内)", "emotion": {{{emotion_template}}}}}\n'
+        f'{{"response": "独り言テキスト(30文字以内)", "emotion": {{{emotion_template}}}, "pose": "neutral"}}\n'
         f"emotion の各値は 0〜100。キャラクターの性格と発話内容に合った値を設定してください。\n"
+        f"pose は neutral / happy / angry / sad / fun のいずれか。\n"
         f"JSON のみ出力。"
     )
 
@@ -535,12 +536,17 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
     # LLM+TTS を並行準備するスレッド
     filler_ready = threading.Event()
     filler_audio = [None]  # [0] = audio_path or None
+    filler_pose = [None]   # [0] = pose value (LLM JSON から抽出)
 
     def _prepare_filler():
         char = get_character(slug)
         filler_text = _generate_filler_text(slug, user_text=user_text)
 
         if filler_text and char:
+            # LLM JSON から pose を抽出 (emotion 対応と同様に tts の parser を再利用)
+            from .tts import _parse_voicepeak_json
+            _, _, _, _pose = _parse_voicepeak_json(filler_text)
+            filler_pose[0] = _pose
             logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)
             try:
                 out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
@@ -594,8 +600,11 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
         logger.debug("フィラー終了（bridge 後）: %s", slug)
         return
 
-    # Phase 3: LLM 生成フィラーを再生
+    # Phase 3: LLM 生成フィラーを再生 (pose があれば立ち絵も切替)
     if filler_audio[0]:
+        if filler_pose[0]:
+            from .obs import set_pose
+            set_pose(slug, filler_pose[0])
         time.sleep(0.3)
         play_audio_file(filler_audio[0])
 
