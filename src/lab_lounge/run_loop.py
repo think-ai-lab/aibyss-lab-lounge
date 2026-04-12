@@ -315,6 +315,15 @@ def run_loop(
                     )
                     _filler_thread.start()
 
+            # OBS 立ち絵を本命応答の再生開始タイミングに同期させるための
+            # 遅延 pose 適用。パイプラインが on_pose_ready で pose を予約し、
+            # 最初のチャンク投入時に _on_tts_chunk 内で set_pose を実行する。
+            _pending_pose: list[str | None] = [None, None]  # [character_slug, pose_value]
+
+            def _on_pose_ready(slug: str, pose: str) -> None:
+                """パイプラインから呼ばれる。pose を予約して実際の切替を遅延させる。"""
+                _pending_pose[:] = [slug, pose]
+
             def _on_tts_chunk(url: str) -> None:
                 # フィラーを停止してから本編を再生
                 # フレーズ完了まで待ち、間を持たせてから本編を開始
@@ -324,6 +333,11 @@ def run_loop(
                     # フィラーと本編の間に少し間を持たせる
                     import time
                     time.sleep(0.5)
+                # 最初のチャンクで OBS 立ち絵を切り替え (本命応答の再生開始と同期)
+                if _pending_pose[0] is not None:
+                    from .obs import set_pose
+                    set_pose(_pending_pose[0], _pending_pose[1] or "neutral")
+                    _pending_pose[0] = None
                 _chunk_count[0] += 1
                 _audio_name = url.rsplit("/", 1)[-1] if "/" in url else url
                 logger.info("TTS チャンク再生キュー投入: %s (chunk %d)", _audio_name, _chunk_count[0])
@@ -342,6 +356,7 @@ def run_loop(
                     utterance_meta=utterance_meta,
                     speaker_hint=speaker_hint,
                     on_tts_chunk_ready=_on_tts_chunk if not skip_playback else None,
+                    on_pose_ready=_on_pose_ready if not skip_playback else None,
                 )
             except Exception as exc:
                 logger.error("Pipeline 失敗: %s", exc)

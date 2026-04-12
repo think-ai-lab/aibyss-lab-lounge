@@ -327,6 +327,7 @@ class PipelineGraphState(TypedDict):
     tts_output_dir: str
     system_prompt: str | None
     on_tts_chunk_ready: Any
+    on_pose_ready: Any
 
     # ノード出力
     character_slug: str
@@ -666,9 +667,13 @@ def _tts_node(state: PipelineGraphState) -> dict:
     character_slug = state["character_slug"]
 
     # LLM JSON 応答から pose を抽出して OBS 立ち絵を切り替え
-    # (tts.done の直前に実行。未設定 or 不明値は set_pose 内で "neutral" にフォールバック)
+    # on_pose_ready コールバックがあれば遅延適用 (本命応答の再生開始タイミングで切替)
+    # なければ従来通り即時切替 (run_once.py 等の互換性)
     _, _, _, pose_value = _parse_voicepeak_json(llm_text)
-    set_pose(character_slug, pose_value or "neutral")
+    if state.get("on_pose_ready"):
+        state["on_pose_ready"](character_slug, pose_value or "neutral")
+    else:
+        set_pose(character_slug, pose_value or "neutral")
 
     if state["use_real_tts"]:
         from .tts import synthesize as _synthesize

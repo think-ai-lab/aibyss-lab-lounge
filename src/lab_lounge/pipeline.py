@@ -170,6 +170,7 @@ def run_pipeline(
     utterance_meta: dict[str, Any] | None = None,
     speaker_hint: str | None = None,
     on_tts_chunk_ready=None,
+    on_pose_ready=None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -200,6 +201,7 @@ def run_pipeline(
             utterance_meta=utterance_meta,
             speaker_hint=speaker_hint,
             on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
         )
     except ImportError:
         logger.info("langgraph 未インストール。レガシーパイプラインにフォールバック。")
@@ -211,6 +213,7 @@ def run_pipeline(
             utterance_meta=utterance_meta,
             speaker_hint=speaker_hint,
             on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
         )
 
 
@@ -223,6 +226,7 @@ def _run_pipeline_graph(
     utterance_meta: dict[str, Any] | None = None,
     speaker_hint: str | None = None,
     on_tts_chunk_ready=None,
+    on_pose_ready=None,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -252,6 +256,7 @@ def _run_pipeline_graph(
         "tts_output_dir": tts_output_dir,
         "system_prompt": None,
         "on_tts_chunk_ready": on_tts_chunk_ready,
+        "on_pose_ready": on_pose_ready,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -284,6 +289,7 @@ def _run_pipeline_legacy(
     utterance_meta: dict[str, Any] | None = None,
     speaker_hint: str | None = None,
     on_tts_chunk_ready=None,
+    on_pose_ready=None,
 ) -> PipelineResult:
     """
     レガシーパイプライン（モノリシック）。langgraph 未インストール時のフォールバック。
@@ -404,11 +410,16 @@ def _run_pipeline_legacy(
     # ─── bubble: answering ───
     _publish_bubble("answering", character.slug, common, links=[llm["event_id"]])
 
-    # ─── OBS 立ち絵切り替え（直接制御、tts.done の直前に実行）───
+    # ─── OBS 立ち絵切り替え ───
+    # on_pose_ready コールバックがあれば遅延適用 (本命応答の再生開始タイミングで切替)
+    # なければ従来通り即時切替 (run_once.py 等の互換性)
     from .tts import _parse_voicepeak_json as _parse_llm_json
-    from .obs import set_pose as _set_pose
     _, _, _, _pose_value = _parse_llm_json(llm_text)
-    _set_pose(character.slug, _pose_value or "neutral")
+    if on_pose_ready:
+        on_pose_ready(character.slug, _pose_value or "neutral")
+    else:
+        from .obs import set_pose as _set_pose
+        _set_pose(character.slug, _pose_value or "neutral")
 
     # 4. tts.done — llm.final を links で参照
     use_real_tts, _env_tts_provider, _env_tts_voice, _env_tts_speaker, tts_output_dir = _get_tts_mode()
