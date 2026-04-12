@@ -676,14 +676,10 @@ def _call_voicepeak(
         if on_chunk_ready:
             on_chunk_ready(filepath.as_uri())
 
-    # 複数チャンクの場合は結合 WAV を作る（イベントの audio_url 用）
-    if len(chunk_paths) > 1:
-        combined_path = out_dir / f"{uuid.uuid4()}.wav"
-        _concatenate_wavs(chunk_paths, combined_path)
-        logger.info("WAV 結合完了: %s (%d chunks)", combined_path.name, len(chunk_paths))
-        audio_url = combined_path.as_uri()
-    else:
-        audio_url = chunk_paths[0].as_uri() if chunk_paths else ""
+    # audio_url は最初のチャンクを代表値とする。
+    # 結合 WAV は生成しない (ストリーミング再生では個別チャンクが使われるため)。
+    # 全チャンクは chunk_audio_urls で参照する。
+    audio_url = chunk_paths[0].as_uri() if chunk_paths else ""
 
     total_duration = sum(chunk_durations)
 

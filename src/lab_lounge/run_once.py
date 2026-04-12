@@ -155,21 +155,38 @@ def run_once(
 
     # ─── 4. TTS 再生 ─────────────────────────────────────────────
     if not skip_playback and tts_ev:
-        audio_url = tts_ev["payload"].get("audio_url", "")
-        if audio_url:
+        chunk_urls = tts_ev["payload"].get("chunk_audio_urls", [])
+        if chunk_urls:
+            # ストリーミング対応: チャンクを順次再生 + 再生後に削除
             t0_play = time.monotonic()
-            success = play_audio_file(audio_url)
+            for url in chunk_urls:
+                play_audio_file(url)
+                try:
+                    from .audio_io import _uri_to_path as _u2p
+                    from pathlib import Path as _Path
+                    p = _Path(_u2p(url))
+                    if p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
             play_ms = int((time.monotonic() - t0_play) * 1000)
-            if success:
-                logger.info("timing: play=%d ms", play_ms)
-            else:
-                # ファイルが存在しない場合 (ダミー TTS) は DEBUG で済む
-                from pathlib import Path as _Path
-                from .audio_io import _uri_to_path as _u2p
-                if _Path(_u2p(audio_url)).exists():
-                    logger.warning("再生できませんでした。TTS ファイル: %s", audio_url)
+            logger.info("timing: play=%d ms (%d chunks)", play_ms, len(chunk_urls))
+        else:
+            # 単一ファイル (voicevox / edge_tts / ダミー)
+            audio_url = tts_ev["payload"].get("audio_url", "")
+            if audio_url:
+                t0_play = time.monotonic()
+                success = play_audio_file(audio_url)
+                play_ms = int((time.monotonic() - t0_play) * 1000)
+                if success:
+                    logger.info("timing: play=%d ms", play_ms)
                 else:
-                    logger.debug("再生スキップ (ダミー TTS): %s", audio_url)
+                    from pathlib import Path as _Path
+                    from .audio_io import _uri_to_path as _u2p
+                    if _Path(_u2p(audio_url)).exists():
+                        logger.warning("再生できませんでした。TTS ファイル: %s", audio_url)
+                    else:
+                        logger.debug("再生スキップ (ダミー TTS): %s", audio_url)
 
     total_ms = int((time.monotonic() - t0_total) * 1000)
     logger.info("timing: total=%d ms", total_ms)

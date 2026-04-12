@@ -196,6 +196,7 @@ def build_tts_done(
     links: list[str],
     seq: int = 2,
     audio_url: str = "file://dummy/audio.opus",
+    chunk_audio_urls: list[str] | None = None,
     duration_ms: int = 3000,
     voice: str = "dummy-voice",
     format: str = "opus",
@@ -203,6 +204,17 @@ def build_tts_done(
     speaker: str = "dummy",
 ) -> dict[str, Any]:
     """tts.done イベントを組み立てて検証する。"""
+    payload: dict[str, Any] = {
+        "text": text,
+        "audio_url": audio_url,
+        "duration_ms": duration_ms,
+        "voice": voice,
+        "format": format,
+        "sample_rate": sample_rate,
+        "speaker": speaker,
+    }
+    if chunk_audio_urls:
+        payload["chunk_audio_urls"] = chunk_audio_urls
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -214,15 +226,7 @@ def build_tts_done(
         "source": "lab-lounge",
         "seq": seq,
         "links": links,
-        "payload": {
-            "text": text,
-            "audio_url": audio_url,
-            "duration_ms": duration_ms,
-            "voice": voice,
-            "format": format,
-            "sample_rate": sample_rate,
-            "speaker": speaker,
-        },
+        "payload": payload,
     }
     validate_event(event)
     return event

@@ -429,6 +429,7 @@ def _run_pipeline_legacy(
         )
         tts_meta: dict[str, Any] = dict(
             audio_url=_tts_result.audio_url,
+            chunk_audio_urls=_tts_result.chunk_audio_urls or None,
             duration_ms=_tts_result.duration_ms,
             voice=_tts_result.voice,
             format=_tts_result.format,
