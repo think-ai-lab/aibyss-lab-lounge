@@ -283,12 +283,23 @@ def run_loop(
             if not skip_playback:
                 _playback_queue = queue.Queue()
 
+                def _cleanup_audio(url: str) -> None:
+                    """再生済み WAV をディスクから削除する (ディスク節約)。"""
+                    try:
+                        from .audio_io import _uri_to_path
+                        p = Path(_uri_to_path(url))
+                        if p.is_file():
+                            p.unlink()
+                    except Exception:
+                        pass  # 削除失敗は無視 (配信中断を防ぐ)
+
                 def _playback_worker(q: queue.Queue) -> None:
                     while True:
                         url = q.get()
                         if url is None:
                             break
                         play_audio_file(url)
+                        _cleanup_audio(url)
 
                 _playback_thread = threading.Thread(
                     target=_playback_worker, args=(_playback_queue,), daemon=True,
@@ -314,6 +325,8 @@ def run_loop(
                     import time
                     time.sleep(0.5)
                 _chunk_count[0] += 1
+                _audio_name = url.rsplit("/", 1)[-1] if "/" in url else url
+                logger.info("TTS チャンク再生キュー投入: %s (chunk %d)", _audio_name, _chunk_count[0])
                 if _playback_queue is not None:
                     _playback_queue.put(url)
 

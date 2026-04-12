@@ -314,7 +314,8 @@ class TestVoicepeakChunking:
         assert call_count[0] > 1
         assert len(result.chunk_audio_urls) == call_count[0]
         assert result.duration_ms > 0
-        assert result.audio_url.startswith("file:///")
+        # audio_url は最初のチャンクを代表値とする (結合 WAV は作らない)
+        assert result.audio_url == result.chunk_audio_urls[0]
 
     def test_single_chunk_no_concatenation(self, tmp_path):
         """短いテキストは 1 チャンクで結合なし。"""
