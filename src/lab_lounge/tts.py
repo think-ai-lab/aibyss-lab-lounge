@@ -470,14 +470,16 @@ def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
                 stdout_text or "(empty)",
             )
 
-            if is_busy and attempt < max_retries:
+            if attempt < max_retries:
+                wait = retry_wait if is_busy else retry_wait * 2
+                reason = "並列実行エラー" if is_busy else f"クラッシュ (returncode={result.returncode})"
                 logger.info(
-                    "VOICEPEAK 並列実行エラー検出 → %.1f 秒待機してリトライ",
-                    retry_wait,
+                    "VOICEPEAK %s検出 → %.1f 秒待機してリトライ",
+                    reason, wait,
                 )
-                time.sleep(retry_wait)
+                time.sleep(wait)
                 continue
-            break  # それ以外のエラー or リトライ上限到達
+            break  # リトライ上限到達
 
         if last_exc is not None:
             future.set_exception(last_exc)
@@ -587,6 +589,23 @@ def _generate_voicepeak_single_file(
     logger.debug("VOICEPEAK コマンド (full): %s", cmd_str)
 
     _submit_voicepeak(cmd_str)
+
+    # VOICEPEAK が returncode=0 でも出力ファイルを生成しないケースがある。
+    # ファイルが存在しない場合は 1 回だけリトライする。
+    if not filepath.is_file():
+        retry_wait = float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "2"))
+        logger.warning(
+            "VOICEPEAK 出力ファイル未生成 (returncode=0): %s → %.1f 秒待機してリトライ",
+            filepath.name, retry_wait * 2,
+        )
+        import time
+        time.sleep(retry_wait * 2)
+        _submit_voicepeak(cmd_str)
+
+    if not filepath.is_file():
+        raise FileNotFoundError(
+            f"VOICEPEAK が出力ファイルを生成しませんでした: {filepath.name}"
+        )
 
     with wave.open(str(filepath)) as wf:
         duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)

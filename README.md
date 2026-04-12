@@ -3,17 +3,14 @@
 A.I.byss Suite の「会話ランタイム」。発話テキストを受け取り、Event Bus (Redis Streams) に
 `utterance.final` → `llm.final` → `tts.done` の 3 イベントを publish する。
 
-> **実装状況**:
-> Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ実装済み。
-> Phase 1 real LLM 対応済み (llm.py / graph.py)。
-> Phase 2 real TTS 対応済み (tts.py)。
-> Phase 3 real STT 対応済み (stt.py)。
-> Phase 4 マイク入力・スピーカー出力対応済み (audio_io.py / run_once.py)。
-> Phase 5 LangSmith 観測対応済み (observability.py)。
-> **Grounded E2E v1 RAG 統合済み** (kb_loader.py / retriever.py / pipeline.py)。
-> `L2_ENABLE_RAG=true` で seed corpus を参照した応答が返る。fallback 設計・debug artifacts・47 件のテストを含む。
-> **Axis A: マルチキャラクター対応済み** (characters.py / router.py / wake_word.py / run_loop.py / VOICEPEAK アダプタ)。
-> ウェイクワード検知 → キャラクター呼び分け → キャラクター別システムプロンプト・TTS ボイスで応答。245 件のテスト。
+> **実装状況** (2026-04-12):
+> - Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ
+> - Phase 1-5 完了 — real STT / LLM / TTS / マイク / LangSmith
+> - Grounded E2E v1 — RAG 統合 (seed corpus + C2Retriever + RecentC2Retriever + CompositeRetriever)
+> - **Axis A** — マルチキャラクター (mimi/chisame/sakura/octamaid/ruka)、Porcupine ウェイクワード、意図ゲート
+> - **Axis B** — 立ち絵切替 (OBS WebSocket)、呼び出しゲート Phase 2、VAD (WebRTC)、C2 RAG v0.1 スケルトン
+> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生、立ち絵タイミング同期
+> - テスト: **586 passed**
 
 ---
 
@@ -605,21 +602,32 @@ tts.done        ['<llm.final の event_id>']
 uv run pytest -v
 ```
 
+**586 passed** (2026-04-12 時点)
+
 テスト一覧:
 
 | ファイル | 内容 |
 |---------|------|
-| `tests/test_events.py` | スキーマ検証・ビルダー・それぞれの STT/LLM/TTS フィールド・ Guardrail G-1 確認 |
-| `tests/test_pipeline.py` | 3 イベント順序・links 因果関係・seq 連番・ utterance_meta パススルー |
+| `tests/test_events.py` | スキーマ検証・ビルダー・STT/LLM/TTS フィールド・Guardrail G-1 |
+| `tests/test_pipeline.py` | 3 イベント順序・links 因果関係・seq 連番・utterance_meta パススルー |
 | `tests/test_bus.py` | XADD フィールド名・JSON 値・クライアント close |
-| `tests/test_stt.py` | `transcribe_audio_file` ・ `_file_duration_ms` ・ ImportError 確認 |
-| `tests/test_tts.py` | `synthesize` ・ provider ディスパッチ・ ImportError 確認 |
-| `tests/test_llm.py` | `call_llm` ・ provider ディスパッチ・ LLMResult フィールド |
-| `tests/test_graph.py` | `run_graph` ・ LangGraph ノード・ ImportError 確認 |
-| `tests/test_observability.py` | `is_langsmith_enabled` ・ `build_run_metadata` ・ tracing on/off 分岐 |
-| `tests/test_run_once.py` | 録音成功フロー・無音・録音失敗・ STT 失敗・ skip_playback・URI 変換 |
-| `tests/test_retriever.py` | kb_loader / LocalRetriever ユニットテスト（22 件） |
-| `tests/test_rag_pipeline.py` | RAG on/off・fallback・debug artifacts 統合テスト（25 件） |
+| `tests/test_stt.py` | `transcribe_audio_file`・`_file_duration_ms`・ImportError |
+| `tests/test_tts.py` | `synthesize`・provider ディスパッチ・ImportError |
+| `tests/test_voicepeak_tts.py` | VOICEPEAK チャンク分割・emotion/speed・ストリーミング |
+| `tests/test_llm.py` | `call_llm`・provider ディスパッチ・LLMResult |
+| `tests/test_graph.py` | `run_graph`・LangGraph ノード・ReAct Agent・RAG context ラッパー |
+| `tests/test_observability.py` | LangSmith tracing on/off |
+| `tests/test_run_once.py` | 録音成功フロー・無音・録音失敗・STT 失敗・skip_playback |
+| `tests/test_retriever.py` | LocalRetriever + C2Retriever + RecentC2Retriever + RRF merge (51 件) |
+| `tests/test_rag_pipeline.py` | RAG on/off・fallback・debug artifacts・C2 profile 分離 |
+| `tests/test_router.py` | テキストマッチ・LLM ルーター・意図ゲート |
+| `tests/test_wake_word.py` | Porcupine・speech・continuous バックエンド |
+| `tests/test_obs.py` | OBS WebSocket pose 切替・init/disconnect |
+| `tests/test_filler.py` | フィラーフレーズ・LLM 生成・emotion/pose 対応 |
+| `tests/test_speech_activated.py` | VAD・silence 検知・WebRTC |
+| `tests/test_transcript_buffer.py` | 常時文字起こしバッファ |
+| `tests/test_web_search.py` | Web 検索ツール |
+| `tests/test_sherpa_streaming.py` | Sherpa ストリーミング STT |
 
 ---
 

@@ -499,24 +499,28 @@ class TestVoicepeakWorker:
         assert result.returncode == 0
         assert call_count[0] == 3  # 2 回リトライ + 1 回成功
 
-    def test_worker_no_retry_on_other_errors(self, monkeypatch):
-        """busy 以外のエラーはリトライしない。"""
+    def test_worker_retries_on_crash(self, monkeypatch):
+        """クラッシュ (非 busy の非ゼロ returncode) でもリトライする。"""
         monkeypatch.setenv("L2_VOICEPEAK_COOLDOWN_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
         monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "2")
 
         call_count = [0]
         def side_effect(*a, **k):
             call_count[0] += 1
-            return subprocess.CompletedProcess(
-                args=[], returncode=1,
-                stdout=b"",
-                stderr=b"invalid text encoding",
-            )
+            if call_count[0] <= 1:
+                # 1 回目はクラッシュ
+                return subprocess.CompletedProcess(
+                    args=[], returncode=3221225477,  # 0xC0000005
+                    stdout=b"", stderr=b"",
+                )
+            # 2 回目は成功
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
 
         future = self._run_worker_once(side_effect)
         result = future.result()
-        assert result.returncode == 1
-        assert call_count[0] == 1  # リトライなし
+        assert result.returncode == 0
+        assert call_count[0] == 2  # クラッシュ 1 回 + 成功 1 回
 
     def test_worker_stops_retry_at_max(self, monkeypatch):
         """リトライ回数が上限に達したら諦める。"""

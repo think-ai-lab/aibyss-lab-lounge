@@ -448,3 +448,12 @@ class TestBuildFillerPrompt:
         prompt = _build_filler_prompt("octamaid")
         assert '"emotion"' not in prompt  # emotion JSON 指示が無い
         assert "テキストのみ出力" in prompt  # 旧指示が残っている
+
+    def test_voicepeak_character_includes_pose(self):
+        """mimi (voicepeak) のプロンプトに pose 指示が含まれる。"""
+        from lab_lounge.filler import _build_filler_prompt
+        prompt = _build_filler_prompt("mimi")
+        assert '"pose"' in prompt
+        assert "neutral" in prompt
+        assert "happy" in prompt
+        assert "fun" in prompt
