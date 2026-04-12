@@ -403,3 +403,48 @@ class TestGenerateFillerText:
             result = _generate_filler_text("mimi")
 
         assert result is None
+
+    def test_json_response_not_stripped(self):
+        """LLM が JSON (emotion 付き) を返した場合、ストリップされずそのまま返る。"""
+        import json as _json
+        json_resp = _json.dumps({"response": "ふふ、お調べしますわ", "emotion": {"happy": 50}})
+        mock_openai = _make_openai_mock(json_resp)
+
+        with patch.dict(sys.modules, {"openai": mock_openai}):
+            result = _generate_filler_text("mimi")
+
+        assert result == json_resp
+        # JSON が壊れていないことを確認
+        parsed = _json.loads(result)
+        assert parsed["response"] == "ふふ、お調べしますわ"
+        assert parsed["emotion"]["happy"] == 50
+
+    def test_plain_text_fallback_still_stripped(self):
+        """LLM がプレーンテキストを返した場合、従来通りクォートが除去される。"""
+        mock_openai = _make_openai_mock('"ふむ、考え中ですわ"')
+
+        with patch.dict(sys.modules, {"openai": mock_openai}):
+            result = _generate_filler_text("mimi")
+
+        assert result == "ふむ、考え中ですわ"  # 外側の " が strip される
+
+
+class TestBuildFillerPrompt:
+    """_build_filler_prompt のテスト。"""
+
+    def test_voicepeak_character_includes_emotion_keys(self):
+        """mimi (voicepeak) のプロンプトに emotion キーと JSON 指示が含まれる。"""
+        from lab_lounge.filler import _build_filler_prompt
+        prompt = _build_filler_prompt("mimi")
+        assert "JSON" in prompt
+        assert '"happy"' in prompt
+        assert '"fun"' in prompt
+        assert '"sulky"' in prompt
+        assert "テキストのみ出力" not in prompt  # 旧指示が除去されている
+
+    def test_voicevox_character_skips_json(self):
+        """octamaid (voicevox) は JSON 形式指示なし、プレーンテキストプロンプトのまま。"""
+        from lab_lounge.filler import _build_filler_prompt
+        prompt = _build_filler_prompt("octamaid")
+        assert '"emotion"' not in prompt  # emotion JSON 指示が無い
+        assert "テキストのみ出力" in prompt  # 旧指示が残っている
