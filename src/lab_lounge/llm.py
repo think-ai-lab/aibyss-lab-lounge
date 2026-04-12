@@ -290,10 +290,11 @@ def call_llm(
         kwargs["system_prompt"] = system_prompt
     result: LLMResult = fn(text, model=model, **kwargs)
     logger.info(
-        "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s",
+        "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s text=%s",
         result.latency_ms,
         result.input_tokens,
         result.output_tokens,
         result.finish_reason,
+        result.text,
     )
     return result

@@ -42,7 +42,7 @@ def _write(filename: str, content: str) -> None:
     path = os.path.join(log_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    logger.debug("debug artifact: %s", path)
+    logger.debug("debug artifact: %s", os.path.basename(path))
 
 
 def write_stt_output(text: str, utterance_meta: dict[str, Any] | None) -> None:

@@ -125,7 +125,7 @@ def _get_rag_mode() -> tuple[bool, int, str]:
           kb_path:    index ファイルの配置パス
     """
     enable_rag = os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
-    top_k = int(os.environ.get("L2_RAG_TOP_K", "3"))
+    top_k = int(os.environ.get("L2_RAG_TOP_K", "5"))  # TD-7: 3→5 (4 Retriever 構成で top_k=3 は狭すぎた)
     kb_path = os.environ.get("L2_KB_PATH", "./data/index")
     return enable_rag, top_k, kb_path
 
@@ -321,9 +321,14 @@ def _run_pipeline_legacy(
     enable_rag, top_k, kb_path = _get_rag_mode()
     if enable_rag:
         try:
-            from .retriever import LocalRetriever
+            from .graph import _build_retriever_from_env
             _t0 = time.monotonic()
-            _retriever = LocalRetriever(kb_path)
+            # 現ターンの utterance.final.event_id を exclude に渡してナルシシスティック RAG を防ぐ
+            _retriever = _build_retriever_from_env(
+                kb_path,
+                stream_id=stream_id,
+                exclude_event_ids=[utt["event_id"]],
+            )
             _docs = _retriever.retrieve(text, top_k=top_k)
             retrieval_latency_ms = int((time.monotonic() - _t0) * 1000)
             if _docs:

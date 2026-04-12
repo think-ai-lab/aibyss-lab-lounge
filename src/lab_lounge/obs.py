@@ -171,7 +171,7 @@ def set_pose(character_slug: str, pose: str) -> None:
     # ターゲットソース存在確認
     target_id = _get_item_id(group_name, target_name)
     if target_id is None:
-        # キャラクターのグループ or ソースが OBS に存在しない → silent no-op
+        logger.info("OBS pose 切替スキップ: %s_%s が存在しません", character_slug, pose)
         return
 
     # 同キャラクターの全 pose ソースを enabled=(p == pose) に設定
@@ -186,7 +186,7 @@ def set_pose(character_slug: str, pose: str) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s 切替失敗: %s", source_name, exc)
 
-    logger.info("OBS pose 切替: %s → %s", character_slug, pose)
+    logger.info("OBS pose 切替完了: %s → %s", character_slug, pose)
 
 
 def disconnect_obs() -> None:

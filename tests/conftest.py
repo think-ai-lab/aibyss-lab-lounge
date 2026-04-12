@@ -45,7 +45,16 @@ def reset_l2_mode_vars(monkeypatch):
                 "L2_USE_LLM_ROUTER", "L2_LLM_ROUTER_MODEL",
                 "L2_USE_INTENT_GATE", "L2_INTENT_GATE_MODEL",
                 "L2_LOG_TO_FILE", "L2_LOG_DIR", "L2_LOG_LEVEL",
-                "L2_OBS_WS_URL", "L2_OBS_WS_PASSWORD"):
+                "L2_OBS_WS_URL", "L2_OBS_WS_PASSWORD",
+                "L2_USE_C2_RETRIEVER", "L2_C2_URL", "L2_C2_URL_READONLY",
+                "L2_C2_RETRIEVER_TOP_K", "L2_C2_RETRIEVER_BUDGET_MS",
+                "L2_USE_C2_RECENT", "L2_C2_RECENT_TOP_K", "L2_C2_RECENT_SCOPE",
+                # RAG 関連 (run_once.py / run_loop.py の load_dotenv() で .env
+                # から漏洩するのを防ぐ。特に L2_ENABLE_RAG は TestRagOff に影響)
+                "L2_ENABLE_RAG", "L2_KB_PATH", "L2_RAG_TOP_K",
+                "L2_DEBUG_ARTIFACTS", "L2_DEBUG_LOG_DIR",
+                # Redis 関連 (統合テストが Redis を掴まないよう空にしておく)
+                "REDIS_STREAM_KEY"):
         monkeypatch.delenv(var, raising=False)
 
     # VOICEPEAK 関連: テスト時は待機・リトライなしに強制
