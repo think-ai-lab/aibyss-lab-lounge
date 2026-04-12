@@ -44,6 +44,10 @@ class CharacterConfig:
     filler_model: str = ""       # 空文字 = 環境変数 L2_LLM_FILLER_MODEL のデフォルトを使用
     porcupine_model: str | None = None
     aliases: list[str] = field(default_factory=list)
+    # VOICEPEAK ナレーター固有の emotion キー名。
+    # フィラー LLM プロンプトに含めて JSON 出力を誘導する。
+    # 空タプル = emotion 非対応 (voicevox 等) → フィラーはプレーンテキスト生成。
+    voicepeak_emotion_keys: tuple[str, ...] = ()
 
 
 # ─── キャラクター定義 ────────────────────────────────────────────────
@@ -61,6 +65,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         filler_model="gpt-5.4-mini",
         porcupine_model="mimi-sama_ja_windows_v4_0_0.ppn",
         aliases=["ミミ", "お嬢様"],
+        voicepeak_emotion_keys=("happy", "fun", "angry", "sad", "sulky"),
     ),
     "chisame": CharacterConfig(
         slug="chisame",
@@ -74,6 +79,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         filler_model="gemini-3.1-flash-lite-preview",
         porcupine_model="chisame-san_ja_windows_v3_0_0.ppn",
         aliases=["ちさめ"],
+        voicepeak_emotion_keys=("bosoboso", "doyaru", "honwaka", "angry", "teary"),
     ),
     "sakura": CharacterConfig(
         slug="sakura",
@@ -87,6 +93,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         filler_model="claude-haiku-4-5-20251001",
         porcupine_model="sakura-san_ja_windows_v3_0_0.ppn",
         aliases=["さくら", "桜さん", "桜"],
+        voicepeak_emotion_keys=("happy", "sad", "angry", "whisper", "cool"),
     ),
     "octamaid": CharacterConfig(
         slug="octamaid",

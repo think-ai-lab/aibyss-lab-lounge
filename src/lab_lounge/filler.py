@@ -360,6 +360,37 @@ _FILLER_DEFAULT_PROMPT = (
 )
 
 
+def _build_filler_prompt(slug: str) -> str:
+    """キャラクター設定からフィラー用システムプロンプトを構築する。
+
+    voicepeak_emotion_keys が設定されているキャラクターの場合、
+    JSON 形式 (response + emotion) の出力を指示するプロンプトを返す。
+    未設定 (voicevox 等) の場合は従来通りプレーンテキスト指示。
+    """
+    from .characters import get_character
+
+    try:
+        char = get_character(slug)
+    except KeyError:
+        return _FILLER_DEFAULT_PROMPT
+
+    base = _FILLER_PROMPTS.get(slug, _FILLER_DEFAULT_PROMPT)
+
+    if not char.voicepeak_emotion_keys:
+        return base  # emotion 非対応 → プレーンテキストのまま
+
+    # JSON 形式指示に切り替え: 旧指示を除去して JSON フォーマットを追加
+    base = base.replace("30文字以内。テキストのみ出力。JSON不要。", "").rstrip()
+    emotion_template = ", ".join(f'"{k}": 0' for k in char.voicepeak_emotion_keys)
+    return (
+        base + "\n"
+        f'出力は以下の JSON で返してください:\n'
+        f'{{"response": "独り言テキスト(30文字以内)", "emotion": {{{emotion_template}}}}}\n'
+        f"emotion の各値は 0〜100。キャラクターの性格と発話内容に合った値を設定してください。\n"
+        f"JSON のみ出力。"
+    )
+
+
 def _detect_provider(model: str) -> str:
     """モデル名からプロバイダーを自動判定する。"""
     m = model.lower()
@@ -386,7 +417,7 @@ def _call_filler_llm(
             client = anthropic.Anthropic()
             resp = client.messages.create(
                 model=model,
-                max_tokens=60,
+                max_tokens=150,
                 temperature=0.9,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_text}],
@@ -401,7 +432,7 @@ def _call_filler_llm(
                 contents=user_text,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=60,
+                    max_output_tokens=150,
                     temperature=0.9,
                 ),
             )
@@ -416,7 +447,7 @@ def _call_filler_llm(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},
                 ],
-                max_completion_tokens=60,
+                max_completion_tokens=150,
                 temperature=0.9,
             )
             content = resp.choices[0].message.content
@@ -448,7 +479,7 @@ def _generate_filler_text(slug: str, *, user_text: str = "") -> str | None:
     except KeyError:
         return None
 
-    system_prompt = _FILLER_PROMPTS.get(slug, _FILLER_DEFAULT_PROMPT)
+    system_prompt = _build_filler_prompt(slug)
 
     # キャラクター設定 > 環境変数 > デフォルト
     if char.filler_model:
@@ -464,7 +495,10 @@ def _generate_filler_text(slug: str, *, user_text: str = "") -> str | None:
     text = _call_filler_llm(model, system_prompt, user_msg)
 
     if text:
-        text = text.strip('"').strip("「」")
+        # JSON レスポンス (emotion 付き) の場合はストリップしない
+        # TTS の _parse_voicepeak_json() がそのまま解析する
+        if not text.startswith("{"):
+            text = text.strip('"').strip("「」")
         logger.info("LLM フィラー生成: [%s] %r (model=%s)", slug, text, model)
         return text if text else None
 
