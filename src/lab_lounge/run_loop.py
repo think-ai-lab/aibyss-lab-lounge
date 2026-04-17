@@ -170,6 +170,7 @@ def _run_playback_worker(
     publish_bubble_fn,
     play_audio_fn,
     cleanup_audio_fn,
+    set_pose_fn=None,
     done_delay_seconds: float = 5.0,
 ) -> None:
     """
@@ -177,6 +178,7 @@ def _run_playback_worker(
 
     動作:
     1. task dict 受信時:
+       - キャラクターが変わったら set_pose_fn で立ち絵切替 (再生直前、正確なタイミング)
        - publish_bubble_fn(character, "speaking", chunk_text) を呼ぶ
        - play_audio_fn(url) で再生（ブロッキング）
        - cleanup_audio_fn(url) で後始末
@@ -186,17 +188,21 @@ def _run_playback_worker(
        - 未 publish なら即 break（bubble は V2 安全弁で消える）
 
     Sprint Axis D Block 1: OBS セリフテロップ表示
+    Phase 3: 立ち絵切替を再生時点に移動 (TTS 生成時点ではなく)
 
     Args:
         q:                   queue.Queue[dict | None] — task dict または None sentinel
-            task dict: {"url": str, "text": str, "is_last": bool, "character": str}
+            task dict: {"url": str, "text": str, "is_last": bool, "character": str,
+                        "pose": str (optional)}
         publish_bubble_fn:   (character: str, step: str, text: str) -> None
         play_audio_fn:       (url: str) -> None  — ブロッキング再生
         cleanup_audio_fn:    (url: str) -> None  — 再生後のファイル削除等
+        set_pose_fn:         (character: str, pose: str) -> None  — OBS 立ち絵切替 (optional)
         done_delay_seconds:  最終チャンク再生完了から done publish までの待機秒数
     """
     speaking_published = False
     last_character: str | None = None
+    current_pose_character: str | None = None
     while True:
         task = q.get()
         if task is None:
@@ -205,12 +211,29 @@ def _run_playback_worker(
                 time.sleep(done_delay_seconds)
                 publish_bubble_fn(last_character, "done", "")
             break
-        # speaking publish → 再生 → クリーンアップ
-        publish_bubble_fn(task["character"], "speaking", task["text"])
+        # Phase 3: 再生直前にキャラクターが変わったら立ち絵切替 + HUD 通知
+        character = task["character"]
+        if set_pose_fn and character != current_pose_character:
+            pose = task.get("pose", "neutral")
+            try:
+                set_pose_fn(character, pose)
+                logger.info("playback pose 切替: %s → %s", character, pose)
+            except Exception as exc:
+                logger.warning("playback pose 切替失敗: %s (%s)", character, exc)
+            # HUD に立ち絵変更を通知 (publish_bubble_fn 経由)
+            # bubble.html は STEP_ORDER 外の "pose_change" を無視するため bubble 表示に影響なし
+            publish_bubble_fn(character, "pose_change", f"pose: {pose}")
+            current_pose_character = character
+        # speaking publish → 再生 → クリーンアップ → done_event 通知
+        publish_bubble_fn(character, "speaking", task["text"])
         speaking_published = True
-        last_character = task["character"]
+        last_character = character
         play_audio_fn(task["url"])
         cleanup_audio_fn(task["url"])
+        # Phase 3: 再生完了通知 (ask_character の導入セリフ同期用)
+        done_event = task.get("done_event")
+        if done_event is not None:
+            done_event.set()
 
 
 def run_loop(
@@ -365,6 +388,14 @@ def run_loop(
                     except Exception:
                         pass  # 削除失敗は無視 (配信中断を防ぐ)
 
+                # OBS 立ち絵切替関数 (Phase 3: playback worker が再生直前に呼ぶ)
+                def _set_pose_safe(character_slug: str, pose: str) -> None:
+                    try:
+                        from .obs import set_pose
+                        set_pose(character_slug, pose)
+                    except Exception as exc:
+                        logger.warning("OBS pose 切替失敗: %s → %s (%s)", character_slug, pose, exc)
+
                 _playback_thread = threading.Thread(
                     target=_run_playback_worker,
                     args=(_playback_queue,),
@@ -372,6 +403,7 @@ def run_loop(
                         "publish_bubble_fn": _publish_bubble_safe,
                         "play_audio_fn": play_audio_file,
                         "cleanup_audio_fn": _cleanup_audio,
+                        "set_pose_fn": _set_pose_safe,
                     },
                     daemon=True,
                 )
@@ -386,9 +418,9 @@ def run_loop(
                     )
                     _filler_thread.start()
 
-            # OBS 立ち絵を本命応答の再生開始タイミングに同期させるための
-            # 遅延 pose 適用。パイプラインが on_pose_ready で pose を予約し、
-            # 最初のチャンク投入時に _on_tts_chunk 内で set_pose を実行する。
+            # OBS 立ち絵 pose の予約。パイプラインが on_pose_ready で pose を予約し、
+            # task dict の "pose" フィールドに含めて playback worker に渡す。
+            # Phase 3: 立ち絵切替は playback worker が再生直前に実行 (TTS 生成時ではなく)。
             _pending_pose: list[str | None] = [None, None]  # [character_slug, pose_value]
 
             def _on_pose_ready(slug: str, pose: str) -> None:
@@ -397,17 +429,10 @@ def run_loop(
 
             def _on_tts_chunk(url: str, chunk_text: str, is_last: bool, character: str) -> None:
                 # フィラーを停止してから本編を再生
-                # フレーズ完了まで待ち、間を持たせてから本編を開始
                 if _filler_thread is not None and _filler_thread.is_alive():
                     _filler_stop.set()
                     _filler_thread.join(timeout=30)
-                    # フィラーと本編の間に少し間を持たせる
                     time.sleep(0.5)
-                # 最初のチャンクで OBS 立ち絵を切り替え (本命応答の再生開始と同期)
-                if _pending_pose[0] is not None:
-                    from .obs import set_pose
-                    set_pose(_pending_pose[0], _pending_pose[1] or "neutral")
-                    _pending_pose[0] = None
                 _chunk_count[0] += 1
                 _audio_name = url.rsplit("/", 1)[-1] if "/" in url else url
                 logger.info(
@@ -415,12 +440,29 @@ def run_loop(
                     _audio_name, _chunk_count[0], is_last, len(chunk_text),
                 )
                 if _playback_queue is not None:
-                    _playback_queue.put({
+                    # _pending_pose があればこのチャンクの pose として付与
+                    # (playback worker が再生直前に set_pose する)
+                    chunk_pose = "neutral"
+                    if _pending_pose[0] == character and _pending_pose[1]:
+                        chunk_pose = _pending_pose[1]
+                        _pending_pose[0] = None
+                    task = {
                         "url": url,
                         "text": chunk_text,
                         "is_last": is_last,
                         "character": character,
-                    })
+                        "pose": chunk_pose,
+                    }
+                    # Phase 3: done_event があれば task に付与 (ask_character 導入セリフ同期用)
+                    try:
+                        from .mcp_servers.ask_character import _chunk_done_event_var
+                        done_event = _chunk_done_event_var.get(None)
+                        if done_event is not None and is_last:
+                            task["done_event"] = done_event
+                            _chunk_done_event_var.set(None)
+                    except ImportError:
+                        pass
+                    _playback_queue.put(task)
 
             try:
                 result = run_pipeline(

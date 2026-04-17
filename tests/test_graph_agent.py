@@ -186,6 +186,22 @@ class TestBubbleToolCallbackHandler:
         assert len(published) == 0
 
 
+class TestAskCharacterToolRegistration:
+    """ask_character ツール登録を検証する (Phase 3)。"""
+
+    def test_ask_character_registered(self):
+        """ask_character_tool がツールリストに含まれる。"""
+        from lab_lounge.graph import _load_mcp_tools
+        tools = _load_mcp_tools()
+        tool_names = {t.name for t in tools}
+        assert "ask_character_tool" in tool_names
+
+    def test_bubble_handler_has_ask_character(self):
+        """BubbleToolCallbackHandler に ask_character のマッピングがある。"""
+        from lab_lounge.graph import BubbleToolCallbackHandler
+        assert "ask_character_tool" in BubbleToolCallbackHandler.TOOL_MESSAGE_KEY
+
+
 class TestRetrieveMemoryToolRegistration:
     """L2_ENABLE_RAG による retrieve_memory ツール登録の制御を検証する。"""
 

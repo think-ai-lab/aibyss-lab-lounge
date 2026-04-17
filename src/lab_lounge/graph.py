@@ -139,6 +139,20 @@ def _load_mcp_tools():
             except Exception as exc:
                 logger.warning("retrieve_memory ツール読み込み失敗: %s", exc)
 
+        # ask_character ツール (常に登録)
+        try:
+            from .mcp_servers.ask_character import ask_character
+
+            @lc_tool
+            def ask_character_tool(character_slug: str, question: str) -> str:
+                """他のAITuberキャラクターに質問する。自分の専門外の質問や、別の視点が欲しい場合に使用する。character_slug は相手の識別子 (mimi/chisame/sakura/ruka/octamaid)。自分自身には質問しないこと。1 応答で最大 2 回まで。"""
+                return ask_character(character_slug, question)
+
+            tools.append(ask_character_tool)
+            logger.info("ツール登録完了: ask_character")
+        except Exception as exc:
+            logger.warning("ask_character ツール読み込み失敗: %s", exc)
+
         if not tools:
             logger.warning("有効なツールが 0 件。ツールなしで続行。")
 
@@ -229,6 +243,7 @@ class BubbleToolCallbackHandler:
     TOOL_MESSAGE_KEY: dict[str, str] = {
         "retrieve_memory_tool": "searching",
         "web_search_tool": "web_search",
+        "ask_character_tool": "ask_character",
     }
 
     def __init__(self, character_slug: str, common: dict):
@@ -741,6 +756,15 @@ def _generation_node(state: PipelineGraphState) -> dict:
                 stream_id=common.get("stream_id"),
                 exclude_event_ids=[utt_event_id],
             )
+
+        # Phase 3: ask_character ツール用のコンテキストをセット
+        from .mcp_servers.ask_character import set_ask_character_context
+        set_ask_character_context(
+            on_tts_chunk=state["on_tts_chunk_ready"],
+            tts_output_dir=state["tts_output_dir"],
+            common=common,
+            caller_slug=state["character_slug"],
+        )
 
         _run_meta = build_run_metadata(
             stream_id=common["stream_id"],
