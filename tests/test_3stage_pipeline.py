@@ -160,7 +160,7 @@ class TestThreeStageFlow:
         )
         filler_thread.start()
 
-        def on_chunk(url):
+        def on_chunk(url, *_args, **_kwargs):
             filler_stop.set()
             filler_thread.join(timeout=5)
             chunk_received.set()
@@ -232,7 +232,7 @@ class TestTtsChunkCallback:
         playback_queue: queue.Queue[str | None] = queue.Queue()
         chunk_count = [0]
 
-        def on_chunk(url: str) -> None:
+        def on_chunk(url: str, *_args, **_kwargs) -> None:
             chunk_count[0] += 1
             playback_queue.put(url)
 
@@ -247,7 +247,7 @@ class TestTtsChunkCallback:
 
         chunk_urls = []
 
-        def on_chunk(url: str) -> None:
+        def on_chunk(url: str, *_args, **_kwargs) -> None:
             chunk_urls.append(url)
 
         fake_tts = TTSResult(
@@ -262,7 +262,7 @@ class TestTtsChunkCallback:
 
         def mock_synthesize(text, *, provider, voice, speaker, output_dir, on_chunk_ready=None):
             if on_chunk_ready:
-                on_chunk_ready("file:///tmp/chunk_001.wav")
+                on_chunk_ready("file:///tmp/chunk_001.wav", text, True, speaker)
             return fake_tts
 
         with patch("lab_lounge.tts.synthesize", side_effect=mock_synthesize):
@@ -284,7 +284,7 @@ class TestTtsChunkCallback:
         )
         filler_thread.start()
 
-        def on_chunk(url: str) -> None:
+        def on_chunk(url: str, *_args, **_kwargs) -> None:
             if filler_thread.is_alive():
                 filler_stop.set()
                 filler_thread.join(timeout=5)
@@ -327,7 +327,7 @@ class TestRunLoopPipelineSection:
         filler_thread.start()
 
         # --- コールバック定義 ---
-        def on_chunk(url: str) -> None:
+        def on_chunk(url: str, *_args, **_kwargs) -> None:
             if filler_thread is not None and filler_thread.is_alive():
                 filler_stop.set()
                 filler_thread.join(timeout=5)
@@ -359,7 +359,7 @@ class TestRunLoopPipelineSection:
         """フィラー無効時はフィラースレッドなしで正常動作する。"""
         chunk_count = [0]
 
-        def on_chunk(url: str) -> None:
+        def on_chunk(url: str, *_args, **_kwargs) -> None:
             chunk_count[0] += 1
 
         result = run_pipeline(

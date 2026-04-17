@@ -150,6 +150,150 @@ class TestSynthesize:
             )
 
 
+class TestCallVoicevoxChunking:
+    """Sprint Axis D (2026-04-14): _call_voicevox が VOICEPEAK と同じく
+    140 字分割 + on_chunk_ready コールバックを行うことを検証。
+
+    VOICEVOX API 自体は urllib で呼び出すため、`_generate_voicevox_single_file`
+    をモックして API 呼び出しを回避する。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_single_file(self, monkeypatch, tmp_path):
+        """各チャンクのファイル生成をモックして API を叩かない。"""
+        def fake_generate(text, *, speaker_id, voicevox_url, filepath):
+            # 最小限の WAV ヘッダを書き込む (再生されることはないのでデータなしで可)
+            # 呼び出し元は (duration_ms, sample_rate) を受け取れればよい
+            filepath.write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+            return (1000, 24000)  # 1 秒, 24kHz
+
+        monkeypatch.setattr(tts_mod, "_generate_voicevox_single_file", fake_generate)
+        return fake_generate
+
+    def test_short_text_single_chunk(self, tmp_path):
+        """140 字以内の短文 → 1 チャンクのみ生成。"""
+        result = tts_mod._call_voicevox(
+            "短いテキストです。",
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+        )
+        assert len(result.chunk_audio_urls) == 1
+        assert result.audio_url == result.chunk_audio_urls[0]
+
+    def test_long_text_split_into_multiple_chunks(self, tmp_path):
+        """140 字超のテキスト → 複数チャンクに分割される (VOICEPEAK と同じロジック)。"""
+        long_text = "これは長いテキストです。" * 20  # ~220 字
+        result = tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+        )
+        assert len(result.chunk_audio_urls) > 1
+
+    def test_on_chunk_ready_called_per_chunk(self, tmp_path):
+        """on_chunk_ready が各チャンク生成後に呼ばれる (url, text, is_last, speaker)。"""
+        calls: list[tuple[str, str, bool, str]] = []
+        long_text = "これは長いテキストです。" * 20
+
+        result = tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+            on_chunk_ready=lambda url, text, is_last, speaker: calls.append(
+                (url, text, is_last, speaker)
+            ),
+        )
+
+        assert len(calls) == len(result.chunk_audio_urls)
+        urls = [c[0] for c in calls]
+        assert all(url.startswith("file:///") for url in urls)
+
+    def test_on_chunk_ready_is_last_flag(self, tmp_path):
+        """on_chunk_ready の is_last は最終チャンクのみ True (VOICEPEAK と同じ挙動)。"""
+        is_last_flags: list[bool] = []
+        long_text = "これは長いテキストです。" * 20
+
+        tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+            on_chunk_ready=lambda url, text, is_last, speaker: is_last_flags.append(is_last),
+        )
+
+        assert len(is_last_flags) > 1
+        assert is_last_flags[-1] is True
+        assert all(f is False for f in is_last_flags[:-1])
+
+    def test_on_chunk_ready_passes_speaker(self, tmp_path):
+        """on_chunk_ready の第 4 引数に speaker (character slug) が渡る。"""
+        speakers: list[str] = []
+        long_text = "これは長いテキストです。" * 20
+
+        tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+            on_chunk_ready=lambda url, text, is_last, speaker: speakers.append(speaker),
+        )
+
+        assert len(speakers) > 0
+        assert all(s == "octamaid" for s in speakers)
+
+    def test_on_chunk_ready_passes_chunk_text(self, tmp_path):
+        """on_chunk_ready の第 2 引数に VOICEVOX に投入したチャンクテキストが渡る。"""
+        texts: list[str] = []
+        long_text = "これは長いテキストです。" * 20
+
+        tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            speaker="octamaid",
+            on_chunk_ready=lambda url, text, is_last, speaker: texts.append(text),
+        )
+
+        assert len(texts) > 1
+        # 各チャンクは 140 字以内
+        assert all(len(t) <= 140 for t in texts)
+
+    def test_on_chunk_ready_not_called_when_none(self, tmp_path):
+        """コールバック未指定時はエラーなく動作する。"""
+        long_text = "これは長いテキストです。" * 20
+        result = tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+            on_chunk_ready=None,
+        )
+        assert len(result.chunk_audio_urls) > 1
+
+    def test_combined_duration_is_sum(self, tmp_path):
+        """結合 duration_ms が各チャンクの合計になる。"""
+        long_text = "これは長いテキストです。" * 20
+        result = tts_mod._call_voicevox(
+            long_text,
+            voice="89",
+            output_dir=str(tmp_path),
+        )
+        # fake_generate は各チャンク 1000ms を返すので合計 = 1000 × チャンク数
+        expected = 1000 * len(result.chunk_audio_urls)
+        assert result.duration_ms == expected
+
+    def test_speaker_defaults_to_voicevox_prefix(self, tmp_path):
+        """speaker 未指定時は TTSResult.speaker が voicevox-<id> 形式。"""
+        result = tts_mod._call_voicevox(
+            "短いテキスト",
+            voice="89",
+            output_dir=str(tmp_path),
+        )
+        assert result.speaker == "voicevox-89"
+
+
 class TestParseVoicepeakJson:
     """_parse_voicepeak_json の pose 抽出テスト (4-tuple return)。"""
 

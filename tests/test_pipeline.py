@@ -36,10 +36,15 @@ class TestRunPipeline:
         types = [ev["type"] for ev in result.events]
         assert types == ["utterance.final", "llm.final", "tts.done"]
 
-    def test_publish_called_seven_times(self, mock_publish):
-        """3 メインイベント + 4 bubble.update = 7 回。"""
+    def test_publish_called_five_times(self, mock_publish):
+        """3 メインイベント + 2 bubble.update (thinking/answering) = 5 回。
+
+        Sprint Axis D Block 1: done は run_loop の再生 worker が発行。
+        Sprint Axis D Block 3: retrieval ノード削除で bubble("thinking") が 1 つ減少。
+        routing が "thinking"、generation が "answering" の 2 回。
+        """
         run_pipeline("hello", **COMMON)
-        assert mock_publish.call_count == 7
+        assert mock_publish.call_count == 5
 
     def test_llm_links_utterance(self, mock_publish):
         result = run_pipeline("hello", **COMMON)

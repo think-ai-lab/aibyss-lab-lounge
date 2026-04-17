@@ -756,3 +756,107 @@ class TestRecentC2Retriever:
             docs = retriever.retrieve("q")
 
         assert docs[0].source == "c2-recent:utterance.final"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Sprint Axis D Block 2: AITuber 相互知識の常時保持
+# 実 kb index にキャラクター相互知識が索引されていることの検証
+# (OpenAI API 呼び出しなし、chunks.json のメタデータレベル検証のみ)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCharacterKnowledgeInIndex:
+    """本番 kb index (data/index/chunks.json) にキャラクター相互知識が
+    索引されていることを検証する。
+
+    前提:
+    - docs/kb/ai_agents.md, think_ai_lab.md が存在する
+    - scripts/build_index.py で索引済み
+    - index がない環境 (初回セットアップ前等) では skip される
+    """
+
+    @pytest.fixture()
+    def real_chunks(self):
+        """本番 index の chunks.json を読み込む (なければ skip)。"""
+        import json
+        import os
+        index_path = os.path.join(
+            os.path.dirname(__file__), "..", "data", "index", "chunks.json"
+        )
+        if not os.path.exists(index_path):
+            pytest.skip(f"kb index not found: {index_path}. Run scripts/build_index.py first.")
+        with open(index_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_ai_agents_md_indexed(self, real_chunks):
+        """ai_agents.md が index に含まれる。"""
+        sources = {c["source"] for c in real_chunks}
+        assert "ai_agents.md" in sources, (
+            f"ai_agents.md missing from index. Found sources: {sources}"
+        )
+
+    def test_think_ai_lab_md_indexed(self, real_chunks):
+        """think_ai_lab.md が index に含まれる。"""
+        sources = {c["source"] for c in real_chunks}
+        assert "think_ai_lab.md" in sources, (
+            f"think_ai_lab.md missing from index. Found sources: {sources}"
+        )
+
+    def test_all_five_characters_mentioned_in_kb(self, real_chunks):
+        """5 キャラ全員が kb の少なくとも 1 チャンクに含まれる。"""
+        all_text = " ".join(c["text"] for c in real_chunks)
+        for char_name in ["ミミ", "ちさめ", "さくら", "ルカ", "オクタメイド"]:
+            assert char_name in all_text, (
+                f"character '{char_name}' not found in kb — "
+                f"クロスキャラクター参照が機能しない可能性"
+            )
+
+    def test_wake_words_documented(self, real_chunks):
+        """各キャラのウェイクワードが kb に記述されている。"""
+        all_text = " ".join(c["text"] for c in real_chunks)
+        for wake_word in ["ミミ様", "ちさめさん", "さくらさん", "オクタメイド"]:
+            assert wake_word in all_text, (
+                f"wake word '{wake_word}' not documented in kb"
+            )
+
+    def test_four_quadrant_design_documented(self, real_chunks):
+        """think_ai_lab.md に 4 象限バランス設計 (抽象↔具体 × 論理↔感情) が記述されている。"""
+        tal_chunks = [c for c in real_chunks if c["source"] == "think_ai_lab.md"]
+        tal_text = " ".join(c["text"] for c in tal_chunks)
+        assert "抽象" in tal_text
+        assert "具体" in tal_text
+        assert "論理" in tal_text
+        assert "感情" in tal_text
+        # 4 人の役割割り当てが think_ai_lab.md にある
+        for char in ["ルカ", "ミミ", "ちさめ", "さくら"]:
+            assert char in tal_text, f"{char} の役割が think_ai_lab.md に記載なし"
+
+    def test_naming_rules_documented(self, real_chunks):
+        """呼称ルールが ai_agents.md に記述されている (アビスメイト含む)。"""
+        agents_chunks = [c for c in real_chunks if c["source"] == "ai_agents.md"]
+        agents_text = " ".join(c["text"] for c in agents_chunks)
+        # アビスメイト (視聴者呼称) と呼称関連ワード
+        assert "アビスメイト" in agents_text, "視聴者呼称 アビスメイト が kb に記載なし"
+
+    def test_chisame_ramble_mode_documented(self, real_chunks):
+        """ちさめ暴走モード (専門話題で早口になる特性) が kb に記述されている。
+
+        他キャラが「ちさめさん、暴走してる?」と参照する時に必要。
+        """
+        all_text = " ".join(c["text"] for c in real_chunks)
+        assert "暴走" in all_text, "ちさめ暴走モードが kb に記載なし"
+
+    def test_conversation_flow_documented(self, real_chunks):
+        """会話フロー (ルカ→ミミ→ちさめ→さくら→ルカ) が think_ai_lab.md にある。
+
+        各キャラが自分の発言順序・役割を把握するために必要。
+        """
+        tal_chunks = [c for c in real_chunks if c["source"] == "think_ai_lab.md"]
+        tal_text = " ".join(c["text"] for c in tal_chunks)
+        # 基本フローに 4 キャラ全員が登場する段落があるはず
+        # (think_ai_lab.md の「会話の流れ」セクション)
+        flow_chunks = [c for c in tal_chunks
+                       if all(name in c["text"] for name in ["ルカ", "ミミ", "ちさめ", "さくら"])]
+        assert len(flow_chunks) > 0, (
+            "4 人全員が登場するチャンクがない — 会話フローの相互認識ができない"
+        )
