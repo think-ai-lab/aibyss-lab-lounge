@@ -2,6 +2,7 @@
   "mimi": {
     "searching": "記録を確認中ですわ",
     "web_search": "海の向こうまで調べていますの",
+    "ask_character": "仲間に聞いてみますわね",
     "thinking": "少々お待ちを……",
     "answering": "お話しする準備ができましたわ",
     "done": ""
@@ -9,6 +10,7 @@
   "chisame": {
     "searching": "過去のデータを参照中です",
     "web_search": "インターネットで裏取りします",
+    "ask_character": "他のメンバーの意見も確認します",
     "thinking": "分析しています",
     "answering": "回答をまとめます",
     "done": ""
@@ -16,6 +18,7 @@
   "sakura": {
     "searching": "ちょっと調べてみますねぇ",
     "web_search": "もう少し調べますぅ",
+    "ask_character": "みんなに聞いてみますねぇ",
     "thinking": "んー……考え中ですよぉ",
     "answering": "お待たせしましたぁ",
     "done": ""
@@ -23,6 +26,7 @@
   "octamaid": {
     "searching": "データベースを参照中です",
     "web_search": "インターネットを検索中です",
+    "ask_character": "他のメンバーに照会中です",
     "thinking": "処理中です",
     "answering": "回答を準備しました",
     "done": ""
