@@ -114,19 +114,24 @@ class TestRunGraphAgentMode:
 
 
 class TestToolRoutingGuidance:
-    """_build_tool_routing_guidance のガイダンス生成を検証する。"""
+    """Skills 定義ファイルベースのガイダンス生成を検証する。
 
-    def test_guidance_contains_retrieve_memory(self):
-        """retrieve_memory ガイダンスが含まれる。"""
-        from lab_lounge.graph import _TOOL_ROUTING_GUIDANCE
-        assert "retrieve_memory" in _TOOL_ROUTING_GUIDANCE
-        assert "web_search" in _TOOL_ROUTING_GUIDANCE
-        assert "ツールなし" in _TOOL_ROUTING_GUIDANCE
+    Sprint Axis D Block 4: _TOOL_ROUTING_GUIDANCE ハードコードを
+    skills/common/tool_routing.md に移行。
+    """
 
-    def test_guidance_encourages_retrieve_memory_when_unsure(self):
-        """「迷ったら retrieve_memory」の指示が含まれる。"""
-        from lab_lounge.graph import _TOOL_ROUTING_GUIDANCE
-        assert "迷った" in _TOOL_ROUTING_GUIDANCE
+    def test_skills_contain_retrieve_memory(self):
+        """Skills プロンプトに retrieve_memory ガイダンスが含まれる。"""
+        from lab_lounge.skill_loader import build_skills_prompt
+        result = build_skills_prompt("mimi")
+        assert "retrieve_memory" in result
+        assert "web_search" in result
+
+    def test_skills_encourage_retrieve_memory_when_unsure(self):
+        """「迷ったら retrieve_memory」の指示が Skills に含まれる。"""
+        from lab_lounge.skill_loader import build_skills_prompt
+        result = build_skills_prompt("mimi")
+        assert "迷った" in result
 
 
 class TestBubbleToolCallbackHandler:

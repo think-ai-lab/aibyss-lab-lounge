@@ -152,67 +152,20 @@ def _load_mcp_tools():
         return []
 
 
-_TOOL_ROUTING_GUIDANCE = """
-## ツール使用判断ガイド
-
-あなたは以下のツールを利用可能です。質問の性質に応じて適切に判断してください:
-
-- **retrieve_memory**: 過去の会話・知識ベースを検索する。以下の場合に使用:
-  - 「前に話した〜」「さっきの〜」「以前〜」など過去への言及
-  - キャラクターや設定についての具体的な質問
-  - 迷った場合はこちらを選ぶ（呼ばない判断ミスの方がコストが高い）
-
-- **web_search**: インターネットで最新情報を検索する。以下の場合に使用:
-  - 天気・ニュース・時事ネタなどリアルタイム情報が必要
-  - 事実確認が必要な場合
-
-- **ツールなし**: 以下の場合はツールを呼ばず即座に応答:
-  - 挨拶（「こんにちは」「おはよう」）
-  - 感想・相槌（「なるほど」「すごいね」）
-  - 一般的な質問で既知の情報のみで回答可能
-
-複数のツールが必要な場合は両方呼んでください。
-1 回の応答でツール呼び出しは最大 3 回までにしてください。
-""".strip()
-
-
-def _build_tool_routing_guidance(tools: list) -> str:
-    """登録済みツールに応じた tool_routing ガイダンスを生成する。"""
-    if not tools:
-        return ""
-    tool_names = {getattr(t, "name", "") for t in tools}
-    has_retrieve = "retrieve_memory_tool" in tool_names
-    has_web = "web_search_tool" in tool_names
-    if has_retrieve and has_web:
-        return _TOOL_ROUTING_GUIDANCE
-    elif has_retrieve:
-        # web_search なしの場合のガイダンス (将来用)
-        return _TOOL_ROUTING_GUIDANCE.replace(
-            "- **web_search**: インターネットで最新情報を検索する。以下の場合に使用:\n"
-            "  - 天気・ニュース・時事ネタなどリアルタイム情報が必要\n"
-            "  - 事実確認が必要な場合\n\n",
-            "",
-        )
-    elif has_web:
-        # retrieve_memory なしの場合のガイダンス
-        return _TOOL_ROUTING_GUIDANCE.replace(
-            "- **retrieve_memory**: 過去の会話・知識ベースを検索する。以下の場合に使用:\n"
-            "  - 「前に話した〜」「さっきの〜」「以前〜」など過去への言及\n"
-            "  - キャラクターや設定についての具体的な質問\n"
-            "  - 迷った場合はこちらを選ぶ（呼ばない判断ミスの方がコストが高い）\n\n",
-            "",
-        )
-    return ""
-
-
-def _build_agent_graph(provider: str, model: str, system_prompt: str | None = None):
+def _build_agent_graph(
+    provider: str,
+    model: str,
+    system_prompt: str | None = None,
+    character_slug: str | None = None,
+):
     """
     ツール付き ReAct Agent グラフを構築する。
 
     MCP サーバーからツールを読み込み、LLM がツール使用を自律判断する。
     ツール読み込み失敗時は単一ノード構成にフォールバック。
 
-    Sprint Axis D Block 3: tool_routing ガイダンスをシステムプロンプトに結合する。
+    Sprint Axis D Block 4: Skills 定義ファイルから行動判断基準を読み込み、
+    system_prompt と結合して Agent に注入する。
     """
     try:
         from langgraph.prebuilt import create_react_agent
@@ -227,14 +180,12 @@ def _build_agent_graph(provider: str, model: str, system_prompt: str | None = No
         logger.info("ツールなし。単一ノード構成にフォールバック。")
         return None
 
-    # tool_routing ガイダンスをシステムプロンプトに結合
-    guidance = _build_tool_routing_guidance(tools)
-    if system_prompt and guidance:
-        combined_prompt = f"{system_prompt}\n\n{guidance}"
-    elif guidance:
-        combined_prompt = guidance
-    else:
-        combined_prompt = system_prompt
+    # Skills 定義ファイルから行動判断基準を読み込み、system_prompt と結合
+    from .skill_loader import build_skills_prompt
+    skills_text = build_skills_prompt(character_slug or "") if character_slug else ""
+
+    parts = [p for p in [system_prompt, skills_text] if p]
+    combined_prompt = "\n\n".join(parts) if parts else None
 
     llm = _get_llm_for_agent(provider, model)
     agent = create_react_agent(
@@ -242,7 +193,7 @@ def _build_agent_graph(provider: str, model: str, system_prompt: str | None = No
         tools,
         prompt=combined_prompt,
     )
-    logger.info("ReAct Agent 構築完了: tools=%d model=%s", len(tools), model)
+    logger.info("ReAct Agent 構築完了: tools=%d model=%s skills=%s", len(tools), model, bool(skills_text))
     return agent
 
 
@@ -361,7 +312,7 @@ def run_graph(
     )
 
     if _is_tools_enabled():
-        agent = _build_agent_graph(provider, model, system_prompt)
+        agent = _build_agent_graph(provider, model, system_prompt, character_slug=character_slug)
         if agent is not None:
             return _run_agent(
                 agent, text, model,
