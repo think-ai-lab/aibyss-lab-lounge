@@ -23,22 +23,12 @@ pipeline.py — 開発用テキストパイプライン
 
 import logging
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .bus import publish
-from .characters import get_character, load_system_prompt
-from .debug import (
-    write_llm_prompt,
-    write_llm_response,
-    write_retrieval,
-    write_stt_output,
-)
-from .events import build_bubble_update, build_llm_final, build_tts_done, build_utterance_final
-from .observability import build_run_metadata
-from .router import route
+from .events import build_bubble_update
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +165,7 @@ def run_pipeline(
     """
     テキストを受け取り 3 イベントを publish する。
 
-    langgraph がインストール済みの場合は LangGraph 4 ノードグラフを使用。
-    未インストール時は _run_pipeline_legacy() にフォールバック。
+    LangGraph パイプライングラフ (routing → generation → tts) を使用。
 
     Args:
         text:            発話テキスト（utterance.final の payload.text）
@@ -192,29 +181,16 @@ def run_pipeline(
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
     """
-    try:
-        return _run_pipeline_graph(
-            text,
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            utterance_meta=utterance_meta,
-            speaker_hint=speaker_hint,
-            on_tts_chunk_ready=on_tts_chunk_ready,
-            on_pose_ready=on_pose_ready,
-        )
-    except ImportError:
-        logger.info("langgraph 未インストール。レガシーパイプラインにフォールバック。")
-        return _run_pipeline_legacy(
-            text,
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            utterance_meta=utterance_meta,
-            speaker_hint=speaker_hint,
-            on_tts_chunk_ready=on_tts_chunk_ready,
-            on_pose_ready=on_pose_ready,
-        )
+    return _run_pipeline_graph(
+        text,
+        stream_id=stream_id,
+        session_id=session_id,
+        trace_id=trace_id,
+        utterance_meta=utterance_meta,
+        speaker_hint=speaker_hint,
+        on_tts_chunk_ready=on_tts_chunk_ready,
+        on_pose_ready=on_pose_ready,
+    )
 
 
 def _run_pipeline_graph(
@@ -280,185 +256,6 @@ def _run_pipeline_graph(
     )
 
 
-def _run_pipeline_legacy(
-    text: str,
-    *,
-    stream_id: str,
-    session_id: str,
-    trace_id: str,
-    utterance_meta: dict[str, Any] | None = None,
-    speaker_hint: str | None = None,
-    on_tts_chunk_ready=None,
-    on_pose_ready=None,
-) -> PipelineResult:
-    """
-    レガシーパイプライン（モノリシック）。langgraph 未インストール時のフォールバック。
-    """
-    common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
 
-    # 0. ルーティング — どのキャラクターが応答するか決定
-    decision = route(text, name_hint=speaker_hint)
-    character = get_character(decision.speaker)
-    try:
-        system_prompt = load_system_prompt(character)
-    except FileNotFoundError:
-        logger.warning(
-            "システムプロンプトが見つかりません: %s。プロンプトなしで続行。",
-            character.system_prompt_file,
-        )
-        system_prompt = None
-
-    # 1. utterance.final — STT メタデータがあれば反映する
-    utt_kwargs: dict[str, Any] = utterance_meta or {}
-    utt = build_utterance_final(text=text, seq=0, **utt_kwargs, **common)
-    publish(utt)
-    write_stt_output(text, utterance_meta)
-
-    # ─── bubble: searching ───
-    _publish_bubble("searching", character.slug, common, links=[utt["event_id"]])
-
-    # 2. Retrieve (optional) — L2_ENABLE_RAG=true のときのみ実行
-    rag_context: str | None = None
-    rag_used = False
-    retrieved_doc_ids: list[str] = []
-    retrieval_latency_ms = 0
-    answer_mode = "fallback"
-
-    enable_rag, top_k, kb_path = _get_rag_mode()
-    if enable_rag:
-        try:
-            from .graph import _build_retriever_from_env
-            _t0 = time.monotonic()
-            # 現ターンの utterance.final.event_id を exclude に渡してナルシシスティック RAG を防ぐ
-            _retriever = _build_retriever_from_env(
-                kb_path,
-                stream_id=stream_id,
-                exclude_event_ids=[utt["event_id"]],
-            )
-            _docs = _retriever.retrieve(text, top_k=top_k)
-            retrieval_latency_ms = int((time.monotonic() - _t0) * 1000)
-            if _docs:
-                rag_context = "\n\n---\n\n".join(d.text for d in _docs)
-                retrieved_doc_ids = [d.doc_id for d in _docs]
-                _retrieval_scores = [d.score for d in _docs]
-                rag_used = True
-                answer_mode = "grounded"
-                logger.info(
-                    "RAG 検索完了: latency_ms=%d docs=%d ids=%s",
-                    retrieval_latency_ms,
-                    len(_docs),
-                    retrieved_doc_ids,
-                )
-            else:
-                _retrieval_scores = []
-            write_retrieval(retrieved_doc_ids, _retrieval_scores, retrieval_latency_ms, rag_enabled=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("RAG 検索失敗 (fallback): %s", exc)
-            rag_context = None
-            rag_used = False
-            answer_mode = "fallback"
-            write_retrieval([], [], retrieval_latency_ms, rag_enabled=True)
-
-    # ─── bubble: thinking ───
-    _publish_bubble("thinking", character.slug, common, links=[utt["event_id"]])
-
-    # 3. llm.final — utterance.final を links で参照
-    use_real, provider, llm_model = _get_llm_mode(character)
-    if use_real:
-        # real mode: graph.py 経由 (lazy import — ダミーモードでは langgraph 不要)
-        from .graph import run_graph as _run_graph
-        _run_meta = build_run_metadata(
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            rag_used=rag_used,
-            answer_mode=answer_mode,
-            retrieval_latency_ms=retrieval_latency_ms,
-            retrieved_doc_count=len(retrieved_doc_ids),
-            retrieved_doc_ids=retrieved_doc_ids,
-        )
-        write_llm_prompt(text, rag_context)
-        _llm_result = _run_graph(
-            text,
-            model=llm_model,
-            provider=provider,
-            context=rag_context,
-            system_prompt=system_prompt,
-            run_metadata=_run_meta,
-        )
-        write_llm_response(_llm_result.text)
-        llm_text = _llm_result.text
-        llm_meta: dict[str, Any] = dict(
-            model=_llm_result.model,
-            input_tokens=_llm_result.input_tokens,
-            output_tokens=_llm_result.output_tokens,
-            latency_ms=_llm_result.latency_ms,
-            finish_reason=_llm_result.finish_reason,
-            rag_used=rag_used,
-            answer_mode=answer_mode,
-            retrieval_latency_ms=retrieval_latency_ms,
-            retrieved_doc_count=len(retrieved_doc_ids),
-            retrieved_doc_ids=retrieved_doc_ids,
-        )
-    else:
-        # dummy mode: 後方互換のため "ダミー応答: {text}" を維持する
-        llm_text = f"ダミー応答: {text}"
-        llm_meta = {}  # build_llm_final のデフォルト値を使う
-    llm = build_llm_final(text=llm_text, seq=1, links=[utt["event_id"]], **llm_meta, **common)
-    publish(llm)
-
-    # ─── bubble: answering ───
-    _publish_bubble("answering", character.slug, common, links=[llm["event_id"]])
-
-    # ─── OBS 立ち絵切り替え ───
-    # on_pose_ready コールバックがあれば遅延適用 (本命応答の再生開始タイミングで切替)
-    # なければ従来通り即時切替 (run_once.py 等の互換性)
-    from .tts import _parse_voicepeak_json as _parse_llm_json
-    _, _, _, _pose_value = _parse_llm_json(llm_text)
-    if on_pose_ready:
-        on_pose_ready(character.slug, _pose_value or "neutral")
-    else:
-        from .obs import set_pose as _set_pose
-        _set_pose(character.slug, _pose_value or "neutral")
-
-    # 4. tts.done — llm.final を links で参照
-    use_real_tts, _env_tts_provider, _env_tts_voice, _env_tts_speaker, tts_output_dir = _get_tts_mode()
-    # キャラクター設定を優先。env は fallback
-    tts_provider = character.tts_provider
-    tts_voice = character.tts_voice
-    tts_speaker = character.slug
-    if use_real_tts:
-        # real mode: tts.py 経由 (lazy import — ダミーモードでは edge-tts 不要)
-        from .tts import synthesize as _synthesize
-        _tts_result = _synthesize(
-            llm_text,
-            provider=tts_provider,
-            voice=tts_voice,
-            speaker=tts_speaker,
-            output_dir=tts_output_dir,
-            on_chunk_ready=on_tts_chunk_ready,
-        )
-        tts_meta: dict[str, Any] = dict(
-            audio_url=_tts_result.audio_url,
-            chunk_audio_urls=_tts_result.chunk_audio_urls or None,
-            duration_ms=_tts_result.duration_ms,
-            voice=_tts_result.voice,
-            format=_tts_result.format,
-            sample_rate=_tts_result.sample_rate,
-            speaker=_tts_result.speaker,
-        )
-    else:
-        tts_meta = dict(speaker=tts_speaker)  # ダミーモードでも speaker slug を記録
-    tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **tts_meta, **common)
-    publish(tts)
-
-    # bubble: done は run_loop.py の _playback_worker が最終チャンク再生 + 5 秒後に発行する
-    # (Sprint Axis D Block 1: OBS セリフテロップ表示)
-
-    return PipelineResult(
-        stream_id=stream_id,
-        session_id=session_id,
-        trace_id=trace_id,
-        speaker=character.slug,
-        events=[utt, llm, tts],
-    )
+# レガシーパイプライン (_run_pipeline_legacy) は Sprint Axis D で廃止。
+# LangGraph は必須依存。パイプラインは _run_pipeline_graph のみ使用。
