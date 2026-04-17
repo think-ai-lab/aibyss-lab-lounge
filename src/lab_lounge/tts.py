@@ -119,21 +119,15 @@ def _mp3_duration_ms(filepath: Path) -> int | None:
 
 # ─── VOICEVOX adapter ────────────────────────────────────────────
 
-def _call_voicevox(
+def _generate_voicevox_single_file(
     text: str,
     *,
-    voice: str,
-    output_dir: str,
-    speaker: str = "",
-    **kwargs,
-) -> TTSResult:
+    speaker_id: int,
+    voicevox_url: str,
+    filepath: Path,
+) -> tuple[int, int]:
     """
-    VOICEVOX Engine HTTP API を使って音声合成する（stdlib のみ）。
-
-    voice には VOICEVOX のスピーカー ID（整数文字列）を渡す。
-      例: "3" → ずんだもん
-    VOICEVOX Engine のベース URL は環境変数 L2_TTS_VOICEVOX_URL で変更できる
-    (デフォルト: http://localhost:50021)
+    1 チャンク分の VOICEVOX 音声ファイルを生成し、(duration_ms, sample_rate) を返す。
 
     API フロー:
       1. POST /audio_query?text=<>&speaker=<id>  → audio_query JSON
@@ -144,14 +138,6 @@ def _call_voicevox(
     import urllib.parse
     import urllib.request
     import wave
-
-    voicevox_url = os.environ.get("L2_TTS_VOICEVOX_URL", "http://localhost:50021")
-    try:
-        speaker_id = int(voice)
-    except ValueError as exc:
-        raise ValueError(
-            f"voicevox provider の voice はスピーカー ID の整数文字列（例: '3'）にしてください: {voice!r}"
-        ) from exc
 
     # 1. audio_query
     query_params = urllib.parse.urlencode({"text": text, "speaker": speaker_id})
@@ -173,24 +159,96 @@ def _call_voicevox(
     with urllib.request.urlopen(req) as resp:
         wav_bytes = resp.read()
 
-    # duration from WAV header
+    # duration + sample_rate from WAV header
     with wave.open(io.BytesIO(wav_bytes)) as wf:
         duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)
+        sample_rate = wf.getframerate()
 
-    # 保存
-    out_dir = Path(output_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filepath = out_dir / f"{uuid.uuid4()}.wav"
     filepath.write_bytes(wav_bytes)
     logger.info("VOICEVOX WAV 生成完了: %s (%d bytes)", filepath.name, len(wav_bytes))
 
+    return duration_ms, sample_rate
+
+
+def _call_voicevox(
+    text: str,
+    *,
+    voice: str,
+    output_dir: str,
+    speaker: str = "",
+    on_chunk_ready=None,
+    **kwargs,
+) -> TTSResult:
+    """
+    VOICEVOX Engine HTTP API を使って音声合成する（stdlib のみ）。
+
+    voice には VOICEVOX のスピーカー ID（整数文字列）を渡す。
+      例: "3" → ずんだもん
+    VOICEVOX Engine のベース URL は環境変数 L2_TTS_VOICEVOX_URL で変更できる
+    (デフォルト: http://localhost:50021)
+
+    VOICEPEAK と同じ `_split_text_for_voicepeak` で 140 字分割し、チャンクごとに生成する。
+    VOICEVOX 自体に文字数制限はないが、配信演出 (OBS セリフテロップ / ストリーミング再生) を
+    VOICEPEAK と揃えるためにチャンク分割を適用する (Sprint Axis D 2026-04-14)。
+
+    on_chunk_ready コールバックが渡された場合、各チャンク生成直後に
+    (audio_url, chunk_text, is_last, speaker) を通知する（ストリーミング再生用）。
+
+    Args:
+        voice:           VOICEVOX スピーカー ID (整数文字列、例: "89")
+        on_chunk_ready:  チャンク生成完了時コールバック
+            (audio_url: str, chunk_text: str, is_last: bool, speaker: str) -> None
+    """
+    voicevox_url = os.environ.get("L2_TTS_VOICEVOX_URL", "http://localhost:50021")
+    try:
+        speaker_id = int(voice)
+    except ValueError as exc:
+        raise ValueError(
+            f"voicevox provider の voice はスピーカー ID の整数文字列（例: '3'）にしてください: {voice!r}"
+        ) from exc
+
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # テキスト分割 (VOICEPEAK と同じロジック。140 字以内の短文は 1 チャンク)
+    chunks = _split_text_for_voicepeak(text)
+    logger.info("VOICEVOX チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(text))
+
+    chunk_paths: list[Path] = []
+    chunk_durations: list[int] = []
+    sample_rate = 24000
+
+    for i, chunk_text in enumerate(chunks):
+        filepath = out_dir / f"{uuid.uuid4()}.wav"
+        dur, sr = _generate_voicevox_single_file(
+            chunk_text,
+            speaker_id=speaker_id,
+            voicevox_url=voicevox_url,
+            filepath=filepath,
+        )
+        chunk_paths.append(filepath)
+        chunk_durations.append(dur)
+        sample_rate = sr
+        logger.info(
+            "VOICEVOX チャンク %d/%d 生成完了: %d ms (%d 文字)",
+            i + 1, len(chunks), dur, len(chunk_text),
+        )
+        if on_chunk_ready:
+            on_chunk_ready(filepath.as_uri(), chunk_text, i == len(chunks) - 1, speaker)
+
+    # audio_url は最初のチャンクを代表値とする。
+    # 結合 WAV は生成しない (ストリーミング再生では個別チャンクが使われるため)。
+    audio_url = chunk_paths[0].as_uri() if chunk_paths else ""
+    total_duration = sum(chunk_durations)
+
     return TTSResult(
-        audio_url=filepath.as_uri(),
-        duration_ms=duration_ms,
+        audio_url=audio_url,
+        duration_ms=total_duration,
         voice=voice,
         format="wav",
-        sample_rate=24000,
+        sample_rate=sample_rate,
         speaker=speaker or f"voicevox-{speaker_id}",
+        chunk_audio_urls=[p.as_uri() for p in chunk_paths],
     )
 
 
@@ -653,12 +711,17 @@ def _call_voicepeak(
 
     140字超のテキストは自然な句読点で分割し、チャンクごとに生成する。
     on_chunk_ready コールバックが渡された場合、各チャンク生成直後に
-    audio_url を通知する（ストリーミング再生用）。
+    (audio_url, chunk_text, is_last, speaker) を通知する（ストリーミング再生用）。
 
     Args:
         voice:           ナレーター名
         speed:           発話速度（50〜200。省略時は VOICEPEAK デフォルト）
-        on_chunk_ready:  チャンク生成完了時コールバック (audio_url: str) -> None
+        on_chunk_ready:  チャンク生成完了時コールバック
+            (audio_url: str, chunk_text: str, is_last: bool, speaker: str) -> None
+            - audio_url:  file:// URI
+            - chunk_text: VOICEPEAK --say に渡した 140 字以内のテキスト
+            - is_last:    最終チャンクなら True
+            - speaker:    キャラクター slug ("mimi" / "chisame" / "sakura" / "octamaid")
     """
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -693,7 +756,7 @@ def _call_voicepeak(
             i + 1, len(chunks), dur, len(chunk_text),
         )
         if on_chunk_ready:
-            on_chunk_ready(filepath.as_uri())
+            on_chunk_ready(filepath.as_uri(), chunk_text, i == len(chunks) - 1, speaker)
 
     # audio_url は最初のチャンクを代表値とする。
     # 結合 WAV は生成しない (ストリーミング再生では個別チャンクが使われるため)。

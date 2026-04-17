@@ -452,8 +452,8 @@ def _run_pipeline_legacy(
     tts = build_tts_done(text=llm_text, seq=2, links=[llm["event_id"]], **tts_meta, **common)
     publish(tts)
 
-    # ─── bubble: done ───
-    _publish_bubble("done", character.slug, common, links=[tts["event_id"]])
+    # bubble: done は run_loop.py の _playback_worker が最終チャンク再生 + 5 秒後に発行する
+    # (Sprint Axis D Block 1: OBS セリフテロップ表示)
 
     return PipelineResult(
         stream_id=stream_id,

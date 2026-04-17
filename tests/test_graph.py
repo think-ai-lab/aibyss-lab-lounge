@@ -173,19 +173,20 @@ class TestRunGraphWithMetadata:
 class TestBuildPipelineGraph:
     """_build_pipeline_graph のグラフ構造を検証する。"""
 
-    def test_graph_has_four_nodes(self):
+    def test_graph_has_three_nodes(self):
+        """Sprint Axis D Block 3: retrieval ノード削除後は 3 ノード。"""
         from lab_lounge.graph import _build_pipeline_graph
         graph = _build_pipeline_graph()
         node_names = set(graph.get_graph().nodes) - {"__start__", "__end__"}
-        assert node_names == {"routing", "retrieval", "generation", "tts"}
+        assert node_names == {"routing", "generation", "tts"}
 
     def test_graph_has_correct_edge_count(self):
         from lab_lounge.graph import _build_pipeline_graph
         graph = _build_pipeline_graph()
         edges = graph.get_graph().edges
-        # __start__→routing, routing→retrieval, retrieval→generation,
-        # generation→tts, tts→__end__ = 5 edges
-        assert len(edges) == 5
+        # __start__→routing, routing→generation,
+        # generation→tts, tts→__end__ = 4 edges
+        assert len(edges) == 4
 
 
 class TestPipelineGraphNodes:
@@ -241,14 +242,8 @@ class TestPipelineGraphNodes:
         assert len(result["events"]) == 1
         assert result["events"][0]["type"] == "utterance.final"
 
-    def test_retrieval_node_skips_when_disabled(self, mock_publish, base_state):
-        from lab_lounge.graph import _retrieval_node
-        # routing 済みの状態をシミュレート
-        base_state["character_slug"] = "octamaid"
-        base_state["events"] = [{"event_id": "utt-1", "type": "utterance.final"}]
-        result = _retrieval_node(base_state)
-        assert result["rag_used"] is False
-        assert result["answer_mode"] == "fallback"
+    # Sprint Axis D Block 3: _retrieval_node は削除されたためテストも削除
+    # RAG 検索は _generation_node 内の Agent がツールとして自律呼び出しする
 
     def test_generation_node_dummy_mode(self, mock_publish, base_state):
         from lab_lounge.graph import _generation_node

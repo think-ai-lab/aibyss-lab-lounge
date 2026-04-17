@@ -330,8 +330,8 @@ class TestVoicepeakChunking:
         assert result.audio_url == result.chunk_audio_urls[0]
 
     def test_on_chunk_ready_called_per_chunk(self, tmp_path):
-        """on_chunk_ready が各チャンク生成後に呼ばれる。"""
-        chunk_urls = []
+        """on_chunk_ready が各チャンク生成後に呼ばれる (url, text, is_last, speaker)。"""
+        calls: list[tuple[str, str, bool, str]] = []
         long_text = "これは長いテキストです。" * 20
 
         with patch.object(subprocess, "run", side_effect=_make_mock_run()):
@@ -339,11 +339,71 @@ class TestVoicepeakChunking:
                 long_text,
                 voice="宮舞モカ",
                 output_dir=str(tmp_path),
-                on_chunk_ready=lambda url: chunk_urls.append(url),
+                speaker="chisame",
+                on_chunk_ready=lambda url, text, is_last, speaker: calls.append(
+                    (url, text, is_last, speaker)
+                ),
             )
 
-        assert len(chunk_urls) == len(result.chunk_audio_urls)
-        assert all(url.startswith("file:///") for url in chunk_urls)
+        assert len(calls) == len(result.chunk_audio_urls)
+        urls = [c[0] for c in calls]
+        assert all(url.startswith("file:///") for url in urls)
+
+    def test_on_chunk_ready_passes_chunk_text(self, tmp_path):
+        """on_chunk_ready の第 2 引数に VOICEPEAK --say に投入したチャンクテキストが渡る。"""
+        texts: list[str] = []
+        long_text = "これは長いテキストです。" * 20
+
+        with patch.object(subprocess, "run", side_effect=_make_mock_run()):
+            _call_voicepeak(
+                long_text,
+                voice="宮舞モカ",
+                output_dir=str(tmp_path),
+                speaker="chisame",
+                on_chunk_ready=lambda url, text, is_last, speaker: texts.append(text),
+            )
+
+        assert len(texts) > 1
+        # 各チャンクテキストは 140 字以内 (VOICEPEAK 制限)
+        assert all(len(t) <= 140 for t in texts)
+        # 連結すれば元のテキストに (ほぼ) 一致する
+        assert "".join(texts).replace(" ", "") != ""
+
+    def test_on_chunk_ready_is_last_flag(self, tmp_path):
+        """on_chunk_ready の is_last は最終チャンクのみ True。"""
+        is_last_flags: list[bool] = []
+        long_text = "これは長いテキストです。" * 20
+
+        with patch.object(subprocess, "run", side_effect=_make_mock_run()):
+            _call_voicepeak(
+                long_text,
+                voice="宮舞モカ",
+                output_dir=str(tmp_path),
+                speaker="chisame",
+                on_chunk_ready=lambda url, text, is_last, speaker: is_last_flags.append(is_last),
+            )
+
+        assert len(is_last_flags) > 1
+        # 最後の 1 回だけ True、それ以外は False
+        assert is_last_flags[-1] is True
+        assert all(f is False for f in is_last_flags[:-1])
+
+    def test_on_chunk_ready_passes_speaker(self, tmp_path):
+        """on_chunk_ready の第 4 引数に speaker (character slug) が渡る。"""
+        speakers: list[str] = []
+        long_text = "これは長いテキストです。" * 20
+
+        with patch.object(subprocess, "run", side_effect=_make_mock_run()):
+            _call_voicepeak(
+                long_text,
+                voice="彩澄りりせ",  # ナレーター名
+                output_dir=str(tmp_path),
+                speaker="mimi",  # character slug
+                on_chunk_ready=lambda url, text, is_last, speaker: speakers.append(speaker),
+            )
+
+        assert len(speakers) > 0
+        assert all(s == "mimi" for s in speakers)
 
     def test_on_chunk_ready_not_called_when_none(self, tmp_path):
         """コールバック未指定時はエラーなく動作する。"""

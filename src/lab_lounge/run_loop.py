@@ -53,7 +53,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .audio_io import RecordError, SilenceError, play_audio_file, record_to_file
+from .bus import publish
 from .emitter import _transcribe_audio
+from .events import build_bubble_update
 from .log_setup import setup_logging
 from .pipeline import PipelineResult, run_pipeline
 
@@ -160,6 +162,55 @@ def _run_filler_safe(slug: str, stop_event: threading.Event, user_text: str = ""
         run_filler_loop(slug, stop_event, user_text=user_text)
     except Exception as exc:
         logger.warning("フィラー再生エラー: %s", exc)
+
+
+def _run_playback_worker(
+    q: queue.Queue,
+    *,
+    publish_bubble_fn,
+    play_audio_fn,
+    cleanup_audio_fn,
+    done_delay_seconds: float = 5.0,
+) -> None:
+    """
+    再生ワーカー: キューから task dict を受け取り、音声再生と bubble publish を調停する。
+
+    動作:
+    1. task dict 受信時:
+       - publish_bubble_fn(character, "speaking", chunk_text) を呼ぶ
+       - play_audio_fn(url) で再生（ブロッキング）
+       - cleanup_audio_fn(url) で後始末
+    2. None sentinel 受信時:
+       - speaking を 1 回以上 publish 済みなら done_delay_seconds 秒待って
+         publish_bubble_fn(last_character, "done", "") を呼んで break
+       - 未 publish なら即 break（bubble は V2 安全弁で消える）
+
+    Sprint Axis D Block 1: OBS セリフテロップ表示
+
+    Args:
+        q:                   queue.Queue[dict | None] — task dict または None sentinel
+            task dict: {"url": str, "text": str, "is_last": bool, "character": str}
+        publish_bubble_fn:   (character: str, step: str, text: str) -> None
+        play_audio_fn:       (url: str) -> None  — ブロッキング再生
+        cleanup_audio_fn:    (url: str) -> None  — 再生後のファイル削除等
+        done_delay_seconds:  最終チャンク再生完了から done publish までの待機秒数
+    """
+    speaking_published = False
+    last_character: str | None = None
+    while True:
+        task = q.get()
+        if task is None:
+            # 最終チャンク再生完了後: speaking を発行していれば done_delay 秒待って done publish
+            if speaking_published and last_character is not None:
+                time.sleep(done_delay_seconds)
+                publish_bubble_fn(last_character, "done", "")
+            break
+        # speaking publish → 再生 → クリーンアップ
+        publish_bubble_fn(task["character"], "speaking", task["text"])
+        speaking_published = True
+        last_character = task["character"]
+        play_audio_fn(task["url"])
+        cleanup_audio_fn(task["url"])
 
 
 def run_loop(
@@ -274,11 +325,32 @@ def run_loop(
                 print(f"認識結果: {input_text}")
 
             # ─── 4. Pipeline（フィラー + ストリーミング TTS 再生）────
+            # 本ターン固有の trace_id を先に生成 (worker 内の bubble.update 発行で使う)
+            turn_trace_id = _new_uuid()
+            turn_common = {
+                "stream_id": session_stream_id,
+                "session_id": session_id_root,
+                "trace_id": turn_trace_id,
+            }
+
             _chunk_count = [0]
-            _playback_queue: queue.Queue[str | None] | None = None
+            _playback_queue: queue.Queue[dict | None] | None = None
             _playback_thread: threading.Thread | None = None
             _filler_stop = threading.Event()
             _filler_thread: threading.Thread | None = None
+
+            def _publish_bubble_safe(character: str, step: str, text: str) -> None:
+                """bubble.update を publish する。失敗は warning log のみ。"""
+                try:
+                    event = build_bubble_update(
+                        character=character,
+                        step=step,
+                        text=text,
+                        **turn_common,
+                    )
+                    publish(event)
+                except Exception as exc:
+                    logger.warning("bubble.update(%s) publish 失敗: %s", step, exc)
 
             if not skip_playback:
                 _playback_queue = queue.Queue()
@@ -293,16 +365,15 @@ def run_loop(
                     except Exception:
                         pass  # 削除失敗は無視 (配信中断を防ぐ)
 
-                def _playback_worker(q: queue.Queue) -> None:
-                    while True:
-                        url = q.get()
-                        if url is None:
-                            break
-                        play_audio_file(url)
-                        _cleanup_audio(url)
-
                 _playback_thread = threading.Thread(
-                    target=_playback_worker, args=(_playback_queue,), daemon=True,
+                    target=_run_playback_worker,
+                    args=(_playback_queue,),
+                    kwargs={
+                        "publish_bubble_fn": _publish_bubble_safe,
+                        "play_audio_fn": play_audio_file,
+                        "cleanup_audio_fn": _cleanup_audio,
+                    },
+                    daemon=True,
                 )
                 _playback_thread.start()
 
@@ -324,14 +395,13 @@ def run_loop(
                 """パイプラインから呼ばれる。pose を予約して実際の切替を遅延させる。"""
                 _pending_pose[:] = [slug, pose]
 
-            def _on_tts_chunk(url: str) -> None:
+            def _on_tts_chunk(url: str, chunk_text: str, is_last: bool, character: str) -> None:
                 # フィラーを停止してから本編を再生
                 # フレーズ完了まで待ち、間を持たせてから本編を開始
                 if _filler_thread is not None and _filler_thread.is_alive():
                     _filler_stop.set()
                     _filler_thread.join(timeout=30)
                     # フィラーと本編の間に少し間を持たせる
-                    import time
                     time.sleep(0.5)
                 # 最初のチャンクで OBS 立ち絵を切り替え (本命応答の再生開始と同期)
                 if _pending_pose[0] is not None:
@@ -340,9 +410,17 @@ def run_loop(
                     _pending_pose[0] = None
                 _chunk_count[0] += 1
                 _audio_name = url.rsplit("/", 1)[-1] if "/" in url else url
-                logger.info("TTS チャンク再生キュー投入: %s (chunk %d)", _audio_name, _chunk_count[0])
+                logger.info(
+                    "TTS チャンク再生キュー投入: %s (chunk %d, is_last=%s, len=%d)",
+                    _audio_name, _chunk_count[0], is_last, len(chunk_text),
+                )
                 if _playback_queue is not None:
-                    _playback_queue.put(url)
+                    _playback_queue.put({
+                        "url": url,
+                        "text": chunk_text,
+                        "is_last": is_last,
+                        "character": character,
+                    })
 
             try:
                 result = run_pipeline(
@@ -352,7 +430,7 @@ def run_loop(
                     stream_id=session_stream_id,
                     session_id=session_id_root,
                     # trace_id はリクエスト単位 (分散トレース用、個々のターンを識別)
-                    trace_id=_new_uuid(),
+                    trace_id=turn_trace_id,
                     utterance_meta=utterance_meta,
                     speaker_hint=speaker_hint,
                     on_tts_chunk_ready=_on_tts_chunk if not skip_playback else None,
@@ -367,6 +445,8 @@ def run_loop(
                     _playback_queue.put(None)
                 if _playback_thread is not None:
                     _playback_thread.join(timeout=5)
+                # Pipeline 例外時の bubble 閉じは V2 の 30 秒安全弁に委ねる
+                # (speaker_hint が不確定なケースもあり、補填 done は見送り)
                 continue
 
             # LLM 応答を表示 + ログ記録
@@ -388,14 +468,23 @@ def run_loop(
                 if _filler_thread is not None and _filler_thread.is_alive():
                     _filler_stop.set()
                     _filler_thread.join(timeout=30)
-                    import time
                     time.sleep(0.5)
 
                 tts_ev = next((ev for ev in result.events if ev["type"] == "tts.done"), None)
                 if tts_ev:
                     audio_url = tts_ev["payload"].get("audio_url", "")
+                    fallback_text = tts_ev["payload"].get("text", "")
                     if audio_url:
+                        # 非ストリーミング fallback: 再生直前に speaking publish
+                        # → 再生 → 5 秒後に done publish
+                        _publish_bubble_safe(result.speaker, "speaking", fallback_text)
                         play_audio_file(audio_url)
+                        time.sleep(5.0)
+                        _publish_bubble_safe(result.speaker, "done", "")
+            elif skip_playback:
+                # skip_playback=True: worker が走らないので done を直接 publish
+                # (pipeline は done を発行しなくなったため)
+                _publish_bubble_safe(result.speaker, "done", "")
 
             turn += 1
 

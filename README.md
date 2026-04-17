@@ -9,7 +9,7 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 > - Grounded E2E v1 — RAG 統合 (seed corpus + C2Retriever + RecentC2Retriever + CompositeRetriever)
 > - **Axis A** — マルチキャラクター (mimi/chisame/sakura/octamaid/ruka)、Porcupine ウェイクワード、意図ゲート
 > - **Axis B** — 立ち絵切替 (OBS WebSocket)、呼び出しゲート Phase 2、VAD (WebRTC)、C2 RAG v0.1 スケルトン
-> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生、立ち絵タイミング同期
+> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生 + チャンク自動削除、立ち絵タイミング同期 (本命応答 + フィラー)、VOICEPEAK クラッシュリトライ、操作ログ網羅性改善
 > - テスト: **586 passed**
 
 ---

@@ -122,7 +122,15 @@ class TestRagOff:
 # ─── RAG on — grounded ────────────────────────────────────────────
 
 class TestRagOn:
-    """L2_ENABLE_RAG=true で RAG が動き payload に反映されることを確認する。"""
+    """L2_ENABLE_RAG=true で retrieve_memory ツールが登録される
+    ことを確認する（Sprint Axis D Block 3: Agent ツール化後）。
+
+    旧テスト (rag_used/answer_mode/retrieved_doc_count 等) は
+    _retrieval_node 削除に伴い廃止。RAG 検索は Agent が自律的に
+    retrieve_memory ツールを呼ぶため、ツール登録の検証のみ行う。
+    ツール呼び出し自体の検証は test_graph_agent.py / test_retrieve_memory.py
+    および E2E 手動テストに委ねる。
+    """
 
     @pytest.fixture(autouse=True)
     def enable_rag(self, monkeypatch, fake_index):
@@ -130,64 +138,20 @@ class TestRagOn:
         monkeypatch.setenv("L2_KB_PATH", fake_index)
         monkeypatch.setenv("L2_RAG_TOP_K", "2")
 
-    def test_rag_used_true_when_docs_found(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
-        assert result.events[1]["payload"]["rag_used"] is True
-
-    def test_answer_mode_grounded_when_docs_found(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
-        assert result.events[1]["payload"]["answer_mode"] == "grounded"
-
-    def test_retrieved_doc_count_matches_top_k(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
-        assert result.events[1]["payload"]["retrieved_doc_count"] == 2
-
-    def test_retrieved_doc_ids_in_payload(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
-        doc_ids = result.events[1]["payload"]["retrieved_doc_ids"]
-        assert isinstance(doc_ids, list)
-        assert len(doc_ids) == 2
-
-    def test_retrieval_latency_ms_is_recorded(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
-        assert result.events[1]["payload"]["retrieval_latency_ms"] >= 0
-
-    def test_run_graph_called_with_context(
-        self, mock_publish, mock_real_llm, mock_run_graph
-    ):
-        """run_graph に context が渡ること（RAG コンテキストが LLM に届く）。"""
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            run_pipeline("テスト", **COMMON)
-        _, kwargs = mock_run_graph.call_args
-        assert kwargs.get("context") is not None
-        assert isinstance(kwargs["context"], str)
-
     def test_still_three_events(self, mock_publish, mock_real_llm, mock_run_graph):
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
+        result = run_pipeline("テスト", **COMMON)
         assert len(result.events) == 3
 
     def test_no_stream_idx_in_events(self, mock_publish, mock_real_llm, mock_run_graph):
         """Guardrail G-1: RAG on でも stream_idx を含めない。"""
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            result = run_pipeline("テスト", **COMMON)
+        result = run_pipeline("テスト", **COMMON)
         for ev in result.events:
             assert "stream_idx" not in ev
+
+    def test_rag_enabled_flag_controls_tool_registration(self, monkeypatch):
+        """L2_ENABLE_RAG=true で _is_rag_enabled() が True を返す。"""
+        from lab_lounge.graph import _is_rag_enabled
+        assert _is_rag_enabled() is True
 
 
 # ─── fallback — retriever 失敗時 ──────────────────────────────────
@@ -281,19 +245,9 @@ class TestDebugArtifacts:
         data = json.loads(open(os.path.join(log_dir, "stt_output.json"), encoding="utf-8").read())
         assert data["text"] == "確認テキスト"
 
-    def test_retrieval_json_written_when_rag_on(
-        self, mock_publish, mock_real_llm, mock_run_graph, monkeypatch, log_dir, fake_index
-    ):
-        monkeypatch.setenv("L2_DEBUG_ARTIFACTS", "true")
-        monkeypatch.setenv("L2_DEBUG_LOG_DIR", log_dir)
-        monkeypatch.setenv("L2_ENABLE_RAG", "true")
-        monkeypatch.setenv("L2_KB_PATH", fake_index)
-        with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
-            run_pipeline("テスト", **COMMON)
-        assert os.path.exists(os.path.join(log_dir, "retrieval.json"))
-        data = json.loads(open(os.path.join(log_dir, "retrieval.json"), encoding="utf-8").read())
-        assert data["rag_enabled"] is True
-        assert "results" in data
+    # Sprint Axis D Block 3: _retrieval_node 削除に伴い retrieval.json は
+    # 生成されなくなった。RAG 検索は Agent がツールとして呼ぶため、
+    # debug artifacts は LangSmith トレースに委ねる。
 
 
 # ═══════════════════════════════════════════════════════════════════

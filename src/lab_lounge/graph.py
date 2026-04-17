@@ -98,19 +98,51 @@ def _get_llm_for_agent(provider: str, model: str):
         return ChatOpenAI(model=model)
 
 
+def _is_rag_enabled() -> bool:
+    """RAG (retrieve_memory ツール) が有効かどうかを返す。"""
+    return os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
+
+
 def _load_mcp_tools():
     """MCP サーバーからツールを LangChain ツールとして読み込む。"""
     try:
-        from .mcp_servers.web_search import web_search
         from langchain_core.tools import tool as lc_tool
 
-        @lc_tool
-        def web_search_tool(query: str) -> str:
-            """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
-            return web_search(query)
+        tools = []
 
-        logger.info("ツール登録完了: web_search")
-        return [web_search_tool]
+        # web_search ツール
+        try:
+            from .mcp_servers.web_search import web_search
+
+            @lc_tool
+            def web_search_tool(query: str) -> str:
+                """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
+                return web_search(query)
+
+            tools.append(web_search_tool)
+            logger.info("ツール登録完了: web_search")
+        except Exception as exc:
+            logger.warning("web_search ツール読み込み失敗: %s", exc)
+
+        # retrieve_memory ツール (L2_ENABLE_RAG=true のとき)
+        if _is_rag_enabled():
+            try:
+                from .mcp_servers.retrieve_memory import retrieve_memory
+
+                @lc_tool
+                def retrieve_memory_tool(query: str) -> str:
+                    """過去の会話や知識ベースから関連情報を検索する。「前に話した〜」「さっきの〜」「以前〜」など過去への言及がある場合に使用する。迷ったら使う。"""
+                    return retrieve_memory(query)
+
+                tools.append(retrieve_memory_tool)
+                logger.info("ツール登録完了: retrieve_memory (RAG 有効)")
+            except Exception as exc:
+                logger.warning("retrieve_memory ツール読み込み失敗: %s", exc)
+
+        if not tools:
+            logger.warning("有効なツールが 0 件。ツールなしで続行。")
+
+        return tools
 
     except ImportError as exc:
         logger.warning("ツール読み込み失敗 (import): %s", exc)
@@ -120,12 +152,67 @@ def _load_mcp_tools():
         return []
 
 
+_TOOL_ROUTING_GUIDANCE = """
+## ツール使用判断ガイド
+
+あなたは以下のツールを利用可能です。質問の性質に応じて適切に判断してください:
+
+- **retrieve_memory**: 過去の会話・知識ベースを検索する。以下の場合に使用:
+  - 「前に話した〜」「さっきの〜」「以前〜」など過去への言及
+  - キャラクターや設定についての具体的な質問
+  - 迷った場合はこちらを選ぶ（呼ばない判断ミスの方がコストが高い）
+
+- **web_search**: インターネットで最新情報を検索する。以下の場合に使用:
+  - 天気・ニュース・時事ネタなどリアルタイム情報が必要
+  - 事実確認が必要な場合
+
+- **ツールなし**: 以下の場合はツールを呼ばず即座に応答:
+  - 挨拶（「こんにちは」「おはよう」）
+  - 感想・相槌（「なるほど」「すごいね」）
+  - 一般的な質問で既知の情報のみで回答可能
+
+複数のツールが必要な場合は両方呼んでください。
+1 回の応答でツール呼び出しは最大 3 回までにしてください。
+""".strip()
+
+
+def _build_tool_routing_guidance(tools: list) -> str:
+    """登録済みツールに応じた tool_routing ガイダンスを生成する。"""
+    if not tools:
+        return ""
+    tool_names = {getattr(t, "name", "") for t in tools}
+    has_retrieve = "retrieve_memory_tool" in tool_names
+    has_web = "web_search_tool" in tool_names
+    if has_retrieve and has_web:
+        return _TOOL_ROUTING_GUIDANCE
+    elif has_retrieve:
+        # web_search なしの場合のガイダンス (将来用)
+        return _TOOL_ROUTING_GUIDANCE.replace(
+            "- **web_search**: インターネットで最新情報を検索する。以下の場合に使用:\n"
+            "  - 天気・ニュース・時事ネタなどリアルタイム情報が必要\n"
+            "  - 事実確認が必要な場合\n\n",
+            "",
+        )
+    elif has_web:
+        # retrieve_memory なしの場合のガイダンス
+        return _TOOL_ROUTING_GUIDANCE.replace(
+            "- **retrieve_memory**: 過去の会話・知識ベースを検索する。以下の場合に使用:\n"
+            "  - 「前に話した〜」「さっきの〜」「以前〜」など過去への言及\n"
+            "  - キャラクターや設定についての具体的な質問\n"
+            "  - 迷った場合はこちらを選ぶ（呼ばない判断ミスの方がコストが高い）\n\n",
+            "",
+        )
+    return ""
+
+
 def _build_agent_graph(provider: str, model: str, system_prompt: str | None = None):
     """
     ツール付き ReAct Agent グラフを構築する。
 
     MCP サーバーからツールを読み込み、LLM がツール使用を自律判断する。
     ツール読み込み失敗時は単一ノード構成にフォールバック。
+
+    Sprint Axis D Block 3: tool_routing ガイダンスをシステムプロンプトに結合する。
     """
     try:
         from langgraph.prebuilt import create_react_agent
@@ -140,14 +227,96 @@ def _build_agent_graph(provider: str, model: str, system_prompt: str | None = No
         logger.info("ツールなし。単一ノード構成にフォールバック。")
         return None
 
+    # tool_routing ガイダンスをシステムプロンプトに結合
+    guidance = _build_tool_routing_guidance(tools)
+    if system_prompt and guidance:
+        combined_prompt = f"{system_prompt}\n\n{guidance}"
+    elif guidance:
+        combined_prompt = guidance
+    else:
+        combined_prompt = system_prompt
+
     llm = _get_llm_for_agent(provider, model)
     agent = create_react_agent(
         llm,
         tools,
-        prompt=system_prompt,
+        prompt=combined_prompt,
     )
     logger.info("ReAct Agent 構築完了: tools=%d model=%s", len(tools), model)
     return agent
+
+
+# ─── Agent ツール呼び出し時の bubble.update ────────────────────────
+
+class BubbleToolCallbackHandler:
+    """Agent がツールを呼んだときに bubble.update を発行する LangChain コールバック。
+
+    Sprint Axis D Block 3: HUD に「記憶検索中」「Web検索中」を動的表示。
+
+    LangChain の CallbackManager が期待する属性 (ignore_chain, raise_error 等) を
+    提供するため、必要最小限のプロトコルを実装する。
+    BaseCallbackHandler を継承しないのは langchain_core の import を
+    グラフ構築時まで遅延させるため。
+
+    step は常に "searching" (V2 STEP_ORDER で統一)。
+    text で bubble_messages.json のキャラ別メッセージを使い分ける:
+    - retrieve_memory_tool → bubble_messages[character]["searching"]
+    - web_search_tool → bubble_messages[character]["web_search"]
+    """
+
+    # LangChain CallbackManager が参照する属性 (BaseCallbackHandler 互換)
+    ignore_llm = False
+    ignore_retry = True
+    ignore_chain = True
+    ignore_agent = False
+    ignore_retriever = True
+    ignore_chat_model = False
+    raise_error = False
+    run_inline = False
+
+    # ツール名 → bubble_messages.json のキー
+    TOOL_MESSAGE_KEY: dict[str, str] = {
+        "retrieve_memory_tool": "searching",
+        "web_search_tool": "web_search",
+    }
+
+    def __init__(self, character_slug: str, common: dict):
+        self._character_slug = character_slug
+        self._common = common
+
+    # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
+    def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
+    def on_chain_end(self, *args, **kwargs) -> None: pass  # noqa: E704
+    def on_chat_model_start(self, *args, **kwargs) -> None: pass  # noqa: E704
+    def on_llm_end(self, *args, **kwargs) -> None: pass  # noqa: E704
+    def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
+    def on_tool_end(self, *args, **kwargs) -> None: pass  # noqa: E704
+
+    def on_tool_start(self, serialized: dict, input_str: str, **kwargs) -> None:
+        """ツール呼び出し開始時にbubble.updateを発行する。"""
+        from .pipeline import _load_bubble_messages
+        from .events import build_bubble_update
+        from .bus import publish
+
+        tool_name = serialized.get("name", "")
+        msg_key = self.TOOL_MESSAGE_KEY.get(tool_name)
+        if not msg_key:
+            return  # 未知のツールは無視 (fail-open)
+
+        char_msgs = _load_bubble_messages().get(self._character_slug, {})
+        text = char_msgs.get(msg_key, "検索中…")
+
+        try:
+            event = build_bubble_update(
+                character=self._character_slug,
+                step="searching",
+                text=text,
+                **self._common,
+            )
+            publish(event)
+            logger.info("bubble.update(searching): tool=%s character=%s", tool_name, self._character_slug)
+        except Exception as exc:
+            logger.warning("bubble.update(searching) 失敗: %s", exc)
 
 
 # ─── 公開 API ────────────────────────────────────────────────────
@@ -160,6 +329,8 @@ def run_graph(
     context: str | None = None,
     system_prompt: str | None = None,
     run_metadata: dict | None = None,
+    character_slug: str | None = None,
+    common: dict | None = None,
 ) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
@@ -168,12 +339,14 @@ def run_graph(
     それ以外は従来の単一ノード構成。
 
     Args:
-        text:          発話テキスト
-        model:         使用するモデル名
-        provider:      LLM プロバイダ（"openai" / "google" / "anthropic"）
-        context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
-        system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
-        run_metadata:  LangGraph config["metadata"] に渡す dict (optional)。
+        text:            発話テキスト
+        model:           使用するモデル名
+        provider:        LLM プロバイダ（"openai" / "google" / "anthropic"）
+        context:         RAG で取得した参照テキスト（Agent モードでは未使用、レガシー互換用）
+        system_prompt:   キャラクター別システムプロンプト（省略時は従来動作）
+        run_metadata:    LangGraph config["metadata"] に渡す dict (optional)
+        character_slug:  キャラクター slug (Agent モード時の bubble.update 用)
+        common:          stream_id/session_id/trace_id dict (Agent モード時の bubble.update 用)
 
     Returns:
         LLMResult
@@ -183,16 +356,20 @@ def run_graph(
         RuntimeError: Graph が result を返さなかった場合
     """
     logger.info(
-        "Graph 実行開始: model=%s provider=%s rag=%s tools=%s",
-        model, provider, context is not None, _is_tools_enabled(),
+        "Graph 実行開始: model=%s provider=%s tools=%s",
+        model, provider, _is_tools_enabled(),
     )
-
-    import time
 
     if _is_tools_enabled():
         agent = _build_agent_graph(provider, model, system_prompt)
         if agent is not None:
-            return _run_agent(agent, text, model, context, system_prompt, run_metadata)
+            return _run_agent(
+                agent, text, model,
+                run_metadata=run_metadata,
+                character_slug=character_slug,
+                common=common,
+                system_prompt=system_prompt,
+            )
 
     # 従来互換: 単一ノード構成
     graph = _build_simple_graph()
@@ -217,40 +394,36 @@ def _run_agent(
     agent,
     text: str,
     model: str,
-    context: str | None,
-    system_prompt: str | None,
-    run_metadata: dict | None,
+    *,
+    run_metadata: dict | None = None,
+    character_slug: str | None = None,
+    common: dict | None = None,
+    system_prompt: str | None = None,
 ) -> LLMResult:
-    """ReAct Agent を実行し、LLMResult に変換する。"""
+    """ReAct Agent を実行し、LLMResult に変換する。
+
+    Sprint Axis D Block 3:
+    - TD-2 context wrapper 削除 (Agent が自分で retrieve_memory ツールを呼ぶため)
+    - BubbleToolCallbackHandler でツール呼び出し時に bubble.update を発行
+    """
     import time
 
     t0 = time.monotonic()
 
-    # Agent への入力メッセージを組み立て
-    # TD-2 対策: 参照情報があっても ReAct Agent がツール呼び出しを省略しないよう、
-    # 「参照情報は過去の参考データ」「最新情報が必要ならツールを使え」を明示する。
-    # 注: キャラクター system_prompt は変更せず、ここでラップすることで
-    # キャラクター音声トーンに影響を与えないようにする。
-    messages = []
-    if context:
-        text_with_context = (
-            f"{text}\n\n"
-            f"---\n"
-            f"## 参照情報 (過去の会話や知識ベースから抽出)\n\n"
-            f"{context}\n\n"
-            f"---\n"
-            f"**注意**: 上記の参照情報は過去の参考データです。"
-            f"最新の情報 (天気・ニュース・時刻・今日の出来事など) が必要な場合は、"
-            f"必ず利用可能なツール (web_search 等) を呼び出して確認してください。"
-        )
-    else:
-        text_with_context = text
+    # Agent への入力メッセージ (ツール判断は Agent + system_prompt のガイダンスに委ねる)
+    input_data = {"messages": [{"role": "user", "content": text}]}
 
-    input_data = {"messages": [{"role": "user", "content": text_with_context}]}
-    config = {"metadata": run_metadata} if run_metadata else None
+    # config 構築
+    config: dict = {}
+    if run_metadata:
+        config["metadata"] = run_metadata
+    # bubble.update コールバック (Agent がツールを呼んだとき HUD に動的表示)
+    if character_slug and common:
+        handler = BubbleToolCallbackHandler(character_slug, common)
+        config["callbacks"] = [handler]
 
     try:
-        result = agent.invoke(input_data, config)
+        result = agent.invoke(input_data, config or None)
         latency_ms = int((time.monotonic() - t0) * 1000)
 
         # Agent の最終メッセージから応答テキストを抽出
@@ -289,12 +462,11 @@ def _run_agent(
         )
     except Exception as exc:
         logger.error("Agent 実行失敗: %s。単一ノードにフォールバック。", exc)
-        # フォールバック: 従来の単一ノード構成
+        # フォールバック: 従来の単一ノード構成 (system_prompt を引き継ぐ)
         return call_llm(
             text,
             model=model,
             provider="openai",
-            context=context,
             system_prompt=system_prompt,
         )
 
@@ -386,8 +558,8 @@ def _routing_node(state: PipelineGraphState) -> dict:
     publish(utt)
     write_stt_output(text, state["utterance_meta"])
 
-    # bubble: searching
-    _publish_bubble("searching", character.slug, common, links=[utt["event_id"]])
+    # bubble: thinking (Sprint Axis D Block 3: "searching" は Agent ツール呼び出し時に動的発行)
+    _publish_bubble("thinking", character.slug, common, links=[utt["event_id"]])
 
     updates["events"] = [utt]
     return updates
@@ -594,7 +766,13 @@ def _retrieval_node(state: PipelineGraphState) -> dict:
 
 
 def _generation_node(state: PipelineGraphState) -> dict:
-    """生成ノード: LLM 呼び出し + llm.final 発行。"""
+    """生成ノード: LLM 呼び出し + llm.final 発行。
+
+    Sprint Axis D Block 3:
+    - retrieve_memory ツール用の contextvars をセットしてから Agent 実行
+    - Agent がツールを自律判断 (retrieve_memory / web_search / なし)
+    - rag_used / answer_mode は Agent 実行後に事後判定
+    """
     from .pipeline import publish, _publish_bubble
     from .events import build_llm_final
     from .observability import build_run_metadata
@@ -605,24 +783,28 @@ def _generation_node(state: PipelineGraphState) -> dict:
     utt_event_id = state["events"][0]["event_id"]
 
     if state["use_real_llm"]:
+        # Sprint Axis D Block 3: retrieve_memory ツール用のセッションコンテキストをセット
+        if _is_rag_enabled():
+            from .mcp_servers.retrieve_memory import set_retrieval_context
+            set_retrieval_context(
+                stream_id=common.get("stream_id"),
+                exclude_event_ids=[utt_event_id],
+            )
+
         _run_meta = build_run_metadata(
             stream_id=common["stream_id"],
             session_id=common["session_id"],
             trace_id=common["trace_id"],
-            rag_used=state["rag_used"],
-            answer_mode=state["answer_mode"],
-            retrieval_latency_ms=state["retrieval_latency_ms"],
-            retrieved_doc_count=len(state["retrieved_doc_ids"]),
-            retrieved_doc_ids=state["retrieved_doc_ids"],
         )
-        write_llm_prompt(text, state["rag_context"])
+        write_llm_prompt(text, None)
         _llm_result = run_graph(
             text,
             model=state["llm_model"],
             provider=state["llm_provider"],
-            context=state["rag_context"],
             system_prompt=state["system_prompt"],
             run_metadata=_run_meta,
+            character_slug=state["character_slug"],
+            common=common,
         )
         write_llm_response(_llm_result.text)
         llm_text = _llm_result.text
@@ -632,11 +814,6 @@ def _generation_node(state: PipelineGraphState) -> dict:
             output_tokens=_llm_result.output_tokens,
             latency_ms=_llm_result.latency_ms,
             finish_reason=_llm_result.finish_reason,
-            rag_used=state["rag_used"],
-            answer_mode=state["answer_mode"],
-            retrieval_latency_ms=state["retrieval_latency_ms"],
-            retrieved_doc_count=len(state["retrieved_doc_ids"]),
-            retrieved_doc_ids=state["retrieved_doc_ids"],
         )
     else:
         llm_text = f"ダミー応答: {text}"
@@ -700,7 +877,8 @@ def _tts_node(state: PipelineGraphState) -> dict:
     tts = build_tts_done(text=llm_text, seq=2, links=[llm_event_id], **tts_meta, **common)
     publish(tts)
 
-    _publish_bubble("done", state["character_slug"], common, links=[tts["event_id"]])
+    # bubble: done は run_loop.py の _playback_worker が最終チャンク再生 + 5 秒後に発行する
+    # (Sprint Axis D Block 1: OBS セリフテロップ表示)
 
     return {
         "tts_meta": tts_meta,
@@ -712,7 +890,10 @@ def _tts_node(state: PipelineGraphState) -> dict:
 
 
 def _build_pipeline_graph():
-    """4 ノードパイプライングラフを構築する。
+    """3 ノードパイプライングラフを構築する。
+
+    Sprint Axis D Block 3: _retrieval_node を削除。
+    RAG 検索は _generation_node 内の Agent がツールとして自律呼び出しする。
 
     langgraph が未インストールの場合は ImportError を送出する。
     """
@@ -720,12 +901,10 @@ def _build_pipeline_graph():
 
     builder = StateGraph(PipelineGraphState)
     builder.add_node("routing", _routing_node)
-    builder.add_node("retrieval", _retrieval_node)
     builder.add_node("generation", _generation_node)
     builder.add_node("tts", _tts_node)
     builder.set_entry_point("routing")
-    builder.add_edge("routing", "retrieval")
-    builder.add_edge("retrieval", "generation")
+    builder.add_edge("routing", "generation")
     builder.add_edge("generation", "tts")
     builder.add_edge("tts", END)
     return builder.compile()
