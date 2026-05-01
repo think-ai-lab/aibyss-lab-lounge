@@ -3,7 +3,7 @@ obs.py — OBS WebSocket クライアント（立ち絵切り替え用）
 
 責務:
   - OBS Studio の WebSocket に接続し、立ち絵ソースを show/hide する
-  - LLM が返す pose 値（neutral/happy/angry/sad/fun）に応じて、
+  - LLM が返す pose 値（base + キャラ別 special）に応じて、
     指定キャラクターの対応ソースを表示、他ポーズのソースを非表示にする
   - OBS 未接続時・obsws-python 未インストール時は no-op（warning ログのみ）
     で L2 の主機能はクラッシュしない
@@ -11,22 +11,30 @@ obs.py — OBS WebSocket クライアント（立ち絵切り替え用）
 【OBS 側の構成】
   Scene: (任意、親シーン名は L2 から意識しない)
   ├── Group: mimi              ← グループ名 = キャラクター slug
-  │   ├── mimi_neutral (Image Source)
-  │   ├── mimi_happy
-  │   ├── mimi_angry
-  │   ├── mimi_sad
-  │   └── mimi_fun
+  │   ├── mimi_{neutral|happy|angry|sad|fun}              # base 5
+  │   └── mimi_special_{sulky|pondering|amused}            # mimi 固有
   ├── Group: chisame
-  │   └── (同 5 ソース)
-  └── Group: sakura
-      └── (同 5 ソース)
+  │   ├── chisame_{neutral|happy|angry|sad|fun}
+  │   └── chisame_special_{overdrive|doya|bosoboso}
+  ├── Group: sakura
+  │   ├── sakura_{neutral|happy|angry|sad|fun}
+  │   └── sakura_special_{whisper|cool}
+  ├── Group: ruka
+  │   └── ruka_{neutral|happy|angry|sad|fun}
+  └── Group: octamaid
+      └── octamaid_{neutral|happy|angry|sad|fun}
 
   ※ OBS WebSocket API では Group は内部的に "Scene" として扱われるため、
      API 呼び出し時の scene_name にはキャラクター slug（グループ名）を渡す。
+  ※ 各キャラの利用可能 pose 集合は system_prompts/system_*.txt が真実源。
+     LLM が pose を出力する範囲は system_prompt のスキーマで縛られているため、
+     VALID_POSES は全キャラの和集合をフラットに保持する（キャラ違反は
+     構造的に発生しない）。OBS にソースが存在しない場合は _get_item_id が
+     None を返し、set_pose は安全に no-op で fall through する。
 
 【ソース命名規則】
   `{character_slug}_{pose}`
-  例: mimi_neutral, mimi_happy, mimi_angry, mimi_sad, mimi_fun
+  例: mimi_neutral, mimi_happy, mimi_special_sulky, chisame_special_overdrive
 
 【環境変数】
   L2_OBS_WS_URL      — OBS WebSocket URL (ws://host:port 形式)
@@ -43,14 +51,33 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-VALID_POSES: frozenset[str] = frozenset({"neutral", "happy", "angry", "sad", "fun"})
+# 全キャラ共通の base 5 個 + キャラ別 special pose の和集合。
+# 真実源は system_prompts/system_*.txt のスキーマで、ここはそれに同期する。
+# special pose を追加した際は system_prompt と本セット両方を更新する。
+VALID_POSES: frozenset[str] = frozenset({
+    # 全キャラ共通の base
+    "neutral", "happy", "angry", "sad", "fun",
+    # mimi 固有
+    "special_sulky", "special_pondering", "special_amused",
+    # chisame 固有
+    "special_overdrive", "special_doya", "special_bosoboso",
+    # sakura 固有
+    "special_whisper", "special_cool",
+})
 
 # モジュールレベル状態（プロセス内シングルトン）
 _client: Any = None
 _connected: bool = False
 _init_attempted: bool = False
-# キー: (group_name, source_name) → SceneItemId
+# キー: (group_name, source_name) → SceneItemId。存在するソースのみ登録される。
+# group の全 item を 1 度の API 呼び出し (GetGroupSceneItemList) で一括取得して
+# 投入するため、未登録 source への単発問合せ (= OBSSDKRequestError code 600) は
+# 発生しない。
 _item_id_cache: dict[tuple[str, str], int] = {}
+# 既に GetGroupSceneItemList を呼んだ group の集合。同 group への再ロードを防ぐ。
+# OBS 側にソースが動的に追加されることは想定しない。動的追加時は disconnect_obs()
+# でクリアできる。
+_loaded_groups: set[str] = set()
 
 
 def _parse_ws_url(url: str) -> tuple[str, int]:
@@ -108,31 +135,56 @@ def init_obs() -> None:
         _connected = False
 
 
+def _ensure_group_loaded(group_name: str) -> None:
+    """
+    指定 group の全 scene item を一括取得してキャッシュする (初回のみ API 呼び出し)。
+
+    OBS WebSocket v5 では Group は内部的に Scene として扱われるが、
+    GetGroupSceneItemList が group 専用 API として用意されている。1 回の呼び出しで
+    その group の全ソース (sourceName, sceneItemId) を取得できるため、
+    未登録ソースへの単発 GetSceneItemId (= OBSSDKRequestError code 600 を発生させる)
+    を完全に避けられる。
+
+    エラー時 (group 不在等) も _loaded_groups に登録し、以降のリトライをスキップする。
+    OBSSDKRequestError は obsws-python のロガーが ERROR レベルで自動出力するため、
+    本関数の except では握り潰すしかない。
+    """
+    if group_name in _loaded_groups:
+        return
+    _loaded_groups.add(group_name)  # 失敗時もリトライしない (= ERROR ログを 1 回に抑える)
+
+    if _client is None:
+        return
+
+    try:
+        resp = _client.get_group_scene_item_list(group_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("group %s の item list 取得失敗 (group 不在等): %s", group_name, exc)
+        return
+
+    # response.scene_items は list of dict (各 dict は camelCase キー)
+    items = getattr(resp, "scene_items", None) or []
+    registered = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_name = item.get("sourceName")
+        scene_item_id = item.get("sceneItemId")
+        if source_name and scene_item_id is not None:
+            _item_id_cache[(group_name, source_name)] = scene_item_id
+            registered += 1
+    logger.debug("group %s: %d ソースをキャッシュ", group_name, registered)
+
+
 def _get_item_id(group_name: str, source_name: str) -> int | None:
     """
     グループ内のソースの SceneItemId を取得する（キャッシュ付き）。
 
-    OBS WebSocket API v5 では Group は内部的に Scene として扱われるため、
-    `scene_name` パラメータにはグループ名を渡す。
+    初回呼び出し時に GetGroupSceneItemList で group 全体を一括取得してキャッシュ。
+    以降は API を呼ばず cache lookup のみ。存在しないソースは None を返す。
     """
-    cache_key = (group_name, source_name)
-    if cache_key in _item_id_cache:
-        return _item_id_cache[cache_key]
-
-    if _client is None:
-        return None
-
-    try:
-        resp = _client.get_scene_item_id(group_name, source_name)
-        # obsws-python v5 の戻り値は dataclass: scene_item_id 属性を持つ
-        item_id: int | None = getattr(resp, "scene_item_id", None)
-        if item_id is None:
-            return None
-        _item_id_cache[cache_key] = item_id
-        return item_id
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("SceneItemId 取得失敗: %s/%s (%s)", group_name, source_name, exc)
-        return None
+    _ensure_group_loaded(group_name)
+    return _item_id_cache.get((group_name, source_name))
 
 
 def set_pose(character_slug: str, pose: str) -> None:
@@ -146,7 +198,8 @@ def set_pose(character_slug: str, pose: str) -> None:
 
     Args:
         character_slug: キャラクター slug (e.g., "mimi") — グループ名としても使用される
-        pose:           立ち絵 slug ("neutral" / "happy" / "angry" / "sad" / "fun")
+        pose:           立ち絵 slug。base (neutral/happy/angry/sad/fun) と各キャラの
+                        system_prompt に定義された special_* (e.g., special_pondering)。
     """
     global _init_attempted
 
@@ -201,6 +254,7 @@ def disconnect_obs() -> None:
     _connected = False
     _init_attempted = False
     _item_id_cache.clear()
+    _loaded_groups.clear()
 
 
 # ─── テスト用 internal ──────────────────────────────────────────
@@ -212,6 +266,7 @@ def _reset_for_tests() -> None:
     _connected = False
     _init_attempted = False
     _item_id_cache.clear()
+    _loaded_groups.clear()
 
 
 def _set_client_for_tests(client: Any, connected: bool = True) -> None:
@@ -221,3 +276,4 @@ def _set_client_for_tests(client: Any, connected: bool = True) -> None:
     _connected = connected
     _init_attempted = True
     _item_id_cache.clear()
+    _loaded_groups.clear()

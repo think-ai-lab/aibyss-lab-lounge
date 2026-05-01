@@ -174,18 +174,29 @@ class TestInitObs:
 def _make_mock_client(item_ids: dict[tuple[str, str], int]) -> MagicMock:
     """
     `{(group_name, source_name): scene_item_id}` マッピングを返すモッククライアント。
+
+    新実装の obs.py は GetGroupSceneItemList で group 全体を一括取得するため、
+    `get_group_scene_item_list(group_name)` を mock してその group の全 item を
+    list で返す。group が登録されていない場合は obsws-python と同様に例外を投げる。
     """
+    from collections import defaultdict
+
     client = MagicMock()
 
-    def get_scene_item_id(group_name, source_name):
-        key = (group_name, source_name)
-        if key in item_ids:
-            resp = MagicMock()
-            resp.scene_item_id = item_ids[key]
-            return resp
-        raise RuntimeError(f"Source not found: {group_name}/{source_name}")
+    # item_ids を group 単位で再構成
+    group_items: dict[str, list[dict]] = defaultdict(list)
+    for (group, source), item_id in item_ids.items():
+        group_items[group].append({"sourceName": source, "sceneItemId": item_id})
 
-    client.get_scene_item_id.side_effect = get_scene_item_id
+    def get_group_scene_item_list(group_name):
+        items = group_items.get(group_name)
+        if not items:
+            raise RuntimeError(f"Group not found: {group_name}")
+        resp = MagicMock()
+        resp.scene_items = items
+        return resp
+
+    client.get_group_scene_item_list.side_effect = get_group_scene_item_list
     client.set_scene_item_enabled = MagicMock()
     return client
 
@@ -278,22 +289,25 @@ class TestSetPose:
 
         client.set_scene_item_enabled.assert_not_called()
 
-    def test_item_id_cached(self):
-        """SceneItemId は初回取得後にキャッシュされる (同キャラ 2 回目は呼ばない)。"""
+    def test_group_loaded_once(self):
+        """group は初回 set_pose で 1 度だけ一括ロードされ、以降は API 呼び出されない。"""
         client = _make_mock_client(_mimi_group_item_ids())
         obs_mod._set_client_for_tests(client, connected=True)
 
         obs_mod.set_pose("mimi", "happy")
-        first_count = client.get_scene_item_id.call_count
+        # 初回: get_group_scene_item_list が 1 回呼ばれる
+        assert client.get_group_scene_item_list.call_count == 1
 
         obs_mod.set_pose("mimi", "sad")
-        second_count = client.get_scene_item_id.call_count
+        # 2 回目: API は呼ばれない (cache から取得)
+        assert client.get_group_scene_item_list.call_count == 1
 
-        # 2 回目は完全にキャッシュから取得 → 呼び出し回数増加なし
-        assert second_count == first_count
+        obs_mod.set_pose("mimi", "neutral")
+        # 3 回目も同じ
+        assert client.get_group_scene_item_list.call_count == 1
 
     def test_cache_is_per_group(self):
-        """キャッシュはグループ単位で分離される。"""
+        """キャッシュはグループ単位で分離される (mimi と chisame で別々の API call)。"""
         client = _make_mock_client({
             **_mimi_group_item_ids(),
             ("chisame", "chisame_neutral"): 10,
@@ -305,16 +319,16 @@ class TestSetPose:
         obs_mod._set_client_for_tests(client, connected=True)
 
         obs_mod.set_pose("mimi", "happy")
-        mimi_calls = client.get_scene_item_id.call_count
+        # mimi の初回ロードのみ
+        assert client.get_group_scene_item_list.call_count == 1
 
-        # chisame グループへの切替時は chisame の item_id を取得するため再度呼び出しが発生
         obs_mod.set_pose("chisame", "happy")
-        assert client.get_scene_item_id.call_count > mimi_calls
+        # chisame の初回ロード → 2 回目
+        assert client.get_group_scene_item_list.call_count == 2
 
-        # 同じ chisame の 2 回目はキャッシュから
-        before = client.get_scene_item_id.call_count
         obs_mod.set_pose("chisame", "sad")
-        assert client.get_scene_item_id.call_count == before
+        # 同 chisame は cache 済み → 増えない
+        assert client.get_group_scene_item_list.call_count == 2
 
     def test_set_scene_item_enabled_failure_logged_not_raised(self):
         """set_scene_item_enabled が失敗しても例外を伝播させない。"""
@@ -351,7 +365,22 @@ class TestSetPose:
 
 
 class TestValidPoses:
-    def test_contains_5_poses(self):
-        assert obs_mod.VALID_POSES == frozenset(
-            {"neutral", "happy", "angry", "sad", "fun"}
-        )
+    def test_contains_base_poses(self):
+        """base 5 個 (neutral/happy/angry/sad/fun) は必ず含まれる。"""
+        for pose in ("neutral", "happy", "angry", "sad", "fun"):
+            assert pose in obs_mod.VALID_POSES
+
+    def test_contains_mimi_specials(self):
+        """mimi 固有の special pose が含まれる (system_mimi.txt と同期)。"""
+        for pose in ("special_sulky", "special_pondering", "special_amused"):
+            assert pose in obs_mod.VALID_POSES
+
+    def test_contains_chisame_specials(self):
+        """chisame 固有の special pose が含まれる (system_chisame.txt と同期)。"""
+        for pose in ("special_overdrive", "special_doya", "special_bosoboso"):
+            assert pose in obs_mod.VALID_POSES
+
+    def test_contains_sakura_specials(self):
+        """sakura 固有の special pose が含まれる (system_sakura.txt と同期)。"""
+        for pose in ("special_whisper", "special_cool"):
+            assert pose in obs_mod.VALID_POSES
