@@ -44,6 +44,10 @@ class CharacterConfig:
     filler_model: str = ""       # 空文字 = 環境変数 L2_LLM_FILLER_MODEL のデフォルトを使用
     porcupine_model: str | None = None
     aliases: list[str] = field(default_factory=list)
+    # 呼びかけ用の親しみのある通り名 (例: 「ちさめ」「さくら」)。空文字なら
+    # display_name を使う。ask_character の導入セリフ生成時に target に直接
+    # 語りかける際、フルネーム ("波心ちさめ") よりも自然になるため使用する。
+    nickname: str = ""
     # VOICEPEAK ナレーター固有の emotion キー名。
     # フィラー LLM プロンプトに含めて JSON 出力を誘導する。
     # 空タプル = emotion 非対応 (voicevox 等) → フィラーはプレーンテキスト生成。
@@ -56,12 +60,13 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
     "mimi": CharacterConfig(
         slug="mimi",
         display_name="ミミ・オクタヴィア",
+        nickname="ミミ",
         wake_word="ミミ様",
         tts_provider="voicepeak",
         tts_voice="Asumi Ririse",
         system_prompt_file="system_mimi.txt",
         llm_provider="openai",
-        llm_model="gpt-5.4",
+        llm_model="gpt-5.5",
         filler_model="gpt-5.4-mini",
         porcupine_model="mimi-sama_ja_windows_v4_0_0.ppn",
         aliases=["ミミ", "お嬢様"],
@@ -70,6 +75,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
     "chisame": CharacterConfig(
         slug="chisame",
         display_name="波心ちさめ",
+        nickname="ちさめ",
         wake_word="ちさめさん",
         tts_provider="voicepeak",
         tts_voice="Miyamai Moca",
@@ -84,6 +90,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
     "sakura": CharacterConfig(
         slug="sakura",
         display_name="八重笠さくら",
+        nickname="さくら",
         wake_word="さくらさん",
         tts_provider="voicepeak",
         tts_voice="Haruno Sora",
@@ -98,6 +105,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
     "octamaid": CharacterConfig(
         slug="octamaid",
         display_name="オクタメイド",
+        nickname="オクタメイド",
         wake_word="オクタメイド",
         tts_provider="voicevox",
         tts_voice="89", # Voidoll
@@ -108,6 +116,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
     "ruka": CharacterConfig(
         slug="ruka",
         display_name="坂東ルカ",
+        nickname="ルカ",
         wake_word=None,
         tts_provider="voicepeak",
         tts_voice="Frimomen",  # 暫定

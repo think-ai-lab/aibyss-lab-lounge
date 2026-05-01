@@ -202,12 +202,26 @@ def _build_agent_graph(
     combined_prompt = "\n\n".join(parts) if parts else None
 
     llm = _get_llm_for_agent(provider, model)
+    # 並列ツール呼び出しを抑制する (S999 で観測された複数 ask_character の同時発火対策)。
+    # parallel_tool_calls=False を bind_tools 時に渡すことで、LLM の 1 応答内で
+    # 同時に複数のツールが呼ばれなくなる (= 同一ターンで ask_character を 2 回並列発行
+    # しなくなる)。LangChain v0.3+ で OpenAI / Anthropic 共通の引数。
+    # Gemini は本パラメータ非対応のため bind_tools せず素通しする (Skills の文言で誘導)。
+    bound_llm = (
+        llm.bind_tools(tools, parallel_tool_calls=False)
+        if provider in ("openai", "anthropic")
+        else llm
+    )
     agent = create_react_agent(
-        llm,
+        bound_llm,
         tools,
         prompt=combined_prompt,
     )
-    logger.info("ReAct Agent 構築完了: tools=%d model=%s skills=%s", len(tools), model, bool(skills_text))
+    logger.info(
+        "ReAct Agent 構築完了: tools=%d model=%s skills=%s parallel_tool_calls=%s",
+        len(tools), model, bool(skills_text),
+        False if provider in ("openai", "anthropic") else "(provider非対応)",
+    )
     return agent
 
 
@@ -758,12 +772,17 @@ def _generation_node(state: PipelineGraphState) -> dict:
             )
 
         # Phase 3: ask_character ツール用のコンテキストをセット
+        # on_pose_ready は target 応答の pose を target キャラの chunk 1 再生
+        # 直前に切り替えるためのコールバック。caller の最終応答 pose 切替と
+        # 同じ仕組み (= playback worker の _pending_pose 経由) を target にも
+        # 適用する。
         from .mcp_servers.ask_character import set_ask_character_context
         set_ask_character_context(
             on_tts_chunk=state["on_tts_chunk_ready"],
             tts_output_dir=state["tts_output_dir"],
             common=common,
             caller_slug=state["character_slug"],
+            on_pose_ready=state.get("on_pose_ready"),
         )
 
         _run_meta = build_run_metadata(
@@ -771,9 +790,20 @@ def _generation_node(state: PipelineGraphState) -> dict:
             session_id=common["session_id"],
             trace_id=common["trace_id"],
         )
-        write_llm_prompt(text, None)
+        # user message に「ルカからの発言」prefix を付ける。これがないと caller LLM が
+        # user message の発話者を「アビスメイト」(視聴者) と推測してしまうケースがある
+        # (特に system_prompt でアビスメイト言及が多い sakura で顕著)。明示的に
+        # 「ルカからの発言」と渡すことで、各キャラの system_prompt にある
+        # 「ルカを『ルカさん』と呼ぶ」等の指示が確実に効くようになる。
+        # 例外: text が既に「ルカ」で始まる、もしくは明示的に「アビスメイトから」等と
+        # ある場合はそのまま (= ユーザー側で発話者を明示している)。
+        if text and not text.startswith("[") and "アビスメイト" not in text[:30]:
+            tagged_text = f"[ルカからの発言]\n{text}"
+        else:
+            tagged_text = text
+        write_llm_prompt(tagged_text, None)
         _llm_result = run_graph(
-            text,
+            tagged_text,
             model=state["llm_model"],
             provider=state["llm_provider"],
             system_prompt=state["system_prompt"],
@@ -828,6 +858,15 @@ def _tts_node(state: PipelineGraphState) -> dict:
         set_pose(character_slug, pose_value or "neutral")
 
     if state["use_real_tts"]:
+        # caller の最終応答 TTS を投入する前に、ask_character がバックグラウンド
+        # 合成中の協働応答 TTS の完了を待つ。これがないと VOICEPEAK FIFO ワーカー
+        # に caller TTS と target TTS が同時に投入されて交互合成・再生になる
+        # (= 「ちさめ chunk1 → mimi → ちさめ chunk2」のような順序乱れ)。
+        # caller LLM 推論は target TTS 合成と並行で進んでいるため、ここで待つ
+        # 時間は実用上ゼロ〜数秒に収まることが多い。
+        from .mcp_servers.ask_character import wait_bg_tts_complete
+        wait_bg_tts_complete(common.get("session_id", ""))
+
         from .tts import synthesize as _synthesize
         _tts_result = _synthesize(
             llm_text,

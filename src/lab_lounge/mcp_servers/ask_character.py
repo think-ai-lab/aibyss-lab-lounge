@@ -23,6 +23,7 @@ Phase 3: AITuber 掛け合い
 import contextvars
 import logging
 import os
+import threading
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,101 @@ _caller_slug_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 _chunk_done_event_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ask_char_chunk_done_event", default=None,
 )
+# 立ち絵切替予約コールバック (run_loop.py の _on_pose_ready)。target 応答の本応答
+# TTS 投入時に呼び出すことで、playback worker が target chunk 1 再生直前に
+# target キャラの pose (例: special_doya / special_overdrive) で立ち絵切替する。
+# graph.py の _generation_node で _tts_node の on_pose_ready と同じものをここでも
+# セットする。
+_on_pose_ready_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "ask_char_on_pose_ready", default=None,
+)
+
+# ─── ターン状態 (session_id をキーにした module-level dict) ──────────
+# contextvars ではなく dict + Lock で管理する理由:
+#   LangGraph の ToolNode は asyncio.create_task() などで子 context を生成して
+#   ツール関数を実行する。contextvars.set() で書き換えた値は親 context に
+#   伝搬しないため、複数回の ask_character_tool 呼出し間でカウントが共有
+#   できなかった (S999 で ask_index が常に 1 にリセットされる事象)。
+#
+# session_id (= run_loop の 1 セッション = 配信 1 回 ≒ 1 ターン群) をキーに
+# して、process グローバルな状態を Lock 付きで保持する。set_ask_character_context()
+# で session 開始時にリセットする。
+_ask_state_lock = threading.Lock()
+_ask_counts: dict[str, int] = {}        # session_id → 同一ターン内の呼出し回数
+_previous_targets: dict[str, str] = {}  # session_id → 直前 target の display_name
+# 同一 session 内の協働応答 TTS バックグラウンドスレッドの完了 event リスト。
+# graph.py の _tts_node (caller の最終応答 TTS 投入前) と run_loop.py の playback
+# queue close 前で wait_bg_tts_complete() で待つ。これにより:
+#   - caller の最終応答 TTS が target TTS と同時に VOICEPEAK ワーカーキューに
+#     投入されて交互合成・再生になるのを防ぐ (順序保証)
+#   - playback queue の close sentinel が target chunks 投入完了前に送られて
+#     残りの chunks が再生されないのを防ぐ (途中切れ防止)
+_bg_tts_events: dict[str, list[threading.Event]] = {}
+
+
+def _reset_session_state(session_id: str) -> None:
+    """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
+    if not session_id:
+        return
+    with _ask_state_lock:
+        _ask_counts[session_id] = 0
+        _previous_targets[session_id] = ""
+
+
+def _next_ask_state(session_id: str) -> tuple[int, str]:
+    """カウントをインクリメントし、(新しい ask_index, インクリメント前の直前 target) を返す。
+
+    session_id が空の場合は (1, "") を返し、状態は保持しない。
+    """
+    if not session_id:
+        return (1, "")
+    with _ask_state_lock:
+        idx = _ask_counts.get(session_id, 0) + 1
+        _ask_counts[session_id] = idx
+        prev = _previous_targets.get(session_id, "")
+    return (idx, prev)
+
+
+def _record_target(session_id: str, target_display: str) -> None:
+    """ask_character 完了後に直前 target の display_name を記録する。"""
+    if not session_id:
+        return
+    with _ask_state_lock:
+        _previous_targets[session_id] = target_display
+
+
+def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
+    """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。"""
+    if not session_id:
+        return
+    with _ask_state_lock:
+        _bg_tts_events.setdefault(session_id, []).append(event)
+
+
+def wait_bg_tts_complete(session_id: str, timeout: float = 180.0) -> None:
+    """指定 session の全 bg_tts (協働応答 TTS バックグラウンド合成) の完了を待つ。
+
+    graph.py の _tts_node (caller の最終応答 TTS 投入前) と run_loop.py の
+    playback queue close 前で呼び出される。完了を待ち終わった events は dict から
+    取り除かれるため、複数回呼んでも問題ない (空リストになる)。
+
+    Args:
+        session_id: 待機対象の session_id (空文字なら no-op)
+        timeout:    1 event あたりの最大待機秒数 (default: 180)
+    """
+    if not session_id:
+        return
+    with _ask_state_lock:
+        events = _bg_tts_events.pop(session_id, [])
+    if not events:
+        return
+    logger.info(
+        "wait_bg_tts_complete: session=%s pending=%d events 待機開始",
+        session_id, len(events),
+    )
+    for ev in events:
+        ev.wait(timeout=timeout)
+    logger.info("wait_bg_tts_complete: session=%s 全 events 完了", session_id)
 
 
 def set_ask_character_context(
@@ -54,21 +150,39 @@ def set_ask_character_context(
     tts_output_dir: str = "./data/audio",
     common: dict | None = None,
     caller_slug: str = "",
+    on_pose_ready: Callable | None = None,
 ) -> None:
-    """Agent 実行前にコンテキストをセットする。graph.py の _generation_node から呼ばれる。"""
+    """Agent 実行前にコンテキストをセットする。graph.py の _generation_node から呼ばれる。
+
+    Args:
+        on_pose_ready: target 応答の pose 切替予約コールバック。
+                       (slug: str, pose: str) -> None。
+                       graph.py の _tts_node が caller の pose 切替で使うものと
+                       同じ関数 (_on_pose_ready) を渡す想定。
+    """
     _on_tts_chunk_var.set(on_tts_chunk)
     _tts_output_dir_var.set(tts_output_dir)
     _common_var.set(common or {})
     _caller_slug_var.set(caller_slug)
+    _on_pose_ready_var.set(on_pose_ready)
+    # ターン開始時に呼出し回数と直前 target をリセット (各ターン独立にカウント)。
+    # graph.py の _generation_node がターン開始時に 1 回呼ぶ前提。
+    session_id = (common or {}).get("session_id", "")
+    _reset_session_state(session_id)
 
 
 def reset_ask_character_context() -> None:
-    """テスト用: contextvars をデフォルトにリセットする。"""
+    """テスト用: contextvars と session 状態をデフォルトにリセットする。"""
     _on_tts_chunk_var.set(None)
     _tts_output_dir_var.set("./data/audio")
     _common_var.set({})
     _caller_slug_var.set("")
     _chunk_done_event_var.set(None)
+    _on_pose_ready_var.set(None)
+    with _ask_state_lock:
+        _ask_counts.clear()
+        _previous_targets.clear()
+        _bg_tts_events.clear()
 
 
 # ─── MCP サーバー ──────────────────────────────────────────────────
@@ -144,11 +258,33 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         caller_char = get_character(caller_slug) if caller_slug else None
         caller_display = caller_char.display_name if caller_char else "ルカ"
     except KeyError:
+        caller_char = None
         caller_display = "ルカ"
 
+    # ターン内 ask_character 呼出し回数をカウントアップ + 直前の target を読み出す。
+    # 2 回目以降は _generate_intro が「ルカへの受け止めコメント」を省くプロンプトに
+    # 切り替えるため、ask_index と previous_target_display を後段に渡す。
+    # session_id をキーにした module-level dict を使う (contextvars だと
+    # LangGraph の ToolNode 子 context で値が伝搬しないため)。
+    common_dict = _common_var.get() or {}
+    session_id = common_dict.get("session_id", "")
+
+    # 直前の ask_character の協働応答 TTS バックグラウンド合成完了を待つ。
+    # これがないと、2 回目の ask_character が始まる際 (caller LLM が次の判断を
+    # 出した直後) に「caller の問いかけ TTS」が VOICEPEAK FIFO ワーカーキューに
+    # 直前 target の chunks と並行で投入され、再生順序が乱れる
+    # (例: 「ちさめ chunk1 → mimi のさくらへの問いかけ → ちさめ chunk2,3 → さくら」)。
+    # caller LLM 推論時間が直前 target の TTS 合成と並行で進むため、ここで待つ
+    # 時間は実用上ゼロ〜数十秒に収まる。直前 target が再生中なら配信上の空白は
+    # 発生しない (= 直前の発話が続いている間に wait する形になる)。
+    wait_bg_tts_complete(session_id)
+
+    ask_index, previous_target_display = _next_ask_state(session_id)
+
     logger.info(
-        "ask_character 実行: caller=%s target=%s question=%r",
-        caller_slug, character_slug, question[:80],
+        "ask_character 実行: caller=%s target=%s ask_index=%d previous=%s question=%r",
+        caller_slug, character_slug, ask_index, previous_target_display or "(none)",
+        question[:80],
     )
 
     # 質問に「誰からの質問か」コンテキストを追加
@@ -200,6 +336,8 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             caller_char=caller_char,
             target_char=target_char,
             user_question=question,
+            ask_index=ask_index,
+            previous_target_display=previous_target_display,
         )
 
     # 4a-2. 協働先への質問コンテキストにルカの原文 + 導入セリフを含める
@@ -268,20 +406,149 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     # 5. 協働先の応答を TTS 合成 + 再生キュー投入
     if on_tts_chunk and use_real_tts:
+        from ..pipeline import _publish_bubble
+
+        # 5-a. target の "考え中" bubble を発行する (filler 再生中のテロップ用)。
+        # graph.py の _generation_node が caller の thinking bubble を出すのと同じ仕組みで、
+        # filler が target の声で再生されている間、V2 HUD には target の thinking テキスト
+        # (例: chisame「分析しています」/ sakura「んー……考え中ですよぉ」) を表示する。
+        if common:
+            try:
+                _publish_bubble("thinking", target_char.slug, common)
+            except Exception as exc:
+                logger.warning(
+                    "協働先 bubble.update(thinking) 発行失敗 (%s): %s",
+                    target_char.slug, exc,
+                )
+
+        # 5-b. target の bridge filler を再生キュー投入する (応答 TTS の合成中の空白を埋める)。
+        # 「caller の問いかけ完了 → 即 target の応答が始まる」と target の VOICEPEAK 合成
+        # (1 チャンク目 ~22 秒) を待つ間に視聴者の耳が空白を感じる。bridge filler
+        # (例: chisame の「ええと……」/ sakura の「えっとぉ……」) を 1 つ挟むことで、
+        # 受け止めの一言を経て自然に応答へ繋がる。bridge は事前生成キャッシュから取るため、
+        # LLM/TTS のレイテンシも上乗せしない。
         try:
-            from ..tts import synthesize as tts_synthesize
-            tts_synthesize(
-                response_text,
-                provider=target_char.tts_provider,
-                voice=target_char.tts_voice,
-                speaker=target_char.slug,
-                output_dir=tts_output_dir,
-                on_chunk_ready=on_tts_chunk,
-            )
+            from ..filler import select_filler_path
+            bridge_path, _ = select_filler_path(target_char.slug, "bridge")
+            if bridge_path:
+                # chunk_text を空文字にする理由:
+                #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
+                #   bubble.update step="speaking" の表示テキストにそのまま流す。
+                #   filler 用の内部識別ラベル (e.g., "(target bridge filler)") をここに
+                #   渡すと HUD にそのまま出てしまうため、空文字を渡し、playback worker
+                #   側で「空文字なら speaking publish をスキップ」して直前の thinking
+                #   テロップを維持させる。
+                on_tts_chunk(
+                    bridge_path.as_uri(),
+                    "",
+                    False,  # is_last=False — 本応答が続く
+                    target_char.slug,
+                )
+                logger.info(
+                    "ask_character target bridge filler 投入: [%s] %s",
+                    target_char.slug, bridge_path.name,
+                )
+            else:
+                logger.debug("target bridge filler なし: %s", target_char.slug)
         except Exception as exc:
-            logger.warning("ask_character TTS 合成失敗 (%s): %s", character_slug, exc)
+            logger.warning("target bridge filler 投入失敗 (%s): %s", target_char.slug, exc)
+
+        # 5-c. 協働応答 TTS 合成 + 再生キュー投入 (バックグラウンド実行)。
+        #
+        # tts_synthesize は VOICEPEAK の全チャンク合成完了まで同期ブロックする
+        # (1 chunk あたり ~20 秒 × 数チャンク = 数十秒)。これを別スレッドに逃すことで、
+        # _ask_character_impl は ToolNode 戻り値を即時 return → caller の Agent が
+        # すぐ次の LLM 推論 (例: 次の ask_character の呼出し判断) に進める。
+        #
+        # 完了 event を session_id に紐付けて登録する。graph.py の _tts_node
+        # (caller の最終応答 TTS 投入前) と run_loop.py の playback queue close
+        # 前で wait_bg_tts_complete() を呼び順序を保証する。これが無いと:
+        #   - caller の最終応答 TTS と target TTS が VOICEPEAK FIFO に同時投入されて
+        #     交互合成・再生になる (= 「ちさめ chunk1 → mimi → ちさめ chunk2」)
+        #   - playback queue の close sentinel が target chunks 投入前に送られて
+        #     target が途中で切れる
+        #
+        # answering bubble は本応答 TTS の最初のチャンクが再生キュー投入される
+        # 直前に発火させる (on_chunk_ready ラッパー経由)。これにより:
+        #   - bridge filler 再生中は thinking テロップが維持される
+        #   - 本応答 TTS の最初のチャンクが鳴り始めるタイミングで answering テロップ
+        #     に切替
+        bg_tts_done = threading.Event()
+        first_chunk_seen = [False]
+        # contextvars はバックグラウンドスレッドの context isolation で値が
+        # 引き継がれない可能性があるため、ここで値を取得してクロージャ経由で
+        # _bg_tts_synthesize に渡す。
+        on_pose_ready = _on_pose_ready_var.get()
+
+        # response_text から pose を事前に抽出 (_wrapped_on_chunk_ready で使用)。
+        # 本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
+        # _pending_poses に予約するタイミングと _on_tts_chunk で pop されるタイミング
+        # の順序が保証される (= bridge filler 投入時には予約がなく neutral、本応答
+        # chunk 1 投入時に target_pose が予約されている状態を作る)。
+        from ..tts import _parse_voicepeak_json
+        _, _, _, target_pose = _parse_voicepeak_json(response_text)
+
+        def _wrapped_on_chunk_ready(url: str, chunk_text: str, is_last: bool, character: str) -> None:
+            # 本応答 TTS の最初のチャンクが投入される直前のフック
+            if not first_chunk_seen[0]:
+                first_chunk_seen[0] = True
+                # answering bubble を発行
+                if common:
+                    try:
+                        _publish_bubble("answering", target_char.slug, common)
+                    except Exception as exc:
+                        logger.warning(
+                            "協働先 bubble.update(answering) 発行失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
+                # target pose 予約 (= _pending_poses[target_char.slug] に格納)。
+                # 直後の on_tts_chunk で _pending_poses.pop され、本応答 chunk 1 の
+                # task["pose"] にセットされる。playback worker が再生直前に
+                # set_pose で立ち絵切替。
+                if on_pose_ready and target_pose:
+                    try:
+                        on_pose_ready(target_char.slug, target_pose)
+                        logger.info(
+                            "ask_character target pose 予約: %s → %s",
+                            target_char.slug, target_pose,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ask_character target pose 予約失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
+            on_tts_chunk(url, chunk_text, is_last, character)
+
+        def _bg_tts_synthesize() -> None:
+            try:
+                from ..tts import synthesize as tts_synthesize
+                tts_synthesize(
+                    response_text,
+                    provider=target_char.tts_provider,
+                    voice=target_char.tts_voice,
+                    speaker=target_char.slug,
+                    output_dir=tts_output_dir,
+                    on_chunk_ready=_wrapped_on_chunk_ready,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ask_character 協働応答 TTS 合成失敗 (%s): %s",
+                    character_slug, exc,
+                )
+            finally:
+                bg_tts_done.set()
+
+        _register_bg_tts_event(session_id, bg_tts_done)
+        threading.Thread(target=_bg_tts_synthesize, daemon=True).start()
+        logger.info(
+            "ask_character 協働応答 TTS 合成をバックグラウンド開始: target=%s session=%s",
+            character_slug, session_id or "(none)",
+        )
 
     logger.info("ask_character 完了: target=%s response_len=%d", character_slug, len(response_text))
+
+    # 直前 target を更新 (次回 ask_character 呼出し時の導入セリフ生成で参照される)
+    _record_target(session_id, target_char.display_name)
 
     # Agent への戻り値: 応答元と再生済みであることを明確に伝える
     caller_name = caller_char.display_name if caller_char else "あなた"
@@ -291,9 +558,14 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         f"【重要な指示】\n"
         f"- 上記は{target_char.display_name}が話した内容です（ルカからの応答ではありません）。\n"
         f"- この応答はすでに{target_char.display_name}の声で視聴者に直接再生されています。\n"
-        f"- 要約や繰り返しは不要です。「聞いてまいりました」「こう言っていました」も不要です。\n"
-        f"- {caller_name}として、{target_char.display_name}が話した内容を踏まえた上で、"
-        f"あなた自身の視点で補足・感想・次の展開を述べてください。\n"
+        f"- 逐語的な要約や繰り返しは不要です。「聞いてまいりました」「こう言っていました」"
+        f"「○○さんによると」のような第三者報告調も不要です。\n"
+        f"- まず{target_char.display_name}の発言に直接リアクション（同意・補足・関連付け・異論など）を返してください。\n"
+        f"  例: 「そうですわね、構造としてはまさにその通り」"
+        f"「{target_char.display_name}の言う『◯◯』、まさに核心ですわね」のような直接的な呼応。\n"
+        f"- そのリアクションを起点に、{caller_name}として自分の視点・感想・次の展開を述べてください。\n"
+        f"- 振った相手の発言を無視して独白的に締めることは避けてください"
+        f"（視聴者には『振った意味がない』と映ります）。\n"
         f"- {target_char.display_name}がすでに話し終えた前提で、自然に会話を続けてください。"
     )
 
@@ -346,7 +618,16 @@ def _run_collaboration_agent(
     )
 
     llm = _get_llm_for_agent(provider, model)
-    agent = create_react_agent(llm, collab_tools, prompt=combined_prompt)
+    # 並列ツール呼び出しを抑制 (graph.py と同じ理由: S999 対策)。
+    # 協働先 Agent は ask_character を呼べないため再帰並列の懸念は無いが、
+    # web_search / retrieve_memory も同時実行されると音声レイテンシが乱れるため
+    # 抑制しておく。
+    bound_llm = (
+        llm.bind_tools(collab_tools, parallel_tool_calls=False)
+        if provider in ("openai", "anthropic")
+        else llm
+    )
+    agent = create_react_agent(bound_llm, collab_tools, prompt=combined_prompt)
 
     # Agent 実行 (BubbleToolCallbackHandler で bubble.update を発行)
     result = _run_agent(
@@ -363,16 +644,32 @@ def _generate_intro(
     caller_char,
     target_char,
     user_question: str,
+    ask_index: int = 1,
+    previous_target_display: str = "",
 ) -> str:
     """
     導入セリフを軽量 LLM で動的生成する。
 
-    呼び出し元キャラの口調で:
-    1. ルカの質問へのコメント (クッション)
-    2. 協働先キャラへの問いかけ (質問のキャラ口調での言い換え)
-    を一体で生成する。
+    呼び出し元キャラの口調で、以下を生成する:
+
+      ask_index == 1 (1 人目への振り):
+        1. ルカの質問を受け止めるコメント (クッション)
+        2. 協働先キャラへの問いかけ
+        を 1〜3 文で一体生成。
+
+      ask_index >= 2 (2 人目以降):
+        ルカへのコメントは省略 (1 人目への振りで既に発話済みのため繰り返しを避ける)。
+        直前 target (previous_target_display) との対比 / 補完を意識しつつ、
+        現 target に直接語りかける 1〜2 文。
 
     emotion/speed/pose 付き JSON で返すため、TTS で感情が反映される。
+
+    Args:
+        caller_char:              呼び出し元キャラ
+        target_char:              協働先キャラ
+        user_question:            ルカからの元の質問
+        ask_index:                同一ターン内の ask_character 呼出し回数 (1 始まり)
+        previous_target_display:  直前に呼び出した target の display_name (なければ空文字)
 
     Returns:
         生成された JSON テキスト (emotion 付き)。失敗時は空文字。
@@ -390,14 +687,48 @@ def _generate_intro(
     except FileNotFoundError:
         caller_system_prompt = None
 
-    intro_prompt = (
-        f"ルカから「{user_question}」と聞かれました。"
-        f"これに対して:\n"
-        f"1. まずルカの質問を受け止めるコメントを一言\n"
-        f"2. 続けて、{target_char.display_name}に直接語りかけて同じ内容を聞く\n"
-        f"を、あなたの口調で自然に繋げて 1〜3 文で返答してください。\n"
-        f"通常の応答と同じ JSON フォーマット (emotion/speed/pose/response) で返してください。"
-    )
+    # 直接呼びかけ用の通り名 (nickname) を優先。空なら display_name を使う。
+    # フルネーム ("波心ちさめ" / "八重笠さくら") は固いため、 nickname ("ちさめ" /
+    # "さくら") で語りかけることで自然な掛け合いになる。
+    target_call_name = target_char.nickname or target_char.display_name
+    previous_call_name = previous_target_display  # 既に display_name が入っている
+
+    if ask_index <= 1:
+        # 1 人目への振り: ルカへの受け止めコメント + target への問いかけ
+        intro_prompt = (
+            f"ルカから「{user_question}」と聞かれました。"
+            f"これに対して:\n"
+            f"1. まずルカの質問を受け止めるコメントを一言\n"
+            f"2. 続けて、{target_call_name}に直接語りかけて同じ内容を聞く\n"
+            f"を、あなたの口調で自然に繋げて 1〜3 文で返答してください。\n"
+            f"{target_call_name}には親しみのある呼び方 ({target_call_name}) で語りかけ、"
+            f"フルネーム ({target_char.display_name}) は使わないでください。\n"
+            f"通常の応答と同じ JSON フォーマット (emotion/speed/pose/response) で返してください。"
+        )
+    else:
+        # 2 人目以降: 「ルカへのコメント」は 1 人目で済ませているため繰り返さない。
+        # 直前 target (previous) と現 target (target_char) の対比/補完を意識し、
+        # 短く現 target に直接語りかける。冒頭をルカ呼びかけ (例: 「ふふ、ルカ」)
+        # で始めない。
+        prev_phrase = (
+            f"先ほど{previous_call_name}に同じ問いを振りました。"
+            if previous_call_name
+            else ""
+        )
+        intro_prompt = (
+            f"ルカからの元の質問「{user_question}」について、"
+            f"続けて{target_call_name}にも視点を聞きたい場面です。\n"
+            f"{prev_phrase}\n"
+            f"指示:\n"
+            f"- ルカへの受け止めコメントは入れない (1 人目で既に済んでいるため繰り返さない)\n"
+            f"- 「ふふ、ルカ」「その問いは…」のようなルカ呼びかけや感想で始めない\n"
+            f"- 「では」「次に」「続いて」などの繋ぎ語、または{target_call_name}の名前から始める\n"
+            f"- {target_call_name}に直接語りかけて同じ内容を聞く (1〜2 文)\n"
+            f"- 親しみのある呼び方 ({target_call_name}) で語りかけ、"
+            f"フルネーム ({target_char.display_name}) は使わない\n"
+            f"あなたの口調で自然に書いてください。\n"
+            f"通常の応答と同じ JSON フォーマット (emotion/speed/pose/response) で返してください。"
+        )
 
     try:
         result = call_llm(

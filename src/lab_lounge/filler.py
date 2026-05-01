@@ -601,6 +601,9 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
         return
 
     # Phase 3: LLM 生成フィラーを再生 (pose があれば立ち絵も切替)
+    # LLM フィラーは caller の声で再生される独り言なので、立ち絵も caller の
+    # ものに切り替えるのが自然 (前キャラの立ち絵で caller の声が流れる方が
+    # 違和感が大きい)。立ち絵切替は LLM フィラーの再生直前に行う。
     if filler_audio[0]:
         if filler_pose[0]:
             from .obs import set_pose

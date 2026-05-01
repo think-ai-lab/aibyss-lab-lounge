@@ -203,6 +203,7 @@ def _run_playback_worker(
     speaking_published = False
     last_character: str | None = None
     current_pose_character: str | None = None
+    current_pose: str | None = None
     while True:
         task = q.get()
         if task is None:
@@ -212,22 +213,50 @@ def _run_playback_worker(
                 publish_bubble_fn(last_character, "done", "")
             break
         # Phase 3: 再生直前にキャラクターが変わったら立ち絵切替 + HUD 通知
+        # task["pose"] の値:
+        #   - 文字列 (e.g., "special_doya")  → その pose に切替 (chunk 1 など、新規予約時)
+        #   - None                           → 切替しない (chunk 2 以降。現在の pose を維持)
+        #
+        # 「キャラが変わった + pose=None」 のみ neutral にフォールバック。
+        # これがないと、chunk 1 で special_doya に切替えた後の chunk 2/3 で neutral
+        # に逆戻りしてしまう (chunk 1 だけが pose 値を持ち、後続は None になるため)。
         character = task["character"]
-        if set_pose_fn and character != current_pose_character:
-            pose = task.get("pose", "neutral")
-            try:
-                set_pose_fn(character, pose)
-                logger.info("playback pose 切替: %s → %s", character, pose)
-            except Exception as exc:
-                logger.warning("playback pose 切替失敗: %s (%s)", character, exc)
-            # HUD に立ち絵変更を通知 (publish_bubble_fn 経由)
-            # bubble.html は STEP_ORDER 外の "pose_change" を無視するため bubble 表示に影響なし
-            publish_bubble_fn(character, "pose_change", f"pose: {pose}")
-            current_pose_character = character
+        pose = task.get("pose")  # None or str
+
+        if set_pose_fn:
+            should_switch = False
+            new_pose: str | None = None
+            if character != current_pose_character:
+                # キャラ変化 → 必ず切替 (pose 指定があればそれ、無ければ neutral)
+                new_pose = pose if pose else "neutral"
+                should_switch = True
+            elif pose is not None and pose != current_pose:
+                # 同キャラだが新しい pose 値が指定された (= bridge filler → 本応答 等)
+                new_pose = pose
+                should_switch = True
+            # else: 同キャラ + pose=None or 同 pose → 切替不要
+
+            if should_switch and new_pose is not None:
+                try:
+                    set_pose_fn(character, new_pose)
+                    logger.info("playback pose 切替: %s → %s", character, new_pose)
+                except Exception as exc:
+                    logger.warning("playback pose 切替失敗: %s (%s)", character, exc)
+                # HUD に立ち絵変更を通知 (publish_bubble_fn 経由)
+                # bubble.html は STEP_ORDER 外の "pose_change" を無視するため bubble 表示に影響なし
+                publish_bubble_fn(character, "pose_change", f"pose: {new_pose}")
+                current_pose_character = character
+                current_pose = new_pose
         # speaking publish → 再生 → クリーンアップ → done_event 通知
-        publish_bubble_fn(character, "speaking", task["text"])
-        speaking_published = True
-        last_character = character
+        # task["text"] が空文字の場合は speaking publish をスキップする。
+        # ask_character の target bridge filler が「テロップを出さず直前の
+        # thinking テロップを維持したい」ケースでこのパターンを使う
+        # (chunk_text="" を on_tts_chunk に渡してくる)。
+        chunk_text = task["text"]
+        if chunk_text:
+            publish_bubble_fn(character, "speaking", chunk_text)
+            speaking_published = True
+            last_character = character
         play_audio_fn(task["url"])
         cleanup_audio_fn(task["url"])
         # Phase 3: 再生完了通知 (ask_character の導入セリフ同期用)
@@ -418,14 +447,23 @@ def run_loop(
                     )
                     _filler_thread.start()
 
-            # OBS 立ち絵 pose の予約。パイプラインが on_pose_ready で pose を予約し、
-            # task dict の "pose" フィールドに含めて playback worker に渡す。
+            # OBS 立ち絵 pose の予約 (キャラ別 dict)。パイプラインが on_pose_ready で
+            # キャラごとに pose を予約し、対応するキャラの最初の TTS チャンクが
+            # 再生キューに入る時に task["pose"] として付与する。
             # Phase 3: 立ち絵切替は playback worker が再生直前に実行 (TTS 生成時ではなく)。
-            _pending_pose: list[str | None] = [None, None]  # [character_slug, pose_value]
+            #
+            # 旧設計 (list[1]) では複数キャラの予約が衝突した:
+            # - ask_character が target=sakura 用に special_whisper を予約
+            # - その後 caller=mimi が最終応答用に special_pondering を予約 → 上書き
+            # - sakura chunk 1 再生時に _pending_pose の slug が mimi で一致せず neutral に
+            #   フォールバックしてしまう
+            # キャラ別 dict にすることで、各キャラの予約が独立に保持される。
+            _pending_poses: dict[str, str] = {}
 
             def _on_pose_ready(slug: str, pose: str) -> None:
                 """パイプラインから呼ばれる。pose を予約して実際の切替を遅延させる。"""
-                _pending_pose[:] = [slug, pose]
+                if pose:
+                    _pending_poses[slug] = pose
 
             def _on_tts_chunk(url: str, chunk_text: str, is_last: bool, character: str) -> None:
                 # フィラーを停止してから本編を再生
@@ -440,18 +478,18 @@ def run_loop(
                     _audio_name, _chunk_count[0], is_last, len(chunk_text),
                 )
                 if _playback_queue is not None:
-                    # _pending_pose があればこのチャンクの pose として付与
-                    # (playback worker が再生直前に set_pose する)
-                    chunk_pose = "neutral"
-                    if _pending_pose[0] == character and _pending_pose[1]:
-                        chunk_pose = _pending_pose[1]
-                        _pending_pose[0] = None
+                    # 該当キャラの pose 予約があれば付与 (playback worker が再生直前に
+                    # set_pose する)。一度使ったら dict から削除して、同キャラの後続
+                    # チャンクには pose=None を渡す (= 「切替不要、現在の pose を維持」)。
+                    # これがないと、chunk 1 で special_doya に切り替わった後、
+                    # chunk 2/3 で neutral に逆戻りしてしまう。
+                    chunk_pose = _pending_poses.pop(character, None)
                     task = {
                         "url": url,
                         "text": chunk_text,
                         "is_last": is_last,
                         "character": character,
-                        "pose": chunk_pose,
+                        "pose": chunk_pose,  # None or pose value
                     }
                     # Phase 3: done_event があれば task に付与 (ask_character 導入セリフ同期用)
                     try:
@@ -499,6 +537,17 @@ def run_loop(
                 print(f"[{result.speaker}] {_resp}")
 
             # ─── 5. TTS 再生完了待機 ────────────────────────────
+            # ask_character の協働応答 TTS バックグラウンド合成完了を待つ。
+            # これがないと、caller の最終応答 TTS が完了した直後に sentinel が
+            # 投げられて、target の chunks がまだ playback queue に投入される前に
+            # playback worker が break し、target の発話が途中で切れる
+            # (例: 「ちさめ chunk1 だけ再生されて chunks 2-5 が再生されない」)。
+            try:
+                from .mcp_servers.ask_character import wait_bg_tts_complete
+                wait_bg_tts_complete(session_id_root)
+            except Exception as exc:
+                logger.warning("wait_bg_tts_complete 失敗 (続行): %s", exc)
+
             if _playback_queue is not None:
                 _playback_queue.put(None)
             if _playback_thread is not None:

@@ -605,11 +605,16 @@ def _generate_voicepeak_single_file(
     filepath: Path,
     speed: int | None = None,
     emotion: dict[str, int] | None = None,
+    speaker: str | None = None,
 ) -> tuple[int, int]:
     """
     VOICEPEAK CLI で 1 チャンク分の WAV を生成する。
 
     FIFO キューで排他制御される。投入順序が合成順序になる。
+
+    Args:
+        speaker: ログに出力するキャラクター slug (e.g., "mimi")。誰の発話かを
+                 ログから即座に追えるようにするための識別情報。
 
     Returns:
         (duration_ms, sample_rate)
@@ -640,25 +645,41 @@ def _generate_voicepeak_single_file(
 
     # 配信中のコンソール表示でファイルパス (ユーザーディレクトリ等) を漏らさないよう、
     # ログにはファイル名・narrator・テキスト長のみを出す。完全なコマンドは debug レベルへ。
+    # 並行 / バックグラウンド合成中に「誰の何のチャンクか」を即座に追えるよう、
+    # speaker と text 先頭 (40 文字) を含める。
+    text_preview = safe_text if len(safe_text) <= 40 else safe_text[:40] + "…"
     logger.info(
-        "VOICEPEAK 投入: narrator=%s text_len=%d out=%s",
-        voice, len(safe_text), filepath.name,
+        "VOICEPEAK 投入: speaker=%s narrator=%s text_len=%d out=%s text=%r",
+        speaker or "(unknown)", voice, len(safe_text), filepath.name, text_preview,
     )
     logger.debug("VOICEPEAK コマンド (full): %s", cmd_str)
 
     _submit_voicepeak(cmd_str)
 
-    # VOICEPEAK が returncode=0 でも出力ファイルを生成しないケースがある。
-    # ファイルが存在しない場合は 1 回だけリトライする。
+    # VOICEPEAK が returncode=0 でも出力ファイルを生成しないケースは
+    # 「待っても永久に出ない」(= subprocess が正常終了したのにファイル書き込みが発生
+    # しない不具合) なので、polling ではなく subprocess そのものを再実行する。
+    # 1 秒間隔で最大 20 回まで再投入を試みる。
+    # 環境変数:
+    #   L2_VOICEPEAK_OUTPUT_RETRY_INTERVAL_SEC (default: 1.0) — 再実行間の待機秒数
+    #   L2_VOICEPEAK_OUTPUT_RETRY_MAX_ATTEMPTS (default: 20)  — 最大再実行回数
     if not filepath.is_file():
-        retry_wait = float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "2"))
-        logger.warning(
-            "VOICEPEAK 出力ファイル未生成 (returncode=0): %s → %.1f 秒待機してリトライ",
-            filepath.name, retry_wait * 2,
-        )
+        interval_sec = float(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_INTERVAL_SEC", "1.0"))
+        max_attempts = int(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_MAX_ATTEMPTS", "20"))
         import time
-        time.sleep(retry_wait * 2)
-        _submit_voicepeak(cmd_str)
+        for attempt in range(1, max_attempts + 1):
+            logger.warning(
+                "VOICEPEAK 出力ファイル未生成 (returncode=0): %s → %.1f 秒待機して subprocess 再実行 (%d/%d)",
+                filepath.name, interval_sec, attempt, max_attempts,
+            )
+            time.sleep(interval_sec)
+            _submit_voicepeak(cmd_str)
+            if filepath.is_file():
+                logger.info(
+                    "VOICEPEAK 再実行成功 (%d/%d): %s",
+                    attempt, max_attempts, filepath.name,
+                )
+                break
 
     if not filepath.is_file():
         raise FileNotFoundError(
@@ -733,7 +754,11 @@ def _call_voicepeak(
 
     # テキスト分割
     chunks = _split_text_for_voicepeak(say_text)
-    logger.info("VOICEPEAK チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(say_text))
+    text_preview_full = say_text if len(say_text) <= 60 else say_text[:60] + "…"
+    logger.info(
+        "VOICEPEAK チャンク分割: speaker=%s %d 個 (元テキスト %d 文字) text=%r",
+        speaker or "(unknown)", len(chunks), len(say_text), text_preview_full,
+    )
 
     chunk_paths: list[Path] = []
     chunk_durations: list[int] = []
@@ -747,13 +772,16 @@ def _call_voicepeak(
             filepath=filepath,
             speed=effective_speed,
             emotion=json_emotion,
+            speaker=speaker,
         )
         chunk_paths.append(filepath)
         chunk_durations.append(dur)
         sample_rate = sr
+        chunk_preview = chunk_text if len(chunk_text) <= 40 else chunk_text[:40] + "…"
         logger.info(
-            "VOICEPEAK チャンク %d/%d 生成完了: %d ms (%d 文字)",
-            i + 1, len(chunks), dur, len(chunk_text),
+            "VOICEPEAK チャンク %d/%d 生成完了: speaker=%s %d ms (%d 文字) text=%r",
+            i + 1, len(chunks), speaker or "(unknown)",
+            dur, len(chunk_text), chunk_preview,
         )
         if on_chunk_ready:
             on_chunk_ready(filepath.as_uri(), chunk_text, i == len(chunks) - 1, speaker)
@@ -819,17 +847,21 @@ def synthesize(
             f"未対応の provider: {provider!r}。対応プロバイダ: {supported}"
         )
 
+    # 並行 / バックグラウンド合成中に「誰の何を合成中か」を即座に追えるよう、
+    # speaker と text 先頭をログに含める。
+    speaker_for_log = kwargs.get("speaker") or "(unknown)"
+    text_preview = text if len(text) <= 40 else text[:40] + "…"
     logger.info(
-        "TTS 開始: provider=%s voice=%s text_len=%d",
-        provider, voice, len(text),
+        "TTS 開始: speaker=%s provider=%s voice=%s text_len=%d text=%r",
+        speaker_for_log, provider, voice, len(text), text_preview,
     )
     result: TTSResult = fn(text, voice=voice, output_dir=output_dir, **kwargs)
     # audio_url は file:///T:/Users/... のような絶対パスになるため、配信中の
     # コンソール表示でユーザーディレクトリが漏れないようファイル名のみログ
     audio_filename = result.audio_url.rsplit("/", 1)[-1] if result.audio_url else ""
     logger.info(
-        "TTS 完了: duration_ms=%d audio=%s",
-        result.duration_ms, audio_filename,
+        "TTS 完了: speaker=%s duration_ms=%d audio=%s",
+        speaker_for_log, result.duration_ms, audio_filename,
     )
     logger.debug("TTS 完了 audio_url (full): %s", result.audio_url)
     return result
