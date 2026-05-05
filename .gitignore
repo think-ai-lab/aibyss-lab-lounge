@@ -216,3 +216,12 @@ sherpa-models/
 # audio files
 data/audio/*.wav
 data/filler_cache/**/*.wav
+output.wav
+
+# stream context
+# 配信文脈は個人メモ・配信外で得た情報を含みうるため、実ファイルは丸ごと git 外。
+#   - current.md          : 今、起動時に読まれるファイル (一時参照)
+#   - yyyymmdd_NN.md      : 過去ログ archive / 将来予定 (例: 20260506_01.md)
+# 構造を伝えるテンプレ current.example.md のみ commit 対象 (下の例外指定で残す)。
+data/stream_context/*.md
+!data/stream_context/current.example.md
