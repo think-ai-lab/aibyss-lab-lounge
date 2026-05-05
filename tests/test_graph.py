@@ -218,7 +218,9 @@ class TestPipelineGraphNodes:
             tts_speaker="octamaid",
             tts_output_dir="./data/audio",
             system_prompt=None,
+            stream_context=None,
             on_tts_chunk_ready=None,
+            on_pose_ready=None,
             character_slug="",
             rag_context=None,
             rag_used=False,
@@ -367,7 +369,9 @@ class TestPipelineGraphFullInvoke:
             "tts_speaker": "octamaid",
             "tts_output_dir": "./data/audio",
             "system_prompt": None,
+            "stream_context": None,
             "on_tts_chunk_ready": None,
+            "on_pose_ready": None,
             "character_slug": "",
             "rag_context": None,
             "rag_used": False,
@@ -403,7 +407,9 @@ class TestPipelineGraphFullInvoke:
             "tts_speaker": "octamaid",
             "tts_output_dir": "./data/audio",
             "system_prompt": None,
+            "stream_context": None,
             "on_tts_chunk_ready": None,
+            "on_pose_ready": None,
             "character_slug": "",
             "rag_context": None,
             "rag_used": False,
@@ -431,3 +437,125 @@ class TestPipelineGraphFullInvoke:
         with patch.object(builtins, "__import__", side_effect=mock_import):
             with pytest.raises(ImportError):
                 _build_pipeline_graph()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Stream context (今日の配信内容) の結合テスト
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestComposeSystemPrompt:
+    """_compose_system_prompt のユニットテスト。
+
+    キャラ素体プロンプト + 配信文脈 → 拡張 system_prompt の組み立てを検証する。
+    """
+
+    def test_no_stream_context_returns_character_prompt_unchanged(self):
+        """配信文脈が None なら キャラ素体をそのまま返す (後方互換)。"""
+        from lab_lounge.graph import _compose_system_prompt
+        assert _compose_system_prompt("キャラ素体", None) == "キャラ素体"
+
+    def test_empty_stream_context_returns_character_prompt_unchanged(self):
+        """空文字列の配信文脈も結合しない (空セクションで LLM を惑わせない)。"""
+        from lab_lounge.graph import _compose_system_prompt
+        assert _compose_system_prompt("キャラ素体", "") == "キャラ素体"
+
+    def test_merges_with_separator_and_heading(self):
+        """配信文脈ありなら "## 本日の配信" 見出しで結合される。"""
+        from lab_lounge.graph import _compose_system_prompt
+        result = _compose_system_prompt("キャラ素体", "今日は大神プレイ")
+        assert result is not None
+        assert "キャラ素体" in result
+        assert "## 本日の配信" in result
+        assert "今日は大神プレイ" in result
+        # 順序: キャラ素体 → 区切り → 配信文脈
+        assert result.index("キャラ素体") < result.index("## 本日の配信")
+        assert result.index("## 本日の配信") < result.index("今日は大神プレイ")
+        # 既存 "## 参照情報" と同じ "\n\n---\n\n" セパレータを使う
+        assert "\n\n---\n\n" in result
+
+    def test_no_character_prompt_returns_stream_context_with_heading(self):
+        """キャラ素体が None でも配信文脈だけは見出し付きで返す
+        (FileNotFoundError 等のフォールバック動作)。"""
+        from lab_lounge.graph import _compose_system_prompt
+        result = _compose_system_prompt(None, "今日の配信内容")
+        assert result is not None
+        assert result.startswith("## 本日の配信")
+        assert "今日の配信内容" in result
+
+    def test_both_none_returns_none(self):
+        """両方 None なら None (システムプロンプトなしで実行)。"""
+        from lab_lounge.graph import _compose_system_prompt
+        assert _compose_system_prompt(None, None) is None
+
+
+class TestRoutingNodeStreamContextMerge:
+    """routing ノードが state["stream_context"] を system_prompt にマージする検証。"""
+
+    @pytest.fixture()
+    def mock_publish(self):
+        with patch("lab_lounge.pipeline.publish", return_value="1-0"):
+            yield
+
+    def _make_state(self, stream_context: str | None):
+        """最小 PipelineGraphState を組み立てる。"""
+        from lab_lounge.graph import PipelineGraphState
+        return PipelineGraphState(
+            text="テスト",
+            common=dict(stream_id="s1", session_id="ss1", trace_id="t1"),
+            speaker_hint=None,
+            utterance_meta=None,
+            use_real_llm=False,
+            llm_provider="openai",
+            llm_model="gpt-5.4-mini",
+            enable_rag=False,
+            rag_top_k=3,
+            kb_path="./data/index",
+            use_real_tts=False,
+            tts_provider="voicevox",
+            tts_voice="89",
+            tts_speaker="octamaid",
+            tts_output_dir="./data/audio",
+            system_prompt=None,
+            stream_context=stream_context,
+            on_tts_chunk_ready=None,
+            on_pose_ready=None,
+            character_slug="",
+            rag_context=None,
+            rag_used=False,
+            retrieved_doc_ids=[],
+            retrieval_latency_ms=0,
+            answer_mode="fallback",
+            llm_text="",
+            llm_meta={},
+            tts_meta={},
+            events=[],
+        )
+
+    def test_routing_merges_stream_context_into_system_prompt(self, mock_publish):
+        """routing 後の system_prompt にキャラ素体と配信文脈の両方が含まれる。"""
+        from lab_lounge.graph import _routing_node
+        state = self._make_state(stream_context="今日は1年ぶりの配信、大神をプレイ")
+        result = _routing_node(state)
+
+        merged = result["system_prompt"]
+        assert merged is not None
+        # オクタメイドのキャラ素体テキスト由来の語が含まれている
+        assert "オクタメイド" in merged
+        # 配信文脈見出しと本文が含まれている
+        assert "## 本日の配信" in merged
+        assert "今日は1年ぶりの配信、大神をプレイ" in merged
+
+    def test_routing_without_stream_context_keeps_system_prompt_unchanged(
+        self, mock_publish
+    ):
+        """配信文脈なし時は従来通りキャラ素体のみが system_prompt になる (後方互換)。"""
+        from lab_lounge.graph import _routing_node
+        state = self._make_state(stream_context=None)
+        result = _routing_node(state)
+
+        merged = result["system_prompt"]
+        assert merged is not None
+        assert "オクタメイド" in merged
+        # 配信文脈見出しが入っていないこと (= キャラ素体のみ)
+        assert "## 本日の配信" not in merged

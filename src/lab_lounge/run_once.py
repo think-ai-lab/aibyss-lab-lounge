@@ -49,6 +49,7 @@ load_dotenv()
 from .audio_io import RecordError, SilenceError, play_audio_file, record_to_file
 from .emitter import _transcribe_audio
 from .pipeline import PipelineResult, run_pipeline
+from .stream_context import load_stream_context
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,12 +135,16 @@ def run_once(
     _trace = _new_uuid()
 
     t0_pipe = time.monotonic()
+    # 配信文脈は run_once 起動時 (= ここ) に1度だけロード。
+    # ファイル未存在 / 空時は None で従来挙動。
+    stream_context = load_stream_context()
     result = run_pipeline(
         input_text,
         stream_id=_sid,
         session_id=_sess,
         trace_id=_trace,
         utterance_meta=utterance_meta,
+        stream_context=stream_context,
     )
     pipe_ms = int((time.monotonic() - t0_pipe) * 1000)
 

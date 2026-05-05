@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .pipeline import run_pipeline
+from .stream_context import load_stream_context
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,12 +121,15 @@ def main(argv: list[str] | None = None) -> None:
     session_id = _new_uuid()
     trace_id = _new_uuid()  # TODO: 将来 W3C Trace Context 形式に変更 (Guardrail G-7)
 
+    # 配信文脈を CLI 起動時に1度ロード (run_loop / run_once と挙動を揃える)
+    stream_context = load_stream_context()
     result = run_pipeline(
         input_text,
         stream_id=stream_id,
         session_id=session_id,
         trace_id=trace_id,
         utterance_meta=utterance_meta,
+        stream_context=stream_context,
     )
 
     print(f"stream_id  : {result.stream_id}")

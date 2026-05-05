@@ -478,6 +478,13 @@ class PipelineGraphState(TypedDict):
     tts_speaker: str
     tts_output_dir: str
     system_prompt: str | None
+    # 配信単位の文脈 (Markdown 本文)。run_loop / run_once 起動時に
+    # stream_context.load_stream_context() で読み込まれた値が入る。
+    # routing ノードで character の system_prompt にマージされ、
+    # generation 以降は state["system_prompt"] 側で配信文脈を含んだ
+    # 拡張プロンプトを参照する (この stream_context フィールド自体は
+    # 配信中に再利用しない記録目的)。None なら配信文脈なしで動作。
+    stream_context: str | None
     on_tts_chunk_ready: Any
     on_pose_ready: Any
 
@@ -497,6 +504,57 @@ class PipelineGraphState(TypedDict):
 # ─── ノード実装 ──────────────────────────────────────────────────
 
 
+# 配信文脈をシステムプロンプトに重ねるときの見出し。
+# 既存の "## 参照情報" (RAG context、llm.py で結合) と対称に配置することで、
+# キャラ素体 → 本日の配信 → 参照情報 という3層の同心円構造を作る。
+# 順序の意味: 普遍 (キャラ人格) → 当日の前提 → 今ターンの動的情報。
+_STREAM_CONTEXT_HEADING = "## 本日の配信"
+
+
+def _compose_system_prompt(
+    character_prompt: str | None,
+    stream_context: str | None,
+) -> str | None:
+    """
+    キャラクター素体プロンプトに配信文脈を重ねた拡張 system_prompt を返す。
+
+    Args:
+        character_prompt: load_system_prompt() の戻り値 (キャラ素体)。
+        stream_context:   stream_context.load_stream_context() の戻り値。
+                          None / 空文字列なら結合せずキャラ素体をそのまま返す。
+
+    Returns:
+        結合済みプロンプト。両方 None なら None。
+
+    結合フォーマット:
+        <キャラ素体>
+
+        ---
+
+        ## 本日の配信
+
+        <stream_context>
+
+    【WHY: 順序】
+        キャラ素体 (上位・不変) → 配信文脈 (中位・配信単位) という
+        同心円構造を作る。LLM の attention 順序効果を踏まえると、
+        安定した情報を上に置くと一貫した応答になりやすい。
+        後段 llm.py で "## 参照情報" (RAG, ターン単位) が末尾に追加されるため、
+        最終的に「不変 → 配信単位 → ターン単位」の3層になる。
+    """
+    if not stream_context:
+        return character_prompt
+    if not character_prompt:
+        # キャラ素体が無い (FileNotFoundError 等) ケース。
+        # 配信文脈だけでも LLM の前提に効かせるため、見出し付きで返す。
+        return f"{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
+    return (
+        f"{character_prompt}"
+        f"\n\n---\n\n"
+        f"{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
+    )
+
+
 def _routing_node(state: PipelineGraphState) -> dict:
     """ルーティングノード: キャラクター決定 + utterance.final 発行。"""
     from .pipeline import publish, _publish_bubble
@@ -512,13 +570,20 @@ def _routing_node(state: PipelineGraphState) -> dict:
     decision = route(text, name_hint=state["speaker_hint"])
     character = get_character(decision.speaker)
     try:
-        system_prompt = load_system_prompt(character)
+        character_prompt = load_system_prompt(character)
     except FileNotFoundError:
         logger.warning(
             "システムプロンプトが見つかりません: %s。プロンプトなしで続行。",
             character.system_prompt_file,
         )
-        system_prompt = None
+        character_prompt = None
+
+    # 配信文脈 (run_loop 起動時にロードされ state に乗っている) を重ねる。
+    # 配信文脈なし or キャラ素体読み込み失敗時も _compose_system_prompt が
+    # 適切に処理する (後方互換)。
+    system_prompt = _compose_system_prompt(
+        character_prompt, state.get("stream_context")
+    )
 
     updates: dict = {
         "character_slug": character.slug,

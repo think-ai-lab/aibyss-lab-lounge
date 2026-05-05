@@ -161,6 +161,7 @@ def run_pipeline(
     speaker_hint: str | None = None,
     on_tts_chunk_ready=None,
     on_pose_ready=None,
+    stream_context: str | None = None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -177,6 +178,11 @@ def run_pipeline(
                          省略時は build_utterance_final() のデフォルト値を使う。
         speaker_hint:    ウェイクワード検知結果のキャラクター slug / 名前 (optional)。
                          Router に渡され、応答キャラクターを決定する。
+        stream_context:  「今日の配信内容」Markdown 本文 (optional)。
+                         run_loop 起動時に1度ロードされ、配信中の全ターンで
+                         同じ値が渡される。routing ノードでキャラ素体に
+                         "## 本日の配信" として重ねられる。
+                         None なら配信文脈なしで動作 (後方互換)。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
@@ -190,6 +196,7 @@ def run_pipeline(
         speaker_hint=speaker_hint,
         on_tts_chunk_ready=on_tts_chunk_ready,
         on_pose_ready=on_pose_ready,
+        stream_context=stream_context,
     )
 
 
@@ -203,6 +210,7 @@ def _run_pipeline_graph(
     speaker_hint: str | None = None,
     on_tts_chunk_ready=None,
     on_pose_ready=None,
+    stream_context: str | None = None,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -231,6 +239,7 @@ def _run_pipeline_graph(
         "tts_speaker": tts_speaker,
         "tts_output_dir": tts_output_dir,
         "system_prompt": None,
+        "stream_context": stream_context,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
         "character_slug": "",

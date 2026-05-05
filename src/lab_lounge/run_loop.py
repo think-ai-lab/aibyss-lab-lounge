@@ -58,6 +58,7 @@ from .emitter import _transcribe_audio
 from .events import build_bubble_update
 from .log_setup import setup_logging
 from .pipeline import PipelineResult, run_pipeline
+from .stream_context import load_stream_context
 
 setup_logging(session_name="run_loop")
 
@@ -321,6 +322,13 @@ def run_loop(
         session_stream_id, session_id_root,
     )
 
+    # ─── 配信文脈の読み込み (起動時1回) ────────────────────────────
+    # 「今日の配信内容」(data/stream_context/current.md) を読み込み、
+    # 全ターンの run_pipeline() に同じ値を渡す。
+    # 配信中にファイルを編集しても反映されない (再起動が必要)。
+    # ファイル未存在 / 空時は None で従来通り動作 (後方互換)。
+    stream_context = load_stream_context()
+
     turn = 0
     try:
         while max_turns is None or turn < max_turns:
@@ -515,6 +523,8 @@ def run_loop(
                     speaker_hint=speaker_hint,
                     on_tts_chunk_ready=_on_tts_chunk if not skip_playback else None,
                     on_pose_ready=_on_pose_ready if not skip_playback else None,
+                    # 配信文脈は起動時1回ロード済み、全ターン同じ値を渡す
+                    stream_context=stream_context,
                 )
             except Exception as exc:
                 logger.error("Pipeline 失敗: %s", exc)

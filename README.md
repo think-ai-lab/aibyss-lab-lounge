@@ -596,6 +596,99 @@ tts.done        ['<llm.final の event_id>']
 
 ---
 
+## 配信文脈のカスタマイズ
+
+「今日の配信内容」を別ファイルで管理し、システムプロンプトに重ねて全キャラに
+共通の前提を共有させる仕組みです。例えば「今日は1年ぶりの配信、大神をプレイ」
+のような配信単位の状況を、`mimi` / `chisame` / `sakura` / `octamaid` / `ruka`
+すべてに同時に伝えられます。
+
+### 仕組み
+
+`run_loop` / `run_once` / `emitter` の起動時に1度だけ
+`data/stream_context/current.md` を読み込み、その内容をキャラごとの
+システムプロンプトに `## 本日の配信` セクションとしてマージします。
+
+最終的に LLM へ渡るシステムメッセージは3層構造になります:
+
+```
+<キャラ素体 system_prompt>          ← 不変・人格基盤
+
+---
+
+## 本日の配信                       ← 配信単位の前提 (current.md)
+
+<stream_context Markdown 本文>
+
+---
+
+## 参照情報                         ← ターン毎に変わる動的情報 (RAG)
+
+<RAG context>
+```
+
+### ファイル命名規約 — 2 種類のファイル
+
+`data/stream_context/` 配下の実ファイルはすべて gitignore 対象です。配信文脈は
+性質上、個人メモや配信外で得た情報を含みうるため、git の外で管理します。
+構造を伝えるテンプレ `current.example.md` のみ commit 対象です。
+
+| ファイル | git 管理 | 用途 |
+|---------|---------|------|
+| `current.example.md` | **commit** | 構造を伝えるテンプレ (新規利用者向け) |
+| `current.md` | **gitignore** | 「今、起動時に読まれるファイル」を指す一時参照 |
+| `yyyymmdd_NN.md` | **gitignore** | 配信単位の本体ファイル。過去ログ archive / 将来の予定を蓄積 |
+
+- `yyyymmdd`: 配信予定日 (例: `20260506`)
+- `NN`: 同日内の通し番号 (`01`, `02`, ...) — 同じ日に複数配信する場合に増やす
+
+過去の配信文脈を後から振り返ったり、将来の配信を事前に書き溜めておく運用は
+**ローカル / Notion 等の別場所で管理** するのが想定です。
+
+### 使い方 — 通常運用 (将来予定 → 配信 → archive)
+
+```bash
+# 1. 配信予定を事前に書く (例: 2026-05-06 の初回配信)
+cp data/stream_context/current.example.md data/stream_context/20260506_01.md
+# 20260506_01.md を編集 (## 今日の予定 / ## ハイライト / ## キャラへの共有事項)
+# このファイルは gitignore 対象なのでローカルにのみ残る
+
+# 2. 配信当日、今回使うファイルを current.md として参照
+#    (案A) コピーする
+cp data/stream_context/20260506_01.md data/stream_context/current.md
+#    (案B) .env で直接指定
+echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
+
+# 3. 起動 — 起動時に1度だけ読み込まれる
+uv run python -m lab_lounge.run_loop --wake-backend speech
+
+# 4. 配信終了後、yyyymmdd_NN.md がローカル archive として残る
+#    必要なら別の場所 (Notion 等) に控えを残す運用が安全
+```
+
+### 環境変数で別パスを指定
+
+```env
+# 日付ベースのファイルを直接参照する (推奨 — current.md コピー不要)
+L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md
+
+# 任意のパスを参照する (絶対パスも可)
+# L2_STREAM_CONTEXT_FILE=/path/to/your/today.md
+```
+
+### 仕様メモ
+
+- 配信中にファイルを編集しても**反映されない** (再起動が必要)。
+  → 配信単位の固定前提を扱う設計のため。
+- ファイル未存在 / 空ファイル時は配信文脈なしで動作する (後方互換)。
+- 全キャラ共通の1ファイル。キャラ別出し分けは現バージョンでは未対応。
+- Agent モード (`L2_ENABLE_TOOLS=true`) や `ask_character` ツール経由のキャラ間
+  対話でも同じ配信文脈が伝播する (routing ノードで合成済みのため)。
+- 実ファイル全体が gitignore 対象なので、配信外で得たコメントや個人メモを書き
+  込んでも誤って公開リポに混入する事故を防げる。
+
+---
+
 ## テスト
 
 ```bash
