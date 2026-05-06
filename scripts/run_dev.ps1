@@ -19,6 +19,7 @@
 # 使い方: PowerShell から実行
 #   .\scripts\run_dev.ps1
 #   .\scripts\run_dev.ps1 -MaxTurns 5
+#   .\scripts\run_dev.ps1 -MaxTurns 0                          # 無制限 (Ctrl+C で停止、prod と同じ挙動)
 #   .\scripts\run_dev.ps1 -WakeBackend continuous -MaxTurns 3
 #
 # 【分離の保証】
@@ -31,6 +32,8 @@
 
 param(
     [string]$WakeBackend = "continuous",
+    # MaxTurns: dev の default は 3 ターン (暴走防止)。
+    # 0 以下を指定すると --max-turns を渡さず run_loop 側で無制限になる (prod と仕様統一)。
     [int]$MaxTurns = 3
 )
 
@@ -169,5 +172,15 @@ if ($ViolationFound) {
     exit 1
 }
 
-Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBackend max-turns=$MaxTurns)..." -ForegroundColor Green
-uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
+Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBackend)..." -ForegroundColor Green
+# WHY: prod と仕様を揃え、$MaxTurns が 0 以下なら --max-turns を渡さず
+#      run_loop 側で無制限ループにする (Python 側 default = None = 無制限)。
+#      run_dev.ps1 -MaxTurns 0 で「即終了」になる罠を解消し、明示的に
+#      無制限を指定したいケース (長時間の手動実験) に対応する。
+if ($MaxTurns -gt 0) {
+    Write-Host "  max-turns=$MaxTurns (有限)" -ForegroundColor Gray
+    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
+} else {
+    Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
+    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend
+}
