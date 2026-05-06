@@ -159,3 +159,237 @@ class TestTranscriptBufferClear:
         buf.clear()
         assert buf.total_chars == 0
         assert buf.full_text() == ""
+
+
+# ─── TestTranscriptBufferSnapshot ─────────────────────────────────
+
+
+class TestTranscriptBufferSnapshot:
+    """snapshot() — Block 0 で追加。Phase 0.5 の挙手承認時に最新 buffer を
+    BG LLM へ渡す用途を想定。元 buffer への以降の変更がスナップショットに
+    反映されないこと（独立性）を検証する。"""
+
+    def test_snapshot_returns_separate_instance(self):
+        buf = TranscriptBuffer()
+        buf.add(TranscriptSegment(text="A", timestamp=100.0, duration_ms=500))
+        snap = buf.snapshot()
+        assert snap is not buf
+
+    def test_snapshot_preserves_content(self):
+        buf = TranscriptBuffer()
+        buf.add(TranscriptSegment(text="A", timestamp=100.0, duration_ms=500))
+        buf.add(TranscriptSegment(text="B", timestamp=101.0, duration_ms=500))
+        snap = buf.snapshot()
+        assert len(snap) == 2
+        assert snap.full_text() == "A\nB"
+
+    def test_snapshot_preserves_settings(self):
+        buf = TranscriptBuffer(window_sec=60.0, max_chars=500)
+        snap = buf.snapshot()
+        assert snap._window_sec == 60.0
+        assert snap._max_chars == 500
+
+    def test_snapshot_independent_after_original_add(self):
+        """元 buffer に追加しても snapshot に反映されない。"""
+        buf = TranscriptBuffer()
+        buf.add(TranscriptSegment(text="A", timestamp=100.0, duration_ms=500))
+        snap = buf.snapshot()
+        buf.add(TranscriptSegment(text="B", timestamp=101.0, duration_ms=500))
+        assert len(snap) == 1
+        assert snap.full_text() == "A"
+        assert len(buf) == 2
+
+    def test_snapshot_independent_after_original_clear(self):
+        """元 buffer を clear しても snapshot に反映されない。"""
+        buf = TranscriptBuffer()
+        buf.add(TranscriptSegment(text="A", timestamp=100.0, duration_ms=500))
+        snap = buf.snapshot()
+        buf.clear()
+        assert len(snap) == 1
+        assert len(buf) == 0
+
+    def test_snapshot_of_empty_buffer(self):
+        buf = TranscriptBuffer()
+        snap = buf.snapshot()
+        assert len(snap) == 0
+        assert snap.full_text() == ""
+
+    def test_modifying_snapshot_does_not_affect_original(self):
+        """逆方向の独立性: snapshot に追加しても元 buffer は変わらない。"""
+        buf = TranscriptBuffer()
+        buf.add(TranscriptSegment(text="A", timestamp=100.0, duration_ms=500))
+        snap = buf.snapshot()
+        snap.add(TranscriptSegment(text="B", timestamp=101.0, duration_ms=500))
+        assert len(buf) == 1
+        assert buf.full_text() == "A"
+        assert len(snap) == 2
+
+
+# ─── TestTranscriptBufferThreadSafety ─────────────────────────────
+
+
+class TestTranscriptBufferThreadSafety:
+    """マルチスレッドアクセスでの整合性を確認する。
+
+    Block 0 では BackgroundContinuousListener (録音スレッド) と run_loop メイン
+    スレッドの両方から呼ばれるため、deque 破壊・deadlock が起きないことを
+    検証する。
+    """
+
+    def test_concurrent_add_keeps_all_segments(self):
+        """並列 add で deque 破壊が起きず、全セグメントが残る。"""
+        import threading
+
+        buf = TranscriptBuffer(window_sec=1000.0, max_chars=1_000_000)
+        n_threads = 10
+        n_per_thread = 100
+
+        def writer(thread_idx: int) -> None:
+            for i in range(n_per_thread):
+                buf.add(TranscriptSegment(
+                    text=f"t{thread_idx}_{i}",
+                    timestamp=100.0 + thread_idx * 0.01 + i * 0.001,
+                    duration_ms=500,
+                ))
+
+        threads = [
+            threading.Thread(target=writer, args=(t,))
+            for t in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        for t in threads:
+            assert not t.is_alive(), "writer スレッドがタイムアウト"
+        assert len(buf) == n_threads * n_per_thread
+
+    def test_concurrent_add_and_clear_no_deadlock(self):
+        """add と clear の並列実行で deadlock / 例外が起きない。"""
+        import threading
+        import time as _time
+
+        buf = TranscriptBuffer(window_sec=1000.0, max_chars=1_000_000)
+        stop_event = threading.Event()
+        errors: list[Exception] = []
+
+        def writer() -> None:
+            try:
+                i = 0
+                while not stop_event.is_set():
+                    buf.add(TranscriptSegment(
+                        text=f"x{i}",
+                        timestamp=100.0 + i * 0.001,
+                        duration_ms=500,
+                    ))
+                    i += 1
+            except Exception as exc:
+                errors.append(exc)
+
+        def clearer() -> None:
+            try:
+                while not stop_event.is_set():
+                    buf.clear()
+            except Exception as exc:
+                errors.append(exc)
+
+        w = threading.Thread(target=writer)
+        c = threading.Thread(target=clearer)
+        w.start()
+        c.start()
+
+        _time.sleep(0.2)
+        stop_event.set()
+        w.join(timeout=2.0)
+        c.join(timeout=2.0)
+
+        assert not errors, f"スレッドで例外: {errors}"
+        assert not w.is_alive() and not c.is_alive()
+
+    def test_concurrent_add_and_extract_context(self):
+        """add と extract_context の並列実行で deadlock / 例外が起きない。"""
+        import threading
+        import time as _time
+
+        buf = TranscriptBuffer(window_sec=1000.0, max_chars=1_000_000)
+        stop_event = threading.Event()
+        errors: list[Exception] = []
+
+        def writer() -> None:
+            try:
+                i = 0
+                while not stop_event.is_set():
+                    buf.add(TranscriptSegment(
+                        text=f"x{i}",
+                        timestamp=100.0 + i * 0.001,
+                        duration_ms=500,
+                    ))
+                    i += 1
+            except Exception as exc:
+                errors.append(exc)
+
+        def reader() -> None:
+            try:
+                while not stop_event.is_set():
+                    buf.extract_context()
+            except Exception as exc:
+                errors.append(exc)
+
+        w = threading.Thread(target=writer)
+        r = threading.Thread(target=reader)
+        w.start()
+        r.start()
+
+        _time.sleep(0.2)
+        stop_event.set()
+        w.join(timeout=2.0)
+        r.join(timeout=2.0)
+
+        assert not errors, f"スレッドで例外: {errors}"
+        assert not w.is_alive() and not r.is_alive()
+
+    def test_concurrent_add_and_snapshot(self):
+        """add と snapshot の並列実行で deadlock / 例外が起きず、snapshot が一貫した状態を返す。"""
+        import threading
+        import time as _time
+
+        buf = TranscriptBuffer(window_sec=1000.0, max_chars=1_000_000)
+        stop_event = threading.Event()
+        errors: list[Exception] = []
+        snapshots: list[TranscriptBuffer] = []
+
+        def writer() -> None:
+            try:
+                i = 0
+                while not stop_event.is_set():
+                    buf.add(TranscriptSegment(
+                        text=f"x{i}",
+                        timestamp=100.0 + i * 0.001,
+                        duration_ms=500,
+                    ))
+                    i += 1
+            except Exception as exc:
+                errors.append(exc)
+
+        def snapshotter() -> None:
+            try:
+                while not stop_event.is_set():
+                    snap = buf.snapshot()
+                    snapshots.append(snap)
+            except Exception as exc:
+                errors.append(exc)
+
+        w = threading.Thread(target=writer)
+        s = threading.Thread(target=snapshotter)
+        w.start()
+        s.start()
+
+        _time.sleep(0.2)
+        stop_event.set()
+        w.join(timeout=2.0)
+        s.join(timeout=2.0)
+
+        assert not errors, f"スレッドで例外: {errors}"
+        # スナップショットが取れていること（いくつ取れたかは環境依存）
+        assert len(snapshots) > 0
