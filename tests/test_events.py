@@ -8,6 +8,7 @@ import jsonschema
 import pytest
 
 from lab_lounge.events import (
+    build_dispatcher_queue_update,
     build_llm_final,
     build_tts_done,
     build_utterance_final,
@@ -209,5 +210,102 @@ class TestTtsDone:
         assert payload["speaker"] == "Nanami"
         # スキーマ検証も通る
         validate_event(ev)
+
+
+class TestDispatcherQueueUpdate:
+    """build_dispatcher_queue_update — Block 0 (録音常時化) で導入。
+    HUD のデバッグ dashboard 用。配信画面非表示。"""
+
+    def test_schema_valid_empty_queue(self):
+        """queue 空でもスキーマ検証を通る。"""
+        ev = build_dispatcher_queue_update(
+            queue=[],
+            max_size=3,
+            ttl_sec=60.0,
+            **COMMON,
+        )
+        validate_event(ev)
+
+    def test_schema_valid_with_entries(self):
+        """queue にエントリがあってもスキーマ検証を通る。"""
+        queue = [
+            {
+                "character_slug": "mimi",
+                "keyword": "ミミ様",
+                "transcript": "深海って怖い場所?",
+                "age_sec": 5.2,
+            },
+            {
+                "character_slug": "chisame",
+                "keyword": "ちさめさん",
+                "transcript": "データ的には?",
+                "age_sec": 1.0,
+            },
+        ]
+        ev = build_dispatcher_queue_update(
+            queue=queue,
+            max_size=3,
+            ttl_sec=60.0,
+            **COMMON,
+        )
+        validate_event(ev)
+
+    def test_required_fields(self):
+        ev = build_dispatcher_queue_update(
+            queue=[],
+            max_size=3,
+            ttl_sec=60.0,
+            **COMMON,
+        )
+        for f in ("ver", "event_id", "ts", "stream_id", "session_id", "trace_id", "type", "source", "payload"):
+            assert f in ev
+
+    def test_event_id_is_uuid(self):
+        ev = build_dispatcher_queue_update(
+            queue=[], max_size=3, ttl_sec=60.0, **COMMON,
+        )
+        assert UUID_PATTERN.match(ev["event_id"]), f"UUID 形式でない: {ev['event_id']}"
+
+    def test_ver_type_source(self):
+        ev = build_dispatcher_queue_update(
+            queue=[], max_size=3, ttl_sec=60.0, **COMMON,
+        )
+        assert ev["ver"] == "0.1"
+        assert ev["type"] == "dispatcher.queue.update"
+        assert ev["source"] == "lab-lounge"
+
+    def test_payload_contents(self):
+        queue = [
+            {
+                "character_slug": "sakura",
+                "keyword": "さくらさん",
+                "transcript": "気持ちは?",
+                "age_sec": 2.5,
+            },
+        ]
+        ev = build_dispatcher_queue_update(
+            queue=queue,
+            max_size=3,
+            ttl_sec=60.0,
+            **COMMON,
+        )
+        payload = ev["payload"]
+        assert payload["queue"] == queue
+        assert payload["max_size"] == 3
+        assert payload["ttl_sec"] == 60.0
+        assert payload["state"] == "idle"  # default
+
+    def test_state_field(self):
+        ev = build_dispatcher_queue_update(
+            queue=[], max_size=3, ttl_sec=60.0, state="responding", **COMMON,
+        )
+        assert ev["payload"]["state"] == "responding"
+
+    def test_no_stream_idx(self):
+        """Guardrail G-1: stream_idx を含めない"""
+        ev = build_dispatcher_queue_update(
+            queue=[], max_size=3, ttl_sec=60.0, **COMMON,
+        )
+        assert "stream_idx" not in ev
 
 

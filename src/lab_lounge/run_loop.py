@@ -111,6 +111,25 @@ def _init_listener(
         except Exception as exc:
             raise
 
+    # bg-continuous バックエンド (Block 0: 録音常時化)
+    # 応答パイプライン実行中もマイクを OFF にしないリスナー。
+    # BackgroundContinuousListener が別スレッドで録音を継続し、検知した
+    # wake_event は Dispatcher (run_loop 本体で生成) の queue に積まれる。
+    if requested == "bg-continuous":
+        try:
+            from .wake_word import BackgroundContinuousListener
+            listener = BackgroundContinuousListener(
+                device=audio_device,
+                tmp_dir=tmp_dir,
+                stt_provider=stt_provider,
+            )
+            logger.info(
+                "ウェイクワードバックエンド: bg-continuous (常時録音 + Dispatcher queue)"
+            )
+            return listener, "bg-continuous"
+        except Exception as exc:
+            raise
+
     # sherpa バックエンド (明示指定のみ)
     if requested == "sherpa":
         try:
@@ -305,6 +324,7 @@ def run_loop(
         "speech": "音声認識モード (VAD + STT)。キャラクター名を含めて話しかけてください。",
         "sherpa": "音声認識モード (Sherpa-ONNX)。キャラクター名を含めて話しかけてください。",
         "continuous": "常時文字起こしモード。会話の文脈を含めてキャラクター名で呼びかけてください。",
+        "bg-continuous": "常時録音モード (BG + Dispatcher)。応答中もマイクが OFF にならず、検知した発話は queue で順次処理されます。",
         "keyboard": "Enter キーモードで起動しました。",
     }
     print(mode_msg.get(effective_backend, "起動しました。"))
@@ -329,6 +349,72 @@ def run_loop(
     # ファイル未存在 / 空時は None で従来通り動作 (後方互換)。
     stream_context = load_stream_context()
 
+    # ─── Dispatcher の生成 (Block 0: bg-continuous バックエンド時のみ) ─────
+    # 状態管理 (IDLE / RESPONDING) と wake_event_queue を担う。
+    # listener (BackgroundContinuousListener) からの on_wake_detected コールバック
+    # で queue に event が積まれ、メインスレッドの dispatcher.wait_for_next_event()
+    # で取り出される。応答中も録音は継続される。
+    dispatcher = None
+    if effective_backend == "bg-continuous":
+        from .dispatcher import (
+            DRAIN_MAX_AGE_SEC,
+            DRAIN_MAX_EVENTS,
+            Dispatcher,
+        )
+        from .events import build_dispatcher_queue_update
+
+        def _publish_queue_update(queue_copy):
+            """``dispatcher.queue.update`` イベントを Redis Stream に publish する。
+
+            HUD のデバッグ dashboard で「現在スタックしている応答」を可視化する用途
+            (配信画面非表示)。queue 変化時 (add / dequeue / evict) に呼ばれる。
+            """
+            try:
+                now = time.monotonic()
+                queue_dicts = [
+                    {
+                        "character_slug": q.event.character_slug,
+                        "keyword": q.event.keyword,
+                        "transcript": q.event.transcript,
+                        "age_sec": now - q.enqueued_at,
+                    }
+                    for q in queue_copy
+                ]
+                event = build_dispatcher_queue_update(
+                    queue=queue_dicts,
+                    max_size=DRAIN_MAX_EVENTS,
+                    ttl_sec=DRAIN_MAX_AGE_SEC,
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    # queue.update イベントは特定ターンに紐付かないため、毎回新 trace_id
+                    trace_id=_new_uuid(),
+                    state=dispatcher.get_state().value if dispatcher else "idle",
+                )
+                publish(event)
+            except Exception as exc:
+                logger.warning("dispatcher.queue.update publish 失敗: %s", exc)
+
+        dispatcher = Dispatcher(on_queue_update=_publish_queue_update)
+        # BackgroundContinuousListener を起動。録音スレッドが回り始め、
+        # 検知された wake_event は dispatcher.on_wake_detected で queue に積まれる。
+        listener.start(on_wake_detected=dispatcher.on_wake_detected)
+        logger.info("Block 0: Dispatcher + BackgroundContinuousListener 起動完了")
+
+    def _bg_cleanup_pipeline() -> None:
+        """bg-continuous モードでの pipeline 終了処理。
+
+        - listener の routing_paused を解除して wake 判定を再開
+        - dispatcher を IDLE 状態に戻し、期限切れ event を破棄、queue 残りがあれば
+          メインスレッドを起こす
+
+        Pipeline 成功・失敗を問わず必ず呼ぶ必要がある (routing_paused が True のまま
+        放置されると wake 検知が永続的に止まり、wait_for_next_event が無限待機する)。
+        """
+        if effective_backend == "bg-continuous":
+            listener.set_routing_paused(False)
+            if dispatcher is not None:
+                dispatcher.on_pipeline_complete()
+
     turn = 0
     try:
         while max_turns is None or turn < max_turns:
@@ -337,8 +423,13 @@ def run_loop(
             input_text: str | None = None
             utterance_meta = None
 
-            if effective_backend in ("porcupine", "speech", "sherpa", "continuous"):
-                wake_result = listener.listen_once(timeout_seconds=wake_timeout)
+            if effective_backend in ("porcupine", "speech", "sherpa", "continuous", "bg-continuous"):
+                # bg-continuous は dispatcher の queue から取り出す (応答中も録音継続)
+                # その他のバックエンドは listener.listen_once で同期ブロッキング待機
+                if effective_backend == "bg-continuous":
+                    wake_result = dispatcher.wait_for_next_event(timeout=wake_timeout)
+                else:
+                    wake_result = listener.listen_once(timeout_seconds=wake_timeout)
                 if wake_result is None:
                     # タイムアウト → 再度待機
                     continue
@@ -346,14 +437,24 @@ def run_loop(
                 logger.info("ウェイクワード検知: %s", speaker_hint)
                 print(f"ウェイクワード検知: {speaker_hint}")
 
-                # speech / sherpa / continuous バックエンドは transcript がそのまま発話テキスト
-                if effective_backend in ("speech", "sherpa", "continuous") and wake_result.transcript:
+                # speech / sherpa / continuous / bg-continuous バックエンドは
+                # transcript がそのまま発話テキスト (録音 + STT 完了済み)
+                if (
+                    effective_backend in ("speech", "sherpa", "continuous", "bg-continuous")
+                    and wake_result.transcript
+                ):
                     input_text = wake_result.transcript
                     logger.info("STT 認識結果: %s", input_text)
                     print(f"認識結果: {input_text}")
             else:
                 # keyboard モード
                 _wait_for_enter()
+
+            # bg-continuous: pipeline 開始前に listener の routing_paused を True に。
+            # これにより応答中は新規 wake_event の通知が止まる (録音とバッファ蓄積は継続)。
+            # _bg_cleanup_pipeline() を必ず呼んで False に戻すことを忘れない。
+            if effective_backend == "bg-continuous":
+                listener.set_routing_paused(True)
 
             # ─── 2. マイク録音 (porcupine / keyboard のみ) ───────
             if input_text is None:
@@ -537,6 +638,9 @@ def run_loop(
                     _playback_thread.join(timeout=5)
                 # Pipeline 例外時の bubble 閉じは V2 の 30 秒安全弁に委ねる
                 # (speaker_hint が不確定なケースもあり、補填 done は見送り)
+                # bg-continuous: routing_paused を解除して dispatcher を IDLE に戻す。
+                # これがないと次ターンの wait_for_next_event が永続的に blocking する。
+                _bg_cleanup_pipeline()
                 continue
 
             # LLM 応答を表示 + ログ記録
@@ -586,6 +690,11 @@ def run_loop(
                 # skip_playback=True: worker が走らないので done を直接 publish
                 # (pipeline は done を発行しなくなったため)
                 _publish_bubble_safe(result.speaker, "done", "")
+
+            # bg-continuous: pipeline 成功 path の終端。
+            # routing_paused 解除 + dispatcher 状態を IDLE に戻す + 期限切れ event を破棄。
+            # queue に残っている event があれば次の wait_for_next_event で取り出される。
+            _bg_cleanup_pipeline()
 
             turn += 1
 
@@ -642,10 +751,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--wake-backend",
-        choices=["porcupine", "speech", "sherpa", "continuous", "keyboard"],
+        choices=["porcupine", "speech", "sherpa", "continuous", "bg-continuous", "keyboard"],
         default=None,
         metavar="BACKEND",
-        help="ウェイクワードバックエンド: porcupine / speech / keyboard (省略時は自動選択)",
+        help=(
+            "ウェイクワードバックエンド: porcupine / speech / sherpa / continuous / "
+            "bg-continuous (応答中も録音継続) / keyboard (省略時は自動選択)"
+        ),
     )
     parser.add_argument(
         "--stt-provider",
