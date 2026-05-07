@@ -268,6 +268,70 @@ class TestHallucinationFilter:
         # 既存パターンは引き続き機能
         assert _is_likely_hallucination("ご視聴ありがとうございました", 2000)
 
+    def test_short_phrase_repetition_detected(self):
+        """Phase 0.5-A フェーズ 8: 短句 (3-4 文字) が 3 回以上反復するパターンを検出する。
+
+        既存ルール 3 (半分フレーズの 2 回反復) では検出できない短句反復を
+        ルール 4 (短句 2-8 文字の 3 回以上反復) で補う。
+        """
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # メイドカフェ系反復ハルシネーション (実走 2026-05-07 で観測)
+        assert _is_likely_hallucination(
+            "お嬢様、お嬢様、お嬢様、お嬢様、お嬢様", 3000,
+        )
+        # 区切り無し反復
+        assert _is_likely_hallucination("お嬢様お嬢様お嬢様お嬢様お嬢様", 3000)
+        # 短句 (2 文字) 4 回反復
+        assert _is_likely_hallucination("はいはいはいはい", 2000)
+        # 5 文字 phrase × 3 回
+        assert _is_likely_hallucination("ありがとうありがとうありがとう", 3500)
+
+    def test_short_phrase_2_repeats_not_detected(self):
+        """短句が 2 回しか繰り返されない場合は未検出 (普通の発話)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # 「そうそう」は 4 文字、len < 6 でルール 4 skip
+        assert not _is_likely_hallucination("そうそう", 1500)
+        # 「ねぇねぇ」も同様 (4 文字、len < 6)
+        assert not _is_likely_hallucination("ねぇねぇ", 1500)
+
+    def test_ojousama_okaeri_pattern_detected(self):
+        """Phase 0.5-A フェーズ 8: 'お嬢様のお帰りの日' が完全/末尾一致パターンとして検出される。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert _is_likely_hallucination("お嬢様のお帰りの日", 5000)
+        # 末尾一致 (句読点付き)
+        assert _is_likely_hallucination("お嬢様のお帰りの日。", 5000)
+        # 「お嬢様のお帰り」も独立パターンとして登録
+        assert _is_likely_hallucination("お嬢様のお帰り", 4000)
+
+    def test_ojousama_alone_not_detected(self):
+        """重要: 'お嬢様' 単独は mimi の alias なのでハルシネーション扱いしない。
+
+        実走時にルカが mimi を「お嬢様」と呼びかけるケースを fail させてはいけない。
+        """
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination("お嬢様", 1500)
+        # 「お嬢様!」「お嬢様。」も末尾句読点除去後 "お嬢様" として検出されない
+        assert not _is_likely_hallucination("お嬢様!", 1500)
+        # 「お嬢様、こちらをご覧ください」も検出されない (普通の文)
+        assert not _is_likely_hallucination("お嬢様、こちらをご覧ください", 4000)
+
+    def test_normal_short_phrases_not_detected(self):
+        """通常の日本語短文は誤検出されない (Phase 0.5-A フェーズ 8 ルール 4 の誤検知防止)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination("こんにちは", 1500)
+        assert not _is_likely_hallucination("ありがとう", 1500)
+        # callout 系 (短い)
+        assert not _is_likely_hallucination("ミミ様", 1000)
+        assert not _is_likely_hallucination("ちさめさん", 1500)
+        # 普通の発話 (短句反復なし)
+        assert not _is_likely_hallucination("AI 倫理について", 3000)
+        assert not _is_likely_hallucination("最近どうかな", 2000)
+
     def test_filter_disabled_via_env(self, monkeypatch):
         """L2_STT_HALLUCINATION_FILTER=false で apply_hallucination_filter は素通し。"""
         from lab_lounge.stt import _apply_hallucination_filter

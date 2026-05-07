@@ -88,6 +88,11 @@ _HALLUCINATION_PATTERNS: tuple[str, ...] = (
     "字幕:",
     "by H.",
     "Subtitled by",
+    # Phase 0.5-A 実走で観測 (2026-05-07): メイドカフェ系定型句の誤検知。
+    # 注意: "お嬢様" 単独は mimi の alias なので追加禁止 (mention 経路で誤検知される)。
+    # 完全な定型句 (フレーズ全体) のみパターン化する。
+    "お嬢様のお帰りの日",
+    "お嬢様のお帰り",
 )
 
 
@@ -113,8 +118,10 @@ def _is_likely_hallucination(text: str, audio_duration_ms: int) -> bool:
     判定ルール:
       1. パターンマッチ: 完全一致 or 末尾一致 (定型句で終わる発話を除外)
       2. 短時間 + 長文の不整合: 1 秒未満の録音で 10 文字以上の出力は不審
-      3. 完全反復検出: 同一フレーズが 2 回以上繰り返される
+      3. 長フレーズ反復: 半分のフレーズが 2 回以上繰り返される
          (例: "ご視聴ありがとうご視聴ありがとう...")
+      4. 短句反復 (Phase 0.5-A フェーズ 8): 短句 (2-8 文字) が 3 回以上繰り返される
+         (例: "お嬢様、お嬢様、お嬢様、お嬢様、お嬢様" → ルール 3 では検出不可)
 
     Args:
         text:              Whisper の出力テキスト
@@ -141,11 +148,23 @@ def _is_likely_hallucination(text: str, audio_duration_ms: int) -> bool:
     if 0 < audio_duration_ms < 1000 and len(normalized) >= 10:
         return True
 
-    # ルール 3: 完全反復検出 (半分のフレーズが 2 回以上繰り返される)
+    # ルール 3: 長フレーズ反復検出 (半分のフレーズが 2 回以上繰り返される)
     if len(normalized) >= 12:
         half = normalized[: len(normalized) // 2]
         if half and normalized.count(half) >= 2:
             return True
+
+    # ルール 4 (Phase 0.5-A フェーズ 8): 短句反復検出
+    # ルール 3 では検出できない短句反復 (例: "お嬢様、お嬢様、...") を検出する。
+    # prefix_len 2-8 文字の prefix が 3 回以上出現すればハルシネーションとみなす。
+    # 短い prefix での 3 回反復は普通の発話ではほぼ起き得ない (= 視聴者向け話で
+    # "そうそうそう" のような同句連続も普通は 1-2 回程度)。
+    if len(normalized) >= 6:
+        max_prefix_len = min(9, len(normalized) // 3 + 1)
+        for prefix_len in range(2, max_prefix_len):
+            prefix = normalized[:prefix_len]
+            if prefix and normalized.count(prefix) >= 3:
+                return True
 
     return False
 
