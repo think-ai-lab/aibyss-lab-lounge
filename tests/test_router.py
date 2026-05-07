@@ -546,6 +546,68 @@ class TestCheckIntentInterjectionCandidate:
             check_intent(text)
         assert mock_llm.call_args.args[2] == text
 
+    def test_prompt_includes_interest_areas(self):
+        """Phase 0.5-A フェーズ 8: プロンプトに各キャラの担当エリアが含まれる。
+
+        skills/characters/<slug>.md の `**担当エリア**:` 行を読み取って LLM に
+        提示することで、判定精度を改善する (実走で 'AI 倫理' が候補なし判定された問題対応)。
+        """
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")
+        system_prompt = mock_llm.call_args.args[1]
+        # 各キャラの担当エリアキーワードがプロンプトに含まれる (md 内容に依存)
+        # mimi: 抽象 × 感情（美学・価値観・ノブレスオブリージュ）
+        # chisame: 具体 × 論理（データ・根拠・実行計画）
+        # sakura: 具体 × 感情（感情フォロー・心理安全・倫理的配慮）
+        assert "担当" in system_prompt
+        assert "美学" in system_prompt or "ノブレスオブリージュ" in system_prompt  # mimi
+        assert "データ" in system_prompt or "実行計画" in system_prompt  # chisame
+        assert "感情フォロー" in system_prompt or "倫理的配慮" in system_prompt  # sakura
+
+    def test_prompt_has_judgment_criteria(self):
+        """プロンプトに判定基準 (過剰挙手禁止 / callout 経路への譲渡) が含まれる。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")
+        system_prompt = mock_llm.call_args.args[1]
+        # 「直接触れる」「過剰挙手の禁止」「呼びかけ済み」等の判定基準キーワード
+        assert "直接触れる" in system_prompt
+        assert "呼びかけ" in system_prompt
+        # 過剰挙手禁止の旨が含まれる
+        assert "雑談" in system_prompt or "過剰" in system_prompt
+
+
+class TestLoadCharacterInterestArea:
+    """Phase 0.5-A フェーズ 8: skills/characters/<slug>.md からの担当エリア抽出。"""
+
+    def test_returns_mimi_interest_area(self):
+        """mimi.md から担当エリアを抽出。"""
+        from lab_lounge.router import _load_character_interest_area
+        result = _load_character_interest_area("mimi")
+        assert result is not None
+        # 担当エリア: 抽象 × 感情（美学・価値観・ノブレスオブリージュ）
+        assert "美学" in result or "ノブレスオブリージュ" in result
+
+    def test_returns_chisame_interest_area(self):
+        """chisame.md から担当エリアを抽出。"""
+        from lab_lounge.router import _load_character_interest_area
+        result = _load_character_interest_area("chisame")
+        assert result is not None
+        assert "論理" in result or "データ" in result
+
+    def test_returns_sakura_interest_area(self):
+        """sakura.md から担当エリアを抽出。"""
+        from lab_lounge.router import _load_character_interest_area
+        result = _load_character_interest_area("sakura")
+        assert result is not None
+        assert "感情" in result or "倫理" in result
+
+    def test_returns_none_for_unknown_slug(self):
+        """skills/characters/<slug>.md が無い slug は None。"""
+        from lab_lounge.router import _load_character_interest_area
+        assert _load_character_interest_area("nonexistent_slug") is None
+
 
 class TestCheckApproval:
     """check_approval() の挙動 (Phase 0.5-A で導入)。
