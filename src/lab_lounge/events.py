@@ -274,3 +274,52 @@ def build_bubble_update(
     return event
 
 
+def build_dispatcher_queue_update(
+    *,
+    queue: list[dict[str, Any]],
+    max_size: int,
+    ttl_sec: float,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    state: str = "idle",
+) -> dict[str, Any]:
+    """
+    dispatcher.queue.update イベントを組み立てて検証する。
+
+    Block 0 (録音常時化) で導入。Dispatcher の wake_event_queue が変化したとき
+    (add / dequeue / evict) に発行され、HUD のデバッグ dashboard で「現在
+    スタックしている応答」を可視化するためのイベント。
+
+    配信画面には出さない想定（運用デバッグ用途）。Phase 0.5 では同じパターンで
+    ``dispatcher.handraise.update`` を兄弟イベントとして追加できる。
+
+    Args:
+        queue:    queue 内の各 event を表す dict のリスト。各要素は
+                  ``{"character_slug": str, "keyword": str | None,
+                     "transcript": str | None, "age_sec": float}`` を含む想定
+                  （events.py は中身に介入せず、payload にそのまま載せる）
+        max_size: queue の最大保持件数 (Dispatcher.DRAIN_MAX_EVENTS と一致)
+        ttl_sec:  期限切れ閾値秒数 (Dispatcher.DRAIN_MAX_AGE_SEC と一致)
+        state:    Dispatcher の現在状態 ("idle" / "responding" / "handraising")
+    """
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "dispatcher.queue.update",
+        "source": "lab-lounge",
+        "payload": {
+            "queue": queue,
+            "max_size": max_size,
+            "ttl_sec": ttl_sec,
+            "state": state,
+        },
+    }
+    validate_event(event)
+    return event
+
+

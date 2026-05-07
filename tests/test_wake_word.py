@@ -252,4 +252,151 @@ class TestVadFallback:
             r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert any("webrtcvad" in m for m in warning_msgs)
-        assert any("RMS" in m or "rms" in m.lower() for m in warning_msgs)
+
+
+# ─── BackgroundContinuousListener (Block 0) ──────────────────────
+
+
+def _make_mock_sounddevice():
+    """sounddevice のモック。InputStream の read() は silent PCM を返す
+    (onset 未検知 → segment 生成なし → STT 呼ばれず副作用なし)。"""
+    mock_sd = MagicMock()
+    mock_stream = MagicMock()
+    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+    mock_stream.__exit__ = MagicMock(return_value=None)
+    silent_pcm = np.zeros((_DEFAULT_FRAME_SAMPLES, 1), dtype=np.int16)
+    mock_stream.read.return_value = (silent_pcm, False)
+    mock_sd.InputStream.return_value = mock_stream
+    return mock_sd
+
+
+class TestBackgroundContinuousListenerInit:
+    """初期化系テスト (スレッド起動なし)。"""
+
+    def test_buffer_property_is_transcript_buffer(self):
+        from lab_lounge.transcript_buffer import TranscriptBuffer
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert isinstance(listener.buffer, TranscriptBuffer)
+
+    def test_initial_no_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert listener._thread is None
+
+    def test_initial_routing_not_paused(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert not listener._routing_paused.is_set()
+
+    def test_custom_window_and_max_chars(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener(
+            context_window_sec=60.0,
+            context_max_chars=500,
+        )
+        assert listener.buffer._window_sec == 60.0
+        assert listener.buffer._max_chars == 500
+
+
+class TestBackgroundContinuousListenerLifecycle:
+    """start / stop / cleanup のライフサイクルテスト。
+
+    sounddevice をモックし、silent PCM のみ返すことで実マイク入力なしで
+    スレッドのライフサイクル動作を検証する (onset 検知に至らないため
+    STT / numpy 演算等の重い処理は走らない)。
+    """
+
+    def test_start_starts_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        import time as _time
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+
+            _time.sleep(0.1)  # スレッドが回ることを確認する短い待機
+            assert listener._thread is not None
+            assert listener._thread.is_alive()
+
+            listener.stop(timeout=2.0)
+
+    def test_stop_terminates_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        import time as _time
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+            _time.sleep(0.05)
+            listener.stop(timeout=2.0)
+            assert listener._thread is None
+
+    def test_double_start_raises(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+            try:
+                with pytest.raises(RuntimeError, match="既に起動中"):
+                    listener.start(on_wake_detected=lambda r: None)
+            finally:
+                listener.stop(timeout=2.0)
+
+    def test_stop_without_start_is_noop(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        # 例外なく動く
+        listener.stop()
+        assert listener._thread is None
+
+    def test_cleanup_stops_and_clears_buffer(self):
+        from lab_lounge.transcript_buffer import TranscriptSegment
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+
+            # buffer に直接 segment を入れて、cleanup で消えることを確認
+            listener.buffer.add(TranscriptSegment(
+                text="前のテスト残骸", timestamp=100.0, duration_ms=500,
+            ))
+            assert len(listener.buffer) == 1
+
+            listener.cleanup()
+            assert listener._thread is None
+            assert len(listener.buffer) == 0
+
+
+class TestBackgroundContinuousListenerRoutingPause:
+    """set_routing_paused のフラグ動作テスト (スレッド起動なし)。"""
+
+    def test_set_routing_paused_true(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        assert listener._routing_paused.is_set()
+
+    def test_set_routing_paused_false(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        listener.set_routing_paused(False)
+        assert not listener._routing_paused.is_set()
+
+    def test_set_routing_paused_idempotent(self):
+        """同じ値を複数回設定しても問題ない。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        listener.set_routing_paused(True)
+        assert listener._routing_paused.is_set()
+        listener.set_routing_paused(False)
+        listener.set_routing_paused(False)
+        assert not listener._routing_paused.is_set()

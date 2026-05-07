@@ -192,3 +192,41 @@ class TestRunPlaybackWorker:
         assert play_fn.call_count == 2
         steps = [c[1] for c in publish_calls]
         assert steps == ["speaking", "speaking", "done"]
+
+
+class TestInitListenerBgContinuous:
+    """Block 0: _init_listener の bg-continuous 分岐テスト。
+
+    BackgroundContinuousListener.__init__ は sounddevice を遅延 import するため、
+    モックなしで初期化できる (録音スレッドは start() で起動)。
+    """
+
+    def test_returns_background_continuous_listener(self):
+        from lab_lounge.run_loop import _init_listener
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        listener, effective = _init_listener(
+            backend="bg-continuous",
+            audio_device=None,
+            tmp_dir=None,
+        )
+        try:
+            assert isinstance(listener, BackgroundContinuousListener)
+            assert effective == "bg-continuous"
+        finally:
+            listener.cleanup()
+
+    def test_passes_stt_provider(self):
+        """stt_provider 引数が listener に伝わる。"""
+        from lab_lounge.run_loop import _init_listener
+
+        listener, _ = _init_listener(
+            backend="bg-continuous",
+            audio_device=None,
+            tmp_dir=None,
+            stt_provider="faster-whisper",
+        )
+        try:
+            assert listener._stt_provider == "faster-whisper"
+        finally:
+            listener.cleanup()
