@@ -361,7 +361,10 @@ def run_loop(
             DRAIN_MAX_EVENTS,
             Dispatcher,
         )
-        from .events import build_dispatcher_queue_update
+        from .events import (
+            build_dispatcher_handraise_update,
+            build_dispatcher_queue_update,
+        )
 
         def _publish_queue_update(queue_copy):
             """``dispatcher.queue.update`` イベントを Redis Stream に publish する。
@@ -394,11 +397,91 @@ def run_loop(
             except Exception as exc:
                 logger.warning("dispatcher.queue.update publish 失敗: %s", exc)
 
-        dispatcher = Dispatcher(on_queue_update=_publish_queue_update)
+        # ─── Phase 0.5-A フェーズ 6: handraise 関連の publish helper ───
+        # Dispatcher は状態機械として純粋に保つため、bus.publish への接続は run_loop の
+        # closure 側で実装する。queue.update と同じく、handraise 関連イベントは特定の
+        # ターンに紐付かないため毎回新 trace_id を生成する。
+        def _publish_handraise_update(states_copy, cooldowns_copy):
+            """``dispatcher.handraise.update`` イベントを Redis Stream に publish する。
+
+            Phase 0.5-A の挙手機能で、HandraiseState / CooldownState の dict が
+            変化した瞬間 (start / approval / denial / lapse) に呼ばれる。HUD の
+            デバッグ dashboard で「現在挙手中のキャラ」「連続却下回数」を可視化する
+            (配信画面非表示)。
+
+            Args:
+                states_copy:    {target_slug: HandraiseState} の shallow copy
+                cooldowns_copy: {target_slug: CooldownState} の shallow copy
+            """
+            try:
+                now = time.monotonic()
+                states_payload = [
+                    {
+                        "target_slug": s.target_slug,
+                        "started_at_age_sec": now - s.started_at,
+                        "phrase": s.phrase,
+                        "se_pending": s.se_pending,
+                        "utterance_count_since": s.utterance_count_since,
+                        "trace_id": s.trace_id,
+                    }
+                    for s in states_copy.values()
+                ]
+                cooldowns_payload = {
+                    slug: {
+                        "cooldown_until": cd.cooldown_until,
+                        "consecutive_denials": cd.consecutive_denials,
+                        "threshold_multiplier": cd.threshold_multiplier,
+                    }
+                    for slug, cd in cooldowns_copy.items()
+                }
+                event = build_dispatcher_handraise_update(
+                    handraise_states=states_payload,
+                    cooldowns=cooldowns_payload,
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    trace_id=_new_uuid(),
+                )
+                publish(event)
+            except Exception as exc:
+                logger.warning("dispatcher.handraise.update publish 失敗: %s", exc)
+
+        def _publish_bubble_from_dispatcher(character, step, text, ttl_ms):
+            """Dispatcher 発の ``bubble.update`` を Redis Stream に publish する。
+
+            通常応答中の bubble.update (ターン毎 trace_id) と区別するため、
+            handraise 関連の bubble は毎回新 trace_id で発行する (= ターンに紐付か
+            ない概念)。Dispatcher 側から ``handraise / denied / lapsed`` の 3 種類が
+            発行される。``answering`` は run_loop が承認時に別経路で発行する
+            (フェーズ 7 で接続)。
+            """
+            try:
+                event = build_bubble_update(
+                    character=character,
+                    step=step,
+                    text=text,
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    trace_id=_new_uuid(),
+                    ttl_ms=ttl_ms,
+                )
+                publish(event)
+            except Exception as exc:
+                logger.warning("bubble.update(%s) from dispatcher publish 失敗: %s", step, exc)
+
+        dispatcher = Dispatcher(
+            on_queue_update=_publish_queue_update,
+            on_handraise_update=_publish_handraise_update,
+            on_bubble_update=_publish_bubble_from_dispatcher,
+        )
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、
         # 検知された wake_event は dispatcher.on_wake_detected で queue に積まれる。
-        listener.start(on_wake_detected=dispatcher.on_wake_detected)
-        logger.info("Block 0: Dispatcher + BackgroundContinuousListener 起動完了")
+        # Phase 0.5-A フェーズ 6: 全 segment を dispatcher.on_segment_added に流して
+        # 挙手判定 (interjection_candidate) と承認判定 (check_approval) を担わせる。
+        listener.start(
+            on_wake_detected=dispatcher.on_wake_detected,
+            on_segment_added=dispatcher.on_segment_added,
+        )
+        logger.info("Block 0 + Phase 0.5-A: Dispatcher + BackgroundContinuousListener 起動完了")
 
     def _bg_cleanup_pipeline() -> None:
         """bg-continuous モードでの pipeline 終了処理。
