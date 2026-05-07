@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from lab_lounge import stt as _stt
+from lab_lounge.router import IntentResult
 from lab_lounge.stt import STTResult
 from lab_lounge.wake_word import (
     _DEFAULT_SILENCE_FRAMES,
@@ -314,18 +315,28 @@ class TestContinuousListenerIntentGate:
         mock_check.assert_not_called()
 
     def test_intent_gate_callout_returns_result(self, monkeypatch):
-        """意図ゲートが 'callout' → 通常通り結果を返す。"""
+        """意図ゲートが callout → 通常通り結果を返す (Phase 0.5-A: IntentResult)。"""
         monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
-        with patch("lab_lounge.router.check_intent", return_value="callout") as mock_check:
+        callout_result = IntentResult(
+            intent="callout", target_slug="mimi", confidence=1.0
+        )
+        with patch(
+            "lab_lounge.router.check_intent", return_value=callout_result
+        ) as mock_check:
             result = self._run_single_with_env("ねぇミミ様、これどう思う？")
         assert result is not None
         assert result.character_slug == "mimi"
         mock_check.assert_called_once()
 
     def test_intent_gate_unknown_proceeds_fail_open(self, monkeypatch):
-        """意図ゲートが 'unknown' → fail-open で通常通り返す。"""
+        """意図ゲートが unknown → fail-open で通常通り返す (Phase 0.5-A: IntentResult)。"""
         monkeypatch.setenv("L2_USE_INTENT_GATE", "true")
-        with patch("lab_lounge.router.check_intent", return_value="unknown") as mock_check:
+        unknown_result = IntentResult(
+            intent="unknown", target_slug="mimi", confidence=0.0
+        )
+        with patch(
+            "lab_lounge.router.check_intent", return_value=unknown_result
+        ) as mock_check:
             result = self._run_single_with_env("ミミ様、テスト")
         assert result is not None
         assert result.character_slug == "mimi"
@@ -348,7 +359,8 @@ class TestContinuousListenerIntentGate:
              patch("lab_lounge.wake_word.tempfile.NamedTemporaryFile", mock_ntf), \
              patch.object(Path, "unlink"), \
              patch.object(_stt, "transcribe_audio_file", return_value=_stt_result("ミミ様の仕組みはすごいですね")), \
-             patch("lab_lounge.router.check_intent", return_value="mention"), \
+             patch("lab_lounge.router.check_intent",
+                   return_value=IntentResult(intent="mention", target_slug="mimi", confidence=1.0)), \
              patch("time.monotonic", side_effect=monotonic_calls):
             result = listener.listen_once(timeout_seconds=30.0)
 
@@ -371,7 +383,11 @@ class TestContinuousListenerIntentGate:
             _stt_result("ミミ様って可愛いよね"),       # 1 回目: 言及
             _stt_result("ねぇミミ様、聞いていい？"),  # 2 回目: 呼びかけ
         ]
-        intent_results = ["mention", "callout"]
+        # Phase 0.5-A: check_intent は IntentResult を返すので IntentResult リストを mock。
+        intent_results = [
+            IntentResult(intent="mention", target_slug="mimi", confidence=1.0),
+            IntentResult(intent="callout", target_slug="mimi", confidence=1.0),
+        ]
 
         with patch.dict(sys.modules, {"sounddevice": mock_sd, "soundfile": mock_sf}), \
              patch("lab_lounge.wake_word.tempfile.NamedTemporaryFile", mock_ntf), \

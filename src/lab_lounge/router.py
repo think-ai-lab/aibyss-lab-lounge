@@ -303,9 +303,51 @@ def route(
     return RoutingDecision(speaker=default.slug, reason="default")
 
 
-# ─── LLM 意図ゲート (呼び出しゲート Phase 2) ─────────────────────
+# ─── LLM 意図ゲート (Phase 2 + Phase 0.5-A) ─────────────────────
+#
+# Phase 2 (Axis B): check_intent で「呼びかけ vs 言及」を判定 (character_slug 指定時)
+# Phase 0.5-A: check_intent を IntentResult 返却に拡張、character_slug=None で
+#              「自発介入候補キャラ」を判定する interjection_candidate モードを追加。
+#              check_approval を新規追加し、handraising 中のルカ承認/却下を判定。
+# ────────────────────────────────────────────────────────────
 
 _INTENT_GATE_MODEL = os.environ.get("L2_INTENT_GATE_MODEL", "claude-haiku-4-5-20251001")
+
+
+@dataclass(frozen=True)
+class IntentResult:
+    """check_intent() の戻り値 (Phase 0.5-A で導入)。
+
+    intent:
+      - "callout"               — 特定キャラへの直接の呼びかけ (Phase 2)
+      - "mention"               — キャラについての言及のみ (Phase 2)
+      - "unknown"               — LLM 失敗 / パース失敗 (fail-open)
+      - "interjection_candidate"— 名前ヒントなしで自発介入候補のキャラを検出
+                                  (Phase 0.5-A 挙手システム)
+    target_slug:
+      - callout/mention 時は呼出元の character_slug
+      - interjection_candidate 時は LLM が判定した候補 slug
+      - unknown 時は呼出元 slug or None
+    confidence: 0.0-1.0、現状は 1.0 / 0.0 の二値 (将来 LLM 出力に拡張)
+    """
+
+    intent: Literal["callout", "mention", "unknown", "interjection_candidate"]
+    target_slug: str | None
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ApprovalResult:
+    """check_approval() の戻り値 (Phase 0.5-A handraising 中のみ)。
+
+    granted=True  → ルカが承認 (「ミミ、どうぞ」「いいよ」)
+    granted=False → ルカが却下 (「いや、いいわ」「やめて」)
+    どちらでもない発話の場合は check_approval が ``None`` を返す (本 dataclass 未使用)。
+    """
+
+    granted: bool
+    target_slug: str
+    confidence: float
 
 
 def is_intent_gate_enabled() -> bool:
@@ -313,24 +355,46 @@ def is_intent_gate_enabled() -> bool:
     return os.environ.get("L2_USE_INTENT_GATE", "").lower() in ("1", "true", "yes")
 
 
-def check_intent(context: str, character_slug: str) -> str:
+def check_intent(
+    text: str,
+    character_slug: str | None = None,
+) -> IntentResult:
     """
-    発話文脈に特定キャラクターへの「呼びかけ」が含まれるかを LLM で判定する。
+    発話文脈の意図を LLM で判定する (Phase 2 互換 + Phase 0.5-A 拡張)。
 
-    「ミミ様の仕組みは〜」のような「言及」発話と、「ねぇミミ様、どう思う？」のような
-    「呼びかけ」発話を区別する。ContinuousListener 経由で配信中の誤反応を防ぐ。
+    モード:
+      - character_slug 指定時 (Phase 2 互換):
+          特定キャラへの呼びかけ (callout) / 言及 (mention) / 不明 (unknown) を判定。
+          ContinuousListener / BackgroundContinuousListener が、ウェイクワード
+          検知後の文脈チェックで使う。
+      - character_slug=None 時 (Phase 0.5-A):
+          挙手候補キャラを判定。各キャラの関心領域に触れる発話があれば
+          interjection_candidate を返す。Dispatcher.on_segment_added が、
+          handraising キャラ無し + IDLE/RESPONDING 中に呼ぶ。
 
-    L2_INTENT_GATE_MODEL でモデルを指定可能。
-    モデル名からプロバイダー（OpenAI / Anthropic / Google）を自動判定する。
+    L2_INTENT_GATE_MODEL でモデル指定可能。プロバイダ自動判定。
 
     Args:
-        context:        バッファから抽出した発話文脈テキスト
-        character_slug: ルーティング先のキャラクター slug
+        text:           判定対象の発話テキスト (バッファ抽出 or 1 segment)
+        character_slug: Phase 2 互換モードでは判定対象キャラの slug、
+                        Phase 0.5-A interjection_candidate モードでは None
 
     Returns:
-        "callout" — キャラクターへの呼びかけ
-        "mention" — キャラクターについての言及のみ
-        "unknown" — 判定不能（LLM エラー・パース失敗）。呼び出し元は fail-open 推奨
+        IntentResult (frozen dataclass)。LLM 失敗時は intent="unknown" で fail-open。
+    """
+    if character_slug is not None:
+        return _check_intent_for_character(text, character_slug)
+    return _check_intent_interjection_candidate(text)
+
+
+def _check_intent_for_character(
+    text: str,
+    character_slug: str,
+) -> IntentResult:
+    """Phase 2 互換: 特定キャラへの callout/mention/unknown を判定する。
+
+    ロジックは Phase 2 (Axis B) と同一だが、戻り値を str → IntentResult に変更。
+    ContinuousListener / BackgroundContinuousListener から呼ばれる。
     """
     system_prompt = (
         "あなたは発話意図判定器です。\n"
@@ -347,18 +411,171 @@ def check_intent(context: str, character_slug: str) -> str:
     )
 
     model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
-    answer = _call_router_llm(model, system_prompt, context)
+    answer = _call_router_llm(model, system_prompt, text)
 
     if answer is None:
         logger.warning("意図ゲート: LLM 呼び出し失敗 → unknown (fail-open)")
-        return "unknown"
+        return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
 
     logger.info("意図ゲート応答: %r (model=%s char=%s)", answer, model, character_slug)
 
     if answer == "callout":
-        return "callout"
+        return IntentResult(intent="callout", target_slug=character_slug, confidence=1.0)
     if answer == "mention":
-        return "mention"
+        return IntentResult(intent="mention", target_slug=character_slug, confidence=1.0)
 
     logger.warning("意図ゲート: 予期しない応答 %r → unknown (fail-open)", answer)
-    return "unknown"
+    return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
+
+
+def _check_intent_interjection_candidate(text: str) -> IntentResult:
+    """Phase 0.5-A: 自発介入候補のキャラを判定する。
+
+    候補は octamaid (補助員ボット) を除く挙手対応キャラ (mimi / chisame / sakura)。
+    LLM に「自分の関心領域に触れる発話があるキャラ」を判定させ、該当があれば
+    interjection_candidate + target_slug を返す (該当なしは unknown)。
+
+    Notion §C1 確定: octamaid は挙手しない設計。
+    フェーズ 4 では候補 slug + display_name のみ提示。フェーズ 7 で interject.md
+    を活用したプロンプト強化を検討する。
+    """
+    characters = get_all_characters()
+    # octamaid は挙手しない (補助員ボットとして応答待機専用)
+    candidate_chars = [c for c in characters if c.slug != "octamaid"]
+    candidate_slugs = [c.slug for c in candidate_chars]
+
+    if not candidate_slugs:
+        logger.warning("interjection_candidate: 候補キャラなし → unknown")
+        return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+
+    candidates_desc = "\n".join(
+        f"- {c.slug} ({c.display_name})"
+        for c in candidate_chars
+    )
+
+    system_prompt = (
+        "あなたは自発介入候補判定器です。\n"
+        "ユーザー (ルカ) と他キャラの会話の文脈で、特定キャラへの呼びかけは無いが、\n"
+        "あるキャラが「自分の関心領域・専門分野」として自発介入したそうな発話があるかを\n"
+        "判定してください。\n\n"
+        f"候補キャラ:\n{candidates_desc}\n\n"
+        "判定:\n"
+        "- 候補 slug 一語: そのキャラが自発介入したそうな話題が含まれる\n"
+        "- none: 該当なし、または既に呼びかけがある\n\n"
+        f"回答は以下のいずれか一語のみ: {', '.join(candidate_slugs)}, none"
+    )
+
+    model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
+    answer = _call_router_llm(model, system_prompt, text)
+
+    if answer is None:
+        logger.warning("interjection_candidate: LLM 呼び出し失敗 → unknown (fail-open)")
+        return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+
+    logger.info("interjection_candidate 応答: %r (model=%s)", answer, model)
+
+    if answer == "none":
+        return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+
+    if answer in candidate_slugs:
+        return IntentResult(
+            intent="interjection_candidate",
+            target_slug=answer,
+            confidence=1.0,
+        )
+
+    logger.warning("interjection_candidate: 候補外 slug %r → unknown", answer)
+    return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+
+
+def check_approval(
+    text: str,
+    candidate_slugs: list[str],
+) -> ApprovalResult | None:
+    """Phase 0.5-A: handraising 中の承認/却下を判定する。
+
+    ルカの発話を:
+      - 承認 (granted): 「(キャラ名)、どうぞ」「いいよ」「話して」など発話を促す
+      - 却下 (denied):  「いや、いいわ」「やめて」「後で」など発話を断る
+      - 関係なし:       上記いずれでもない別の話題 → ``None`` を返す
+                       (呼出元 Dispatcher は通常の意図ゲート処理に流す)
+
+    候補が複数 (複数挙手連鎖) の場合も対応。LLM はキャラ名を識別して
+    「どのキャラへの承認/却下か」を返す。
+
+    L2_INTENT_GATE_MODEL でモデル指定可能。
+
+    Args:
+        text:            ルカの発話テキスト
+        candidate_slugs: 現在 handraising 中のキャラ slug のリスト (1 件以上)
+
+    Returns:
+        ApprovalResult | None: 承認/却下のいずれかなら ApprovalResult、
+                              どちらでもない場合 / LLM 失敗時は ``None`` で fail-open
+                              (呼出元は通常の意図ゲート処理に流す)。
+    """
+    if not candidate_slugs:
+        return None
+
+    # キャラ名 (display_name + nickname + aliases) も提示することで、LLM が
+    # 「ミミ、どうぞ」のような自然な日本語を slug に変換しやすくなる。
+    characters = get_all_characters()
+    slug_to_names: dict[str, list[str]] = {}
+    for c in characters:
+        if c.slug not in candidate_slugs:
+            continue
+        names: list[str] = [c.display_name]
+        if c.nickname:
+            names.append(c.nickname)
+        names.extend(c.aliases)
+        slug_to_names[c.slug] = [n for n in names if n]
+
+    candidates_with_names = "\n".join(
+        f"- {slug}: {', '.join(slug_to_names.get(slug, [slug]))}"
+        for slug in candidate_slugs
+    )
+
+    system_prompt = (
+        "あなたは挙手承認判定器です。\n"
+        "AI キャラ (挙手中) に対して、ユーザー (ルカ) の発話を:\n"
+        "- 承認 (granted): 「(キャラ名)、どうぞ」「いいよ」「話して」など発話を促す\n"
+        "- 却下 (denied):  「いや、いいわ」「やめて」「後で」など発話を断る\n"
+        "- 関係なし (none): 上記いずれでもない別の話題\n"
+        "を判定してください。\n\n"
+        f"挙手中の候補:\n{candidates_with_names}\n\n"
+        "回答は次のいずれか一行のみ:\n"
+        "- granted:<slug>\n"
+        "- denied:<slug>\n"
+        "- none\n"
+        f"(slug は {', '.join(candidate_slugs)} のいずれか)"
+    )
+
+    model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
+    answer = _call_router_llm(model, system_prompt, text)
+
+    if answer is None:
+        logger.warning("check_approval: LLM 呼び出し失敗 → None (fail-open: 通常処理へ)")
+        return None
+
+    logger.info(
+        "check_approval 応答: %r (model=%s candidates=%s)",
+        answer, model, candidate_slugs,
+    )
+
+    if answer == "none":
+        return None
+
+    if ":" in answer:
+        verdict, _, slug = answer.partition(":")
+        slug = slug.strip()
+        verdict = verdict.strip()
+        if slug not in candidate_slugs:
+            logger.warning("check_approval: 候補外 slug %r → None", slug)
+            return None
+        if verdict == "granted":
+            return ApprovalResult(granted=True, target_slug=slug, confidence=1.0)
+        if verdict == "denied":
+            return ApprovalResult(granted=False, target_slug=slug, confidence=1.0)
+
+    logger.warning("check_approval: 予期しない応答 %r → None", answer)
+    return None

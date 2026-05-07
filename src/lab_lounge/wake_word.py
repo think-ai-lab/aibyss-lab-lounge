@@ -1045,15 +1045,18 @@ class ContinuousListener:
                     # 「言及」と判定された場合はバッファを保持して次のセグメントを待つ
                     # (跨ぎ発話への対応: 「ミミ様のことなんだけど…聞いていい？」)
                     if _router.is_intent_gate_enabled():
+                        # Phase 0.5-A: check_intent は IntentResult を返す
+                        # ContinuousListener では character_slug 指定モード
+                        # (callout/mention/unknown 判定) のみ使う。
                         intent = _router.check_intent(context, char_slug)
-                        if intent == "mention":
+                        if intent.intent == "mention":
                             logger.info(
                                 "意図ゲート: 言及と判定してスキップ: char=%s (バッファ保持)",
                                 char_slug,
                             )
                             continue  # バッファは保持したまま次のセグメント待ち
                         # "callout" or "unknown" → fall through (fail-open)
-                        logger.info("意図ゲート: %s (char=%s) → 通過", intent, char_slug)
+                        logger.info("意図ゲート: %s (char=%s) → 通過", intent.intent, char_slug)
 
                     self._buffer.clear()
 
@@ -1354,14 +1357,18 @@ class BackgroundContinuousListener:
 
         # LLM 意図ゲート (Phase 2): mention と判定されたらバッファ保持 + スキップ
         if _router.is_intent_gate_enabled():
+            # Phase 0.5-A: check_intent は IntentResult を返す
+            # BackgroundContinuousListener では character_slug 指定モード
+            # (callout/mention/unknown 判定) のみ使う。
+            # interjection_candidate モードは Dispatcher.on_segment_added が呼ぶ。
             intent = _router.check_intent(context, char_slug)
-            if intent == "mention":
+            if intent.intent == "mention":
                 logger.info(
                     "BG 意図ゲート: 言及と判定してスキップ: char=%s (バッファ保持)",
                     char_slug,
                 )
                 return
-            logger.info("BG 意図ゲート: %s (char=%s) → 通過", intent, char_slug)
+            logger.info("BG 意図ゲート: %s (char=%s) → 通過", intent.intent, char_slug)
 
         # 通過したらバッファクリア (応答後の重複検知を防ぐ)
         self._buffer.clear()

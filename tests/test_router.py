@@ -6,7 +6,10 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from lab_lounge.router import (
+    ApprovalResult,
+    IntentResult,
     RoutingDecision,
+    check_approval,
     route,
     _find_all_matches,
     _route_by_llm,
@@ -332,35 +335,44 @@ class TestIsIntentGateEnabled:
 
 
 class TestCheckIntent:
-    """check_intent() のテスト。_call_router_llm をモックして LLM 呼び出しを回避する。"""
+    """check_intent() の Phase 2 互換モード (character_slug 指定) のテスト。
+    Phase 0.5-A で戻り値が str → IntentResult に変わったため、assertion を更新。
+    _call_router_llm をモックして LLM 呼び出しを回避する。"""
 
     def test_callout_response(self):
-        """LLM が 'callout' を返したら 'callout'。"""
+        """LLM が 'callout' を返したら IntentResult(intent='callout')。"""
         from lab_lounge.router import check_intent
         with patch("lab_lounge.router._call_router_llm", return_value="callout"):
             result = check_intent("ねぇ、ミミ様、どう思う？", "mimi")
-        assert result == "callout"
+        assert result.intent == "callout"
+        assert result.target_slug == "mimi"
+        assert result.confidence == 1.0
 
     def test_mention_response(self):
-        """LLM が 'mention' を返したら 'mention'。"""
+        """LLM が 'mention' を返したら IntentResult(intent='mention')。"""
         from lab_lounge.router import check_intent
         with patch("lab_lounge.router._call_router_llm", return_value="mention"):
             result = check_intent("ミミ様の仕組みは、すごいですね", "mimi")
-        assert result == "mention"
+        assert result.intent == "mention"
+        assert result.target_slug == "mimi"
+        assert result.confidence == 1.0
 
     def test_unknown_on_llm_error(self):
-        """LLM 呼び出し失敗 (None) → 'unknown' (fail-open)。"""
+        """LLM 呼び出し失敗 (None) → IntentResult(intent='unknown') (fail-open)。"""
         from lab_lounge.router import check_intent
         with patch("lab_lounge.router._call_router_llm", return_value=None):
             result = check_intent("テスト", "mimi")
-        assert result == "unknown"
+        assert result.intent == "unknown"
+        assert result.target_slug == "mimi"
+        assert result.confidence == 0.0
 
     def test_unknown_on_invalid_response(self):
-        """LLM が予期しない応答を返したら 'unknown'。"""
+        """LLM が予期しない応答を返したら IntentResult(intent='unknown')。"""
         from lab_lounge.router import check_intent
         with patch("lab_lounge.router._call_router_llm", return_value="maybe"):
             result = check_intent("テスト", "mimi")
-        assert result == "unknown"
+        assert result.intent == "unknown"
+        assert result.target_slug == "mimi"
 
     def test_uses_env_model(self, monkeypatch):
         """L2_INTENT_GATE_MODEL が _call_router_llm に渡される。"""
@@ -396,3 +408,227 @@ class TestCheckIntent:
             check_intent(context, "mimi")
         # 第3引数が user_text
         assert mock_llm.call_args.args[2] == context
+
+
+# ─── Phase 0.5-A で追加されたテストクラス ──────────────────────
+
+
+class TestIntentResult:
+    """IntentResult dataclass の挙動 (Phase 0.5-A で導入)。"""
+
+    def test_frozen(self):
+        """frozen dataclass — フィールド書換は FrozenInstanceError。"""
+        from dataclasses import FrozenInstanceError
+        result = IntentResult(intent="callout", target_slug="mimi", confidence=1.0)
+        with pytest.raises(FrozenInstanceError):
+            result.intent = "mention"  # type: ignore[misc]
+
+    def test_field_types(self):
+        """フィールドの型と値の確認。"""
+        result = IntentResult(
+            intent="interjection_candidate",
+            target_slug="mimi",
+            confidence=0.85,
+        )
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "mimi"
+        assert result.confidence == 0.85
+
+    def test_target_slug_can_be_none(self):
+        """target_slug は None も許容 (interjection_candidate が見つからない時)。"""
+        result = IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+        assert result.target_slug is None
+
+    def test_supports_all_intent_values(self):
+        """4 値の intent を全て格納できる (Literal 型)。"""
+        for intent_val in ("callout", "mention", "unknown", "interjection_candidate"):
+            r = IntentResult(intent=intent_val, target_slug="mimi", confidence=1.0)
+            assert r.intent == intent_val
+
+
+class TestApprovalResult:
+    """ApprovalResult dataclass の挙動 (Phase 0.5-A で導入)。"""
+
+    def test_frozen(self):
+        """frozen dataclass — フィールド書換は FrozenInstanceError。"""
+        from dataclasses import FrozenInstanceError
+        result = ApprovalResult(granted=True, target_slug="mimi", confidence=1.0)
+        with pytest.raises(FrozenInstanceError):
+            result.granted = False  # type: ignore[misc]
+
+    def test_granted_true(self):
+        result = ApprovalResult(granted=True, target_slug="chisame", confidence=1.0)
+        assert result.granted is True
+        assert result.target_slug == "chisame"
+        assert result.confidence == 1.0
+
+    def test_granted_false(self):
+        result = ApprovalResult(granted=False, target_slug="sakura", confidence=0.9)
+        assert result.granted is False
+        assert result.target_slug == "sakura"
+
+
+class TestCheckIntentInterjectionCandidate:
+    """check_intent() の Phase 0.5-A interjection_candidate モード (character_slug=None)。
+
+    挙手システム用に、特定キャラへの呼びかけがない発話に対して「自発介入したそうな
+    キャラ」を判定する。Notion §C1 確定: octamaid は候補から除外。
+    """
+
+    def test_returns_interjection_candidate_with_slug(self):
+        """LLM が候補 slug (mimi) を返したら IntentResult(intent='interjection_candidate')。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="mimi"):
+            result = check_intent("AI 倫理について興味がある")
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "mimi"
+        assert result.confidence == 1.0
+
+    def test_returns_unknown_when_none(self):
+        """LLM が 'none' を返したら IntentResult(intent='unknown', target_slug=None)。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none"):
+            result = check_intent("今日はいい天気だね")
+        assert result.intent == "unknown"
+        assert result.target_slug is None
+
+    def test_returns_unknown_on_llm_error(self):
+        """LLM 呼び出し失敗 (None) → IntentResult(intent='unknown') (fail-open)。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value=None):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
+        assert result.target_slug is None
+        assert result.confidence == 0.0
+
+    def test_returns_unknown_on_invalid_slug(self):
+        """LLM が候補外 slug (octamaid 含む) を返したら IntentResult(intent='unknown')。"""
+        from lab_lounge.router import check_intent
+        # octamaid は候補から除外されているので、LLM が octamaid を返しても候補外扱い
+        with patch("lab_lounge.router._call_router_llm", return_value="octamaid"):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
+
+    def test_returns_unknown_on_unknown_string(self):
+        """LLM が候補にもないランダム文字列を返したら IntentResult(intent='unknown')。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="invalid_char"):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
+
+    def test_octamaid_excluded_from_candidates(self):
+        """Notion C1 確定: octamaid はプロンプト内の候補リストに含まれない。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")  # character_slug=None
+        system_prompt = mock_llm.call_args.args[1]
+        # 候補リストに octamaid が含まれない
+        assert "octamaid" not in system_prompt
+        # 他の主要キャラは含まれる
+        assert "mimi" in system_prompt
+        assert "chisame" in system_prompt
+        assert "sakura" in system_prompt
+
+    def test_prompt_includes_all_eligible_slugs(self):
+        """プロンプトに octamaid 以外の候補 slug が全て含まれる。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")
+        system_prompt = mock_llm.call_args.args[1]
+        for slug in ("mimi", "chisame", "sakura"):
+            assert slug in system_prompt
+
+    def test_text_passed_as_user_text(self):
+        """text が _call_router_llm の user_text として渡される。"""
+        from lab_lounge.router import check_intent
+        text = "AI の倫理問題について考えていた"
+        with patch("lab_lounge.router._call_router_llm", return_value="mimi") as mock_llm:
+            check_intent(text)
+        assert mock_llm.call_args.args[2] == text
+
+
+class TestCheckApproval:
+    """check_approval() の挙動 (Phase 0.5-A で導入)。
+
+    handraising 中のキャラに対して、ルカの発話を承認/却下/関係なしに分類する。
+    """
+
+    def test_returns_granted_for_approval(self):
+        """LLM が 'granted:mimi' を返したら ApprovalResult(granted=True)。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="granted:mimi"):
+            result = check_approval("ミミ、どうぞ", ["mimi"])
+        assert result is not None
+        assert result.granted is True
+        assert result.target_slug == "mimi"
+        assert result.confidence == 1.0
+
+    def test_returns_denied_for_denial(self):
+        """LLM が 'denied:chisame' を返したら ApprovalResult(granted=False)。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="denied:chisame"):
+            result = check_approval("いや、いいわ", ["chisame"])
+        assert result is not None
+        assert result.granted is False
+        assert result.target_slug == "chisame"
+
+    def test_returns_none_for_unrelated(self):
+        """LLM が 'none' を返したら None (関係ない発話 → 通常処理へ)。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="none"):
+            result = check_approval("今日はいい天気だね", ["mimi"])
+        assert result is None
+
+    def test_returns_none_on_llm_error(self):
+        """LLM 失敗時 None (fail-open: 通常処理へ流す)。"""
+        with patch("lab_lounge.router._call_router_llm", return_value=None):
+            result = check_approval("テスト", ["mimi"])
+        assert result is None
+
+    def test_returns_none_on_unknown_slug(self):
+        """LLM が候補外 slug を返したら None。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="granted:unknown_char"):
+            result = check_approval("テスト", ["mimi"])
+        assert result is None
+
+    def test_returns_none_on_invalid_format(self):
+        """LLM が予期しない形式の応答を返したら None。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="maybe"):
+            result = check_approval("テスト", ["mimi"])
+        assert result is None
+
+    def test_returns_none_when_candidates_empty(self):
+        """candidate_slugs が空なら LLM 呼ばずに None。"""
+        with patch("lab_lounge.router._call_router_llm") as mock_llm:
+            result = check_approval("テスト", [])
+        assert result is None
+        mock_llm.assert_not_called()
+
+    def test_prompt_includes_candidate_slugs(self):
+        """system_prompt に candidate_slugs が全て含まれる (キャラ名と共に)。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_approval("テスト", ["mimi", "chisame"])
+        system_prompt = mock_llm.call_args.args[1]
+        assert "mimi" in system_prompt
+        assert "chisame" in system_prompt
+
+    def test_handles_multiple_candidates(self):
+        """複数挙手連鎖時、複数候補から正しい slug を選ぶ。"""
+        with patch("lab_lounge.router._call_router_llm", return_value="granted:sakura"):
+            result = check_approval(
+                "さくら、どうぞ", ["mimi", "chisame", "sakura"]
+            )
+        assert result is not None
+        assert result.granted is True
+        assert result.target_slug == "sakura"
+
+    def test_text_passed_as_user_text(self):
+        """text が _call_router_llm の user_text として渡される。"""
+        text = "ミミ、どうぞ"
+        with patch("lab_lounge.router._call_router_llm", return_value="granted:mimi") as mock_llm:
+            check_approval(text, ["mimi"])
+        assert mock_llm.call_args.args[2] == text
+
+    def test_uses_intent_gate_model_env(self, monkeypatch):
+        """L2_INTENT_GATE_MODEL を流用する (新規環境変数を増やさない)。"""
+        monkeypatch.setenv("L2_INTENT_GATE_MODEL", "gpt-5.4-nano")
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_approval("テスト", ["mimi"])
+        assert mock_llm.call_args.args[0] == "gpt-5.4-nano"
