@@ -200,11 +200,17 @@ def get_cached_filler_paths(slug: str) -> dict[str, list[Path]]:
     キャッシュ済みフィラー WAV パスをカテゴリ別に返す。
 
     Returns:
-        {"opener": [Path, ...], "continue": [Path, ...], "closer": [Path, ...]}
+        {"opener": [...], "continue": [...], "bridge": [...], "closer": [...],
+         "handraise": [...]}
+
+    NOTE: カテゴリリストは ``_VALID_SECTIONS`` と同期させる。フェーズ 2 で
+    handraise セクションが追加されたが、本関数の cat tuple への反映が漏れて
+    いたため、Phase 0.5-A 実走で挙手 wav が認識されない不具合となっていた。
     """
     cache_dir = _FILLER_CACHE_DIR / slug
     result: dict[str, list[Path]] = {}
-    for cat in ("opener", "continue", "bridge", "closer"):
+    # Phase 0.5-A フェーズ 2 で追加された "handraise" を含む全カテゴリを走査
+    for cat in ("opener", "continue", "bridge", "closer", "handraise"):
         if cache_dir.is_dir():
             result[cat] = sorted(cache_dir.glob(f"{cat}_*.wav"))
         else:
@@ -227,14 +233,20 @@ def ensure_filler_cache(
     from .tts import synthesize
 
     phrase_set = load_filler_phrases(slug)
+    # Phase 0.5-A フェーズ 2 で追加された "handraise" を含む全カテゴリを初期化。
+    # 5 カテゴリのうち 1 つでも欠けると、phrase_set.all_phrases の反復中に
+    # KeyError (counters[cat]) で abort する不具合があった (実走で発見)。
+    _empty: dict[str, list[Path]] = {
+        "opener": [], "continue": [], "bridge": [], "closer": [], "handraise": [],
+    }
     if len(phrase_set) == 0:
         logger.warning("フィラーフレーズが定義されていません: %s", slug)
-        return {"opener": [], "continue": [], "bridge": [], "closer": []}
+        return dict(_empty)
 
     char = get_character(slug)
     if char is None:
         logger.warning("キャラクターが見つかりません: %s", slug)
-        return {"opener": [], "continue": [], "bridge": [], "closer": []}
+        return dict(_empty)
 
     cache_dir = _FILLER_CACHE_DIR / slug
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -244,8 +256,12 @@ def ensure_filler_cache(
         for old_file in cache_dir.glob("*.wav"):
             old_file.unlink()
 
-    result_paths: dict[str, list[Path]] = {"opener": [], "continue": [], "bridge": [], "closer": []}
-    counters: dict[str, int] = {"opener": 0, "continue": 0, "bridge": 0, "closer": 0}
+    result_paths: dict[str, list[Path]] = {
+        "opener": [], "continue": [], "bridge": [], "closer": [], "handraise": [],
+    }
+    counters: dict[str, int] = {
+        "opener": 0, "continue": 0, "bridge": 0, "closer": 0, "handraise": 0,
+    }
 
     for cat, entry in phrase_set.all_phrases:
         idx = counters[cat]
