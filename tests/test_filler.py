@@ -20,6 +20,7 @@ from lab_lounge.filler import (
     load_filler_phrases,
     run_filler_loop,
     select_filler_path,
+    select_filler_phrase,
 )
 
 
@@ -457,3 +458,69 @@ class TestBuildFillerPrompt:
         assert "neutral" in prompt
         assert "happy" in prompt
         assert "fun" in prompt
+
+
+# ─── TestHandraiseSection (Phase 0.5-A フェーズ 2) ─────────────────
+
+
+class TestHandraiseSection:
+    """data/filler_phrases/<slug>.txt の [handraise] セクションが読み込まれる。
+
+    Phase 0.5-A で追加された挙手機能用のフレーズ。
+    """
+
+    def test_handraise_loaded_for_mimi(self):
+        """mimi の [handraise] セクションが読み込まれる。"""
+        phrase_set = load_filler_phrases("mimi")
+        assert len(phrase_set.handraise) > 0
+        texts = [p.text for p in phrase_set.handraise]
+        # Phase 0.5-A で追加した代表フレーズが含まれる
+        assert any("わたくし" in t for t in texts)
+
+    def test_handraise_loaded_for_chisame(self):
+        """chisame の [handraise] セクションが読み込まれる。"""
+        phrase_set = load_filler_phrases("chisame")
+        assert len(phrase_set.handraise) > 0
+
+    def test_handraise_loaded_for_sakura(self):
+        """sakura の [handraise] セクションが読み込まれる。"""
+        phrase_set = load_filler_phrases("sakura")
+        assert len(phrase_set.handraise) > 0
+
+    def test_handraise_in_all_phrases(self):
+        """all_phrases プロパティに handraise カテゴリが含まれる。"""
+        phrase_set = load_filler_phrases("mimi")
+        cats = {cat for cat, _ in phrase_set.all_phrases}
+        assert "handraise" in cats
+
+    def test_handraise_counted_in_len(self):
+        """__len__ に handraise の数が含まれる。"""
+        empty = FillerPhraseSet()
+        assert len(empty) == 0
+
+        # handraise だけのセット
+        only_handraise = FillerPhraseSet(
+            handraise=[FillerPhrase(text="testA"), FillerPhrase(text="testB")]
+        )
+        assert len(only_handraise) == 2
+
+
+# ─── TestSelectFillerPhrase (Phase 0.5-A フェーズ 2) ─────────────────
+
+
+class TestSelectFillerPhrase:
+    """select_filler_phrase は Path と FillerPhrase の両方を返す。
+
+    handraise wav 再生時に bubble.text として元フレーズを取得する用途。
+    """
+
+    def test_returns_none_when_no_cache(self):
+        """wav cache が空のキャラなら (None, None, -1) を返す。"""
+        result = select_filler_phrase("nonexistent_slug_xyz", "handraise")
+        assert result == (None, None, -1)
+
+    def test_returns_none_when_no_phrases(self):
+        """phrase 定義もキャッシュも空なら (None, None, -1)。"""
+        # nonexistent slug は filler_phrases ファイルもないので空
+        result = select_filler_phrase("nonexistent_slug_xyz", "opener")
+        assert result == (None, None, -1)

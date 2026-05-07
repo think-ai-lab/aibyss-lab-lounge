@@ -87,7 +87,14 @@ def main() -> None:
             continue
 
         print(f"\n{'='*60}")
-        print(f"  [{slug}] opener={len(phrase_set.opener)} continue={len(phrase_set.continue_)} closer={len(phrase_set.closer)} total={len(phrase_set)}")
+        print(
+            f"  [{slug}] opener={len(phrase_set.opener)} "
+            f"continue={len(phrase_set.continue_)} "
+            f"bridge={len(phrase_set.bridge)} "
+            f"closer={len(phrase_set.closer)} "
+            f"handraise={len(phrase_set.handraise)} "
+            f"total={len(phrase_set)}"
+        )
         print(f"{'='*60}")
 
         for cat, phrase in phrase_set.all_phrases:
@@ -100,7 +107,7 @@ def main() -> None:
         # 生成実行
         paths_by_cat = ensure_filler_cache(slug, force=args.force)
 
-        for cat in ("opener", "continue", "closer"):
+        for cat in ("opener", "continue", "bridge", "closer", "handraise"):
             for p in paths_by_cat.get(cat, []):
                 duration = get_filler_duration_ms(p)
                 print(f"  → [{cat:>8}] {p.name}  ({duration} ms)")

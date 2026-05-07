@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 _FILLER_PHRASES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_phrases"
 _FILLER_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_cache"
 
-_VALID_SECTIONS = {"opener", "continue", "bridge", "closer"}
+_VALID_SECTIONS = {"opener", "continue", "bridge", "closer", "handraise"}
+# "handraise" は Phase 0.5-A で追加。挙手 (interjection_candidate) 検知時に
+# L2 側で再生される短いキャラ声フレーズ。bubble.update(handraise) の text にも
+# 同じフレーズ実体が使われる (wav 再生とテキスト表示が同期)。
 
 
 def is_filler_enabled() -> bool:
@@ -72,6 +75,8 @@ class FillerPhraseSet:
     continue_: list[FillerPhrase] = field(default_factory=list)
     bridge: list[FillerPhrase] = field(default_factory=list)
     closer: list[FillerPhrase] = field(default_factory=list)
+    handraise: list[FillerPhrase] = field(default_factory=list)
+    # ↑ Phase 0.5-A 追加。挙手機能用の短いフレーズ (wav 兼 SE)。
 
     @property
     def all_phrases(self) -> list[tuple[str, FillerPhrase]]:
@@ -80,13 +85,17 @@ class FillerPhraseSet:
         for cat, lst in [("opener", self.opener),
                          ("continue", self.continue_),
                          ("bridge", self.bridge),
-                         ("closer", self.closer)]:
+                         ("closer", self.closer),
+                         ("handraise", self.handraise)]:
             for p in lst:
                 items.append((cat, p))
         return items
 
     def __len__(self) -> int:
-        return len(self.opener) + len(self.continue_) + len(self.bridge) + len(self.closer)
+        return (
+            len(self.opener) + len(self.continue_) + len(self.bridge)
+            + len(self.closer) + len(self.handraise)
+        )
 
 
 def _parse_emotion(emotion_str: str) -> dict[str, int]:
@@ -154,11 +163,16 @@ def load_filler_phrases(slug: str) -> FillerPhraseSet:
             result.bridge.append(phrase)
         elif current_section == "closer":
             result.closer.append(phrase)
+        elif current_section == "handraise":
+            result.handraise.append(phrase)
 
     total = len(result)
     logger.debug(
-        "フィラーフレーズ読み込み: %s (opener=%d continue=%d closer=%d total=%d)",
-        slug, len(result.opener), len(result.continue_), len(result.closer), total,
+        "フィラーフレーズ読み込み: %s "
+        "(opener=%d continue=%d bridge=%d closer=%d handraise=%d total=%d)",
+        slug,
+        len(result.opener), len(result.continue_), len(result.bridge),
+        len(result.closer), len(result.handraise), total,
     )
     if not result.continue_:
         logger.warning(
@@ -324,6 +338,59 @@ def select_filler_path(
     candidates = [i for i in range(len(paths)) if i != last_index]
     idx = random.choice(candidates)
     return paths[idx], idx
+
+
+def select_filler_phrase(
+    slug: str,
+    category: str = "opener",
+    *,
+    last_index: int = -1,
+) -> tuple[Path | None, FillerPhrase | None, int]:
+    """
+    ``select_filler_path`` の拡張版。Path と元の FillerPhrase の両方を返す。
+
+    Phase 0.5-A の挙手機能で導入。handraise wav 再生時に bubble.update の text
+    として元フレーズを表示する必要があるため、wav パスだけでなく FillerPhrase
+    オブジェクト (text + emotion) も同時に取得できるようにする。
+
+    既存 ``select_filler_path`` の呼出側は変更せず、新規の挙手フローのみ
+    こちらを使う想定。
+
+    Args:
+        slug:        キャラクター slug
+        category:    "opener" / "continue" / "bridge" / "closer" / "handraise"
+        last_index:  直前選択 index (重複回避)
+
+    Returns:
+        (Path or None, FillerPhrase or None, index)
+        wav が見つからない場合は (None, None, -1)。
+        wav はあるが phrase が見つからない場合 (キャッシュとフレーズ定義の
+        ズレ) は (Path, None, index) を返し、呼出側が text="" でフォールバック
+        できるようにする。
+    """
+    paths_by_cat = get_cached_filler_paths(slug)
+    paths = paths_by_cat.get(category, [])
+    if not paths:
+        return None, None, -1
+
+    phrase_set = load_filler_phrases(slug)
+    phrases_by_cat: dict[str, list[FillerPhrase]] = {
+        "opener": phrase_set.opener,
+        "continue": phrase_set.continue_,
+        "bridge": phrase_set.bridge,
+        "closer": phrase_set.closer,
+        "handraise": phrase_set.handraise,
+    }
+    phrases = phrases_by_cat.get(category, [])
+
+    if len(paths) == 1:
+        phrase = phrases[0] if phrases else None
+        return paths[0], phrase, 0
+
+    candidates = [i for i in range(len(paths)) if i != last_index]
+    idx = random.choice(candidates)
+    phrase = phrases[idx] if idx < len(phrases) else None
+    return paths[idx], phrase, idx
 
 
 _FILLER_PROMPTS: dict[str, str] = {
