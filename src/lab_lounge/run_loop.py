@@ -69,6 +69,388 @@ def _new_uuid() -> str:
     return str(uuid4())
 
 
+# ─── Phase 0.5-A フェーズ 7: 挙手 BG LLM + handraise 再生統合 ────────
+
+
+def _get_handraise_responding_padding_sec() -> float:
+    """応答完了 → 保留 handraise wav 再生までの空白秒数 (Phase 0.5-A フェーズ 7)。
+
+    RESPONDING 中に挙手したキャラの handraise wav を IDLE 復帰直後に再生すると、
+    視聴者には立て続けに 2 つの音声が聞こえて品位を損ねる。間に padding_sec の
+    sleep を入れて自然な間を作る。
+
+    環境変数 ``L2_HANDRAISE_RESPONDING_PADDING_SEC`` (default 1.5 秒) で調整可。
+    """
+    return float(os.environ.get("L2_HANDRAISE_RESPONDING_PADDING_SEC", "1.5"))
+
+
+def _spawn_handraise_phrase_playback(
+    slug: str,
+    phrase_path: "Path | None",
+    padding_sec: float = 0.0,
+    *,
+    play_audio_fn=None,
+) -> "threading.Thread | None":
+    """handraise wav を別 daemon スレッドで再生する (Phase 0.5-A フェーズ 7)。
+
+    sounddevice は global state なので、通常応答 TTS と同時実行すると競合する。
+    そのため dispatcher 側で「IDLE 中のみ即再生 / RESPONDING 中は se_pending=True で
+    保留 → on_pipeline_complete で release callback 経由で再生」の経路を選択する。
+    本関数は実際の物理 IO のみを担当し、排他制御は呼出側の責任。
+
+    Args:
+        slug:        挙手キャラ slug (ログ用)
+        phrase_path: 再生する wav のパス。None なら no-op (テスト時の安全策)
+        padding_sec: 再生前の sleep 秒数。RESPONDING 完了直後の連続再生を回避する
+                     用途で 1.5 秒程度の値が渡される (default 0 = IDLE 即時再生時)
+        play_audio_fn: テスト差し替え用。None なら ``audio_io.play_audio_file``
+
+    Returns:
+        起動した daemon thread。phrase_path=None なら None。
+    """
+    if phrase_path is None:
+        return None
+    if play_audio_fn is None:
+        play_audio_fn = play_audio_file
+
+    def _body() -> None:
+        if padding_sec > 0:
+            time.sleep(padding_sec)
+        try:
+            play_audio_fn(str(phrase_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "handraise phrase 再生失敗: slug=%s err=%s", slug, exc,
+            )
+
+    t = threading.Thread(
+        target=_body,
+        name=f"handraise-phrase-{slug}",
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
+def _spawn_handraise_response_playback(
+    slug: str,
+    chunks: list[dict],
+    trace_id: str,
+    *,
+    session_stream_id: str,
+    session_id_root: str,
+) -> "threading.Thread":
+    """承認後の TTS chunks を専用 mini playback worker で再生する (Phase 0.5-A フェーズ 7)。
+
+    通常応答用の ``_playback_queue`` は「ターン終了時に sentinel で閉じる」設計のため
+    ターン外 (= 挙手応答) では再利用できない。独立した queue + worker thread を起動する。
+
+    chunks は dispatcher の HandraiseBgResult.chunks (各 dict は ``_run_playback_worker``
+    が読む形式: ``{"url", "text", "is_last", "character", "pose"?}``)。
+
+    Args:
+        slug:               挙手キャラ slug (worker 名 + ログ用)
+        chunks:             再生する TTS chunks の list (BG LLM 先行生成済)
+        trace_id:           bubble.update 発行時の handraise 単位 trace_id
+        session_stream_id:  bubble.update の stream_id
+        session_id_root:    bubble.update の session_id
+
+    Returns:
+        起動した daemon thread。
+    """
+    q: queue.Queue = queue.Queue()
+    for chunk in chunks:
+        q.put(chunk)
+    q.put(None)  # sentinel — 最終 chunk 再生後 worker が done bubble を発行して終了
+
+    def _publish_bubble_for_handraise(character: str, step: str, text: str) -> None:
+        """handraise 応答中の bubble.update を毎回新 trace_id で発行。"""
+        try:
+            event = build_bubble_update(
+                character=character,
+                step=step,
+                text=text,
+                stream_id=session_stream_id,
+                session_id=session_id_root,
+                trace_id=_new_uuid(),
+            )
+            publish(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "handraise playback bubble.update(%s) publish 失敗: %s", step, exc,
+            )
+
+    def _cleanup_audio(url: str) -> None:
+        """再生済 wav の一時ファイルを削除 (ベストエフォート)。"""
+        try:
+            from .audio_io import _uri_to_path
+            p = Path(_uri_to_path(url))
+            if p.is_file():
+                p.unlink()
+        except Exception:
+            pass  # cleanup 失敗は無視 (再生自体は完了済)
+
+    def _set_pose_safe(character: str, pose: str) -> None:
+        """OBS 立ち絵切替 (失敗しても続行)。"""
+        try:
+            from .obs import set_pose
+            set_pose(character, pose)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "handraise playback set_pose 失敗 (無視): %s", exc,
+            )
+
+    t = threading.Thread(
+        target=_run_playback_worker,
+        args=(q,),
+        kwargs={
+            "publish_bubble_fn": _publish_bubble_for_handraise,
+            "play_audio_fn": play_audio_file,
+            "cleanup_audio_fn": _cleanup_audio,
+            "set_pose_fn": _set_pose_safe,
+        },
+        daemon=True,
+        name=f"handraise-playback-{slug}",
+    )
+    t.start()
+    return t
+
+
+def _approved_synthesize_fallback(
+    slug: str,
+    transcript_snapshot,
+    trace_id: str,
+    *,
+    session_stream_id: str,
+    session_id_root: str,
+    stream_context: "str | None" = None,
+) -> None:
+    """挙手承認時に bg_result が無効だった場合の同期 fallback (Phase 0.5-A フェーズ 7)。
+
+    BG LLM が起動失敗 / cancel / 例外で chunks 空の場合に呼ばれる。本関数は daemon
+    スレッド内で同期的に ``run_pipeline`` を呼ぶ (= LLM + TTS + 再生まで blocking)。
+    通常応答パスと同じイベントを発行 (``suppress_bubble_answering=False`` で graph 側
+    が answering bubble を発行)。
+
+    呼出スレッドは別 daemon thread の ``approved-fallback-<slug>`` (run_loop の
+    callback factory が起動する) なので、blocking してもメインループや録音スレッドに
+    影響しない。
+
+    Args:
+        slug:              挙手キャラ slug
+        transcript_snapshot: 挙手判定時の TranscriptBuffer 文字列 (BG LLM の入力)
+        trace_id:          handraise 単位の trace_id (空なら新規生成)
+        session_stream_id: stream_id
+        session_id_root:   session_id
+        stream_context:    配信文脈 markdown (起動時に load_stream_context() で取得)
+    """
+    text = transcript_snapshot or ""
+    if not isinstance(text, str):
+        text = str(text)
+
+    try:
+        run_pipeline(
+            text,
+            stream_id=session_stream_id,
+            session_id=session_id_root,
+            trace_id=trace_id or _new_uuid(),
+            speaker_hint=slug,
+            stream_context=stream_context,
+            suppress_bubble_answering=False,  # graph 側で answering bubble 発行
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "挙手承認 fallback (run_pipeline 同期再生成) 失敗: slug=%s err=%s",
+            slug, exc,
+        )
+
+
+def _create_handraise_runner_and_callbacks(
+    *,
+    session_stream_id: str,
+    session_id_root: str,
+    stream_context: "str | None",
+):
+    """Phase 0.5-A フェーズ 7: 4 つの callback と bg_runner を生成する factory。
+
+    run_loop の closure 内変数 (session_stream_id 等) を捕捉した上で、
+    ``Dispatcher`` コンストラクタに渡せる callable 群を返す。module-level の
+    factory として書くことで、テストから直接 factory を呼んで返り値を検証できる。
+
+    Args:
+        session_stream_id: 当該セッションの stream_id (handraise イベントに付与)
+        session_id_root:   当該セッションの session_id
+        stream_context:    配信文脈 markdown (run_pipeline に渡す)
+
+    Returns:
+        (bg_runner, on_handraise_started, on_handraise_phrase_pending_release,
+         on_handraise_approved) の tuple。``Dispatcher(**kwargs)`` に渡す形。
+    """
+
+    def bg_runner(
+        *,
+        target_slug: str,
+        transcript_snapshot,
+        cancel_event: "threading.Event",
+        on_complete,
+    ) -> "threading.Thread":
+        """BG LLM スレッドを起動して thread を返す。
+
+        承認確率に賭けて LLM + graph 内 TTS まで先行生成する設計。
+        cancel_aware_chunk_hook で chunk 投入時に cancel チェックして、cancel 済
+        なら chunk のファイル削除 + bg_chunks への蓄積をスキップする。
+        """
+        from .dispatcher import HandraiseBgResult
+
+        bg_trace_id = _new_uuid()
+        bg_chunks: list[dict] = []
+
+        def cancel_aware_chunk_hook(url, chunk_text, is_last, character, pose=None):
+            """on_tts_chunk_ready ラッパー。cancel 観察粒度はここ 1 箇所のみ。"""
+            if cancel_event.is_set():
+                # cancel 済 → chunk のファイルを削除して蓄積スキップ
+                # (ベストエフォート: 削除失敗は warning 不要、disk 上の孤立ファイルは
+                #  運用 cleanup で対応)
+                try:
+                    from .audio_io import _uri_to_path
+                    p = Path(_uri_to_path(url))
+                    if p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+                return
+            chunk: dict = {
+                "url": url,
+                "text": chunk_text,
+                "is_last": is_last,
+                "character": character,
+            }
+            if pose is not None:
+                chunk["pose"] = pose
+            bg_chunks.append(chunk)
+
+        def _body() -> None:
+            try:
+                result = run_pipeline(
+                    transcript_snapshot if isinstance(transcript_snapshot, str)
+                    else str(transcript_snapshot or ""),
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    trace_id=bg_trace_id,
+                    speaker_hint=target_slug,
+                    on_tts_chunk_ready=cancel_aware_chunk_hook,
+                    stream_context=stream_context,
+                    suppress_bubble_answering=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "BG LLM 失敗: slug=%s trace_id=%s err=%s",
+                    target_slug, bg_trace_id, exc,
+                )
+                on_complete(HandraiseBgResult(
+                    chunks=[], result=None, trace_id=bg_trace_id,
+                ))
+                return
+
+            on_complete(HandraiseBgResult(
+                chunks=bg_chunks,
+                result=result,
+                trace_id=bg_trace_id,
+            ))
+
+        thread = threading.Thread(
+            target=_body,
+            name=f"BG-LLM-{target_slug}",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def on_handraise_started(slug, phrase_path, se_pending) -> None:
+        """挙手開始通知。IDLE 中は即再生、RESPONDING 中は保留 (se_pending=True)。"""
+        if se_pending:
+            # RESPONDING 中: on_pipeline_complete 内で release callback 発火を待つ
+            logger.info(
+                "handraise wav 保留 (se_pending=True、応答完了後に再生): %s", slug,
+            )
+            return
+        _spawn_handraise_phrase_playback(slug, phrase_path, padding_sec=0.0)
+
+    def on_handraise_phrase_pending_release(slug, phrase_path) -> None:
+        """RESPONDING → IDLE 遷移時、保留していた wav をリリース再生。"""
+        padding = _get_handraise_responding_padding_sec()
+        _spawn_handraise_phrase_playback(slug, phrase_path, padding_sec=padding)
+
+    def on_handraise_approved(slug, bg_result, transcript_snapshot, trace_id) -> None:
+        """承認時の応答開始: bubble.update("answering") 発行 + chunks 再生。
+
+        bg_result が None or chunks 空 (BG 失敗 / 起動前 grant) なら
+        ``_approved_synthesize_fallback`` で同期再生成にフォールバック。
+        """
+        if bg_result is None or not bg_result.chunks:
+            logger.info(
+                "挙手承認: bg_result %s → fallback パス slug=%s",
+                "未生成" if bg_result is None else "chunks 空",
+                slug,
+            )
+            threading.Thread(
+                target=lambda: _approved_synthesize_fallback(
+                    slug, transcript_snapshot, trace_id,
+                    session_stream_id=session_stream_id,
+                    session_id_root=session_id_root,
+                    stream_context=stream_context,
+                ),
+                name=f"approved-fallback-{slug}",
+                daemon=True,
+            ).start()
+            return
+
+        # bg_trace_id を引き継ぐ (handraise 単位の trace_id 一貫性)
+        bg_trace_id = bg_result.trace_id or trace_id or _new_uuid()
+        # answering bubble の text を pipeline_result.events から抽出
+        answering_text = ""
+        if bg_result.result is not None:
+            try:
+                for ev in bg_result.result.events:
+                    if ev.get("type") == "llm.final":
+                        answering_text = ev.get("payload", {}).get("text", "")
+                        break
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("answering text 抽出失敗 (空文字で続行): %s", exc)
+
+        # bubble.update("answering") を発行 (TTS chunk 1 再生開始の直前タイミング)
+        try:
+            event = build_bubble_update(
+                character=slug,
+                step="answering",
+                text=answering_text,
+                stream_id=session_stream_id,
+                session_id=session_id_root,
+                trace_id=bg_trace_id,
+            )
+            publish(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "bubble.update(answering) from approval publish 失敗: %s", exc,
+            )
+
+        # chunks を専用 mini playback worker で再生
+        _spawn_handraise_response_playback(
+            slug,
+            list(bg_result.chunks),
+            bg_trace_id,
+            session_stream_id=session_stream_id,
+            session_id_root=session_id_root,
+        )
+
+    return (
+        bg_runner,
+        on_handraise_started,
+        on_handraise_phrase_pending_release,
+        on_handraise_approved,
+    )
+
+
 def _init_listener(
     *,
     backend: str | None,
@@ -468,10 +850,27 @@ def run_loop(
             except Exception as exc:
                 logger.warning("bubble.update(%s) from dispatcher publish 失敗: %s", step, exc)
 
+        # Phase 0.5-A フェーズ 7: BG LLM 起動 + handraise 物理通知の 4 callback を
+        # factory 経由で生成 (session 識別子 + 配信文脈を closure として捕捉)。
+        (
+            _bg_runner,
+            _on_handraise_started,
+            _on_handraise_phrase_pending_release,
+            _on_handraise_approved,
+        ) = _create_handraise_runner_and_callbacks(
+            session_stream_id=session_stream_id,
+            session_id_root=session_id_root,
+            stream_context=stream_context,
+        )
+
         dispatcher = Dispatcher(
             on_queue_update=_publish_queue_update,
             on_handraise_update=_publish_handraise_update,
             on_bubble_update=_publish_bubble_from_dispatcher,
+            bg_runner=_bg_runner,
+            on_handraise_started=_on_handraise_started,
+            on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
+            on_handraise_approved=_on_handraise_approved,
         )
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、
         # 検知された wake_event は dispatcher.on_wake_detected で queue に積まれる。
