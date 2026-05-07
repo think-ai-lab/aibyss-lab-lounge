@@ -528,13 +528,16 @@ def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
             stdout_text = _decode_voicepeak_output(result.stdout)
             is_busy = _is_voicepeak_busy_error(stderr_text, stdout_text)
 
+            # Phase 0.5-A フェーズ 8: cmd_str 全文も warning に含める
+            # (出力ファイル未生成 / クラッシュ時の引数再現に必要)。
             logger.warning(
                 "VOICEPEAK 非ゼロ終了 (attempt %d/%d): returncode=%d busy=%s"
-                "\n  stderr: %s\n  stdout: %s",
+                "\n  stderr: %s\n  stdout: %s\n  cmd (full): %s",
                 attempt + 1, max_retries + 1,
                 result.returncode, is_busy,
                 stderr_text or "(empty)",
                 stdout_text or "(empty)",
+                cmd_str,
             )
 
             if attempt < max_retries:
@@ -573,15 +576,24 @@ def _ensure_voicepeak_worker() -> _queue_mod.Queue:
     return _voicepeak_queue
 
 
-def _submit_voicepeak(cmd_str: str) -> None:
+def _submit_voicepeak(cmd_str: str):
     """
     VOICEPEAK コマンドをキューに投入し、完了を待つ。
 
     FIFO 順序が保証される。先に投入されたジョブが先に実行される。
 
+    Phase 0.5-A フェーズ 8 (出力ファイル未生成バグ調査):
+    成功時 (returncode=0) は subprocess.CompletedProcess を返す。呼出側で
+    stdout / stderr を参照することで「returncode=0 だが --out が無視されて
+    出力ファイルが書かれない」現象の調査に使う。失敗時 (returncode != 0) は
+    従来通り RuntimeError を投げる。
+
+    Returns:
+        subprocess.CompletedProcess (成功時のみ)
+
     Raises:
         FileNotFoundError: VOICEPEAK コマンドが見つからない
-        RuntimeError: VOICEPEAK 実行エラー
+        RuntimeError: VOICEPEAK 実行エラー (returncode != 0)
     """
     q = _ensure_voicepeak_worker()
     future: concurrent.futures.Future = concurrent.futures.Future()
@@ -593,22 +605,108 @@ def _submit_voicepeak(cmd_str: str) -> None:
         raise
     except Exception as exc:
         logger.error("VOICEPEAK 実行中に例外: %s", exc)
-        logger.debug("VOICEPEAK 実行中に例外 cmd (full): %s", cmd_str)
+        logger.error("VOICEPEAK 実行中に例外 cmd (full): %s", cmd_str)
         raise RuntimeError(f"VOICEPEAK 実行エラー: {type(exc).__name__}: {exc}") from exc
 
     if result.returncode != 0:
-        # ワーカー側で既に詳細ログは出力済み。ここでは例外メッセージのみ組み立てる
+        # ワーカー側で既に詳細ログは出力済み。ここでは例外メッセージのみ組み立てる。
+        # Phase 0.5-A フェーズ 8: cmd (full) も warning に格上げ (出力ファイル未生成
+        # バグの再現に必要)。
         stderr_text = _decode_voicepeak_output(result.stderr) or "(empty)"
         stdout_text = _decode_voicepeak_output(result.stdout) or "(empty)"
         logger.error(
             "VOICEPEAK 実行最終失敗: returncode=%d stderr: %s stdout: %s",
             result.returncode, stderr_text, stdout_text,
         )
-        logger.debug("VOICEPEAK 実行最終失敗 cmd (full): %s", cmd_str)
+        logger.error("VOICEPEAK 実行最終失敗 cmd (full): %s", cmd_str)
         raise RuntimeError(
             f"VOICEPEAK 実行エラー: returncode={result.returncode} "
             f"stderr={stderr_text!r} stdout={stdout_text!r}"
         )
+
+    return result
+
+
+def _log_voicepeak_output_missing_diagnostics(
+    *,
+    filepath,
+    result,
+    cmd_str: str,
+    speaker: str | None,
+    attempt: int,
+    max_attempts: int,
+) -> None:
+    """VOICEPEAK 出力ファイル未生成バグの調査用 warning ログ (Phase 0.5-A フェーズ 8)。
+
+    実走 (2026-05-08) で「returncode=0 だが期待した --out のファイルが生成されず、
+    代わりに L2 ルート直下の output.wav に書かれる」という現象が観測された。
+    再現性のないバグなので、次に発生した瞬間に原因を絞り込めるよう、以下の情報を
+    すべて warning レベルで残す:
+
+      - filepath の絶対パス (Windows パスや日本語混入の判別)
+      - 期待ファイルの親ディレクトリの存在 / 書き込み権限の状況
+      - 「cwd の output.wav」(VOICEPEAK のデフォルト出力先) の有無 + サイズ + mtime
+        → 存在すれば --out 無視疑惑が確定する
+      - subprocess の stdout / stderr (decoded)
+      - cmd_str 全文 (引数のエスケープ / クォート問題の再現に必要)
+
+    Args:
+        filepath:    期待された出力ファイルパス (Path)
+        result:      ``subprocess.CompletedProcess`` (returncode=0 だが file なし)
+        cmd_str:     VOICEPEAK 実行コマンド全文
+        speaker:     キャラ slug (ログ識別用)
+        attempt:     試行回数 (0 = 初回、1 以上 = リトライ)
+        max_attempts: 最大リトライ回数
+    """
+    from pathlib import Path as _Path
+    import time as _time
+
+    speaker_label = speaker or "(unknown)"
+    abs_expected = filepath.resolve() if hasattr(filepath, "resolve") else _Path(filepath).resolve()
+    parent = abs_expected.parent
+    parent_status = "exists" if parent.is_dir() else "MISSING"
+
+    # cwd / repo root の output.wav を確認 (VOICEPEAK がデフォルト出力先に書いた疑い)
+    cwd = _Path.cwd()
+    cwd_output = cwd / "output.wav"
+    if cwd_output.is_file():
+        st = cwd_output.stat()
+        cwd_output_info = (
+            f"cwd_output.wav 存在 (size={st.st_size} bytes, "
+            f"mtime={_time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(st.st_mtime))}, "
+            f"path={cwd_output}) — VOICEPEAK が --out を無視した疑い"
+        )
+    else:
+        cwd_output_info = f"cwd_output.wav 不在 (cwd={cwd})"
+
+    # subprocess の stdout / stderr を decode
+    if result is not None:
+        stdout_text = _decode_voicepeak_output(result.stdout) or "(empty)"
+        stderr_text = _decode_voicepeak_output(result.stderr) or "(empty)"
+        returncode = result.returncode
+    else:
+        stdout_text = "(result is None)"
+        stderr_text = "(result is None)"
+        returncode = -1
+
+    label = "初回検出" if attempt == 0 else f"リトライ後再検出 ({attempt}/{max_attempts})"
+
+    logger.warning(
+        "VOICEPEAK 出力ファイル未生成 [%s] speaker=%s\n"
+        "  expected: name=%s abs=%s parent=%s (%s)\n"
+        "  returncode=%d\n"
+        "  stdout: %s\n"
+        "  stderr: %s\n"
+        "  %s\n"
+        "  cmd (full): %s",
+        label, speaker_label,
+        filepath.name, abs_expected, parent, parent_status,
+        returncode,
+        stdout_text,
+        stderr_text,
+        cwd_output_info,
+        cmd_str,
+    )
 
 
 def _generate_voicepeak_single_file(
@@ -657,7 +755,9 @@ def _generate_voicepeak_single_file(
         cmd_str += f" --emotion {emotion_expr}"
 
     # 配信中のコンソール表示でファイルパス (ユーザーディレクトリ等) を漏らさないよう、
-    # ログにはファイル名・narrator・テキスト長のみを出す。完全なコマンドは debug レベルへ。
+    # 「投入」サマリ行はファイル名・narrator・テキスト長のみを出す。
+    # Phase 0.5-A フェーズ 8: voicepeak.exe 実行時の cmd_str 全文を info レベルで残す
+    # (出力ファイル未生成バグの調査用。引数のエスケープ / クォート / 文字化けの再現に必要)。
     # 並行 / バックグラウンド合成中に「誰の何のチャンクか」を即座に追えるよう、
     # speaker と text 先頭 (40 文字) を含める。
     text_preview = safe_text if len(safe_text) <= 40 else safe_text[:40] + "…"
@@ -665,9 +765,9 @@ def _generate_voicepeak_single_file(
         "VOICEPEAK 投入: speaker=%s narrator=%s text_len=%d out=%s text=%r",
         speaker or "(unknown)", voice, len(safe_text), filepath.name, text_preview,
     )
-    logger.debug("VOICEPEAK コマンド (full): %s", cmd_str)
+    logger.info("VOICEPEAK コマンド (full): %s", cmd_str)
 
-    _submit_voicepeak(cmd_str)
+    initial_result = _submit_voicepeak(cmd_str)
 
     # VOICEPEAK が returncode=0 でも出力ファイルを生成しないケースは
     # 「待っても永久に出ない」(= subprocess が正常終了したのにファイル書き込みが発生
@@ -680,19 +780,42 @@ def _generate_voicepeak_single_file(
         interval_sec = float(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_INTERVAL_SEC", "1.0"))
         max_attempts = int(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_MAX_ATTEMPTS", "20"))
         import time
+
+        # Phase 0.5-A フェーズ 8: 出力ファイル未生成発生時の調査ログ強化。
+        # VOICEPEAK が --out 引数を無視してデフォルト出力先 (cwd の output.wav) に
+        # 書いている疑いを確認するため、cwd の output.wav を検出 + subprocess の
+        # stdout/stderr を warning に出力 + cmd_str 全文を再掲する。
+        _log_voicepeak_output_missing_diagnostics(
+            filepath=filepath,
+            result=initial_result,
+            cmd_str=cmd_str,
+            speaker=speaker,
+            attempt=0,  # 0 = 初回検出 (リトライ前)
+            max_attempts=max_attempts,
+        )
+
         for attempt in range(1, max_attempts + 1):
             logger.warning(
-                "VOICEPEAK 出力ファイル未生成 (returncode=0): %s → %.1f 秒待機して subprocess 再実行 (%d/%d)",
+                "VOICEPEAK 出力ファイル未生成: %s → %.1f 秒待機して subprocess 再実行 (%d/%d)",
                 filepath.name, interval_sec, attempt, max_attempts,
             )
             time.sleep(interval_sec)
-            _submit_voicepeak(cmd_str)
+            retry_result = _submit_voicepeak(cmd_str)
             if filepath.is_file():
                 logger.info(
                     "VOICEPEAK 再実行成功 (%d/%d): %s",
                     attempt, max_attempts, filepath.name,
                 )
                 break
+            # 再投入後も未生成なら詳細を出す (毎回詳細 + cmd_str 再掲)
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=filepath,
+                result=retry_result,
+                cmd_str=cmd_str,
+                speaker=speaker,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
 
     if not filepath.is_file():
         raise FileNotFoundError(
