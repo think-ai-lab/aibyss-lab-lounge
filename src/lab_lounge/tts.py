@@ -463,17 +463,26 @@ def _is_voicepeak_busy_error(stderr: str, stdout: str) -> bool:
 
 
 def _get_voicepeak_retry_wait_sec() -> float:
-    """並列実行エラー発生時のリトライ待機時間（秒）を返す。
+    """並列実行エラー / クラッシュ発生時のリトライ待機時間（秒）を返す。
 
-    並列実行エラー検知時のみ挿入される (通常成功時は待機しない)。
-    環境変数 L2_VOICEPEAK_RETRY_WAIT_SEC で上書き可能 (デフォルト: 2.0)。
+    リトライ前にのみ挿入される (通常成功時は待機しない)。
+    環境変数 L2_VOICEPEAK_RETRY_WAIT_SEC で上書き可能 (デフォルト: 1.0)。
+
+    busy (並列実行エラー) と crash (非ゼロ exit) の両方で同じ値を使う
+    (Phase 0.5-A フェーズ 8: 倍率撤廃。リトライ回数で確率カバーする方針に変更)。
     """
-    return float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "2.0"))
+    return float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "1.0"))
 
 
 def _get_voicepeak_max_retries() -> int:
-    """並列実行エラー発生時の最大リトライ回数を返す。"""
-    return int(os.environ.get("L2_VOICEPEAK_MAX_RETRIES", "2"))
+    """並列実行エラー / クラッシュ発生時の最大リトライ回数を返す。
+
+    環境変数 L2_VOICEPEAK_MAX_RETRIES で上書き可能 (デフォルト: 8)。
+
+    Phase 0.5-A フェーズ 8 で 2 → 8 に拡大。retry_wait を 2.0 → 1.0 に短縮した
+    のと合わせて、最終的な完走確率を担保する (合計待機時間は 4s → 8s と微増)。
+    """
+    return int(os.environ.get("L2_VOICEPEAK_MAX_RETRIES", "8"))
 
 
 def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
@@ -529,7 +538,11 @@ def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
             )
 
             if attempt < max_retries:
-                wait = retry_wait if is_busy else retry_wait * 2
+                # Phase 0.5-A フェーズ 8: busy と crash で wait を共通化 (倍率撤廃)。
+                # 旧設計はクラッシュを重く扱って `retry_wait * 2` だったが、
+                # max_retries を 4 倍 (2 → 8) に拡大したので、回数で確率カバーする
+                # 方針に変更。クラッシュ後の応答開始遅延を短縮する効果。
+                wait = retry_wait
                 reason = "並列実行エラー" if is_busy else f"クラッシュ (returncode={result.returncode})"
                 logger.info(
                     "VOICEPEAK %s検出 → %.1f 秒待機してリトライ",
