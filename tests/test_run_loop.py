@@ -587,6 +587,9 @@ class TestApprovedSynthesizeFallback:
         assert kw["session_id"] == "ses1"
         assert kw["stream_context"] == "配信文脈"
         assert kw["suppress_bubble_answering"] is False  # graph 側で answering 発行
+        # Phase 0.5-A フェーズ 8 修正: chunks 蓄積用 callback が渡される (再生のために必須)
+        assert "on_tts_chunk_ready" in kw
+        assert callable(kw["on_tts_chunk_ready"])
 
     def test_run_pipeline_exception_is_swallowed(self, monkeypatch):
         """run_pipeline 例外は warning ログのみで例外は伝播しない。"""
@@ -596,11 +599,125 @@ class TestApprovedSynthesizeFallback:
             raise RuntimeError("boom")
 
         monkeypatch.setattr("lab_lounge.run_loop.run_pipeline", failing_pipeline)
+        spawn_calls: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: spawn_calls.append(a),
+        )
         # 例外なく完了
         _approved_synthesize_fallback(
             "mimi", "snap", "trace",
             session_stream_id="s1", session_id_root="ses1", stream_context=None,
         )
+        # 例外時は playback も起動されない
+        assert spawn_calls == []
+
+    def test_collects_chunks_and_spawns_playback(self, monkeypatch):
+        """Phase 0.5-A フェーズ 8 修正: TTS chunks が蓄積され、playback worker に渡される。
+
+        run_pipeline 内で on_tts_chunk_ready callback が呼ばれると chunks list に
+        蓄積され、run_pipeline 完了後に _spawn_handraise_response_playback で再生される
+        ことを検証。これが無いと bg_result=None 時の fallback パスで音声が再生されない。
+        """
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        # run_pipeline mock: on_tts_chunk_ready を 2 回呼んで chunks を蓄積させる
+        def fake_run_pipeline(text, **kw):
+            on_chunk = kw["on_tts_chunk_ready"]
+            on_chunk(
+                "file:///c1.wav", "こんにちは", False, "mimi",
+            )
+            on_chunk(
+                "file:///c2.wav", "ですわ", True, "mimi",
+            )
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
+        )
+
+        spawn_calls: list[tuple] = []
+
+        def fake_spawn(slug, chunks, trace_id, **kw):
+            spawn_calls.append((slug, list(chunks), trace_id, kw))
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback", fake_spawn,
+        )
+
+        _approved_synthesize_fallback(
+            "mimi", "snap", "trace-x",
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+        )
+
+        # playback worker が起動された
+        assert len(spawn_calls) == 1
+        slug, chunks, trace_id, kw = spawn_calls[0]
+        assert slug == "mimi"
+        assert trace_id == "trace-x"
+        # chunks が 2 件蓄積されている
+        assert len(chunks) == 2
+        assert chunks[0]["url"] == "file:///c1.wav"
+        assert chunks[0]["text"] == "こんにちは"
+        assert chunks[0]["is_last"] is False
+        assert chunks[1]["url"] == "file:///c2.wav"
+        assert chunks[1]["is_last"] is True
+        # session_stream_id / session_id_root が渡される
+        assert kw["session_stream_id"] == "s1"
+        assert kw["session_id_root"] == "ses1"
+
+    def test_empty_chunks_skips_playback(self, monkeypatch):
+        """run_pipeline が on_tts_chunk_ready を呼ばない (= ダミー TTS or TTS 失敗) 場合、
+        playback worker を起動せず warning ログだけ出す。
+        """
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        # on_tts_chunk_ready を呼ばない (chunks 空)
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline",
+            lambda text, **kw: MagicMock(),
+        )
+
+        spawn_calls: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: spawn_calls.append(a),
+        )
+
+        _approved_synthesize_fallback(
+            "mimi", "snap", "trace-x",
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        # playback worker は起動されない
+        assert spawn_calls == []
+
+    def test_chunk_with_pose_passed_through(self, monkeypatch):
+        """on_tts_chunk_ready の pose 引数が chunk dict に正しく格納される。"""
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        def fake_run_pipeline(text, **kw):
+            kw["on_tts_chunk_ready"](
+                "file:///c.wav", "x", True, "mimi", pose="happy",
+            )
+            return MagicMock()
+
+        monkeypatch.setattr("lab_lounge.run_loop.run_pipeline", fake_run_pipeline)
+        captured: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda slug, chunks, trace_id, **kw: captured.append(list(chunks)),
+        )
+
+        _approved_synthesize_fallback(
+            "mimi", "snap", "trace-x",
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        assert len(captured) == 1
+        assert captured[0][0]["pose"] == "happy"
 
     def test_uses_new_uuid_when_trace_id_empty(self, monkeypatch):
         from lab_lounge.run_loop import _approved_synthesize_fallback
