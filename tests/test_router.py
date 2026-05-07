@@ -566,16 +566,98 @@ class TestCheckIntentInterjectionCandidate:
         assert "感情フォロー" in system_prompt or "倫理的配慮" in system_prompt  # sakura
 
     def test_prompt_has_judgment_criteria(self):
-        """プロンプトに判定基準 (過剰挙手禁止 / callout 経路への譲渡) が含まれる。"""
+        """プロンプトに判定基準 (関連性 / callout 経路への譲渡 / 無関係雑談除外) が含まれる。"""
         from lab_lounge.router import check_intent
         with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
             check_intent("テスト")
         system_prompt = mock_llm.call_args.args[1]
-        # 「直接触れる」「過剰挙手の禁止」「呼びかけ済み」等の判定基準キーワード
-        assert "直接触れる" in system_prompt
+        # Phase 0.5-A フェーズ 8: 「直接触れる」を「触れている / 関連している」に緩和
+        assert "触れている" in system_prompt or "関連している" in system_prompt
+        # 呼びかけ済み時の callout 経路への譲渡
         assert "呼びかけ" in system_prompt
-        # 過剰挙手禁止の旨が含まれる
-        assert "雑談" in system_prompt or "過剰" in system_prompt
+        # 無関係な雑談は除外
+        assert "雑談" in system_prompt or "無関係" in system_prompt
+
+    def test_prompt_includes_few_shot_example(self):
+        """Phase 0.5-A フェーズ 8: プロンプトに具体例 (AI 倫理 → sakura/mimi 等) が含まれる。
+
+        LLM の保守的判定 (具体性が無いと none を返す傾向) を抑制するため、
+        実走で問題になった「AI 倫理について気になっている」のような問題提起を
+        few-shot 例として明示する。
+        """
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")
+        system_prompt = mock_llm.call_args.args[1]
+        # AI 倫理の例 (sakura / mimi がマッチする想定)
+        assert "AI倫理" in system_prompt or "倫理" in system_prompt
+        # 例として「データ」または「論理」キャラの例も含まれる
+        assert "データ" in system_prompt or "論理" in system_prompt
+
+    def test_prompt_strict_output_format(self):
+        """プロンプトに出力形式厳守 (装飾文字 / 改行 / 説明禁止) が明示される。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")
+        system_prompt = mock_llm.call_args.args[1]
+        # 「厳守」「禁止」「一切付けない」等の強い表現で出力形式を縛る
+        assert "厳守" in system_prompt or "一切" in system_prompt
+        # 装飾文字の例示
+        assert "**" in system_prompt or "装飾" in system_prompt
+
+    def test_parses_first_token_when_llm_adds_explanation(self):
+        """Phase 0.5-A フェーズ 8 実走対応: LLM が 'none\\n\\n**理由**: ...' で返しても
+        最初のトークン 'none' で判定する (パース強化)。
+        """
+        from lab_lounge.router import check_intent
+        # 実走で観測された LLM 応答パターン
+        with patch(
+            "lab_lounge.router._call_router_llm",
+            return_value="none\n\n**理由**: 発話が問題提起の段階で、具",
+        ):
+            result = check_intent("最近のAI倫理について気になっている")
+        assert result.intent == "unknown"
+        assert result.target_slug is None
+
+    def test_parses_slug_with_explanation_suffix(self):
+        """LLM が 'sakura\\n\\n理由: 倫理的配慮を担当' で返したら sakura で判定する。"""
+        from lab_lounge.router import check_intent
+        with patch(
+            "lab_lounge.router._call_router_llm",
+            return_value="sakura\n\n理由: 倫理的配慮を担当",
+        ):
+            result = check_intent("最近のAI倫理について")
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "sakura"
+
+    def test_parses_slug_with_punctuation_suffix(self):
+        """LLM が 'mimi.' や 'mimi。' で返しても末尾句読点を除去して判定する。"""
+        from lab_lounge.router import check_intent
+        # 半角ピリオド
+        with patch("lab_lounge.router._call_router_llm", return_value="mimi."):
+            result = check_intent("テスト")
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "mimi"
+        # 全角句点
+        with patch("lab_lounge.router._call_router_llm", return_value="chisame。"):
+            result = check_intent("テスト")
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "chisame"
+        # markdown 装飾
+        with patch("lab_lounge.router._call_router_llm", return_value="**sakura**"):
+            result = check_intent("テスト")
+        assert result.intent == "interjection_candidate"
+        assert result.target_slug == "sakura"
+
+    def test_parses_empty_response_as_unknown(self):
+        """空文字 / 空白のみの応答は unknown (fail-open)。"""
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value=""):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
+        with patch("lab_lounge.router._call_router_llm", return_value="   \n\n  "):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
 
 
 class TestLoadCharacterInterestArea:

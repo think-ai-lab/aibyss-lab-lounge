@@ -497,19 +497,20 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     system_prompt = (
         "あなたは自発介入候補判定器です。\n"
         "ユーザー (ルカ) と他キャラの会話の文脈で、特定キャラへの呼びかけは無いが、\n"
-        "あるキャラが「自分の関心領域・専門分野」として自発介入したそうな発話があるかを\n"
-        "判定してください。\n\n"
+        "あるキャラが「自分の関心領域・専門分野」として自発介入したそうな話題が\n"
+        "発話に含まれているかを判定してください。\n\n"
         f"候補キャラとそれぞれの担当エリア:\n{candidates_desc}\n\n"
         "判定基準:\n"
-        "- 発話内容が候補キャラの担当エリアに**直接触れる**話題か (= そのキャラが\n"
-        "  話さないと文脈が欠落するレベル)。複数候補が該当する場合は、最も中心的な\n"
-        "  キャラ 1 名を選ぶ。\n"
-        "- 既にキャラ名が含まれて呼びかけが発生している場合は none (= callout 経路に流れる)。\n"
-        "- 軽い関連性しかない / 抽象的な話題 / 雑談は none (過剰挙手の禁止)。\n\n"
-        "回答形式:\n"
-        "- 候補 slug 一語 (そのキャラが自発介入すべき話題)\n"
-        "- none (該当なし、または呼びかけ済み、または雑談)\n\n"
-        f"回答は以下のいずれか一語のみ: {', '.join(candidate_slugs)}, none"
+        "- 発話の話題が候補キャラの担当エリアに**触れている / 関連している**かを判定する。\n"
+        "  問題提起の段階 (まだ具体性がなくても) でも、話題が明示されていれば候補有。\n"
+        "  例:「最近のAI倫理について気になっている」 → 倫理担当の sakura、価値観担当の\n"
+        "  mimi が候補。「データの裏付けを取りたい」 → 論理担当の chisame が候補。\n"
+        "- 既にキャラ名で呼びかけ済みなら none (= callout 経路に流れる)。\n"
+        "- 担当エリアと**まったく無関係**な雑談 / 挨拶のみ none。\n"
+        "- 複数候補が該当する場合は最も中心的な 1 名を選ぶ。\n\n"
+        "**出力形式 (厳守)**: 候補 slug 1 語のみ。理由 / 説明 / 改行 / 装飾文字\n"
+        "(`**`、`:`、引用符、空行) は一切付けない。\n"
+        f"許容値: {', '.join(candidate_slugs)}, none"
     )
 
     model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
@@ -521,17 +522,31 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
 
     logger.info("interjection_candidate 応答: %r (model=%s)", answer, model)
 
-    if answer == "none":
+    # Phase 0.5-A フェーズ 8 実走対応: LLM が指示を完全には守らず理由付きで返すケース
+    # (例: "none\n\n**理由**: ...") に備えて、最初のトークンで候補を判定する。
+    # 空白 / 改行で split → 句読点 / 装飾文字を rstrip → 候補と照合。
+    stripped = answer.strip()
+    first_token = ""
+    if stripped:
+        first_token = stripped.split()[0].rstrip(
+            "。.,、!?:;-`'\"*）)】」"
+        ).lstrip("`'\"*（(【「")
+    logger.debug("interjection_candidate: first_token=%r", first_token)
+
+    if first_token == "none":
         return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
 
-    if answer in candidate_slugs:
+    if first_token in candidate_slugs:
         return IntentResult(
             intent="interjection_candidate",
-            target_slug=answer,
+            target_slug=first_token,
             confidence=1.0,
         )
 
-    logger.warning("interjection_candidate: 候補外 slug %r → unknown", answer)
+    logger.warning(
+        "interjection_candidate: 候補外 first_token=%r (raw=%r) → unknown",
+        first_token, answer,
+    )
     return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
 
 
