@@ -228,13 +228,21 @@ def _approved_synthesize_fallback(
     """挙手承認時に bg_result が無効だった場合の同期 fallback (Phase 0.5-A フェーズ 7)。
 
     BG LLM が起動失敗 / cancel / 例外で chunks 空の場合に呼ばれる。本関数は daemon
-    スレッド内で同期的に ``run_pipeline`` を呼ぶ (= LLM + TTS + 再生まで blocking)。
-    通常応答パスと同じイベントを発行 (``suppress_bubble_answering=False`` で graph 側
-    が answering bubble を発行)。
+    スレッド内で同期的に ``run_pipeline`` を呼び、TTS chunks を蓄積してから
+    ``_spawn_handraise_response_playback`` で再生する。
+
+    通常応答パスは run_loop closure 内で ``on_tts_chunk_ready`` 経由で
+    ``_playback_queue`` に投入されるが、fallback はターン外 daemon thread で動くため
+    その経路に乗せられない。代わりに bg_result 経路と同じ専用 mini playback worker
+    (``_spawn_handraise_response_playback``) を再利用する。
+
+    graph 側の ``_publish_bubble("answering")`` は ``suppress_bubble_answering=False``
+    で発行される (= 通常応答パスと同じ流れ。bg_result 経路は run_loop 側で発行
+    していたが、fallback では graph 経路の方が自然)。
 
     呼出スレッドは別 daemon thread の ``approved-fallback-<slug>`` (run_loop の
-    callback factory が起動する) なので、blocking してもメインループや録音スレッドに
-    影響しない。
+    callback factory が起動する) なので、run_pipeline blocking してもメインループや
+    録音スレッドに影響しない。
 
     Args:
         slug:              挙手キャラ slug
@@ -248,13 +256,29 @@ def _approved_synthesize_fallback(
     if not isinstance(text, str):
         text = str(text)
 
+    fallback_trace_id = trace_id or _new_uuid()
+    chunks: list[dict] = []
+
+    def on_chunk(url, chunk_text, is_last, character, pose=None):
+        """TTS chunk 蓄積 hook。run_pipeline 完了後に playback worker へまとめて渡す。"""
+        chunk: dict = {
+            "url": url,
+            "text": chunk_text,
+            "is_last": is_last,
+            "character": character,
+        }
+        if pose is not None:
+            chunk["pose"] = pose
+        chunks.append(chunk)
+
     try:
         run_pipeline(
             text,
             stream_id=session_stream_id,
             session_id=session_id_root,
-            trace_id=trace_id or _new_uuid(),
+            trace_id=fallback_trace_id,
             speaker_hint=slug,
+            on_tts_chunk_ready=on_chunk,
             stream_context=stream_context,
             suppress_bubble_answering=False,  # graph 側で answering bubble 発行
         )
@@ -263,6 +287,26 @@ def _approved_synthesize_fallback(
             "挙手承認 fallback (run_pipeline 同期再生成) 失敗: slug=%s err=%s",
             slug, exc,
         )
+        return
+
+    if not chunks:
+        # TTS 出力なし (ダミー TTS モード or TTS 失敗)。再生はスキップするが、
+        # graph 側で llm.final / tts.done は発行済 (bubble は thinking → answering で停止)。
+        logger.warning(
+            "挙手承認 fallback: chunks 空 (TTS 出力なし) → 再生スキップ slug=%s",
+            slug,
+        )
+        return
+
+    # 蓄積した chunks を専用 mini playback worker で再生 (bg_result 経路と同じ仕組み)。
+    # worker が speaking → done の bubble.update を発行しつつ、wav を順次再生する。
+    _spawn_handraise_response_playback(
+        slug,
+        chunks,
+        fallback_trace_id,
+        session_stream_id=session_stream_id,
+        session_id_root=session_id_root,
+    )
 
 
 def _create_handraise_runner_and_callbacks(
