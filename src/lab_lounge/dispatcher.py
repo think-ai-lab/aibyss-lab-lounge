@@ -29,11 +29,13 @@ Phase 0.5 (挙手システム) への接続点:
 """
 
 import logging
+import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable
 
 from .wake_word import WakeWordResult
@@ -47,6 +49,33 @@ logger = logging.getLogger(__name__)
 #                長文応答中の有効発話を取りこぼさないようにする。
 DRAIN_MAX_EVENTS = 3
 DRAIN_MAX_AGE_SEC = 60.0
+
+
+# ─── Phase 0.5-A 挙手システム設定 (環境変数読込) ──────────────────────
+# 環境変数を Dispatcher.__init__ で 1 回読み込み、self に保持して以後参照する。
+# (環境変数を直接散らさず一元管理し、テストで monkeypatch しやすくする)
+def _get_handraise_config() -> dict[str, Any]:
+    """Phase 0.5-A の挙手機能設定を環境変数から読み込む。
+
+    返り値の dict は次のキーを含む:
+      - "use_handraise":  挙手機能の on/off (default True)
+      - "lapse_sec":      時間 lapse 閾値 (default 300 = 5 分)
+      - "lapse_utterance_count":
+                          utterance lapse 閾値 (default 8 utterance)
+
+    環境変数:
+      L2_USE_HANDRAISE                      "true" / "false" (default true)
+      L2_HANDRAISE_LAPSE_SEC                秒数 (default 300)
+      L2_HANDRAISE_LAPSE_UTTERANCE_COUNT    回数 (default 8)
+    """
+    return {
+        "use_handraise": os.environ.get("L2_USE_HANDRAISE", "true").lower()
+            in ("1", "true", "yes"),
+        "lapse_sec": float(os.environ.get("L2_HANDRAISE_LAPSE_SEC", "300")),
+        "lapse_utterance_count": int(
+            os.environ.get("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", "8")
+        ),
+    }
 
 
 class DispatcherState(Enum):
@@ -78,15 +107,65 @@ class QueuedWakeEvent:
 @dataclass
 class HandraiseState:
     """
-    Phase 0.5 で使う挙手中キャラの状態。Block 0 では _handraise_states dict
-    に格納されることはなく、型予約のみ。
+    Phase 0.5-A で使う挙手中キャラの状態。
 
-    実フィールド (BG LLM task ハンドル、bubble 状態、開始時刻、lapse タイマー等)
-    は Phase 0.5 着手時に追加する。
+    Block 0 で予約された target_slug + started_at に加え、Phase 0.5-A で
+    BG LLM スレッド管理 / lapse タイマー / bubble 表示用フィールドを追加。
+    フェーズ 5b で API メソッドが state を読み書きし、フェーズ 7 で
+    bg_thread / phrase_path 再生の実体組込を行う。
+
+    フィールド:
+      target_slug:           挙手中キャラの slug (一意キー)
+      started_at:            time.monotonic() 基準の開始時刻 (HUD 表示用 age 算出)
+      transcript_snapshot:   挙手判定時の TranscriptBuffer snapshot (T7 で再生成)
+      cancel_event:          却下/lapse 時に set。BG LLM はベストエフォートで観察
+      bg_thread:             BG LLM 生成スレッド (フェーズ 7 で起動、5 では None)
+      bg_result:             BG LLM 生成結果 (フェーズ 7 で実体投入)
+      bg_completed:          BG LLM 完了フラグ (フェーズ 5 では即座 set で no-op)
+      phrase:                bubble.text 用、handraise wav と同じテキスト
+      phrase_path:           handraise wav パス (フェーズ 7 で再生)
+      se_pending:            応答中なら True (フェーズ 7 で on_pipeline_complete 後発火)
+      lapse_timer:           threading.Timer。utterance count 上限超過でも発火
+      utterance_count_since: 挙手以降のルカ発話数 (8 で lapse)
+      trace_id:              handraise 単位の trace_id (bubble.update / handraise.update に付与)
     """
 
     target_slug: str
     started_at: float
+    transcript_snapshot: Any = None         # TranscriptBuffer (循環 import 回避で Any)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    bg_thread: threading.Thread | None = None
+    bg_result: Any = None
+    bg_completed: threading.Event = field(default_factory=threading.Event)
+    phrase: str = ""
+    phrase_path: Path | None = None
+    se_pending: bool = False
+    lapse_timer: threading.Timer | None = None
+    utterance_count_since: int = 0
+    trace_id: str = ""
+
+
+@dataclass
+class CooldownState:
+    """
+    Phase 0.5-A: 連続却下による cooldown 状態。
+
+    consecutive_denials は却下のたびに +1、承認で 0 にリセット。
+    cooldown_until / threshold_multiplier は Phase 0.5-A では値を持たないが
+    (multiplier=1.0 固定)、Phase 0.5-B で「連続却下が増えるほど挙手しにくくする」
+    閾値変動ロジックの土台として保持しておく。
+
+    フィールド:
+      cooldown_until:        cooldown 解除時刻 (time.monotonic() 基準)
+                             Phase 0.5-A では 0.0 のまま (cooldown 強制発動なし)
+      consecutive_denials:   連続却下回数 (承認 / lapse でリセットしない設計)
+                             Phase 0.5-B で閾値変動の入力に使う
+      threshold_multiplier:  挙手閾値の倍率。Phase 0.5-A は常に 1.0 固定
+    """
+
+    cooldown_until: float = 0.0
+    consecutive_denials: int = 0
+    threshold_multiplier: float = 1.0
 
 
 class Dispatcher:
@@ -110,6 +189,10 @@ class Dispatcher:
         self,
         *,
         on_queue_update: Callable[[list[QueuedWakeEvent]], None] | None = None,
+        on_handraise_update: Callable[
+            [dict[str, "HandraiseState"], dict[str, "CooldownState"]], None
+        ] | None = None,
+        on_bubble_update: Callable[[str, str, str, int | None], None] | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
         max_age_sec: float = DRAIN_MAX_AGE_SEC,
     ) -> None:
@@ -119,6 +202,14 @@ class Dispatcher:
                 ``dispatcher.queue.update`` イベントを bus に publish するために
                 run_loop からセットされる想定。Lock 外で呼ばれるため、callback 内で
                 長時間処理しても dispatcher は止まらない。
+            on_handraise_update: 挙手状態 / cooldown 変化時に呼ばれる callback (Phase 0.5-A)。
+                ``dispatcher.handraise.update`` イベントを bus に publish するために
+                run_loop からセットされる想定。callback には _handraise_states と
+                _cooldowns の shallow copy が渡される (Lock 外で呼ばれる)。
+            on_bubble_update: bubble.update 発行が必要な時に呼ばれる callback (Phase 0.5-A)。
+                引数 (character, step, text, ttl_ms) を受け取り、run_loop が
+                ``build_bubble_update(...)`` で event を組み立てて publish する想定。
+                Lock 外で呼ばれる。
             max_events:  queue の最大保持件数。超過分は古いものから破棄
             max_age_sec: enqueue から N 秒以上経過した event を drain 時に破棄
         """
@@ -130,13 +221,24 @@ class Dispatcher:
         self._wake_event_queue: deque[QueuedWakeEvent] = deque()
 
         # Phase 0.5 で使う dict。Block 0 では空のまま。
-        # 型注釈を残しておくことで Phase 0.5 着手時の追加実装が局所化する。
+        # フェーズ 5a で _cooldowns 型を dict[str, float] → dict[str, CooldownState]
+        # に変更 (consecutive_denials / threshold_multiplier の保持)。
         self._handraise_states: dict[str, HandraiseState] = {}
-        self._cooldowns: dict[str, float] = {}  # slug → cooldown_until_monotonic
+        self._cooldowns: dict[str, CooldownState] = {}
 
         self._on_queue_update = on_queue_update
+        # Phase 0.5-A: 挙手状態 + bubble の publish callback
+        self._on_handraise_update = on_handraise_update
+        self._on_bubble_update = on_bubble_update
         self._max_events = max_events
         self._max_age_sec = max_age_sec
+
+        # Phase 0.5-A: 挙手機能の設定 (環境変数から 1 回だけ読み込む)
+        # テストでは monkeypatch.setenv した後に Dispatcher() を生成すれば反映される
+        cfg = _get_handraise_config()
+        self._use_handraise: bool = cfg["use_handraise"]
+        self._lapse_sec: float = cfg["lapse_sec"]
+        self._lapse_utterance_count: int = cfg["lapse_utterance_count"]
 
     # ─── 状態取得 (テスト・デバッグ用) ────────────────────────────────
 
@@ -313,6 +415,64 @@ class Dispatcher:
             self._on_queue_update(queue_copy)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dispatcher: on_queue_update callback failed: %s", exc)
+
+    # ─── Phase 0.5-A 挙手 publish (bubble + handraise.update) ──────
+
+    def _publish_handraise_update(self) -> None:
+        """
+        on_handraise_update callback を呼び出す (Phase 0.5-A)。
+
+        Lock 外で呼ばれることを前提に、_handraise_states / _cooldowns の shallow copy
+        を取得して callback に渡す (callback 内で dispatcher を再呼び出ししても
+        deadlock しないように)。callback で例外が出ても dispatcher 本体は止めない。
+
+        run_loop からセットされる callback は ``build_dispatcher_handraise_update``
+        で event を組み立てて bus に publish する想定。
+        """
+        if self._on_handraise_update is None:
+            return
+        # Lock 取得して copy、Lock 外で callback 呼出 (dispatcher.queue.update と同パターン)
+        with self._lock:
+            states_copy = dict(self._handraise_states)
+            cooldowns_copy = dict(self._cooldowns)
+        try:
+            self._on_handraise_update(states_copy, cooldowns_copy)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Dispatcher: on_handraise_update callback failed: %s", exc,
+            )
+
+    def _publish_bubble_update(
+        self,
+        character: str,
+        step: str,
+        text: str,
+        ttl_ms: int | None = None,
+    ) -> None:
+        """
+        on_bubble_update callback を呼び出す (Phase 0.5-A)。
+
+        Lock 外で呼ばれることを前提に、引数 (character, step, text, ttl_ms) を
+        callback にそのまま渡す。run_loop 側で ``build_bubble_update(...)`` を
+        呼び出して bus に publish する想定。callback で例外が出ても dispatcher
+        本体は止めない。
+
+        Args:
+            character: キャラクター slug
+            step:      "handraise" / "denied" / "lapsed" / "cancelled" 等
+                       (events.py の build_bubble_update に渡される値)
+            text:      bubble 表示テキスト
+            ttl_ms:    自動消去ミリ秒。None なら次 step まで保持。Phase 0.5-A は
+                       denied/lapsed=2000ms / handraise=None を想定
+        """
+        if self._on_bubble_update is None:
+            return
+        try:
+            self._on_bubble_update(character, step, text, ttl_ms)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Dispatcher: on_bubble_update callback failed: %s", exc,
+            )
 
     # ─── Phase 0.5 用 API (Block 0 では NotImplementedError) ──────
     #
