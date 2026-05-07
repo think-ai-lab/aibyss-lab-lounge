@@ -790,17 +790,60 @@ class TestDecodeVoicepeakOutput:
 
 
 class TestVoicepeakLogSanitization:
-    """配信中の機密情報漏洩を防ぐ: VOICEPEAK ログがファイルパスを含まない。"""
+    """配信中のログサニタイズと、調査用 cmd 全文の INFO 出力検証。
 
-    def test_voicepeak_info_log_does_not_contain_full_path(self, tmp_path, caplog):
-        """INFO レベルのログに完全パスが含まれない (ファイル名のみ)。"""
+    Phase 0.5-A フェーズ 8 (実走 2026-05-08) で出力ファイル未生成バグの調査が
+    困難だったため、cmd 全文 (引数 + パス含む) を INFO レベルで残す方針に変更
+    した (ルカ明示要求)。サマリ行 (「VOICEPEAK 投入: speaker=... narrator=...」)
+    にはパスを含めない設計を維持し、調査用の「VOICEPEAK コマンド (full)」行で
+    すべて拾う二段構え。
+    """
+
+    def test_voicepeak_invoke_summary_omits_full_path(self, tmp_path, caplog):
+        """サマリ行 (「VOICEPEAK 投入」) にはファイル名のみで完全パスを含めない。
+
+        cmd 全文は別の INFO 行 (「VOICEPEAK コマンド (full)」) で記録するので、
+        サマリ行は配信中の OBS / コンソールに出ても安全な情報量に保つ。
+        """
         from lab_lounge.tts import _call_voicepeak
 
-        captured_cmd = []
         def mock_run(cmd, **kwargs):
             tokens = _parse_cmd(cmd)
             out = _extract_arg(tokens, "--out")
-            captured_cmd.append(out)
+            if out:
+                _create_dummy_wav(Path(out))
+            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with caplog.at_level("INFO", logger="lab_lounge.tts"):
+                _call_voicepeak(
+                    "テスト", voice="Asumi Ririse", output_dir=str(tmp_path),
+                )
+
+        # 「投入」サマリ行のみを抽出 (cmd full 行は別)
+        invoke_messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "VOICEPEAK 投入:" in r.getMessage()
+        ]
+        all_invoke = " ".join(invoke_messages)
+        # サマリ行に完全パス (tmp_path) は含めない
+        assert str(tmp_path) not in all_invoke
+        # ファイル名 (.wav) は含めてよい
+        assert ".wav" in all_invoke
+
+    def test_voicepeak_info_log_contains_full_command(self, tmp_path, caplog):
+        """Phase 0.5-A フェーズ 8: INFO レベルに cmd 全文 (引数含む) が記録される。
+
+        旧設計はユーザーディレクトリ等のパス漏洩を避けて DEBUG レベルに留めて
+        いたが、実走 (2026-05-08) で出力ファイル未生成バグの調査が困難だった
+        ため INFO レベルに格上げ (ルカ明示要求)。voicepeak.exe 実行時に投入した
+        引数を後から完全に再現できるようにする。
+        """
+        from lab_lounge.tts import _call_voicepeak
+
+        def mock_run(cmd, **kwargs):
+            tokens = _parse_cmd(cmd)
+            out = _extract_arg(tokens, "--out")
             if out:
                 _create_dummy_wav(Path(out))
             return MagicMock(returncode=0, stdout=b"", stderr=b"")
@@ -814,31 +857,209 @@ class TestVoicepeakLogSanitization:
         info_messages = [
             r.getMessage() for r in caplog.records if r.levelno == logging.INFO
         ]
+        # INFO レベルに「VOICEPEAK コマンド (full)」が記録される
+        assert any("VOICEPEAK コマンド (full)" in m for m in info_messages)
+        # 引数 (--say / --narrator / --out) も全部含まれている
         all_info = " ".join(info_messages)
-        # 完全パス (tmp_path のような長いパス) が INFO に含まれない
-        assert str(tmp_path) not in all_info
-        # ファイル名 (.wav) は含まれてよい
-        assert ".wav" in all_info
+        assert "--say" in all_info
+        assert "--narrator" in all_info
+        assert "--out" in all_info
 
-    def test_voicepeak_debug_log_contains_full_command(self, tmp_path, caplog):
-        """DEBUG レベルでは完全コマンドが記録される (デバッグ用途)。"""
-        from lab_lounge.tts import _call_voicepeak
 
-        def mock_run(cmd, **kwargs):
-            tokens = _parse_cmd(cmd)
-            out = _extract_arg(tokens, "--out")
-            if out:
-                _create_dummy_wav(Path(out))
-            return MagicMock(returncode=0, stdout=b"", stderr=b"")
+class TestVoicepeakOutputMissingDiagnostics:
+    """Phase 0.5-A フェーズ 8: 出力ファイル未生成バグの調査用ログ強化。
 
-        with patch("subprocess.run", side_effect=mock_run):
-            with caplog.at_level("DEBUG", logger="lab_lounge.tts"):
-                _call_voicepeak(
-                    "テスト", voice="Asumi Ririse", output_dir=str(tmp_path),
-                )
+    実走 (2026-05-08) で「returncode=0 だが --out のファイルが書かれず、
+    代わりに cwd の output.wav に書かれる」現象が観測されたため、
+    詳細 warning ログを追加した (filepath / cwd output.wav 検出 / stdout /
+    stderr / cmd_str 全文)。
+    """
 
-        debug_messages = [
-            r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
-        ]
-        # DEBUG レベルには完全コマンド (パス含む) が出力される
-        assert any("VOICEPEAK コマンド (full)" in m for m in debug_messages)
+    def test_logs_filepath_and_cmd_when_output_missing(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """warning に期待 filepath、stdout/stderr、cmd 全文が含まれる。"""
+        from lab_lounge.tts import _log_voicepeak_output_missing_diagnostics
+
+        monkeypatch.chdir(tmp_path)  # cwd を tmp_path に固定
+        fake_filepath = tmp_path / "expected_output.wav"
+        fake_result = MagicMock()
+        fake_result.stdout = b"some stdout text"
+        fake_result.stderr = b"some stderr text"
+        fake_result.returncode = 0
+
+        with caplog.at_level("WARNING", logger="lab_lounge.tts"):
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=fake_filepath,
+                result=fake_result,
+                cmd_str='voicepeak --say "test" --out expected_output.wav',
+                speaker="mimi",
+                attempt=0,
+                max_attempts=20,
+            )
+
+        warning_messages = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        # 期待 filepath
+        assert "expected_output.wav" in warning_messages
+        # stdout / stderr
+        assert "some stdout text" in warning_messages
+        assert "some stderr text" in warning_messages
+        # cmd 全文
+        assert "cmd (full)" in warning_messages
+        assert 'voicepeak --say "test"' in warning_messages
+        # speaker
+        assert "mimi" in warning_messages
+        # 「初回検出」ラベル
+        assert "初回検出" in warning_messages
+
+    def test_detects_cwd_output_wav_when_present(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """cwd に output.wav があれば「VOICEPEAK が --out を無視した疑い」が記録される。"""
+        from lab_lounge.tts import _log_voicepeak_output_missing_diagnostics
+
+        monkeypatch.chdir(tmp_path)
+        # cwd に dummy output.wav を作成 (= バグ再現状態)
+        cwd_output = tmp_path / "output.wav"
+        cwd_output.write_bytes(b"X" * 1024)
+
+        fake_filepath = tmp_path / "expected.wav"
+        fake_result = MagicMock()
+        fake_result.stdout = b""
+        fake_result.stderr = b""
+        fake_result.returncode = 0
+
+        with caplog.at_level("WARNING", logger="lab_lounge.tts"):
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=fake_filepath,
+                result=fake_result,
+                cmd_str='voicepeak --say "test"',
+                speaker="sakura",
+                attempt=0,
+                max_attempts=20,
+            )
+
+        warning_messages = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        # cwd_output.wav 存在検出
+        assert "cwd_output.wav 存在" in warning_messages
+        assert "1024 bytes" in warning_messages
+        assert "VOICEPEAK が --out を無視した疑い" in warning_messages
+
+    def test_reports_cwd_output_wav_absence(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """cwd に output.wav が無ければ「不在」ラベルでログされる。"""
+        from lab_lounge.tts import _log_voicepeak_output_missing_diagnostics
+
+        monkeypatch.chdir(tmp_path)
+        # tmp_path には output.wav 無し
+        assert not (tmp_path / "output.wav").exists()
+
+        fake_filepath = tmp_path / "expected.wav"
+        fake_result = MagicMock(stdout=b"", stderr=b"", returncode=0)
+
+        with caplog.at_level("WARNING", logger="lab_lounge.tts"):
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=fake_filepath,
+                result=fake_result,
+                cmd_str="voicepeak --say x",
+                speaker="chisame",
+                attempt=0,
+                max_attempts=20,
+            )
+
+        warning_messages = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        assert "cwd_output.wav 不在" in warning_messages
+        # 「VOICEPEAK が --out を無視した疑い」は出さない
+        assert "--out を無視した疑い" not in warning_messages
+
+    def test_retry_label_when_attempt_nonzero(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """attempt > 0 でラベルが「リトライ後再検出 (X/Y)」になる。"""
+        from lab_lounge.tts import _log_voicepeak_output_missing_diagnostics
+
+        monkeypatch.chdir(tmp_path)
+        fake_filepath = tmp_path / "expected.wav"
+        fake_result = MagicMock(stdout=b"", stderr=b"", returncode=0)
+
+        with caplog.at_level("WARNING", logger="lab_lounge.tts"):
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=fake_filepath,
+                result=fake_result,
+                cmd_str="voicepeak --say x",
+                speaker="mimi",
+                attempt=3,
+                max_attempts=20,
+            )
+
+        warning_messages = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        assert "リトライ後再検出 (3/20)" in warning_messages
+
+    def test_handles_none_result_gracefully(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """result=None でも例外せず特殊ラベルでログ出力する (防御的実装)。"""
+        from lab_lounge.tts import _log_voicepeak_output_missing_diagnostics
+
+        monkeypatch.chdir(tmp_path)
+        fake_filepath = tmp_path / "expected.wav"
+
+        with caplog.at_level("WARNING", logger="lab_lounge.tts"):
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=fake_filepath,
+                result=None,
+                cmd_str="voicepeak --say x",
+                speaker=None,
+                attempt=0,
+                max_attempts=20,
+            )
+
+        warning_messages = " ".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        assert "(result is None)" in warning_messages
+        assert "(unknown)" in warning_messages  # speaker=None フォールバック
+
+
+class TestSubmitVoicepeakReturnsResult:
+    """Phase 0.5-A フェーズ 8: _submit_voicepeak の戻り値拡張検証。
+
+    調査用ログ強化のため、成功時に subprocess.CompletedProcess を返すよう変更。
+    呼出側 (_synthesize_voicepeak_chunk) で stdout/stderr を参照できる。
+    """
+
+    def test_returns_completed_process_on_success(self, monkeypatch):
+        """returncode=0 で CompletedProcess が返ってくる。"""
+        import concurrent.futures
+        import queue as _queue_mod
+        import subprocess
+        from lab_lounge import tts as tts_mod
+
+        # ワーカー初期化を回避するため、worker_fn を直接テストに使う構造に。
+        # ここでは _submit_voicepeak を呼んで、worker が成功 result を返す経路を確認。
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "0")
+
+        # 既存のグローバル worker をリセット
+        monkeypatch.setattr(tts_mod, "_voicepeak_queue", None)
+        monkeypatch.setattr(tts_mod, "_voicepeak_worker_thread", None)
+
+        success_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=b"voicepeak ok", stderr=b"",
+        )
+
+        with patch("subprocess.run", return_value=success_result):
+            result = tts_mod._submit_voicepeak("voicepeak --say test")
+
+        assert result is success_result or result.returncode == 0
+        assert result.stdout == b"voicepeak ok"
