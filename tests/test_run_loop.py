@@ -323,3 +323,297 @@ class TestRunLoopBgContinuousWiring:
         assert callable(dispatcher_kwargs["on_queue_update"])
         assert callable(dispatcher_kwargs["on_handraise_update"])
         assert callable(dispatcher_kwargs["on_bubble_update"])
+
+    def test_dispatcher_receives_phase7_callbacks(self, monkeypatch):
+        """Phase 0.5-A フェーズ 7: bg_runner / on_handraise_started /
+        on_handraise_phrase_pending_release / on_handraise_approved も渡される。
+        """
+        from lab_lounge.run_loop import run_loop
+
+        _, dispatcher_kwargs = self._setup_spies(monkeypatch)
+
+        run_loop(
+            max_turns=0,
+            wake_backend="bg-continuous",
+            wake_timeout=0.1,
+        )
+
+        assert "bg_runner" in dispatcher_kwargs
+        assert "on_handraise_started" in dispatcher_kwargs
+        assert "on_handraise_phrase_pending_release" in dispatcher_kwargs
+        assert "on_handraise_approved" in dispatcher_kwargs
+        assert callable(dispatcher_kwargs["bg_runner"])
+        assert callable(dispatcher_kwargs["on_handraise_started"])
+        assert callable(dispatcher_kwargs["on_handraise_phrase_pending_release"])
+        assert callable(dispatcher_kwargs["on_handraise_approved"])
+
+
+# ─── Phase 0.5-A フェーズ 7 (BG LLM + handraise 再生統合) ──────────
+
+
+class TestSpawnHandraisePhrasePlayback:
+    """Phase 0.5-A フェーズ 7: _spawn_handraise_phrase_playback の単体テスト。"""
+
+    def test_returns_none_when_phrase_path_is_none(self):
+        from lab_lounge.run_loop import _spawn_handraise_phrase_playback
+        result = _spawn_handraise_phrase_playback("mimi", None)
+        assert result is None
+
+    def test_calls_play_audio_fn_with_path(self):
+        from pathlib import Path
+        from lab_lounge.run_loop import _spawn_handraise_phrase_playback
+        called: list[str] = []
+
+        def fake_play(path):
+            called.append(path)
+            return True
+
+        thread = _spawn_handraise_phrase_playback(
+            "mimi",
+            Path("/tmp/x.wav"),
+            padding_sec=0.0,
+            play_audio_fn=fake_play,
+        )
+        thread.join(timeout=2.0)
+        assert called == [str(Path("/tmp/x.wav"))]
+
+    def test_padding_sec_delays_playback(self):
+        """padding_sec > 0 で再生開始が遅延する (RESPONDING → IDLE 直後の連続再生回避)。"""
+        from pathlib import Path
+        from lab_lounge.run_loop import _spawn_handraise_phrase_playback
+        called_at: list[float] = []
+
+        def fake_play(path):
+            called_at.append(time.monotonic())
+
+        start = time.monotonic()
+        thread = _spawn_handraise_phrase_playback(
+            "mimi",
+            Path("/tmp/x.wav"),
+            padding_sec=0.2,
+            play_audio_fn=fake_play,
+        )
+        thread.join(timeout=2.0)
+        assert len(called_at) == 1
+        delta = called_at[0] - start
+        assert delta >= 0.18, f"padding が機能していない (delta={delta:.3f}s)"
+
+    def test_play_exception_is_swallowed(self):
+        """play_audio_fn 例外は warning ログのみで daemon thread が落ちない。"""
+        from pathlib import Path
+        from lab_lounge.run_loop import _spawn_handraise_phrase_playback
+
+        def failing_play(path):
+            raise RuntimeError("boom")
+
+        thread = _spawn_handraise_phrase_playback(
+            "mimi",
+            Path("/tmp/x.wav"),
+            play_audio_fn=failing_play,
+        )
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+
+class TestCreateHandraiseRunnerAndCallbacks:
+    """Phase 0.5-A フェーズ 7: factory が 4 つの callable を返す + 挙動検証。"""
+
+    def _factory(self, **overrides):
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+        defaults = dict(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+        )
+        defaults.update(overrides)
+        return _create_handraise_runner_and_callbacks(**defaults)
+
+    def test_returns_four_callables(self):
+        bg_runner, on_started, on_release, on_approved = self._factory()
+        assert callable(bg_runner)
+        assert callable(on_started)
+        assert callable(on_release)
+        assert callable(on_approved)
+
+    def test_on_handraise_started_idle_calls_spawn(self, monkeypatch):
+        """se_pending=False で _spawn_handraise_phrase_playback を呼ぶ (padding=0)。"""
+        from pathlib import Path
+        spawn_calls: list[tuple] = []
+
+        def fake_spawn(slug, phrase_path, padding_sec=0.0, **kw):
+            spawn_calls.append((slug, phrase_path, padding_sec))
+            return None
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
+        )
+        _, on_started, _, _ = self._factory()
+        on_started("mimi", Path("/tmp/x.wav"), False)
+        assert spawn_calls == [("mimi", Path("/tmp/x.wav"), 0.0)]
+
+    def test_on_handraise_started_responding_does_not_spawn(self, monkeypatch):
+        """se_pending=True ではスキップ (release callback 経由で後ほど再生)。"""
+        from pathlib import Path
+        spawn_calls: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_phrase_playback",
+            lambda *a, **kw: spawn_calls.append(a),
+        )
+        _, on_started, _, _ = self._factory()
+        on_started("mimi", Path("/tmp/x.wav"), True)
+        assert spawn_calls == []
+
+    def test_on_handraise_phrase_pending_release_uses_padding_env(self, monkeypatch):
+        """release callback は L2_HANDRAISE_RESPONDING_PADDING_SEC env を参照。"""
+        from pathlib import Path
+        monkeypatch.setenv("L2_HANDRAISE_RESPONDING_PADDING_SEC", "0.7")
+        spawn_calls: list[tuple] = []
+
+        def fake_spawn(slug, phrase_path, padding_sec=0.0, **kw):
+            spawn_calls.append((slug, phrase_path, padding_sec))
+            return None
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
+        )
+        _, _, on_release, _ = self._factory()
+        on_release("sakura", Path("/tmp/x.wav"))
+        assert spawn_calls == [("sakura", Path("/tmp/x.wav"), 0.7)]
+
+    def test_on_handraise_approved_with_chunks_publishes_and_plays(self, monkeypatch):
+        """bg_result 有 + chunks 有で answering bubble 発行 + chunks 再生。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        published: list = []
+        spawn_calls: list[tuple] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish",
+            lambda ev: published.append(ev),
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
+                (slug, list(chunks), trace_id)
+            ),
+        )
+        _, _, _, on_approved = self._factory()
+
+        # bg_result.result.events 内の llm.final から text を取る
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": "わたくしの見解は…"}},
+            {"type": "tts.done"},
+        ]
+        bg = HandraiseBgResult(
+            chunks=[{"url": "u1", "text": "x", "is_last": True, "character": "mimi"}],
+            result=fake_result,
+            trace_id="bg-abc",
+        )
+        on_approved("mimi", bg, "snap", "trace-orig")
+
+        # bubble.update("answering") が 1 回発行
+        bubble_calls = [
+            e for e in published
+            if e.get("type") == "bubble.update"
+            and e.get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_calls) == 1
+        assert bubble_calls[0]["payload"]["character"] == "mimi"
+        assert bubble_calls[0]["payload"]["text"] == "わたくしの見解は…"
+        # chunks 再生も呼ばれる
+        assert len(spawn_calls) == 1
+        assert spawn_calls[0][0] == "mimi"
+
+    def test_on_handraise_approved_with_none_result_uses_fallback(self, monkeypatch):
+        """bg_result=None でフォールバックスレッドが起動する。"""
+        called: list[tuple] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._approved_synthesize_fallback",
+            lambda slug, snap, trace, **kw: called.append((slug, snap, trace)),
+        )
+        _, _, _, on_approved = self._factory()
+        on_approved("mimi", None, "snap", "trace-x")
+        # daemon thread 内 fallback なのでポーリング待機
+        for _ in range(40):
+            if called:
+                break
+            time.sleep(0.05)
+        assert len(called) == 1
+        assert called[0] == ("mimi", "snap", "trace-x")
+
+    def test_on_handraise_approved_with_empty_chunks_uses_fallback(self, monkeypatch):
+        """bg_result 有だが chunks 空でも fallback に流れる。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        called: list[str] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._approved_synthesize_fallback",
+            lambda slug, snap, trace, **kw: called.append(slug),
+        )
+        bg = HandraiseBgResult(chunks=[], result=None, trace_id="x")
+        _, _, _, on_approved = self._factory()
+        on_approved("mimi", bg, "snap", "trace-x")
+        for _ in range(40):
+            if called:
+                break
+            time.sleep(0.05)
+        assert called == ["mimi"]
+
+
+class TestApprovedSynthesizeFallback:
+    """Phase 0.5-A フェーズ 7: _approved_synthesize_fallback の単体テスト。"""
+
+    def test_calls_run_pipeline_with_speaker_hint(self, monkeypatch):
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+        called: list[tuple] = []
+
+        def fake_run_pipeline(text, **kw):
+            called.append((text, kw))
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
+        )
+        _approved_synthesize_fallback(
+            "mimi", "テスト発話", "trace-x",
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context="配信文脈",
+        )
+        assert len(called) == 1
+        text, kw = called[0]
+        assert text == "テスト発話"
+        assert kw["speaker_hint"] == "mimi"
+        assert kw["stream_id"] == "s1"
+        assert kw["session_id"] == "ses1"
+        assert kw["stream_context"] == "配信文脈"
+        assert kw["suppress_bubble_answering"] is False  # graph 側で answering 発行
+
+    def test_run_pipeline_exception_is_swallowed(self, monkeypatch):
+        """run_pipeline 例外は warning ログのみで例外は伝播しない。"""
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        def failing_pipeline(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("lab_lounge.run_loop.run_pipeline", failing_pipeline)
+        # 例外なく完了
+        _approved_synthesize_fallback(
+            "mimi", "snap", "trace",
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+    def test_uses_new_uuid_when_trace_id_empty(self, monkeypatch):
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+        called: list[dict] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline",
+            lambda text, **kw: called.append(kw) or MagicMock(),
+        )
+        _approved_synthesize_fallback(
+            "mimi", "snap", "",  # trace_id 空
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+        assert len(called) == 1
+        # 新 UUID が割り当てられている (空文字ではない)
+        assert called[0]["trace_id"]
+        assert len(called[0]["trace_id"]) == 36  # UUID4 形式
