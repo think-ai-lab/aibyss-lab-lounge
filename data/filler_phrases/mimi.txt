@@ -20,3 +20,10 @@
 うーん、何と申しましょうか……	happy=50
 つまりですわね……	happy=50
 ちょっと考えをまとめますわ……	happy=50
+
+# Phase 0.5-A: 挙手 (interjection_candidate) — handraise wav 兼 SE。
+# 1-2 秒の短いフレーズで、上品に介入希望を示す。
+[handraise]
+わたくしからもよろしいかしら	happy=40
+ひとつ、よろしいですこと	happy=40
+お話しさせていただいても	happy=40,sulky=10

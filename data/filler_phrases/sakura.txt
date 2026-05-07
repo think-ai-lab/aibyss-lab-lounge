@@ -19,3 +19,10 @@
 それでですねぇ……	happy=50
 うーん、どう言えばいいかなぁ……	happy=50
 ちょっとまとめますねぇ……	happy=50
+
+# Phase 0.5-A: 挙手 (interjection_candidate) — handraise wav 兼 SE。
+# 1-2 秒の短いフレーズで、優しく介入希望を示す。
+[handraise]
+えっとぉ、わたしからもいいですかぁ	happy=40
+あのぉ、ちょっといいですかぁ	happy=40
+ひとつ、お話してもいいですかぁ	happy=40
