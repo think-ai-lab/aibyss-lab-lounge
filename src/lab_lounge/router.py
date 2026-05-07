@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from .characters import (
@@ -428,6 +429,37 @@ def _check_intent_for_character(
     return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
 
 
+def _load_character_interest_area(slug: str) -> str | None:
+    """``skills/characters/<slug>.md`` から ``**担当エリア**:`` 行を抽出する (Phase 0.5-A フェーズ 8)。
+
+    interjection_candidate プロンプトに各キャラの担当領域を含めるためのヘルパー。
+    md ファイルが Single Source Of Truth (SSOT) で、router.py 側でハードコードする
+    DRY 違反を避ける。md のヘッダ近辺だけを走査するため I/O コストは最小。
+
+    Args:
+        slug: キャラクター slug (例: "mimi")
+
+    Returns:
+        担当エリアの記述 (例: "抽象 × 感情（美学・価値観・ノブレスオブリージュ）")。
+        md ファイルが見つからない / `**担当エリア**:` 行が無い場合は None。
+    """
+    skills_dir = Path(__file__).parent / "skills" / "characters"
+    md_file = skills_dir / f"{slug}.md"
+    if not md_file.is_file():
+        return None
+    try:
+        content = md_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.debug("interest_area 読込失敗: slug=%s err=%s", slug, exc)
+        return None
+    # 先頭 10 行のみ走査 (担当エリアは通常 line 3 付近の見出し直下)
+    for line in content.splitlines()[:10]:
+        stripped = line.strip()
+        if stripped.startswith("**担当エリア**:"):
+            return stripped.replace("**担当エリア**:", "").strip()
+    return None
+
+
 def _check_intent_interjection_candidate(text: str) -> IntentResult:
     """Phase 0.5-A: 自発介入候補のキャラを判定する。
 
@@ -436,8 +468,11 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     interjection_candidate + target_slug を返す (該当なしは unknown)。
 
     Notion §C1 確定: octamaid は挙手しない設計。
-    フェーズ 4 では候補 slug + display_name のみ提示。フェーズ 7 で interject.md
-    を活用したプロンプト強化を検討する。
+
+    Phase 0.5-A フェーズ 8: 各キャラの担当エリア (skills/characters/<slug>.md の
+    `**担当エリア**:` 行) をプロンプトに含めて、LLM の判定精度を改善した。
+    実走で「AI 倫理について…」発話に対して候補なし (none) と保守的に判定された
+    問題への対応。
     """
     characters = get_all_characters()
     # octamaid は挙手しない (補助員ボットとして応答待機専用)
@@ -448,20 +483,32 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
         logger.warning("interjection_candidate: 候補キャラなし → unknown")
         return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
 
-    candidates_desc = "\n".join(
-        f"- {c.slug} ({c.display_name})"
-        for c in candidate_chars
-    )
+    # 各候補キャラに担当エリアを添える (skills/characters/<slug>.md からロード)。
+    # 担当エリアが取得できないキャラは display_name のみで提示 (グレースフルデグレード)。
+    candidates_lines: list[str] = []
+    for c in candidate_chars:
+        interest = _load_character_interest_area(c.slug)
+        if interest:
+            candidates_lines.append(f"- {c.slug} ({c.display_name}) — 担当: {interest}")
+        else:
+            candidates_lines.append(f"- {c.slug} ({c.display_name})")
+    candidates_desc = "\n".join(candidates_lines)
 
     system_prompt = (
         "あなたは自発介入候補判定器です。\n"
         "ユーザー (ルカ) と他キャラの会話の文脈で、特定キャラへの呼びかけは無いが、\n"
         "あるキャラが「自分の関心領域・専門分野」として自発介入したそうな発話があるかを\n"
         "判定してください。\n\n"
-        f"候補キャラ:\n{candidates_desc}\n\n"
-        "判定:\n"
-        "- 候補 slug 一語: そのキャラが自発介入したそうな話題が含まれる\n"
-        "- none: 該当なし、または既に呼びかけがある\n\n"
+        f"候補キャラとそれぞれの担当エリア:\n{candidates_desc}\n\n"
+        "判定基準:\n"
+        "- 発話内容が候補キャラの担当エリアに**直接触れる**話題か (= そのキャラが\n"
+        "  話さないと文脈が欠落するレベル)。複数候補が該当する場合は、最も中心的な\n"
+        "  キャラ 1 名を選ぶ。\n"
+        "- 既にキャラ名が含まれて呼びかけが発生している場合は none (= callout 経路に流れる)。\n"
+        "- 軽い関連性しかない / 抽象的な話題 / 雑談は none (過剰挙手の禁止)。\n\n"
+        "回答形式:\n"
+        "- 候補 slug 一語 (そのキャラが自発介入すべき話題)\n"
+        "- none (該当なし、または呼びかけ済み、または雑談)\n\n"
         f"回答は以下のいずれか一語のみ: {', '.join(candidate_slugs)}, none"
     )
 
