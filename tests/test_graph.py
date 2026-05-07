@@ -221,6 +221,7 @@ class TestPipelineGraphNodes:
             stream_context=None,
             on_tts_chunk_ready=None,
             on_pose_ready=None,
+            suppress_bubble_answering=False,
             character_slug="",
             rag_context=None,
             rag_used=False,
@@ -255,6 +256,49 @@ class TestPipelineGraphNodes:
         assert result["llm_text"] == "ダミー応答: テスト入力"
         assert len(result["events"]) == 1
         assert result["events"][0]["type"] == "llm.final"
+
+    def test_generation_node_publishes_answering_bubble_by_default(
+        self, mock_publish, base_state,
+    ):
+        """Phase 0.5-A フェーズ 7: suppress_bubble_answering=False (default) なら
+        bubble.update("answering") が発行される (既存挙動の回帰防止)。
+        """
+        from lab_lounge.graph import _generation_node
+        base_state["character_slug"] = "octamaid"
+        base_state["events"] = [{"event_id": "utt-1", "type": "utterance.final"}]
+        # suppress_bubble_answering は base_state で False (default)
+        _generation_node(base_state)
+        # publish 呼出のうち "bubble.update" + step=="answering" が含まれることを確認
+        bubble_answering_calls = [
+            call for call in mock_publish.call_args_list
+            if call.args[0].get("type") == "bubble.update"
+            and call.args[0].get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_answering_calls) == 1, (
+            "answering bubble が default で発行されていない"
+        )
+        assert bubble_answering_calls[0].args[0]["payload"]["character"] == "octamaid"
+
+    def test_generation_node_suppresses_answering_bubble_when_flag_set(
+        self, mock_publish, base_state,
+    ):
+        """Phase 0.5-A フェーズ 7: suppress_bubble_answering=True で answering bubble が
+        発行されない (BG LLM 先行生成中は graph 側で発行せず、承認時に run_loop が発行)。
+        """
+        from lab_lounge.graph import _generation_node
+        base_state["character_slug"] = "mimi"
+        base_state["events"] = [{"event_id": "utt-1", "type": "utterance.final"}]
+        base_state["suppress_bubble_answering"] = True
+        _generation_node(base_state)
+        # answering bubble は発行されない。llm.final 等の他イベントは発行される
+        bubble_answering_calls = [
+            call for call in mock_publish.call_args_list
+            if call.args[0].get("type") == "bubble.update"
+            and call.args[0].get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_answering_calls) == 0, (
+            "suppress_bubble_answering=True なのに answering bubble が発行された"
+        )
 
     def test_tts_node_dummy_mode(self, mock_publish, base_state):
         from lab_lounge.graph import _tts_node

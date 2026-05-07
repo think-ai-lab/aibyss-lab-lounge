@@ -487,6 +487,13 @@ class PipelineGraphState(TypedDict):
     stream_context: str | None
     on_tts_chunk_ready: Any
     on_pose_ready: Any
+    # Phase 0.5-A フェーズ 7: 挙手 BG LLM モードで True にすると、
+    # _generation_node 内の bubble.update("answering") 発行を抑制する。
+    # 通常応答は run_pipeline 経由で生成するときに graph.py 内で answering bubble
+    # を発行するが、挙手の BG 先行生成では「承認時に run_loop が TTS 開始時刻と
+    # 同期して bubble.update("answering") を発行する」設計のため、graph 側では
+    # 抑制する必要がある (= 二重発行防止)。デフォルト False で既存挙動を維持。
+    suppress_bubble_answering: bool
 
     # ノード出力
     character_slug: str
@@ -892,7 +899,11 @@ def _generation_node(state: PipelineGraphState) -> dict:
     llm = build_llm_final(text=llm_text, seq=1, links=[utt_event_id], **llm_meta, **common)
     publish(llm)
 
-    _publish_bubble("answering", state["character_slug"], common, links=[llm["event_id"]])
+    # Phase 0.5-A フェーズ 7: BG LLM モード (挙手の先行生成) では、承認時に run_loop
+    # が TTS 開始時刻と同期して bubble.update("answering") を発行する。graph 側で
+    # 発行すると二重発行になるので、suppress_bubble_answering=True で抑制する。
+    if not state.get("suppress_bubble_answering", False):
+        _publish_bubble("answering", state["character_slug"], common, links=[llm["event_id"]])
 
     return {
         "llm_text": llm_text,

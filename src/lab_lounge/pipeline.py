@@ -162,6 +162,7 @@ def run_pipeline(
     on_tts_chunk_ready=None,
     on_pose_ready=None,
     stream_context: str | None = None,
+    suppress_bubble_answering: bool = False,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -183,6 +184,11 @@ def run_pipeline(
                          同じ値が渡される。routing ノードでキャラ素体に
                          "## 本日の配信" として重ねられる。
                          None なら配信文脈なしで動作 (後方互換)。
+        suppress_bubble_answering: Phase 0.5-A フェーズ 7 で追加。True にすると
+                         _generation_node 内の bubble.update("answering") 発行を
+                         抑制する。挙手 BG 先行生成では承認時に run_loop が
+                         TTS 開始時刻と同期して bubble を発行する設計のため、
+                         graph 側の二重発行を避ける。デフォルト False で既存挙動。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
@@ -197,6 +203,7 @@ def run_pipeline(
         on_tts_chunk_ready=on_tts_chunk_ready,
         on_pose_ready=on_pose_ready,
         stream_context=stream_context,
+        suppress_bubble_answering=suppress_bubble_answering,
     )
 
 
@@ -211,6 +218,7 @@ def _run_pipeline_graph(
     on_tts_chunk_ready=None,
     on_pose_ready=None,
     stream_context: str | None = None,
+    suppress_bubble_answering: bool = False,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -242,6 +250,7 @@ def _run_pipeline_graph(
         "stream_context": stream_context,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
+        "suppress_bubble_answering": suppress_bubble_answering,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
