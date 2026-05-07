@@ -8,6 +8,8 @@ import jsonschema
 import pytest
 
 from lab_lounge.events import (
+    build_bubble_update,
+    build_dispatcher_handraise_update,
     build_dispatcher_queue_update,
     build_llm_final,
     build_tts_done,
@@ -307,5 +309,250 @@ class TestDispatcherQueueUpdate:
             queue=[], max_size=3, ttl_sec=60.0, **COMMON,
         )
         assert "stream_idx" not in ev
+
+
+class TestBubbleUpdate:
+    """build_bubble_update — Axis B (意図ゲート) 以降で導入。
+    パイプライン進捗を OBS 吹き出しに表示するイベント。
+    Phase 0.5 で挙手ステップ (handraise/denied/lapsed/cancelled) と ttl_ms を追加。
+    """
+
+    def test_schema_valid_basic(self):
+        """基本フィールドだけでスキーマ検証を通る。"""
+        ev = build_bubble_update(
+            character="mimi",
+            step="thinking",
+            text="考え中…",
+            **COMMON,
+        )
+        validate_event(ev)
+
+    def test_required_fields(self):
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        for f in ("ver", "event_id", "ts", "stream_id", "session_id", "trace_id", "type", "source", "payload"):
+            assert f in ev
+
+    def test_event_id_is_uuid(self):
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert UUID_PATTERN.match(ev["event_id"]), f"UUID 形式でない: {ev['event_id']}"
+
+    def test_ver_type_source(self):
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert ev["ver"] == "0.1"
+        assert ev["type"] == "bubble.update"
+        assert ev["source"] == "lab-lounge"
+
+    def test_payload_contents(self):
+        ev = build_bubble_update(
+            character="chisame",
+            step="answering",
+            text="それは興味深いですね",
+            **COMMON,
+        )
+        payload = ev["payload"]
+        assert payload["character"] == "chisame"
+        assert payload["step"] == "answering"
+        assert payload["text"] == "それは興味深いですね"
+
+    def test_no_stream_idx(self):
+        """Guardrail G-1: stream_idx を含めない。"""
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert "stream_idx" not in ev
+
+    def test_links_optional(self):
+        """links を渡すと top-level に追加される。"""
+        parent = "11111111-2222-4333-8444-555555555555"
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…",
+            links=[parent], **COMMON,
+        )
+        assert ev["links"] == [parent]
+
+    def test_links_omitted_when_none(self):
+        """links を渡さないと event に含まれない。"""
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert "links" not in ev
+
+
+class TestBubbleUpdateTtlMs:
+    """Phase 0.5-A で追加された ttl_ms 引数 + 新 step 値の挙動を確認する。"""
+
+    def test_ttl_ms_in_payload_when_set(self):
+        """ttl_ms を渡すと payload.ttl_ms に格納される。"""
+        ev = build_bubble_update(
+            character="mimi", step="denied", text="また今度",
+            ttl_ms=2000, **COMMON,
+        )
+        assert ev["payload"]["ttl_ms"] == 2000
+
+    def test_ttl_ms_omitted_when_none(self):
+        """ttl_ms=None (default) なら payload に ttl_ms キーが含まれない。"""
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert "ttl_ms" not in ev["payload"]
+
+    def test_ttl_ms_explicit_none(self):
+        """ttl_ms=None を明示しても payload に含まれない (handraise 中の永続表示)。"""
+        ev = build_bubble_update(
+            character="mimi", step="handraise", text="ちょっと、いい?",
+            ttl_ms=None, **COMMON,
+        )
+        assert "ttl_ms" not in ev["payload"]
+
+    def test_step_handraise_validates(self):
+        """新 step 値 "handraise" でスキーマ検証を通る。"""
+        ev = build_bubble_update(
+            character="mimi", step="handraise", text="ちょっと、いい?",
+            **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["step"] == "handraise"
+
+    def test_step_denied_with_ttl(self):
+        """新 step 値 "denied" + ttl_ms=2000 でスキーマ検証を通る。"""
+        ev = build_bubble_update(
+            character="mimi", step="denied", text="また今度",
+            ttl_ms=2000, **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["step"] == "denied"
+        assert ev["payload"]["ttl_ms"] == 2000
+
+    def test_step_lapsed_with_ttl(self):
+        """新 step 値 "lapsed" + ttl_ms=2000 でスキーマ検証を通る。"""
+        ev = build_bubble_update(
+            character="sakura", step="lapsed", text="…静まりました",
+            ttl_ms=2000, **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["step"] == "lapsed"
+
+    def test_step_cancelled_with_ttl(self):
+        """新 step 値 "cancelled" + ttl_ms でスキーマ検証を通る。"""
+        ev = build_bubble_update(
+            character="chisame", step="cancelled", text="撤回します",
+            ttl_ms=2000, **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["step"] == "cancelled"
+
+    def test_ttl_ms_with_links(self):
+        """ttl_ms と links を同時に渡せる。"""
+        parent = "11111111-2222-4333-8444-555555555555"
+        ev = build_bubble_update(
+            character="mimi", step="denied", text="また今度",
+            links=[parent], ttl_ms=2000, **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["ttl_ms"] == 2000
+        assert ev["links"] == [parent]
+
+
+class TestDispatcherHandraiseUpdate:
+    """build_dispatcher_handraise_update — Phase 0.5-A で導入。
+    HUD のデバッグ dashboard 用 (配信画面非表示)。dispatcher.queue.update の兄弟。
+    """
+
+    def test_schema_valid_empty(self):
+        """挙手中なし + cooldown なしでもスキーマ検証を通る (リセット時に発行)。"""
+        ev = build_dispatcher_handraise_update(
+            handraise_states=[],
+            cooldowns={},
+            **COMMON,
+        )
+        validate_event(ev)
+
+    def test_schema_valid_with_entries(self):
+        """挙手中キャラと cooldown 状態を持っていてもスキーマ検証を通る。"""
+        states = [
+            {
+                "target_slug": "mimi",
+                "started_at_age_sec": 12.5,
+                "phrase": "ちょっと、いい?",
+                "bg_completed": False,
+                "trace_id": "11111111-2222-4333-8444-555555555555",
+                "utterance_count_since": 2,
+            },
+        ]
+        cooldowns = {
+            "chisame": {
+                "consecutive_denials": 1,
+                "cooldown_until_sec_remaining": 0.0,
+                "threshold_multiplier": 1.0,
+            },
+        }
+        ev = build_dispatcher_handraise_update(
+            handraise_states=states,
+            cooldowns=cooldowns,
+            **COMMON,
+        )
+        validate_event(ev)
+
+    def test_required_fields(self):
+        ev = build_dispatcher_handraise_update(
+            handraise_states=[], cooldowns={}, **COMMON,
+        )
+        for f in ("ver", "event_id", "ts", "stream_id", "session_id", "trace_id", "type", "source", "payload"):
+            assert f in ev
+
+    def test_event_id_is_uuid(self):
+        ev = build_dispatcher_handraise_update(
+            handraise_states=[], cooldowns={}, **COMMON,
+        )
+        assert UUID_PATTERN.match(ev["event_id"]), f"UUID 形式でない: {ev['event_id']}"
+
+    def test_ver_type_source(self):
+        ev = build_dispatcher_handraise_update(
+            handraise_states=[], cooldowns={}, **COMMON,
+        )
+        assert ev["ver"] == "0.1"
+        assert ev["type"] == "dispatcher.handraise.update"
+        assert ev["source"] == "lab-lounge"
+
+    def test_payload_contents(self):
+        states = [{"target_slug": "mimi", "started_at_age_sec": 1.0,
+                   "phrase": "ねぇ", "bg_completed": False,
+                   "trace_id": "t", "utterance_count_since": 0}]
+        cooldowns = {"chisame": {"consecutive_denials": 2,
+                                  "cooldown_until_sec_remaining": 0.0,
+                                  "threshold_multiplier": 1.0}}
+        ev = build_dispatcher_handraise_update(
+            handraise_states=states,
+            cooldowns=cooldowns,
+            **COMMON,
+        )
+        payload = ev["payload"]
+        assert payload["handraise_states"] == states
+        assert payload["cooldowns"] == cooldowns
+
+    def test_no_stream_idx(self):
+        """Guardrail G-1: stream_idx を含めない。"""
+        ev = build_dispatcher_handraise_update(
+            handraise_states=[], cooldowns={}, **COMMON,
+        )
+        assert "stream_idx" not in ev
+
+    def test_payload_passes_through_unchanged(self):
+        """events.py は handraise_states / cooldowns の中身に介入せず、そのまま payload に載せる。"""
+        # events.py が想定外のキーを足したり消したりしないことを確認
+        states = [{"target_slug": "mimi", "extra_field": "xxx",
+                   "started_at_age_sec": 0.0, "phrase": "", "bg_completed": True,
+                   "trace_id": "", "utterance_count_since": 0}]
+        ev = build_dispatcher_handraise_update(
+            handraise_states=states, cooldowns={}, **COMMON,
+        )
+        # extra_field がそのまま残る (= events.py が dict の中身を変えない)
+        assert ev["payload"]["handraise_states"][0]["extra_field"] == "xxx"
 
 

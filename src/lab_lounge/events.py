@@ -241,6 +241,7 @@ def build_bubble_update(
     session_id: str,
     trace_id: str,
     links: list[str] | None = None,
+    ttl_ms: int | None = None,
 ) -> dict[str, Any]:
     """
     bubble.update イベントを組み立てて検証する。
@@ -250,9 +251,24 @@ def build_bubble_update(
 
     Args:
         character: キャラクター slug (e.g., "mimi")
-        step:      進捗ステップ ("searching" / "thinking" / "answering" / "done")
+        step:      進捗ステップ。次のいずれかを想定:
+                     - 通常応答: "searching" / "thinking" / "answering" / "done"
+                     - Phase 0.5 (挙手): "handraise" / "denied" / "lapsed" / "cancelled"
+                   (events.py は文字列の中身に介入しない。受信側 V2 が解釈する)
         text:      表示テキスト（キャラクター口調の固定文字列）
+        ttl_ms:    表示後の自動消去ミリ秒数。None なら受信側で next step まで保持。
+                   Phase 0.5 では denied/lapsed=2000ms を想定し、handraise 自体は
+                   None (承認/却下/lapse まで保持) で発行する。
+                   payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
     """
+    payload: dict[str, Any] = {
+        "character": character,
+        "step": step,
+        "text": text,
+    }
+    # ttl_ms はオプション。None 時は payload に含めない (受信側 default 挙動を維持)。
+    if ttl_ms is not None:
+        payload["ttl_ms"] = ttl_ms
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -262,11 +278,7 @@ def build_bubble_update(
         "trace_id": trace_id,
         "type": "bubble.update",
         "source": "lab-lounge",
-        "payload": {
-            "character": character,
-            "step": step,
-            "text": text,
-        },
+        "payload": payload,
     }
     if links:
         event["links"] = links
@@ -317,6 +329,59 @@ def build_dispatcher_queue_update(
             "max_size": max_size,
             "ttl_sec": ttl_sec,
             "state": state,
+        },
+    }
+    validate_event(event)
+    return event
+
+
+def build_dispatcher_handraise_update(
+    *,
+    handraise_states: list[dict[str, Any]],
+    cooldowns: dict[str, dict[str, Any]],
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+) -> dict[str, Any]:
+    """
+    dispatcher.handraise.update イベントを組み立てて検証する。
+
+    Phase 0.5 (挙手システム) で導入。Dispatcher の挙手中キャラ状態 + 連続却下
+    cooldown 状態が変化したとき (start / approval / denial / lapse) に発行され、
+    HUD のデバッグ dashboard で「現在挙手中のキャラ」「連続却下回数」を可視化する。
+    配信画面には出さない想定 (運用デバッグ用途)。Phase 0.5-B で V2 側 UI が
+    本イベントを購読して可視化する予定。
+
+    `dispatcher.queue.update` (Block 0 で導入) の兄弟イベント。両者は別々の payload
+    を持つが、HUD 側は同じ「dispatcher の内部状態スナップショット」として扱う。
+
+    Args:
+        handraise_states: 挙手中キャラ各々の dict のリスト。各要素は次を含む想定:
+                            {"target_slug": str,
+                             "started_at_age_sec": float,
+                             "phrase": str,
+                             "bg_completed": bool,
+                             "trace_id": str,
+                             "utterance_count_since": int}
+                          (events.py は中身に介入せず、payload にそのまま載せる)
+        cooldowns:        slug → cooldown 状態の dict。各値は次を含む想定:
+                            {"consecutive_denials": int,
+                             "cooldown_until_sec_remaining": float,
+                             "threshold_multiplier": float}
+                          Phase 0.5-A は threshold_multiplier=1.0 固定で発行する。
+    """
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "dispatcher.handraise.update",
+        "source": "lab-lounge",
+        "payload": {
+            "handraise_states": handraise_states,
+            "cooldowns": cooldowns,
         },
     }
     validate_event(event)
