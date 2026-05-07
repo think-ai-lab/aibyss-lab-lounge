@@ -334,7 +334,11 @@ class TestGetCachedFillerPaths:
         cache_dir.mkdir()
         with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
             result = get_cached_filler_paths("test")
-            assert result == {"opener": [], "continue": [], "bridge": [], "closer": []}
+            # Phase 0.5-A フェーズ 2: handraise カテゴリを含む 5 カテゴリすべてが空 list
+            assert result == {
+                "opener": [], "continue": [], "bridge": [],
+                "closer": [], "handraise": [],
+            }
 
     def test_returns_categorized_paths(self, tmp_path):
         cache_dir = tmp_path / "test"
@@ -348,6 +352,8 @@ class TestGetCachedFillerPaths:
             assert len(result["opener"]) == 2
             assert len(result["continue"]) == 1
             assert len(result["closer"]) == 0
+            # 5 カテゴリ全部が dict に存在 (Phase 0.5-A フェーズ 2 の対応漏れ修正で追加)
+            assert "handraise" in result
 
     def test_ignores_old_naming(self, tmp_path):
         """旧形式の 00.wav は無視される。"""
@@ -359,6 +365,89 @@ class TestGetCachedFillerPaths:
         with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
             result = get_cached_filler_paths("test")
             assert len(result["opener"]) == 1
+
+    def test_recognizes_handraise_paths(self, tmp_path):
+        """Phase 0.5-A フェーズ 2: handraise_*.wav が dict に取り込まれる。"""
+        cache_dir = tmp_path / "test"
+        cache_dir.mkdir()
+        (cache_dir / "handraise_00.wav").touch()
+        (cache_dir / "handraise_01.wav").touch()
+        (cache_dir / "handraise_02.wav").touch()
+        (cache_dir / "opener_00.wav").touch()  # 別カテゴリの混入確認
+
+        with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
+            result = get_cached_filler_paths("test")
+            assert len(result["handraise"]) == 3
+            assert len(result["opener"]) == 1
+            # ファイル名末尾が handraise_NN.wav パターン以外は混入しない
+            for p in result["handraise"]:
+                assert p.name.startswith("handraise_")
+                assert p.name.endswith(".wav")
+
+
+class TestEnsureFillerCacheHandraise:
+    """Phase 0.5-A フェーズ 2 対応漏れ修正: ensure_filler_cache が handraise
+    セクションの phrase で KeyError を起こさず、result_paths に格納される。
+
+    実走 (2026-05-07) で ``KeyError: 'handraise'`` が判明したため回帰テストとして
+    追加。原因は ``counters`` / ``result_paths`` dict に "handraise" キーが
+    無かったこと (5 箇所の対応漏れ)。
+    """
+
+    def test_handraise_phrase_does_not_cause_key_error(self, tmp_path, monkeypatch):
+        """handraise エントリがある phrase_set でも KeyError なく完了する。"""
+        from lab_lounge.filler import (
+            FillerPhrase,
+            FillerPhraseSet,
+            ensure_filler_cache,
+        )
+
+        # ダミー phrase_set: opener と handraise を 1 つずつ
+        fake_phrase_set = FillerPhraseSet(
+            opener=[FillerPhrase(text="oa", emotion=None)],
+            handraise=[FillerPhrase(text="ha", emotion=None)],
+        )
+        monkeypatch.setattr(
+            "lab_lounge.filler.load_filler_phrases", lambda slug: fake_phrase_set,
+        )
+        monkeypatch.setattr("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path)
+
+        # 既存 wav を準備して TTS 呼出をスキップさせる (target.is_file() and not force)
+        cache_dir = tmp_path / "mimi"
+        cache_dir.mkdir()
+        (cache_dir / "opener_00.wav").write_bytes(b"\x00\x00")
+        (cache_dir / "handraise_00.wav").write_bytes(b"\x00\x00")
+
+        # KeyError なく完了 (修正前は handraise エントリ反復時に KeyError)
+        result = ensure_filler_cache("mimi")
+
+        # 5 カテゴリ全部が dict に存在
+        assert set(result.keys()) == {
+            "opener", "continue", "bridge", "closer", "handraise",
+        }
+        # handraise の wav パスが正しく格納される
+        assert len(result["handraise"]) == 1
+        assert result["handraise"][0].name == "handraise_00.wav"
+        # opener も同時に格納
+        assert len(result["opener"]) == 1
+        assert result["opener"][0].name == "opener_00.wav"
+
+    def test_empty_phrase_set_returns_5_categories(self, tmp_path, monkeypatch):
+        """phrase_set が空でも返り値 dict は 5 カテゴリすべて含む。"""
+        from lab_lounge.filler import FillerPhraseSet, ensure_filler_cache
+
+        empty_set = FillerPhraseSet()
+        monkeypatch.setattr(
+            "lab_lounge.filler.load_filler_phrases", lambda slug: empty_set,
+        )
+        monkeypatch.setattr("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path)
+
+        result = ensure_filler_cache("mimi")
+        assert set(result.keys()) == {
+            "opener", "continue", "bridge", "closer", "handraise",
+        }
+        for cat_paths in result.values():
+            assert cat_paths == []
 
 
 # ─── TestGenerateFillerText ───────────────────────────────────────
