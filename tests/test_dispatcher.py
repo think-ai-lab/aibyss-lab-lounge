@@ -1124,3 +1124,314 @@ class TestDispatcherHandraisePublish:
         d.on_interjection_candidate("mimi", transcript_snapshot="t")
         # 例外は warning ログに留まり、state は登録される
         assert "mimi" in d._handraise_states
+
+
+# ─── Phase 0.5-A フェーズ 7 (BG LLM 実体組込) ──────────────────────
+
+
+class TestHandraiseBgResult:
+    """Phase 0.5-A フェーズ 7: HandraiseBgResult dataclass の挙動。"""
+
+    def test_default_values(self):
+        from lab_lounge.dispatcher import HandraiseBgResult
+        r = HandraiseBgResult()
+        assert r.chunks == []
+        assert r.result is None
+        assert r.trace_id == ""
+
+    def test_with_explicit_values(self):
+        from lab_lounge.dispatcher import HandraiseBgResult
+        sentinel_result = MagicMock()
+        r = HandraiseBgResult(
+            chunks=[{"url": "x", "text": "a", "is_last": True, "character": "mimi"}],
+            result=sentinel_result,
+            trace_id="abc",
+        )
+        assert len(r.chunks) == 1
+        assert r.chunks[0]["text"] == "a"
+        assert r.result is sentinel_result
+        assert r.trace_id == "abc"
+
+    def test_chunks_default_factory_independent(self):
+        """default_factory なので mutable default の罠を踏まない。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        r1 = HandraiseBgResult()
+        r2 = HandraiseBgResult()
+        r1.chunks.append({"url": "x"})
+        assert r2.chunks == []  # 独立
+
+
+class TestDispatcherBgRunner:
+    """Phase 0.5-A フェーズ 7: bg_runner 起動と _bg_set_result の挙動。"""
+
+    def _setup(self, monkeypatch, d):
+        _patch_filler(monkeypatch, slug="mimi")
+        _patch_lapse_timer(monkeypatch, d)
+
+    def test_bg_runner_called_with_kwargs(self, monkeypatch):
+        """_start_handraise が bg_runner を必要 kwargs で呼ぶ。"""
+        bg_runner_calls = []
+        fake_thread = MagicMock(spec=threading.Thread)
+
+        def fake_runner(**kwargs):
+            bg_runner_calls.append(kwargs)
+            return fake_thread
+
+        d = Dispatcher(bg_runner=fake_runner)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="snap")
+
+        assert len(bg_runner_calls) == 1
+        kwargs = bg_runner_calls[0]
+        assert kwargs["target_slug"] == "mimi"
+        assert kwargs["transcript_snapshot"] == "snap"
+        assert isinstance(kwargs["cancel_event"], threading.Event)
+        assert callable(kwargs["on_complete"])
+
+    def test_bg_runner_thread_attached_to_state(self, monkeypatch):
+        """bg_runner が返した thread が state.bg_thread に格納される。"""
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(bg_runner=lambda **kw: fake_thread)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].bg_thread is fake_thread
+
+    def test_bg_completed_not_set_when_bg_runner_provided(self, monkeypatch):
+        """bg_runner 注入時、bg_completed はまだ set されていない (BG が完了通知まで)。"""
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(bg_runner=lambda **kw: fake_thread)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert not d._handraise_states["mimi"].bg_completed.is_set()
+
+    def test_bg_completed_set_when_bg_runner_none(self, monkeypatch):
+        """bg_runner=None のデフォルトでは bg_completed が即時 set (フォールバック)。"""
+        d = Dispatcher()  # bg_runner=None
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].bg_completed.is_set()
+        assert d._handraise_states["mimi"].bg_thread is None
+
+    def test_bg_runner_exception_falls_back(self, monkeypatch):
+        """bg_runner が例外時は bg_completed.set() でフォールバック。state は残る。"""
+        def failing_runner(**kw):
+            raise RuntimeError("boom")
+        d = Dispatcher(bg_runner=failing_runner)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert "mimi" in d._handraise_states
+        assert d._handraise_states["mimi"].bg_completed.is_set()
+        assert d._handraise_states["mimi"].bg_thread is None
+
+    def test_bg_set_result_stores_result(self, monkeypatch):
+        """_bg_set_result が bg_result + bg_completed をセットする。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(bg_runner=lambda **kw: fake_thread)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert not d._handraise_states["mimi"].bg_completed.is_set()
+        result = HandraiseBgResult(chunks=[{"x": 1}], trace_id="abc")
+        d._bg_set_result("mimi", result)
+        assert d._handraise_states["mimi"].bg_result is result
+        assert d._handraise_states["mimi"].bg_completed.is_set()
+
+    def test_bg_set_result_idempotent_after_state_removed(self, monkeypatch):
+        """state 削除後の _bg_set_result は冪等で no-op (例外なし)。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(bg_runner=lambda **kw: fake_thread)
+        self._setup(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"denied": "x", "lapsed": "y"}},
+        )
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_approval_denied("mimi")  # state 削除
+        # 削除後の _bg_set_result は no-op (例外なし)
+        d._bg_set_result("mimi", HandraiseBgResult())
+
+
+class TestDispatcherHandraiseStartedCallback:
+    """Phase 0.5-A フェーズ 7: on_handraise_started callback の発火検証。"""
+
+    def test_callback_fires_on_idle_with_se_pending_false(self, monkeypatch):
+        """IDLE 中の挙手で se_pending=False、callback の引数も False。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(on_handraise_started=lambda *a: calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert len(calls) == 1
+        slug, path, se_pending = calls[0]
+        assert slug == "mimi"
+        assert path is not None
+        assert se_pending is False
+
+    def test_callback_fires_on_responding_with_se_pending_true(self, monkeypatch):
+        """RESPONDING 中の挙手で se_pending=True、callback の引数も True。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(on_handraise_started=lambda *a: calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert len(calls) == 1
+        slug, path, se_pending = calls[0]
+        assert slug == "mimi"
+        assert se_pending is True
+
+    def test_no_callback_when_not_set(self, monkeypatch):
+        """on_handraise_started 未設定でも例外なく動く。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()  # callback 未注入
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert "mimi" in d._handraise_states
+
+    def test_callback_exception_does_not_propagate(self, monkeypatch):
+        """callback 内例外が dispatcher 外に伝播しない (warning ログのみ)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+
+        def failing_callback(*args):
+            raise RuntimeError("boom")
+
+        d = Dispatcher(on_handraise_started=failing_callback)
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert "mimi" in d._handraise_states
+
+
+class TestDispatcherPhrasePendingRelease:
+    """Phase 0.5-A フェーズ 7: on_pipeline_complete 内の保留 wav リリース検証。"""
+
+    def test_release_fires_for_se_pending_true(self, monkeypatch):
+        """se_pending=True の挙手は on_pipeline_complete で release callback 発火。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(on_handraise_phrase_pending_release=lambda *a: calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert calls == []  # まだ pipeline_complete 前
+        d.on_pipeline_complete()
+        assert len(calls) == 1
+        slug, path = calls[0]
+        assert slug == "mimi"
+        assert path is not None
+
+    def test_release_does_not_fire_for_se_pending_false(self, monkeypatch):
+        """se_pending=False (IDLE 挙手) は on_pipeline_complete で release されない。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(on_handraise_phrase_pending_release=lambda *a: calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_pipeline_complete()
+        assert calls == []
+
+    def test_release_fires_only_once_across_multiple_pipeline_completes(self, monkeypatch):
+        """se_pending を False に巻き戻すので 2 回目以降の pipeline_complete では発火しない。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(on_handraise_phrase_pending_release=lambda *a: calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_pipeline_complete()  # 1 回目: 発火
+        # state は依然存在するが se_pending は False に戻っている
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_pipeline_complete()  # 2 回目: 発火しない
+        assert len(calls) == 1
+
+    def test_release_resets_se_pending_to_false(self, monkeypatch):
+        """release 後、state.se_pending は False に巻き戻される (多重再生防止)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher(on_handraise_phrase_pending_release=lambda *a: None)
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].se_pending is True
+        d.on_pipeline_complete()
+        assert d._handraise_states["mimi"].se_pending is False
+
+    def test_release_callback_exception_does_not_propagate(self, monkeypatch):
+        """release callback 例外が on_pipeline_complete を止めない。"""
+        _patch_filler(monkeypatch, slug="mimi")
+
+        def failing_release(*a):
+            raise RuntimeError("boom")
+
+        d = Dispatcher(on_handraise_phrase_pending_release=failing_release)
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # 例外なく完了
+        d.on_pipeline_complete()
+        # state 自体は残っている (release 失敗でも se_pending は False に巻き戻る)
+        assert d._handraise_states["mimi"].se_pending is False
+
+
+class TestDispatcherApprovedCallback:
+    """Phase 0.5-A フェーズ 7: on_handraise_approved callback の発火検証。"""
+
+    def _setup(self, monkeypatch, d, *, slug="mimi"):
+        _patch_filler(monkeypatch, slug=slug)
+        _patch_lapse_timer(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {slug: {"denied": "x", "lapsed": "y"}},
+        )
+
+    def test_callback_fires_with_bg_result(self, monkeypatch):
+        """bg_result セット済の state を granted すると callback に bg_result が渡る。"""
+        from lab_lounge.dispatcher import HandraiseBgResult
+        fake_thread = MagicMock(spec=threading.Thread)
+        calls = []
+        d = Dispatcher(
+            bg_runner=lambda **kw: fake_thread,
+            on_handraise_approved=lambda *a: calls.append(a),
+        )
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="snap")
+        result = HandraiseBgResult(chunks=[{"x": 1}], trace_id="bg-abc")
+        d._bg_set_result("mimi", result)
+        d.on_approval_granted("mimi")
+        assert len(calls) == 1
+        slug, bg_result, transcript_snapshot, trace_id = calls[0]
+        assert slug == "mimi"
+        assert bg_result is result
+        assert transcript_snapshot == "snap"
+        assert trace_id != ""
+
+    def test_callback_fires_with_none_bg_result(self, monkeypatch):
+        """bg_result 未完成 (BG 失敗 or BG 起動前 grant) でも callback 発火、bg_result=None。"""
+        calls = []
+        d = Dispatcher(on_handraise_approved=lambda *a: calls.append(a))  # bg_runner=None
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="snap")
+        # bg_runner=None なのでフォールバック (bg_result は None のまま)
+        d.on_approval_granted("mimi")
+        assert len(calls) == 1
+        slug, bg_result, _, _ = calls[0]
+        assert slug == "mimi"
+        assert bg_result is None
+
+    def test_no_callback_on_unknown_slug(self, monkeypatch):
+        """granted on unknown slug は冪等で callback 発火しない。"""
+        calls = []
+        d = Dispatcher(on_handraise_approved=lambda *a: calls.append(a))
+        d.on_approval_granted("unknown")  # state 無し
+        assert calls == []
+
+    def test_callback_exception_does_not_propagate(self, monkeypatch):
+        """callback 例外が dispatcher 外に伝播しない。state 削除は完了する。"""
+
+        def failing_callback(*args):
+            raise RuntimeError("boom")
+
+        d = Dispatcher(on_handraise_approved=failing_callback)
+        self._setup(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_approval_granted("mimi")  # 例外なく完了
+        assert d._handraise_states == {}
