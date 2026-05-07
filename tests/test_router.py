@@ -529,6 +529,38 @@ class TestCheckIntentInterjectionCandidate:
         assert "chisame" in system_prompt
         assert "sakura" in system_prompt
 
+    def test_ruka_excluded_from_candidates(self):
+        """Phase 0.5-A フェーズ 8 実走で確定: ruka (配信者本人) は挙手対象外。
+
+        AI が「ルカとして自発介入する」のは設計上不自然 (= 配信者の意思を AI が
+        代弁する形になり、自律エージェント感の趣旨に反する)。実走 (2026-05-07) で
+        'AIを活用した人員削減について' 発話に対し LLM が ruka を返した事故から確定。
+        """
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
+            check_intent("テスト")  # character_slug=None
+        system_prompt = mock_llm.call_args.args[1]
+        # 候補リストに slug 'ruka' が含まれない (= '- ruka (...)' の形式で出ない)。
+        # ※ プロンプトの「ユーザー (ルカ)」のような自然文での「ルカ」言及は別経路
+        #   なので 'ruka' (slug 形式) のみを assert する
+        assert "ruka" not in system_prompt
+        # 他の主要キャラは引き続き含まれる
+        assert "mimi" in system_prompt
+        assert "chisame" in system_prompt
+        assert "sakura" in system_prompt
+
+    def test_ruka_response_treated_as_invalid_slug(self):
+        """LLM が誤って 'ruka' を返してもパース後 unknown 判定 (除外済 slug)。
+
+        ruka は candidate_slugs に含まれないため、first_token == 'ruka' でも
+        'in candidate_slugs' のチェックで弾かれて unknown になる (二段防御)。
+        """
+        from lab_lounge.router import check_intent
+        with patch("lab_lounge.router._call_router_llm", return_value="ruka"):
+            result = check_intent("テスト")
+        assert result.intent == "unknown"
+        assert result.target_slug is None
+
     def test_prompt_includes_all_eligible_slugs(self):
         """プロンプトに octamaid 以外の候補 slug が全て含まれる。"""
         from lab_lounge.router import check_intent

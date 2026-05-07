@@ -460,14 +460,26 @@ def _load_character_interest_area(slug: str) -> str | None:
     return None
 
 
+_HANDRAISE_EXCLUDED_SLUGS: frozenset[str] = frozenset({
+    # Notion §C1 確定: 補助員ボット、応答待機専用キャラなので挙手しない
+    "octamaid",
+    # Phase 0.5-A フェーズ 8 実走で除外確定 (2026-05-07): 配信者本人 (ルカ) の
+    # キャラクター。AI が「ルカとして自発介入する」のは設計上不自然 (配信者の意思を
+    # AI が代弁する形になり、自律エージェント感の趣旨に反する)。
+    "ruka",
+})
+
+
 def _check_intent_interjection_candidate(text: str) -> IntentResult:
     """Phase 0.5-A: 自発介入候補のキャラを判定する。
 
-    候補は octamaid (補助員ボット) を除く挙手対応キャラ (mimi / chisame / sakura)。
+    候補は ``_HANDRAISE_EXCLUDED_SLUGS`` を除く挙手対応キャラ (mimi / chisame / sakura)。
     LLM に「自分の関心領域に触れる発話があるキャラ」を判定させ、該当があれば
     interjection_candidate + target_slug を返す (該当なしは unknown)。
 
-    Notion §C1 確定: octamaid は挙手しない設計。
+    除外スラグ:
+      - octamaid: 補助員ボット (Notion §C1 確定)
+      - ruka:     配信者本人 (Phase 0.5-A フェーズ 8 実走で確定)
 
     Phase 0.5-A フェーズ 8: 各キャラの担当エリア (skills/characters/<slug>.md の
     `**担当エリア**:` 行) をプロンプトに含めて、LLM の判定精度を改善した。
@@ -475,8 +487,11 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     問題への対応。
     """
     characters = get_all_characters()
-    # octamaid は挙手しない (補助員ボットとして応答待機専用)
-    candidate_chars = [c for c in characters if c.slug != "octamaid"]
+    # 挙手対象から除外: octamaid (補助員) + ruka (配信者本人)。詳細は
+    # ``_HANDRAISE_EXCLUDED_SLUGS`` の docstring を参照。
+    candidate_chars = [
+        c for c in characters if c.slug not in _HANDRAISE_EXCLUDED_SLUGS
+    ]
     candidate_slugs = [c.slug for c in candidate_chars]
 
     if not candidate_slugs:
