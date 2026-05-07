@@ -18,6 +18,7 @@ graph.py — LangGraph state graph（Agent 対応）
   Anthropic:  uv sync --extra llm-anthropic
 """
 
+import functools
 import logging
 import operator
 import os
@@ -166,6 +167,80 @@ def _load_mcp_tools():
         return []
 
 
+@functools.lru_cache(maxsize=None)
+def _get_character_response_schema(character_slug: str):
+    """キャラ別の応答 Pydantic スキーマを動的生成して返す (Phase 0.5-A フェーズ 8)。
+
+    create_agent の ``response_format`` に渡すことで、LLM が以下の strict JSON 形式
+    で応答することを強制する::
+
+        {"response": "...", "emotion": {<キャラ別キー>: 0-100, ...},
+         "speed": 50-200, "pose": "..."}
+
+    Markdown コードブロック (```json ... ```) や絵文字、装飾文字 (`**`、`：` 等)
+    の混入を構造的に防ぐ。VOICEPEAK CLI の引数破壊バグ (実走 2026-05-08 で観測)
+    の根本対策。
+
+    voicepeak_emotion_keys が空のキャラ (octamaid 等) は emotion フィールド無し
+    のスキーマを返す。
+
+    @lru_cache でキャッシュしているのは、生成された Pydantic クラスを LangChain
+    側が schema として参照する際に「同一スキーマ ≒ 同一クラス」の同一性を維持
+    するため (毎回新規クラスを生成すると参照同一性が崩れる可能性)。
+
+    Args:
+        character_slug: キャラクター slug (mimi / chisame / sakura / octamaid / ruka 等)
+
+    Returns:
+        Pydantic BaseModel サブクラス (動的生成)
+    """
+    from pydantic import Field, create_model
+    from .characters import get_character
+
+    # 未登録 slug は KeyError を投げる仕様なので try/except で吸収して generic に
+    try:
+        char = get_character(character_slug)
+    except KeyError:
+        char = None
+    if char is None:
+        # 未登録 slug は generic スキーマ (emotion 無し、最小フィールドのみ)
+        return create_model(
+            "GenericResponse",
+            response=(str, Field(..., description="応答テキスト")),
+            speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+            pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+        )
+
+    emotion_keys = char.voicepeak_emotion_keys
+
+    if not emotion_keys:
+        # emotion 不要キャラ (octamaid / ruka 等、voicevox 等の non-emotion TTS)
+        return create_model(
+            f"{character_slug.capitalize()}Response",
+            response=(str, Field(..., description="ユーザーへの応答テキスト")),
+            speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+            pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+        )
+
+    # キャラ別の emotion フィールドを動的構築
+    emotion_fields = {
+        k: (int, Field(default=0, ge=0, le=100, description=f"{k} 強度 (0-100)"))
+        for k in emotion_keys
+    }
+    emotion_schema = create_model(
+        f"{character_slug.capitalize()}Emotion",
+        **emotion_fields,
+    )
+
+    return create_model(
+        f"{character_slug.capitalize()}Response",
+        response=(str, Field(..., description="ユーザーへの応答テキスト")),
+        emotion=(emotion_schema, Field(..., description="感情パラメータ")),
+        speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+        pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+    )
+
+
 def _build_agent_graph(
     provider: str,
     model: str,
@@ -180,12 +255,20 @@ def _build_agent_graph(
 
     Sprint Axis D Block 4: Skills 定義ファイルから行動判断基準を読み込み、
     system_prompt と結合して Agent に注入する。
+
+    Phase 0.5-A フェーズ 8: 旧 ``langgraph.prebuilt.create_react_agent`` (deprecated)
+    から ``langchain.agents.create_agent`` (新 API、LangChain v1) に移行。
+    Anthropic Claude 4.x の "assistant message prefill" 制約と衝突して
+    response_format=Pydantic 利用時に 400 エラーが出ていた問題を解消する。
+    新 API は tool-based structured output (ProviderStrategy) を使うため、
+    Markdown コードブロック / 絵文字 / 装飾文字なしの strict JSON が返る
+    (実測でレイテンシも -15% 短縮)。
     """
     try:
-        from langgraph.prebuilt import create_react_agent
+        from langchain.agents import create_agent
     except ImportError as exc:
         raise ImportError(
-            "langgraph が必要です。"
+            "langchain (v1+) が必要です。"
             " uv sync --extra llm でインストールしてください。"
         ) from exc
 
@@ -212,15 +295,31 @@ def _build_agent_graph(
         if provider in ("openai", "anthropic")
         else llm
     )
-    agent = create_react_agent(
-        bound_llm,
-        tools,
-        prompt=combined_prompt,
+
+    # Phase 0.5-A フェーズ 8: キャラ別 Pydantic スキーマで構造化出力を強制。
+    # スキーマは voicepeak_emotion_keys から動的生成 (mimi/chisame/sakura で
+    # emotion キーが異なる)。response_format=Pydantic で LLM が必ず JSON
+    # オブジェクトを返すようになり、Markdown コードブロックや絵文字の混入
+    # による VOICEPEAK CLI 引数破壊を構造的に防ぐ。
+    response_schema = (
+        _get_character_response_schema(character_slug) if character_slug else None
     )
+
+    kwargs: dict = {
+        "model": bound_llm,
+        "tools": tools,
+        "system_prompt": combined_prompt,
+    }
+    if response_schema is not None:
+        kwargs["response_format"] = response_schema
+
+    agent = create_agent(**kwargs)
     logger.info(
-        "ReAct Agent 構築完了: tools=%d model=%s skills=%s parallel_tool_calls=%s",
+        "Agent 構築完了 (新 API): tools=%d model=%s skills=%s "
+        "parallel_tool_calls=%s structured_output=%s",
         len(tools), model, bool(skills_text),
         False if provider in ("openai", "anthropic") else "(provider非対応)",
+        response_schema.__name__ if response_schema else "(無効)",
     )
     return agent
 
@@ -406,32 +505,81 @@ def _run_agent(
         result = agent.invoke(input_data, config or None)
         latency_ms = int((time.monotonic() - t0) * 1000)
 
-        # Agent の最終メッセージから応答テキストを抽出
-        final_messages = result.get("messages", [])
         response_text = ""
         usage = {}
+        source = "messages"
 
-        if final_messages:
-            # 最後の AI メッセージを探す（ToolMessage をスキップ）
-            for msg in reversed(final_messages):
-                role = getattr(msg, "type", None) or getattr(msg, "role", "")
-                if role in ("ai", "assistant"):
-                    content = getattr(msg, "content", "")
-                    # Gemini はリスト形式で返すことがある
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        response_text = "".join(text_parts)
-                    else:
-                        response_text = str(content)
+        # Phase 0.5-A フェーズ 8: 新 API (langchain.agents.create_agent) で
+        # response_format=Pydantic を有効化した場合、最終応答が
+        # state["structured_response"] に Pydantic インスタンスとして格納される。
+        # これを優先的に取得し、JSON 文字列化して LLMResult.text に格納する。
+        # 後段の _tts_node / _parse_voicepeak_json は llm_text を JSON として読むため、
+        # 既存パイプラインは無変更で互換性を維持できる。
+        structured = result.get("structured_response")
+        if structured is not None:
+            try:
+                # Pydantic v2: model_dump_json で ASCII 非エスケープ JSON
+                if hasattr(structured, "model_dump_json"):
+                    response_text = structured.model_dump_json()
+                elif hasattr(structured, "model_dump"):
+                    import json as _json
+                    response_text = _json.dumps(
+                        structured.model_dump(), ensure_ascii=False,
+                    )
+                elif isinstance(structured, dict):
+                    import json as _json
+                    response_text = _json.dumps(structured, ensure_ascii=False)
+                else:
+                    # dump できない (Pydantic でも dict でもない) → messages フォールバック
+                    raise TypeError(
+                        "structured_response が dump 不可能 (型 ="
+                        f" {type(structured).__name__})"
+                    )
+                source = "structured_response"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "structured_response の JSON 変換失敗 → messages フォールバック: %s",
+                    exc,
+                )
+                structured = None  # フォールバックに進む
+
+        # フォールバック: messages の最後の AI メッセージから応答テキストを抽出
+        # (response_format 未指定 / 構造化出力 fail-open / 旧 API 互換のため)
+        if structured is None:
+            final_messages = result.get("messages", [])
+            if final_messages:
+                # 最後の AI メッセージを探す（ToolMessage をスキップ）
+                for msg in reversed(final_messages):
+                    role = getattr(msg, "type", None) or getattr(msg, "role", "")
+                    if role in ("ai", "assistant"):
+                        content = getattr(msg, "content", "")
+                        # Gemini はリスト形式で返すことがある
+                        if isinstance(content, list):
+                            text_parts = []
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    text_parts.append(part.get("text", ""))
+                                elif isinstance(part, str):
+                                    text_parts.append(part)
+                            response_text = "".join(text_parts)
+                        else:
+                            response_text = str(content)
+                        usage = getattr(msg, "usage_metadata", None) or {}
+                        break
+
+        # usage tokens は messages 内の最後の AIMessage から取得 (structured_response
+        # 取得時でも同じ messages 配列に含まれている)
+        if not usage:
+            for msg in reversed(result.get("messages", [])):
+                if getattr(msg, "type", None) in ("ai", "assistant") or \
+                        getattr(msg, "role", "") in ("ai", "assistant"):
                     usage = getattr(msg, "usage_metadata", None) or {}
                     break
 
-        logger.info("Agent 実行完了: latency_ms=%d text=%s", latency_ms, response_text)
+        logger.info(
+            "Agent 実行完了: latency_ms=%d source=%s text=%s",
+            latency_ms, source, response_text,
+        )
         return LLMResult(
             text=response_text,
             model=model,
