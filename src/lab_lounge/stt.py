@@ -53,6 +53,127 @@ class STTResult:
     words: list | None = None
 
 
+# ─── Whisper hallucination 抑止 (Phase 0.5-A フェーズ 0) ────────────
+#
+# Whisper の典型的 hallucination パターン。訓練データに YouTube 動画の音声 +
+# 字幕が大量に含まれており、配信終了の定型句が日本語データに偏在している。
+# その結果、無音 / ノイズの入力に対して以下のような「らしい」フレーズを生成
+# してしまう問題が知られている。
+#
+# パターンマッチで除外することで、配信中の環境ノイズによる誤検知を抑止する。
+# faster-whisper のパラメータ (compression_ratio_threshold,
+# log_prob_threshold, condition_on_previous_text=False) と併用してさらに
+# 抑止精度を上げる。
+#
+# 環境変数:
+#   L2_STT_HALLUCINATION_FILTER (default: true)
+#       false にするとフィルタを無効化 (デバッグ用)。
+#   L2_STT_HALLUCINATION_EXTRA_PATTERNS
+#       カンマ区切りで追加パターンを指定可能 (運用ログで観測されたものを足す)。
+
+_HALLUCINATION_PATTERNS: tuple[str, ...] = (
+    # YouTube 字幕由来の配信終了定型句
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "ご視聴ありがとう",
+    "ご覧いただきありがとうございました",
+    "ご覧いただきありがとうございます",
+    "ご覧いただきありがとう",
+    "また次回お会いしましょう",
+    "また次回",
+    "おやすみなさい",
+    # 字幕クレジット
+    "字幕作成",
+    "字幕:",
+    "字幕:",
+    "by H.",
+    "Subtitled by",
+)
+
+
+def _get_hallucination_extra_patterns() -> tuple[str, ...]:
+    """環境変数から追加パターンを読み込む (運用観測の追加対応用)."""
+    raw = os.environ.get("L2_STT_HALLUCINATION_EXTRA_PATTERNS", "")
+    if not raw:
+        return ()
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def _is_hallucination_filter_enabled() -> bool:
+    """hallucination フィルタが有効かどうか。"""
+    return os.environ.get("L2_STT_HALLUCINATION_FILTER", "true").lower() in (
+        "true", "1", "yes",
+    )
+
+
+def _is_likely_hallucination(text: str, audio_duration_ms: int) -> bool:
+    """
+    Whisper の典型的 hallucination パターンを検出する。
+
+    判定ルール:
+      1. パターンマッチ: 完全一致 or 末尾一致 (定型句で終わる発話を除外)
+      2. 短時間 + 長文の不整合: 1 秒未満の録音で 10 文字以上の出力は不審
+      3. 完全反復検出: 同一フレーズが 2 回以上繰り返される
+         (例: "ご視聴ありがとうご視聴ありがとう...")
+
+    Args:
+        text:              Whisper の出力テキスト
+        audio_duration_ms: 録音の時間長 [ms] (短時間判定用)
+
+    Returns:
+        True なら hallucination とみなして空文字化推奨。
+    """
+    if not text:
+        return False
+
+    # 末尾の句読点 / 三点リーダ / 感嘆符を除去して正規化
+    normalized = text.strip().rstrip("。.！!？?…")
+    if not normalized:
+        return False
+
+    # ルール 1: パターンマッチ (完全一致 or 末尾一致)
+    all_patterns = _HALLUCINATION_PATTERNS + _get_hallucination_extra_patterns()
+    for pattern in all_patterns:
+        if normalized == pattern or normalized.endswith(pattern):
+            return True
+
+    # ルール 2: 短時間録音 (1 秒未満) で 10 文字以上の出力は不審
+    if 0 < audio_duration_ms < 1000 and len(normalized) >= 10:
+        return True
+
+    # ルール 3: 完全反復検出 (半分のフレーズが 2 回以上繰り返される)
+    if len(normalized) >= 12:
+        half = normalized[: len(normalized) // 2]
+        if half and normalized.count(half) >= 2:
+            return True
+
+    return False
+
+
+def _apply_hallucination_filter(result: STTResult) -> STTResult:
+    """
+    STT 結果に hallucination フィルタを適用する。
+
+    検出時は text を空文字化して返す (duration_ms / lang は維持)。
+    フィルタ無効化時はそのまま返す。
+    """
+    if not _is_hallucination_filter_enabled():
+        return result
+    if _is_likely_hallucination(result.text, result.duration_ms):
+        logger.warning(
+            "STT hallucination 検出 → 空文字に置換: text=%r duration_ms=%d",
+            result.text, result.duration_ms,
+        )
+        return STTResult(
+            text="",
+            confidence=result.confidence,
+            lang=result.lang,
+            duration_ms=result.duration_ms,
+            words=result.words,
+        )
+    return result
+
+
 # ─── OpenAI Whisper API adapter ──────────────────────────────────
 
 def _call_openai_whisper(
@@ -187,6 +308,20 @@ def _call_faster_whisper(
     """
     faster-whisper (ローカル) で音声ファイルを文字起こしする。
 
+    【hallucination 抑止パラメータ (Phase 0.5-A フェーズ 0 で追加)】
+      環境変数で上書き可能:
+        L2_STT_COMPRESSION_RATIO_THRESHOLD (default 2.4):
+            出力テキストの zlib 圧縮率がこの値を超えたら no-speech とみなす。
+            反復出力 (例: "ご視聴ありがとうご視聴ありがとう...") を弾く。
+        L2_STT_LOG_PROB_THRESHOLD (default -1.0):
+            平均対数確率がこの値を下回ったら no-speech とみなす。
+            低確信のテキストを弾く。
+        L2_STT_NO_SPEECH_THRESHOLD (default 0.6):
+            no_speech_prob がこの値を超えたら出力をスキップ。無音判定の閾値。
+        L2_STT_CONDITION_ON_PREVIOUS_TEXT (default false):
+            true にすると前のセグメントを context として使う (Whisper デフォルト)。
+            false で hallucination の連鎖を防ぐ (Phase 0.5-A 推奨)。
+
     Args:
         path:         音声ファイルのパス
         lang:         言語コード (例: "ja", "en")
@@ -203,11 +338,30 @@ def _call_faster_whisper(
     resolved_compute = compute_type or os.environ.get("L2_STT_COMPUTE_TYPE", default_compute)
     wmodel = _get_faster_whisper_model(model, resolved_device, resolved_compute)
 
+    # hallucination 抑止パラメータ (環境変数で上書き可)
+    compression_ratio_threshold = float(
+        os.environ.get("L2_STT_COMPRESSION_RATIO_THRESHOLD", "2.4")
+    )
+    log_prob_threshold = float(
+        os.environ.get("L2_STT_LOG_PROB_THRESHOLD", "-1.0")
+    )
+    no_speech_threshold = float(
+        os.environ.get("L2_STT_NO_SPEECH_THRESHOLD", "0.6")
+    )
+    condition_on_previous_text = os.environ.get(
+        "L2_STT_CONDITION_ON_PREVIOUS_TEXT", "false"
+    ).lower() in ("true", "1", "yes")
+
     segments, info = wmodel.transcribe(
         path,
         language=lang,
         initial_prompt=prompt or None,
         beam_size=beam_size,
+        # hallucination 抑止パラメータ群
+        compression_ratio_threshold=compression_ratio_threshold,
+        log_prob_threshold=log_prob_threshold,
+        no_speech_threshold=no_speech_threshold,
+        condition_on_previous_text=condition_on_previous_text,
     )
     text = "".join(seg.text for seg in segments)
     duration_ms = int(info.duration * 1000) if info.duration else _file_duration_ms(path)
@@ -275,6 +429,12 @@ def transcribe_audio_file(
     )
     logger.debug("STT 開始 path (full): %s", path)
     result: STTResult = fn(path, lang=lang, prompt=prompt, **kwargs)
+
+    # Phase 0.5-A フェーズ 0: hallucination フィルタ適用
+    # provider 共通で適用 (openai / faster-whisper どちらでも有効)。
+    # 検出時は text を空文字化して、buffer 蓄積 / check_intent への流入を抑止する。
+    result = _apply_hallucination_filter(result)
+
     logger.info(
         "STT 完了: text_len=%d duration_ms=%d lang=%s",
         len(result.text), result.duration_ms, result.lang,
