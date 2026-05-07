@@ -28,6 +28,7 @@ Phase 0.5 (挙手システム) への接続点:
   Phase 0.5 の設計記録は Notion 346e38612fe88190a79cd07c0d9c1484。
 """
 
+import json
 import logging
 import os
 import threading
@@ -37,6 +38,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .wake_word import WakeWordResult
 
@@ -76,6 +78,55 @@ def _get_handraise_config() -> dict[str, Any]:
             os.environ.get("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", "8")
         ),
     }
+
+
+# ─── Phase 0.5-A bubble メッセージ取得 (denied/lapsed/cancelled の text 解決) ──
+# pipeline.py に同名のヘルパーがあるが、dispatcher.py からの循環 import を回避する
+# ため独立実装。フェーズ 7 で run_loop / pipeline と共通化する余地がある。
+# テストでは ``monkeypatch.setattr("lab_lounge.dispatcher._load_bubble_messages",
+# fake)`` で差し替える。
+_BUBBLE_MESSAGES_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "data" / "bubble_messages.json"
+)
+
+
+def _load_bubble_messages() -> dict[str, Any]:
+    """data/bubble_messages.json を読み込んで {slug: {step: text}} の dict を返す。
+
+    ロード失敗時は空 dict を返す (フォールバックで default テキストが使われる)。
+    """
+    try:
+        return json.loads(_BUBBLE_MESSAGES_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "bubble_messages.json 読み込み失敗: %s (default にフォールバック)", exc,
+        )
+        return {}
+
+
+# default フォールバック (octamaid 等で denied/lapsed が定義されてない場合 / 読込失敗時)。
+# 実テキストは data/bubble_messages.json で各キャラ口調に合わせて定義されている。
+_DEFAULT_BUBBLE_TEXTS: dict[str, str] = {
+    "denied": "(また今度…)",
+    "lapsed": "(静まりました)",
+    "cancelled": "(撤回)",
+}
+
+
+def _get_bubble_text(
+    messages: dict[str, Any],
+    character_slug: str,
+    step: str,
+) -> str:
+    """messages から指定 step / キャラのテキストを取得する。
+
+    キャラ別エントリが無い、または step が無い場合は default フォールバック文字列。
+    """
+    char_entry = messages.get(character_slug, {})
+    text = char_entry.get(step)
+    if not text:
+        text = _DEFAULT_BUBBLE_TEXTS.get(step, "")
+    return text
 
 
 class DispatcherState(Enum):
@@ -474,53 +525,247 @@ class Dispatcher:
                 "Dispatcher: on_bubble_update callback failed: %s", exc,
             )
 
-    # ─── Phase 0.5 用 API (Block 0 では NotImplementedError) ──────
+    # ─── Phase 0.5-A 挙手 API (フェーズ 5b で実装解除) ────────────────
     #
-    # Phase 0.5 着手時にここを実装する。シグネチャを予約しておくことで、
-    # Phase 0.5 のテストや呼出し側を Block 0 段階から書き始められる
-    # (NotImplementedError raises を期待値として確認する形)。
+    # 挙手フロー:
+    #   1. on_segment_added(): BG Listener が segment 追加時に呼ぶ (フェーズ 6 で接続)
+    #      - handraising キャラがあれば check_approval を試す
+    #      - 該当なし or なければ check_intent (interjection_candidate モード)
+    #      - 結果に応じて on_interjection_candidate / on_approval_*
+    #   2. on_interjection_candidate(): _start_handraise() を呼んで挙手状態を作る
+    #   3. on_approval_granted(): 承認音声 → 状態解除 + cooldown リセット
+    #   4. on_approval_denied():  却下音声 → 状態解除 + cooldown 加算 + bubble denied
+    #   5. on_lapse_timeout():    時間/utterance lapse → 状態解除 + bubble lapsed
+    #
+    # フェーズ 5 では bg_thread = None / bg_completed.set() 即時呼び (no-op)。
+    # フェーズ 7 で BG LLM 本体 + handraise wav 再生を組み込む。
     #
     # 関連 Notion: 346e38612fe88190a79cd07c0d9c1484
     # ──────────────────────────────────────────────────────────
+
+    def on_segment_added(
+        self,
+        segment: Any,            # TranscriptSegment (循環 import 回避で Any)
+        buffer_full_text: str,
+    ) -> None:
+        """BG Listener から segment 追加時に呼ばれる callback (Phase 0.5-A)。
+
+        フェーズ 6 で BackgroundContinuousListener.start(on_segment_added=...)
+        に接続される。状態に応じて check_intent / check_approval を呼び分け、
+        結果に応じた API を呼び出す。
+
+        判定の優先順位:
+          1. ``self._use_handraise=False`` → 機能 off で即 return
+          2. handraising キャラあり → ``check_approval`` を試す
+             - granted/denied なら on_approval_granted/denied を呼ぶ
+             - None (関係ない発話) → utterance_count_since 加算 (lapse 判定)
+          3. 上記で確定しなければ ``check_intent(text, character_slug=None)`` で
+             interjection_candidate 判定を試す
+             - interjection_candidate なら on_interjection_candidate を呼ぶ
+
+        Args:
+            segment:           TranscriptSegment (現状未使用、フェーズ 7 で
+                              segment.text などを使う可能性あり)
+            buffer_full_text:  TranscriptBuffer.full_text() (LLM 判定対象テキスト)
+        """
+        if not self._use_handraise:
+            return  # 機能 off
+
+        # 関数内 import で循環回避 (router.py 側で dispatcher を import する将来拡張に備える)
+        from . import router as _router
+
+        # handraising キャラがあれば check_approval を先に試す
+        with self._lock:
+            candidate_slugs = list(self._handraise_states.keys())
+
+        if candidate_slugs:
+            approval = _router.check_approval(buffer_full_text, candidate_slugs)
+            if approval is not None:
+                if approval.granted:
+                    self.on_approval_granted(approval.target_slug)
+                else:
+                    self.on_approval_denied(approval.target_slug)
+                return  # 承認/却下確定 → 通常意図ゲート不要
+
+            # check_approval が None (関係ない発話) → utterance_count_since 加算
+            # 同時に複数の slug が utterance lapse 条件超過する可能性があるため、
+            # Lock 内で集めてから Lock 外で順次 on_lapse_timeout を呼ぶ
+            slugs_to_lapse: list[str] = []
+            with self._lock:
+                for slug, state in self._handraise_states.items():
+                    state.utterance_count_since += 1
+                    if state.utterance_count_since >= self._lapse_utterance_count:
+                        slugs_to_lapse.append(slug)
+            for slug in slugs_to_lapse:
+                self.on_lapse_timeout(slug)
+
+        # interjection_candidate 判定 (handraising キャラ無し or 該当発話なし)
+        intent = _router.check_intent(buffer_full_text, character_slug=None)
+        if intent.intent == "interjection_candidate" and intent.target_slug:
+            with self._lock:
+                if intent.target_slug in self._handraise_states:
+                    return  # 既に handraising 中 → 冪等
+            self.on_interjection_candidate(
+                intent.target_slug,
+                transcript_snapshot=buffer_full_text,
+            )
+
+    def _create_lapse_timer(
+        self,
+        target_slug: str,
+        delay_sec: float,
+    ) -> threading.Timer:
+        """lapse タイマーを生成する (Phase 0.5-A)。
+
+        threading.Timer のテスト非決定性を回避するため、生成を委譲メソッド化して
+        ``monkeypatch.setattr(dispatcher_instance, "_create_lapse_timer", fake)``
+        で FakeTimer に差し替えられるようにする。
+        """
+        return threading.Timer(delay_sec, self.on_lapse_timeout, args=[target_slug])
+
+    def _start_handraise(
+        self,
+        target_slug: str,
+        transcript_snapshot: Any,
+    ) -> None:
+        """挙手状態を作成 + lapse_timer 起動 + bubble/handraise イベント発行 (Phase 0.5-A)。
+
+        冪等性: target_slug が既に handraising 中なら no-op。
+        フェーズ 5 では bg_thread = None / bg_completed.set() 即時呼び (no-op)。
+        フェーズ 7 で BG LLM スレッド起動 + handraise wav 再生を組み込む。
+
+        bubble.update(handraise) は ttl_ms=None で発行 (承認/却下/lapse まで保持)。
+        """
+        # 関数内 import で循環回避 + filler.py の副作用を起動時に避ける
+        from .filler import select_filler_phrase
+
+        with self._lock:
+            if target_slug in self._handraise_states:
+                return  # 冪等
+
+            # filler の handraise セクションから wav パス + テキストを取得
+            path, phrase, _ = select_filler_phrase(target_slug, category="handraise")
+            phrase_text = phrase.text if phrase else ""
+
+            state = HandraiseState(
+                target_slug=target_slug,
+                started_at=time.monotonic(),
+                transcript_snapshot=transcript_snapshot,
+                phrase=phrase_text,
+                phrase_path=path,
+                trace_id=str(uuid4()),
+                # 応答中 (RESPONDING) なら se_pending=True (フェーズ 7 で発火)
+                se_pending=(self._state == DispatcherState.RESPONDING),
+            )
+            # bg_thread はフェーズ 5 では None、bg_completed を即座に set (no-op)。
+            # フェーズ 7 で実体スレッド起動に差し替える。
+            state.bg_completed.set()
+            # lapse_timer 起動 (委譲メソッド経由でテスト容易性確保)
+            state.lapse_timer = self._create_lapse_timer(target_slug, self._lapse_sec)
+            state.lapse_timer.start()
+            self._handraise_states[target_slug] = state
+
+        logger.info(
+            "Dispatcher._start_handraise: slug=%s phrase=%r trace_id=%s se_pending=%s",
+            target_slug, phrase_text, state.trace_id, state.se_pending,
+        )
+        # Lock 外で publish (callback の長時間処理が dispatcher を止めないため)
+        self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None)
+        self._publish_handraise_update()
 
     def on_interjection_candidate(
         self,
         target_slug: str,
         transcript_snapshot: Any,  # TranscriptBuffer (循環 import 回避のため Any)
     ) -> None:
-        """
-        Phase 0.5: ``check_intent`` が ``interjection_candidate`` を返したときに呼ぶ。
+        """check_intent が interjection_candidate を返したときに呼ぶ (Phase 0.5-A)。
 
-        target_slug を HANDRAISING 状態に遷移させ、bubble.update(handraise) と
-        BG LLM タスクを起動する想定。Block 0 では未実装 (NotImplementedError)。
+        target_slug を挙手中状態にし、bubble.update(handraise) と
+        dispatcher.handraise.update を発行する。BG LLM 起動はフェーズ 7 で実装。
         """
-        raise NotImplementedError(
-            "Phase 0.5 で実装。Block 0 では HANDRAISING 状態に遷移しない。"
-        )
+        if not self._use_handraise:
+            return
+        self._start_handraise(target_slug, transcript_snapshot)
 
     def on_approval_granted(self, target_slug: str) -> None:
-        """
-        Phase 0.5: ルカの「〇〇、どうぞ」承認音声で呼ばれる。
+        """ルカの「〇〇、どうぞ」承認音声で呼ばれる (Phase 0.5-A)。
 
-        最新 transcript buffer (snapshot) で BG LLM を再生成し、RESPONDING へ
-        遷移する想定。Block 0 では未実装。
+        handraising 状態を解除し、cooldown の consecutive_denials をリセット。
+        実際の TTS / 再生 + bubble.update("answering") はフェーズ 7 で run_loop が
+        引き取る (BG LLM 結果 or 最新 buffer での再生成と TTS 開始タイミングを
+        同期させるため、dispatcher 側では bubble の next step を発行しない)。
         """
-        raise NotImplementedError("Phase 0.5 で実装")
+        if not self._use_handraise:
+            return
+        with self._lock:
+            state = self._handraise_states.get(target_slug)
+            if state is None:
+                return  # 冪等 (既に granted/denied/lapse 済)
+            state.cancel_event.set()  # BG LLM ベストエフォート cleanup (フェーズ 7 で実体)
+            if state.lapse_timer is not None:
+                state.lapse_timer.cancel()
+            # 承認なので連続却下カウントをリセット
+            if target_slug in self._cooldowns:
+                self._cooldowns[target_slug].consecutive_denials = 0
+            del self._handraise_states[target_slug]
+
+        logger.info("Dispatcher.on_approval_granted: slug=%s", target_slug)
+        # bubble.update("answering") はフェーズ 7 で run_loop が発行 (TTS 開始時刻と同期)
+        self._publish_handraise_update()
 
     def on_approval_denied(self, target_slug: str) -> None:
-        """
-        Phase 0.5: ルカの却下で呼ばれる。
+        """ルカの却下 (「いや、いいわ」) で呼ばれる (Phase 0.5-A)。
 
-        BG LLM タスクを cancel し、締めフレーズ bubble を表示して IDLE / cooldown
-        に遷移する想定。Block 0 では未実装。
+        cancel_event.set() で BG LLM 中断、cooldown の consecutive_denials を +1、
+        bubble.update(denied) を ttl_ms=2000 で発行。
+        threshold_multiplier の適用は Phase 0.5-B 以降 (現状は 1.0 固定)。
         """
-        raise NotImplementedError("Phase 0.5 で実装")
+        if not self._use_handraise:
+            return
+        with self._lock:
+            state = self._handraise_states.get(target_slug)
+            if state is None:
+                return  # 冪等
+            state.cancel_event.set()
+            if state.lapse_timer is not None:
+                state.lapse_timer.cancel()
+            # cooldown 加算 (Phase 0.5-A は consecutive_denials のみ、threshold_multiplier=1.0 固定)
+            cd = self._cooldowns.setdefault(target_slug, CooldownState())
+            cd.consecutive_denials += 1
+            denials_after = cd.consecutive_denials
+            del self._handraise_states[target_slug]
+
+        logger.info(
+            "Dispatcher.on_approval_denied: slug=%s consecutive_denials=%d",
+            target_slug, denials_after,
+        )
+        # bubble.update("denied") の text を bubble_messages から取得 (フォールバックあり)
+        messages = _load_bubble_messages()
+        text = _get_bubble_text(messages, target_slug, "denied")
+        self._publish_bubble_update(target_slug, "denied", text, ttl_ms=2000)
+        self._publish_handraise_update()
 
     def on_lapse_timeout(self, target_slug: str) -> None:
-        """
-        Phase 0.5: 30 秒 or 3 utterance 経過で自動 lapse。
+        """lapse_timer 発火 or utterance_count_since 閾値超えで呼ばれる (Phase 0.5-A)。
 
-        BG LLM タスクを cancel し、lapsed bubble (「(遠慮しました)」) を表示する
-        想定。Block 0 では未実装。
+        consecutive_denials は変動なし (lapse は「却下」とは異なる扱い)。
+        bubble.update(lapsed) を ttl_ms=2000 で発行。
+
+        環境変数 ``L2_HANDRAISE_LAPSE_SEC`` (default 300 = 5 分) と
+        ``L2_HANDRAISE_LAPSE_UTTERANCE_COUNT`` (default 8) で閾値を制御する。
         """
-        raise NotImplementedError("Phase 0.5 で実装")
+        if not self._use_handraise:
+            return
+        with self._lock:
+            state = self._handraise_states.get(target_slug)
+            if state is None:
+                return  # 冪等 (既に granted/denied/lapse 済)
+            state.cancel_event.set()
+            # lapse_timer 自身からの呼び出しなのでキャンセル不要 (発火後は cancel しても no-op)
+            del self._handraise_states[target_slug]
+
+        logger.info("Dispatcher.on_lapse_timeout: slug=%s", target_slug)
+        messages = _load_bubble_messages()
+        text = _get_bubble_text(messages, target_slug, "lapsed")
+        self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000)
+        self._publish_handraise_update()

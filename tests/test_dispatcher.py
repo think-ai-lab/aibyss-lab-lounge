@@ -1,18 +1,22 @@
 """
-test_dispatcher.py — Dispatcher のテスト (Block 0)
+test_dispatcher.py — Dispatcher のテスト (Block 0 + Phase 0.5-A)
 
 責務:
   - 状態遷移 (IDLE / RESPONDING / HANDRAISING) の検証
   - wake_event_queue の add / dequeue / drain ルール検証
   - 60 秒期限切れ + 上限 3 件のドレイン戦略検証
-  - publish callback の発火タイミング検証
-  - Phase 0.5 用 API が NotImplementedError を raise すること
+  - publish callback の発火タイミング検証 (queue / handraise / bubble)
+  - Phase 0.5-A 挙手フロー API (on_segment_added / on_interjection_candidate /
+    on_approval_granted / on_approval_denied / on_lapse_timeout) の検証
 
-外部依存 (sounddevice / STT 等) はなく、純粋な状態機械のテスト。
+外部依存 (sounddevice / STT / LLM) はなく、純粋な状態機械のテスト。
+threading.Timer は _FakeTimer に差し替え、決定論的に発火させる。
 """
 
 import threading
 import time
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -25,6 +29,7 @@ from lab_lounge.dispatcher import (
     HandraiseState,
     QueuedWakeEvent,
 )
+from lab_lounge.router import ApprovalResult, IntentResult
 from lab_lounge.wake_word import WakeWordResult
 
 
@@ -87,6 +92,10 @@ class TestDispatcherInit:
         monkeypatch.delenv("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", raising=False)
         d = Dispatcher()
         assert d._lapse_utterance_count == 8
+
+    def test_handraising_state_value_exists(self):
+        """HANDRAISING 状態値が enum に存在する (Phase 0.5-A 用に予約済)。"""
+        assert DispatcherState.HANDRAISING.value == "handraising"
 
 
 # ─── TestDispatcherStateTransition ────────────────────────────────
@@ -468,36 +477,650 @@ class TestDispatcherEnvVarOverride:
         assert d._lapse_utterance_count == 3
 
 
-# ─── TestDispatcherPhase05APIReserved ─────────────────────────────
+# ─── Phase 0.5-A 用テストヘルパー ──────────────────────────────────
 
 
-class TestDispatcherPhase05APIReserved:
-    """Phase 0.5 用 API が NotImplementedError を raise することを確認する。
+class _FakeTimer:
+    """threading.Timer の差し替え用 (Phase 0.5-A)。
 
-    Block 0 ではこれらのメソッドは「予約のみ」で、Phase 0.5 着手時に中身を実装する。
-    シグネチャを変えずに raise を解除するだけで完成する状態を維持する。
+    実時間で待たずに ``.fire()`` で手動発火することで、テストを決定論的にする。
+    ``.start()`` / ``.cancel()`` は no-op (フラグのみ)。
     """
 
-    def test_on_interjection_candidate_raises(self):
-        d = Dispatcher()
-        with pytest.raises(NotImplementedError):
-            d.on_interjection_candidate("mimi", transcript_snapshot=None)
+    def __init__(self, interval, function, args=None, kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args or []
+        self.kwargs = kwargs or {}
+        self.started = False
+        self.cancelled = False
 
-    def test_on_approval_granted_raises(self):
-        d = Dispatcher()
-        with pytest.raises(NotImplementedError):
-            d.on_approval_granted("mimi")
+    def start(self) -> None:
+        self.started = True
 
-    def test_on_approval_denied_raises(self):
-        d = Dispatcher()
-        with pytest.raises(NotImplementedError):
-            d.on_approval_denied("mimi")
+    def cancel(self) -> None:
+        self.cancelled = True
 
-    def test_on_lapse_timeout_raises(self):
-        d = Dispatcher()
-        with pytest.raises(NotImplementedError):
-            d.on_lapse_timeout("mimi")
+    def fire(self) -> None:
+        """テストから手動発火 (Timer タイムアウトと同等)。"""
+        self.function(*self.args, **self.kwargs)
 
-    def test_handraising_state_value_exists(self):
-        """HANDRAISING 状態値が enum に存在する (Block 0 では遷移しない)。"""
-        assert DispatcherState.HANDRAISING.value == "handraising"
+
+def _patch_filler(monkeypatch, *, slug="mimi", text="挙手します") -> None:
+    """``filler.select_filler_phrase`` を固定値返却に差し替える。
+
+    dispatcher._start_handraise の関数内 import 経由でも本物が差し替わるよう、
+    ``lab_lounge.filler.select_filler_phrase`` 自体を mock する。
+    """
+    fake_path = Path(f"/tmp/{slug}_handraise.wav")
+    fake_phrase = MagicMock()
+    fake_phrase.text = text
+    monkeypatch.setattr(
+        "lab_lounge.filler.select_filler_phrase",
+        lambda slug, category="opener", **kw: (fake_path, fake_phrase, 0),
+    )
+
+
+def _patch_lapse_timer(monkeypatch, dispatcher: Dispatcher) -> list[_FakeTimer]:
+    """Dispatcher._create_lapse_timer を _FakeTimer 返却に差し替える。
+
+    返り値の list には生成された _FakeTimer が順に追加される。
+    テストは ``timers[0].fire()`` で lapse を発火できる。
+    """
+    timers: list[_FakeTimer] = []
+
+    def fake_create(target_slug: str, delay_sec: float) -> _FakeTimer:
+        t = _FakeTimer(
+            delay_sec,
+            dispatcher.on_lapse_timeout,
+            args=[target_slug],
+        )
+        timers.append(t)
+        return t
+
+    monkeypatch.setattr(dispatcher, "_create_lapse_timer", fake_create)
+    return timers
+
+
+# ─── TestDispatcherInterjectionFlow (Phase 0.5-A) ─────────────────
+
+
+class TestDispatcherInterjectionFlow:
+    """on_interjection_candidate → _start_handraise の挙動 (Phase 0.5-A)。"""
+
+    def test_creates_handraise_state(self, monkeypatch):
+        """on_interjection_candidate で _handraise_states に slug が登録される。"""
+        _patch_filler(monkeypatch, slug="mimi", text="ねぇ")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="test text")
+        assert "mimi" in d._handraise_states
+        assert d._handraise_states["mimi"].target_slug == "mimi"
+        assert d._handraise_states["mimi"].phrase == "ねぇ"
+        assert d._handraise_states["mimi"].transcript_snapshot == "test text"
+
+    def test_idempotent_when_slug_already_handraising(self, monkeypatch):
+        """既に handraising 中の slug は冪等 (二重登録しない)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t1")
+        first_state = d._handraise_states["mimi"]
+        d.on_interjection_candidate("mimi", transcript_snapshot="t2")  # 2 回目
+        # 同じインスタンスが残っている (transcript_snapshot は更新されない)
+        assert d._handraise_states["mimi"] is first_state
+
+    def test_no_op_when_use_handraise_false(self, monkeypatch):
+        """L2_USE_HANDRAISE=false 時は no-op。"""
+        monkeypatch.setenv("L2_USE_HANDRAISE", "false")
+        d = Dispatcher()
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states == {}
+
+    def test_lapse_timer_started(self, monkeypatch):
+        """lapse_timer が start() 済みになる。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert len(timers) == 1
+        assert timers[0].started is True
+        assert timers[0].interval == d._lapse_sec  # default 300
+
+    def test_se_pending_in_responding(self, monkeypatch):
+        """RESPONDING 中の挙手では se_pending=True (フェーズ 7 で SE 遅延発火)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.transition_to(DispatcherState.RESPONDING)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].se_pending is True
+
+    def test_se_pending_in_idle(self, monkeypatch):
+        """IDLE 中の挙手では se_pending=False (フェーズ 7 で SE 即時発火)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].se_pending is False
+
+    def test_trace_id_is_uuid(self, monkeypatch):
+        """trace_id が UUID4 形式で割当される。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        trace_id = d._handraise_states["mimi"].trace_id
+        assert trace_id != ""
+        assert len(trace_id) == 36  # UUID4 標準形式
+
+    def test_bg_completed_set_in_phase_5(self, monkeypatch):
+        """フェーズ 5 では bg_completed が即座に set されている (no-op placeholder)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].bg_completed.is_set()
+        assert d._handraise_states["mimi"].bg_thread is None  # フェーズ 7 で実体
+
+
+# ─── TestDispatcherApprovalFlow (Phase 0.5-A) ─────────────────────
+
+
+class TestDispatcherApprovalFlow:
+    """on_approval_granted / on_approval_denied の挙動 (Phase 0.5-A)。"""
+
+    def _setup_handraise(
+        self, monkeypatch, d: Dispatcher, *, slug: str = "mimi",
+    ) -> list[_FakeTimer]:
+        """ヘルパー: handraising 状態を作る。bubble_messages も mock。"""
+        _patch_filler(monkeypatch, slug=slug)
+        timers = _patch_lapse_timer(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {slug: {"denied": "また今度", "lapsed": "静かに"}},
+        )
+        d.on_interjection_candidate(slug, transcript_snapshot="t")
+        return timers
+
+    def test_granted_removes_state(self, monkeypatch):
+        d = Dispatcher()
+        self._setup_handraise(monkeypatch, d)
+        assert "mimi" in d._handraise_states
+        d.on_approval_granted("mimi")
+        assert d._handraise_states == {}
+
+    def test_granted_resets_consecutive_denials(self, monkeypatch):
+        """承認は consecutive_denials を 0 にリセット。"""
+        d = Dispatcher()
+        # 既に denial カウントあり
+        d._cooldowns["mimi"] = CooldownState(consecutive_denials=2)
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_granted("mimi")
+        assert d._cooldowns["mimi"].consecutive_denials == 0
+
+    def test_granted_cancels_lapse_timer(self, monkeypatch):
+        d = Dispatcher()
+        timers = self._setup_handraise(monkeypatch, d)
+        d.on_approval_granted("mimi")
+        assert timers[0].cancelled is True
+
+    def test_granted_sets_cancel_event(self, monkeypatch):
+        """承認時に cancel_event を set (BG LLM ベストエフォート cleanup)。"""
+        d = Dispatcher()
+        self._setup_handraise(monkeypatch, d)
+        # 状態取得 (削除前にリファレンスを保持)
+        state = d._handraise_states["mimi"]
+        d.on_approval_granted("mimi")
+        assert state.cancel_event.is_set()
+
+    def test_granted_idempotent_on_unknown_slug(self, monkeypatch):
+        d = Dispatcher()
+        d.on_approval_granted("nonexistent")  # 例外なく動く
+        assert d._handraise_states == {}
+
+    def test_denied_removes_state(self, monkeypatch):
+        d = Dispatcher()
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert d._handraise_states == {}
+
+    def test_denied_increments_consecutive_denials(self, monkeypatch):
+        d = Dispatcher()
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert "mimi" in d._cooldowns
+        assert d._cooldowns["mimi"].consecutive_denials == 1
+        # 2 回目の denial で +1 (再 handraise → denied のサイクル)
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert d._cooldowns["mimi"].consecutive_denials == 2
+
+    def test_denied_threshold_multiplier_remains_1(self, monkeypatch):
+        """Phase 0.5-A は threshold_multiplier=1.0 固定。Phase 0.5-B で変動。"""
+        d = Dispatcher()
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert d._cooldowns["mimi"].threshold_multiplier == 1.0
+
+    def test_denied_publishes_denied_bubble(self, monkeypatch):
+        bubble_calls = []
+        d = Dispatcher(
+            on_bubble_update=lambda *a: bubble_calls.append(a),
+        )
+        self._setup_handraise(monkeypatch, d)
+        bubble_calls.clear()  # handraise bubble を捨てて denied だけ確認
+        d.on_approval_denied("mimi")
+        assert len(bubble_calls) == 1
+        char, step, text, ttl_ms = bubble_calls[0]
+        assert char == "mimi"
+        assert step == "denied"
+        assert text == "また今度"  # mock した bubble_messages から
+        assert ttl_ms == 2000
+
+    def test_denied_cancels_lapse_timer(self, monkeypatch):
+        d = Dispatcher()
+        timers = self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert timers[0].cancelled is True
+
+    def test_denied_idempotent_on_unknown_slug(self, monkeypatch):
+        d = Dispatcher()
+        d.on_approval_denied("nonexistent")
+        assert d._cooldowns == {}  # 冪等: cooldown も加算されない
+
+    def test_no_op_when_use_handraise_false(self, monkeypatch):
+        """L2_USE_HANDRAISE=false 時は state を直接 set しても API は no-op。"""
+        monkeypatch.setenv("L2_USE_HANDRAISE", "false")
+        d = Dispatcher()
+        d._handraise_states["mimi"] = HandraiseState(
+            target_slug="mimi", started_at=0.0,
+        )
+        d.on_approval_denied("mimi")
+        assert "mimi" in d._handraise_states  # 機能 off なら何もしない
+
+
+# ─── TestDispatcherLapse (Phase 0.5-A) ────────────────────────────
+
+
+class TestDispatcherLapse:
+    """lapse_timer 発火 → on_lapse_timeout の挙動 (Phase 0.5-A)。"""
+
+    def test_lapse_removes_state(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"lapsed": "静かに"}},
+        )
+        d = Dispatcher()
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        timers[0].fire()  # FakeTimer を手動発火
+        assert d._handraise_states == {}
+
+    def test_lapse_does_not_increment_denials(self, monkeypatch):
+        """lapse は cooldown.consecutive_denials を変えない (denial と異なる扱い)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d = Dispatcher()
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        timers[0].fire()
+        assert d._cooldowns == {}
+
+    def test_lapse_publishes_lapsed_bubble(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"lapsed": "静かに"}},
+        )
+        bubble_calls = []
+        d = Dispatcher(on_bubble_update=lambda *a: bubble_calls.append(a))
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        bubble_calls.clear()
+        timers[0].fire()
+        assert len(bubble_calls) == 1
+        char, step, text, ttl_ms = bubble_calls[0]
+        assert char == "mimi"
+        assert step == "lapsed"
+        assert text == "静かに"
+        assert ttl_ms == 2000
+
+    def test_lapse_idempotent_on_unknown_slug(self, monkeypatch):
+        d = Dispatcher()
+        d.on_lapse_timeout("nonexistent")  # 例外なく動く
+
+    def test_lapse_uses_default_text_for_octamaid(self, monkeypatch):
+        """bubble_messages に該当キャラがない場合は default フォールバック。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        # 空の messages で default にフォールバック
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        bubble_calls = []
+        d = Dispatcher(on_bubble_update=lambda *a: bubble_calls.append(a))
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        bubble_calls.clear()
+        timers[0].fire()
+        # default フォールバック text が使われる
+        assert "(静まりました)" == bubble_calls[0][2]
+
+    def test_no_op_when_use_handraise_false(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_HANDRAISE", "false")
+        d = Dispatcher()
+        d._handraise_states["mimi"] = HandraiseState(
+            target_slug="mimi", started_at=0.0,
+        )
+        d.on_lapse_timeout("mimi")
+        assert "mimi" in d._handraise_states
+
+
+# ─── TestDispatcherSegmentDispatch (Phase 0.5-A) ──────────────────
+
+
+class TestDispatcherSegmentDispatch:
+    """on_segment_added の状態分岐 (Phase 0.5-A)。
+
+    handraising キャラの有無で check_approval / check_intent を呼び分ける。
+    """
+
+    def test_no_op_when_use_handraise_false(self, monkeypatch):
+        monkeypatch.setenv("L2_USE_HANDRAISE", "false")
+        d = Dispatcher()
+        check_intent_mock = MagicMock()
+        check_approval_mock = MagicMock()
+        monkeypatch.setattr("lab_lounge.router.check_intent", check_intent_mock)
+        monkeypatch.setattr("lab_lounge.router.check_approval", check_approval_mock)
+        d.on_segment_added(MagicMock(), "test text")
+        # 機能 off なら LLM 呼び出しすらしない
+        check_intent_mock.assert_not_called()
+        check_approval_mock.assert_not_called()
+
+    def test_idle_calls_check_intent_for_interjection(self, monkeypatch):
+        """handraising キャラ無し時、check_intent (interjection_candidate モード) を呼ぶ。"""
+        d = Dispatcher()
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        check_approval_mock = MagicMock()
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", check_approval_mock,
+        )
+        d.on_segment_added(MagicMock(), "test text")
+        # check_approval は handraising キャラ無しで呼ばない
+        check_approval_mock.assert_not_called()
+
+    def test_handraising_calls_check_approval_first(self, monkeypatch):
+        """handraising キャラあり時、check_approval を先に呼ぶ。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # check_approval が None を返す (関係ない発話)
+        check_approval_mock = MagicMock(return_value=None)
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", check_approval_mock,
+        )
+        check_intent_mock = MagicMock(
+            return_value=IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent", check_intent_mock,
+        )
+        d.on_segment_added(MagicMock(), "テスト")
+        # check_approval が先に呼ばれる
+        check_approval_mock.assert_called_once_with("テスト", ["mimi"])
+
+    def test_segment_triggers_interjection_when_candidate(self, monkeypatch):
+        """interjection_candidate → on_interjection_candidate が呼ばれる。"""
+        _patch_filler(monkeypatch, slug="mimi", text="挙手")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="interjection_candidate",
+                target_slug="mimi",
+                confidence=1.0,
+            ),
+        )
+        d.on_segment_added(MagicMock(), "AI 倫理について興味がある")
+        assert "mimi" in d._handraise_states
+
+    def test_approval_granted_via_segment(self, monkeypatch):
+        """check_approval が granted を返したら on_approval_granted が呼ばれる。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval",
+            lambda text, slugs: ApprovalResult(
+                granted=True, target_slug="mimi", confidence=1.0,
+            ),
+        )
+        d.on_segment_added(MagicMock(), "ミミ、どうぞ")
+        assert d._handraise_states == {}
+
+    def test_approval_denied_via_segment(self, monkeypatch):
+        """check_approval が denied を返したら on_approval_denied が呼ばれる。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval",
+            lambda text, slugs: ApprovalResult(
+                granted=False, target_slug="mimi", confidence=1.0,
+            ),
+        )
+        d.on_segment_added(MagicMock(), "いや、いいわ")
+        assert d._handraise_states == {}
+        assert d._cooldowns["mimi"].consecutive_denials == 1
+
+    def test_utterance_count_increments_on_unrelated(self, monkeypatch):
+        """check_approval が None で utterance_count_since が +1 (lapse 判定用)。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", lambda text, slugs: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        d.on_segment_added(MagicMock(), "今日はいい天気だね")
+        assert d._handraise_states["mimi"].utterance_count_since == 1
+        d.on_segment_added(MagicMock(), "明日も晴れるかな")
+        assert d._handraise_states["mimi"].utterance_count_since == 2
+
+    def test_utterance_count_threshold_triggers_lapse(self, monkeypatch):
+        """utterance_count_since が閾値超えると自動 lapse。"""
+        monkeypatch.setenv("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", "2")
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", lambda text, slugs: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        d.on_segment_added(MagicMock(), "発話 1")
+        d.on_segment_added(MagicMock(), "発話 2")  # 閾値到達 → 自動 lapse
+        assert d._handraise_states == {}
+
+
+# ─── TestDispatcherHandraisePublish (Phase 0.5-A) ─────────────────
+
+
+class TestDispatcherHandraisePublish:
+    """on_handraise_update / on_bubble_update callback の発火タイミング (Phase 0.5-A)。
+
+    既存 TestDispatcherPublishCallback パターンを踏襲。callback は Lock 外で呼ばれ、
+    例外を投げても dispatcher 本体は止まらない。
+    """
+
+    def test_handraise_callback_fires_on_start(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        calls = []
+        d = Dispatcher(
+            on_handraise_update=lambda states, cd: calls.append(
+                (dict(states), dict(cd)),
+            ),
+        )
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert len(calls) == 1
+        states, cooldowns = calls[0]
+        assert "mimi" in states
+        assert cooldowns == {}
+
+    def test_handraise_callback_fires_on_grant(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        calls = []
+        d = Dispatcher(
+            on_handraise_update=lambda states, cd: calls.append(
+                (dict(states), dict(cd)),
+            ),
+        )
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_approval_granted("mimi")
+        # start + grant で 2 回呼ばれる
+        assert len(calls) == 2
+        # grant 後は state 空
+        assert calls[1][0] == {}
+
+    def test_handraise_callback_fires_on_deny(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        calls = []
+        d = Dispatcher(
+            on_handraise_update=lambda states, cd: calls.append(
+                (dict(states), dict(cd)),
+            ),
+        )
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        d.on_approval_denied("mimi")
+        assert len(calls) == 2
+        # deny 後は state 空、cooldown に mimi
+        assert calls[1][0] == {}
+        assert "mimi" in calls[1][1]
+        assert calls[1][1]["mimi"].consecutive_denials == 1
+
+    def test_handraise_callback_fires_on_lapse(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        calls = []
+        d = Dispatcher(
+            on_handraise_update=lambda states, cd: calls.append(
+                (dict(states), dict(cd)),
+            ),
+        )
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        timers[0].fire()
+        assert len(calls) == 2
+        assert calls[1][0] == {}
+
+    def test_bubble_callback_fires_on_handraise_step(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi", text="挙手")
+        bubble_calls = []
+        d = Dispatcher(on_bubble_update=lambda *a: bubble_calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert len(bubble_calls) == 1
+        char, step, text, ttl_ms = bubble_calls[0]
+        assert char == "mimi"
+        assert step == "handraise"
+        assert text == "挙手"
+        assert ttl_ms is None  # handraise は ttl_ms=None で永続表示
+
+    def test_bubble_callback_fires_on_denied_step(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"denied": "また今度"}},
+        )
+        bubble_calls = []
+        d = Dispatcher(on_bubble_update=lambda *a: bubble_calls.append(a))
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        bubble_calls.clear()
+        d.on_approval_denied("mimi")
+        assert len(bubble_calls) == 1
+        assert bubble_calls[0] == ("mimi", "denied", "また今度", 2000)
+
+    def test_bubble_callback_fires_on_lapsed_step(self, monkeypatch):
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"lapsed": "静かに"}},
+        )
+        bubble_calls = []
+        d = Dispatcher(on_bubble_update=lambda *a: bubble_calls.append(a))
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        bubble_calls.clear()
+        timers[0].fire()
+        assert len(bubble_calls) == 1
+        assert bubble_calls[0] == ("mimi", "lapsed", "静かに", 2000)
+
+    def test_no_callback_when_not_set(self, monkeypatch):
+        """callback 未設定 (None) でも例外なく動く。"""
+        _patch_filler(monkeypatch, slug="mimi")
+        d = Dispatcher()  # callback いずれも None
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # 例外なく完了
+
+    def test_callback_exception_does_not_propagate(self, monkeypatch):
+        """callback で例外が出ても dispatcher は止まらない。"""
+        _patch_filler(monkeypatch, slug="mimi")
+
+        def raise_on_call(*args, **kwargs):
+            raise RuntimeError("test exception")
+
+        d = Dispatcher(
+            on_handraise_update=raise_on_call,
+            on_bubble_update=raise_on_call,
+        )
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # 例外は warning ログに留まり、state は登録される
+        assert "mimi" in d._handraise_states
