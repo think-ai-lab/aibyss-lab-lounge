@@ -1184,7 +1184,10 @@ class BackgroundContinuousListener:
         self._routing_paused = threading.Event()
 
         # コールバック (start で設定)
-        self._on_segment_added: Callable[[Any], None] | None = None
+        # Phase 0.5-A フェーズ 6: on_segment_added は (segment, buffer_full_text) の
+        # 2 引数で呼び出される。buffer_full_text を listener 内 Lock のもとで取得して
+        # 渡すことで、Dispatcher 側で再取得した場合の race による微差異を防ぐ。
+        self._on_segment_added: Callable[[Any, str], None] | None = None
         self._on_wake_detected: Callable[[WakeWordResult], None] | None = None
 
     @property
@@ -1196,7 +1199,7 @@ class BackgroundContinuousListener:
         self,
         *,
         on_wake_detected: Callable[[WakeWordResult], None],
-        on_segment_added: Callable[[Any], None] | None = None,
+        on_segment_added: Callable[[Any, str], None] | None = None,
     ) -> None:
         """
         バックグラウンド録音スレッドを起動する。
@@ -1205,8 +1208,11 @@ class BackgroundContinuousListener:
             on_wake_detected:  wake_event 検知時に呼ばれる callback
                                (Dispatcher.on_wake_detected を渡す想定)
             on_segment_added:  segment が転写完了 + バッファ追加されるたびに呼ばれる
-                               callback。Block 0 では None でも動く (Phase 0.5 で
-                               check_intent 4 値化判定に流す予定)
+                               callback。シグネチャは (segment, buffer_full_text)
+                               の 2 引数。Phase 0.5-A では Dispatcher.on_segment_added
+                               を渡し、check_intent 4 値化判定 (interjection_candidate)
+                               + check_approval (handraising 中) に流す。None の場合
+                               は no-op (Block 0 互換)。
         """
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("BackgroundContinuousListener は既に起動中")
@@ -1318,10 +1324,17 @@ class BackgroundContinuousListener:
                         self._buffer.total_chars,
                     )
 
-                    # on_segment_added: Phase 0.5 で check_intent に流す用 (Block 0 は no-op)
+                    # Phase 0.5-A フェーズ 6: on_segment_added は (segment, buffer_full_text)
+                    # の 2 引数で呼ぶ。buffer.full_text() を listener 内 Lock のもとで
+                    # 取得することで、後で Dispatcher が別タイミングで再取得した際の
+                    # 微差異を防ぐ。
+                    # 挙手判定 (interjection_candidate) は Dispatcher 側で行うため、
+                    # ここでは check_intent を呼ばない (役割分担)。一方 _evaluate_wake は
+                    # 既存の callout/mention/unknown 判定 (= wake 経路) として残しており、
+                    # 両者は独立した責務 (前者: 挙手、後者: wake) で重複呼出は発生しない。
                     if self._on_segment_added is not None:
                         try:
-                            self._on_segment_added(segment)
+                            self._on_segment_added(segment, self._buffer.full_text())
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("on_segment_added callback failed: %s", exc)
 

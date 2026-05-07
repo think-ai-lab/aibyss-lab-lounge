@@ -230,3 +230,96 @@ class TestInitListenerBgContinuous:
             assert listener._stt_provider == "faster-whisper"
         finally:
             listener.cleanup()
+
+
+class TestRunLoopBgContinuousWiring:
+    """Phase 0.5-A フェーズ 6: run_loop の bg-continuous モードでの
+
+    Dispatcher / Listener wiring 検証。
+
+    run_loop() を ``max_turns=0`` で起動して while ループに入らず即座 finally に
+    到達させる。Listener.start と Dispatcher の生成 kwargs を spy して、
+    フェーズ 6 で接続した callback が正しく渡されることを検証する。
+    sounddevice 等の重い依存はモック化する (実際のスレッド起動は省略)。
+    """
+
+    def _setup_spies(self, monkeypatch):
+        """spy オブジェクト + monkeypatch のセットアップを共通化。
+
+        Returns:
+            (listener_start_kwargs, dispatcher_kwargs)
+        """
+        listener_start_kwargs: dict = {}
+        dispatcher_kwargs: dict = {}
+
+        # listener.start を spy (実際のスレッド起動はスキップ)
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        def spy_start(self, **kwargs):
+            listener_start_kwargs.update(kwargs)
+            self._on_wake_detected = kwargs["on_wake_detected"]
+            self._on_segment_added = kwargs.get("on_segment_added")
+
+        monkeypatch.setattr(BackgroundContinuousListener, "start", spy_start)
+
+        # Dispatcher を spy (kwargs を保存して、wait_for_next_event は即 None)
+        from lab_lounge import dispatcher as dispatcher_mod
+
+        OriginalDispatcher = dispatcher_mod.Dispatcher
+
+        class SpyDispatcher(OriginalDispatcher):
+            def __init__(self, **kwargs):
+                dispatcher_kwargs.update(kwargs)
+                super().__init__(**kwargs)
+
+            def wait_for_next_event(self, timeout):
+                return None  # 即座 timeout (max_turns=0 でループに入らないので呼ばれない)
+
+        # run_loop は from .dispatcher import Dispatcher で関数内 import するため、
+        # dispatcher_mod の属性を差し替える
+        monkeypatch.setattr(dispatcher_mod, "Dispatcher", SpyDispatcher)
+
+        # publish を no-op に (bus が Redis に繋がない)
+        from lab_lounge import run_loop as run_loop_mod
+        monkeypatch.setattr(run_loop_mod, "publish", lambda ev: None)
+
+        return listener_start_kwargs, dispatcher_kwargs
+
+    def test_listener_start_receives_on_segment_added(self, monkeypatch):
+        """listener.start kwargs に on_segment_added が渡される。"""
+        from lab_lounge.run_loop import run_loop
+
+        listener_start_kwargs, _ = self._setup_spies(monkeypatch)
+
+        # max_turns=0 で while ループに入らず即座 finally
+        run_loop(
+            max_turns=0,
+            wake_backend="bg-continuous",
+            wake_timeout=0.1,
+        )
+
+        assert "on_segment_added" in listener_start_kwargs
+        assert listener_start_kwargs["on_segment_added"] is not None
+        assert callable(listener_start_kwargs["on_segment_added"])
+        # on_wake_detected も合わせて確認 (Block 0 既存)
+        assert "on_wake_detected" in listener_start_kwargs
+        assert callable(listener_start_kwargs["on_wake_detected"])
+
+    def test_dispatcher_receives_three_callbacks(self, monkeypatch):
+        """Dispatcher 生成時に on_queue_update / on_handraise_update / on_bubble_update が渡される。"""
+        from lab_lounge.run_loop import run_loop
+
+        _, dispatcher_kwargs = self._setup_spies(monkeypatch)
+
+        run_loop(
+            max_turns=0,
+            wake_backend="bg-continuous",
+            wake_timeout=0.1,
+        )
+
+        assert "on_queue_update" in dispatcher_kwargs
+        assert "on_handraise_update" in dispatcher_kwargs
+        assert "on_bubble_update" in dispatcher_kwargs
+        assert callable(dispatcher_kwargs["on_queue_update"])
+        assert callable(dispatcher_kwargs["on_handraise_update"])
+        assert callable(dispatcher_kwargs["on_bubble_update"])

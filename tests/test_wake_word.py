@@ -374,6 +374,67 @@ class TestBackgroundContinuousListenerLifecycle:
             assert len(listener.buffer) == 0
 
 
+class TestBackgroundContinuousListenerOnSegmentAdded:
+    """Phase 0.5-A フェーズ 6: on_segment_added callback の引数仕様。
+
+    callback は ``(segment, buffer_full_text)`` の 2 引数で呼び出される。
+    Dispatcher.on_segment_added と整合させ、buffer.full_text() を listener 内
+    Lock のもとで取得することで race による微差異を防ぐ。
+    """
+
+    def test_callback_signature_is_two_args(self):
+        """Listener._on_segment_added 属性の型は Callable[[Any, str], None]。
+
+        sounddevice を起動せず、_run_loop 内の callback 発火行と同じ呼出パターンを
+        手動で再現して、シグネチャと値伝播を検証する。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        received: list[tuple] = []
+
+        def callback(segment, buffer_full_text):
+            received.append((segment, buffer_full_text))
+
+        listener._on_segment_added = callback
+
+        # buffer に segment を直接追加
+        seg = TranscriptSegment(text="テスト発話", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        # _run_loop 内の callback 発火行と同じ呼出
+        # (sounddevice 不要、buffer は遅延 import 済の純粋オブジェクト)
+        listener._on_segment_added(seg, listener._buffer.full_text())
+
+        assert len(received) == 1
+        received_seg, received_full_text = received[0]
+        assert received_seg is seg
+        assert isinstance(received_full_text, str)
+        assert received_full_text == listener._buffer.full_text()
+        assert "テスト発話" in received_full_text
+
+    def test_callback_default_is_none(self):
+        """start() で on_segment_added を渡さなければ default は None (Block 0 互換)。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert listener._on_segment_added is None
+
+    def test_start_stores_on_segment_added_callback(self):
+        """start(on_segment_added=...) で渡した callback がインスタンス属性に保存される。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            cb = lambda seg, full_text: None
+            listener.start(on_wake_detected=lambda r: None, on_segment_added=cb)
+            try:
+                assert listener._on_segment_added is cb
+            finally:
+                listener.stop(timeout=2.0)
+
+
 class TestBackgroundContinuousListenerRoutingPause:
     """set_routing_paused のフラグ動作テスト (スレッド起動なし)。"""
 
