@@ -602,6 +602,75 @@ class TestVoicepeakWorker:
         assert result.returncode == 1
         assert call_count[0] == 3  # 初回 + 2 回リトライ
 
+    def test_default_retry_wait_is_1_0(self, monkeypatch):
+        """Phase 0.5-A フェーズ 8: デフォルト retry_wait は 1.0 秒 (旧 2.0 から短縮)。"""
+        from lab_lounge.tts import _get_voicepeak_retry_wait_sec
+        monkeypatch.delenv("L2_VOICEPEAK_RETRY_WAIT_SEC", raising=False)
+        assert _get_voicepeak_retry_wait_sec() == 1.0
+
+    def test_default_max_retries_is_8(self, monkeypatch):
+        """Phase 0.5-A フェーズ 8: デフォルト max_retries は 8 (旧 2 から 4 倍)。"""
+        from lab_lounge.tts import _get_voicepeak_max_retries
+        monkeypatch.delenv("L2_VOICEPEAK_MAX_RETRIES", raising=False)
+        assert _get_voicepeak_max_retries() == 8
+
+    def test_busy_and_crash_use_same_wait(self, monkeypatch):
+        """Phase 0.5-A フェーズ 8: 倍率撤廃 — busy / crash 両者で wait が同値。
+
+        旧設計は crash 時 ``retry_wait * 2`` だったが、リトライ回数を 4 倍に
+        拡大したので回数で確率カバーする方針に変更。両ケースとも retry_wait の値
+        そのままで sleep する。
+        """
+        monkeypatch.setenv("L2_VOICEPEAK_RETRY_WAIT_SEC", "0.07")
+        monkeypatch.setenv("L2_VOICEPEAK_MAX_RETRIES", "1")
+
+        # ── crash 経路 (busy 検出されない非ゼロ exit) ──
+        crash_call_count = [0]
+
+        def crash_then_success(*a, **k):
+            crash_call_count[0] += 1
+            if crash_call_count[0] == 1:
+                # 1 回目: クラッシュ (busy パターン無し)
+                return subprocess.CompletedProcess(
+                    args=[], returncode=3221225477,  # 0xC0000005
+                    stdout=b"", stderr=b"",
+                )
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b"",
+            )
+
+        with patch("lab_lounge.tts.time.sleep") as mock_sleep_crash:
+            future_crash = self._run_worker_once(crash_then_success)
+
+        assert future_crash.result().returncode == 0
+        # crash 時の sleep wait は retry_wait のまま (倍率なし)
+        assert mock_sleep_crash.call_count == 1
+        assert mock_sleep_crash.call_args.args[0] == 0.07
+
+        # ── busy 経路 (並列実行エラー) ──
+        busy_call_count = [0]
+
+        def busy_then_success(*a, **k):
+            busy_call_count[0] += 1
+            if busy_call_count[0] == 1:
+                return subprocess.CompletedProcess(
+                    args=[], returncode=1,
+                    stdout=b"",
+                    stderr=b"In this version, up to 1 command line instance "
+                           b"can be executed at same time.",
+                )
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b"",
+            )
+
+        with patch("lab_lounge.tts.time.sleep") as mock_sleep_busy:
+            future_busy = self._run_worker_once(busy_then_success)
+
+        assert future_busy.result().returncode == 0
+        # busy 時も同じ wait (= retry_wait)
+        assert mock_sleep_busy.call_count == 1
+        assert mock_sleep_busy.call_args.args[0] == 0.07
+
 
 class TestIsVoicepeakBusyError:
     """_is_voicepeak_busy_error のパターンマッチ検証。"""
