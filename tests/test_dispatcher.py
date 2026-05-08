@@ -839,10 +839,12 @@ class TestDispatcherSegmentDispatch:
         check_approval_mock = MagicMock()
         monkeypatch.setattr("lab_lounge.router.check_intent", check_intent_mock)
         monkeypatch.setattr("lab_lounge.router.check_approval", check_approval_mock)
-        d.on_segment_added(MagicMock(), "test text")
+        result = d.on_segment_added(MagicMock(), "test text")
         # 機能 off なら LLM 呼び出しすらしない
         check_intent_mock.assert_not_called()
         check_approval_mock.assert_not_called()
+        # W'-2: 機能 off は wake 経路を通常通り走らせる (= False)
+        assert result is False
 
     def test_idle_calls_check_intent_for_interjection(self, monkeypatch):
         """handraising キャラ無し時、check_intent (interjection_candidate モード) を呼ぶ。"""
@@ -857,9 +859,11 @@ class TestDispatcherSegmentDispatch:
         monkeypatch.setattr(
             "lab_lounge.router.check_approval", check_approval_mock,
         )
-        d.on_segment_added(MagicMock(), "test text")
+        result = d.on_segment_added(MagicMock(), "test text")
         # check_approval は handraising キャラ無しで呼ばない
         check_approval_mock.assert_not_called()
+        # W'-2: unknown 帰着 (= 通常発話) は wake 経路を走らせる (= False)
+        assert result is False
 
     def test_handraising_calls_check_approval_first(self, monkeypatch):
         """handraising キャラあり時、check_approval を先に呼ぶ。"""
@@ -880,9 +884,12 @@ class TestDispatcherSegmentDispatch:
         monkeypatch.setattr(
             "lab_lounge.router.check_intent", check_intent_mock,
         )
-        d.on_segment_added(MagicMock(), "テスト")
+        result = d.on_segment_added(MagicMock(), "テスト")
         # check_approval が先に呼ばれる
         check_approval_mock.assert_called_once_with("テスト", ["mimi"])
+        # W'-2: approval=None + check_intent=unknown + lapse 未到達 (デフォルト 8)
+        # → +1 加算のみ、wake 経路は走らせる (= False)
+        assert result is False
 
     def test_segment_triggers_interjection_when_candidate(self, monkeypatch):
         """interjection_candidate → on_interjection_candidate が呼ばれる。"""
@@ -897,8 +904,10 @@ class TestDispatcherSegmentDispatch:
                 confidence=1.0,
             ),
         )
-        d.on_segment_added(MagicMock(), "AI 倫理について興味がある")
+        result = d.on_segment_added(MagicMock(), "AI 倫理について興味がある")
         assert "mimi" in d._handraise_states
+        # W'-2: 新規挙手確定 → wake skip (= True)
+        assert result is True
 
     def test_approval_granted_via_segment(self, monkeypatch):
         """check_approval が granted を返したら on_approval_granted が呼ばれる。"""
@@ -915,8 +924,11 @@ class TestDispatcherSegmentDispatch:
                 granted=True, target_slug="mimi", confidence=1.0,
             ),
         )
-        d.on_segment_added(MagicMock(), "ミミ、どうぞ")
+        result = d.on_segment_added(MagicMock(), "ミミ、どうぞ")
         assert d._handraise_states == {}
+        # W'-2: granted (= 承認発話「ミミ、どうぞ」) → wake skip (= True)。
+        # 旧シナリオで観察された 3 重発火の (3) wake_event 経路を停止する核心点。
+        assert result is True
 
     def test_approval_denied_via_segment(self, monkeypatch):
         """check_approval が denied を返したら on_approval_denied が呼ばれる。"""
@@ -933,9 +945,11 @@ class TestDispatcherSegmentDispatch:
                 granted=False, target_slug="mimi", confidence=1.0,
             ),
         )
-        d.on_segment_added(MagicMock(), "いや、いいわ")
+        result = d.on_segment_added(MagicMock(), "いや、いいわ")
         assert d._handraise_states == {}
         assert d._cooldowns["mimi"].consecutive_denials == 1
+        # W'-2: denied → wake skip (= True)
+        assert result is True
 
     def test_utterance_count_increments_on_unrelated(self, monkeypatch):
         """check_approval が None で utterance_count_since が +1 (lapse 判定用)。"""
@@ -952,10 +966,14 @@ class TestDispatcherSegmentDispatch:
                 intent="unknown", target_slug=None, confidence=0.0,
             ),
         )
-        d.on_segment_added(MagicMock(), "今日はいい天気だね")
+        result1 = d.on_segment_added(MagicMock(), "今日はいい天気だね")
         assert d._handraise_states["mimi"].utterance_count_since == 1
-        d.on_segment_added(MagicMock(), "明日も晴れるかな")
+        # W'-2: +1 加算のみ (閾値 8 未到達) → wake 通す (= False)。
+        # 「自然な雑談中の名前呼びで別ターンを発火させたい」設計意図。
+        assert result1 is False
+        result2 = d.on_segment_added(MagicMock(), "明日も晴れるかな")
         assert d._handraise_states["mimi"].utterance_count_since == 2
+        assert result2 is False
 
     def test_utterance_count_threshold_triggers_lapse(self, monkeypatch):
         """utterance_count_since が閾値超えると自動 lapse。"""
@@ -976,9 +994,147 @@ class TestDispatcherSegmentDispatch:
                 intent="unknown", target_slug=None, confidence=0.0,
             ),
         )
-        d.on_segment_added(MagicMock(), "発話 1")
-        d.on_segment_added(MagicMock(), "発話 2")  # 閾値到達 → 自動 lapse
+        result1 = d.on_segment_added(MagicMock(), "発話 1")
+        # 1 回目: utterance_count=1 (閾値 2 未到達) → False
+        assert result1 is False
+        result2 = d.on_segment_added(MagicMock(), "発話 2")  # 閾値到達 → 自動 lapse
         assert d._handraise_states == {}
+        # W'-2: 閾値到達で自動 lapse 発火 → 状態遷移あり → wake skip (= True)
+        assert result2 is True
+
+
+# ─── TestDispatcherOnSegmentReturnValue (Phase 0.5-A 案 W'-2) ────
+
+
+class TestDispatcherOnSegmentReturnValue:
+    """on_segment_added の戻り値 bool 仕様 (Phase 0.5-A 案 W'-2)。
+
+    実装側の各 return 経路を網羅し、戻り値設計の意図を保証する。
+    既存テスト群 (TestDispatcherSegmentDispatch) でも assertion を追加済だが、
+    本クラスでは「戻り値の境界条件」をピンポイントで検証する。
+    """
+
+    def test_returns_false_when_handraising_existing_candidate_idempotent(
+        self, monkeypatch,
+    ):
+        """既に handraising 中の slug への candidate は冪等 no-op で False を返す。
+
+        WHY: 同一 slug の重複 candidate は state 変化なし → wake 判定を阻害しない。
+        """
+        _patch_filler(monkeypatch, slug="mimi", text="挙手")
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        # 先に 1 回 handraise を立ち上げる
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert "mimi" in d._handraise_states
+        # check_approval=None、check_intent は同じ slug の interjection_candidate を返す
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", lambda text, slugs: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="interjection_candidate",
+                target_slug="mimi",
+                confidence=1.0,
+            ),
+        )
+        result = d.on_segment_added(MagicMock(), "AI 倫理について再度…")
+        # 冪等 no-op → False (= state 変化なし、wake 経路は通常通り)
+        assert result is False
+        # state は 1 件のまま
+        assert list(d._handraise_states.keys()) == ["mimi"]
+
+    def test_returns_true_only_for_lapse_triggering_utterance(self, monkeypatch):
+        """lapse 発火を引き起こした segment のみ True、未到達の +1 加算は False。
+
+        WHY: ルカの自然な雑談で、たまたま挙手中キャラの名前を含む発話があれば
+        wake 経路で別キャラへの呼びかけとして処理させたい (= 「ミミ、後で考えよう」
+        のような発話で挙手 lapse 中でも別キャラに呼びかけ可能にする)。
+        """
+        monkeypatch.setenv("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", "3")
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", lambda text, slugs: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        # +1 加算を 3 回繰り返し、3 回目で閾値到達
+        r1 = d.on_segment_added(MagicMock(), "雑談 1")
+        assert r1 is False  # count=1 (閾値 3 未到達)
+        r2 = d.on_segment_added(MagicMock(), "雑談 2")
+        assert r2 is False  # count=2 (閾値 3 未到達)
+        r3 = d.on_segment_added(MagicMock(), "雑談 3")  # 閾値到達 → lapse
+        assert r3 is True   # 状態遷移あり → wake skip
+        assert d._handraise_states == {}
+
+    def test_returns_true_when_lapse_with_simultaneous_candidate(self, monkeypatch):
+        """lapse 発火と同時に別 slug の interjection_candidate も立つケースで True。
+
+        WHY: 「mimi 挙手中、ルカの発話で mimi が lapse 閾値到達 + sakura が新規挙手」
+        の同時並行ケース。両方の経路で True を返すべき (= or 結合)。
+        """
+        monkeypatch.setenv("L2_HANDRAISE_LAPSE_UTTERANCE_COUNT", "1")
+        _patch_filler(monkeypatch, slug="mimi", text="挙手 m")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages", lambda: {},
+        )
+        d = Dispatcher()
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # 同一 segment で mimi lapse + sakura interjection_candidate が両方立つ
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", lambda text, slugs: None,
+        )
+        # filler を sakura でも patch (= _start_handraise 内で wav 取得が走る)
+        _patch_filler(monkeypatch, slug="sakura", text="挙手 s")
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="interjection_candidate",
+                target_slug="sakura",
+                confidence=1.0,
+            ),
+        )
+        result = d.on_segment_added(MagicMock(), "sakura、何か思うことある?")
+        # mimi は lapse、sakura は新規挙手 → どちらの経路でも True
+        assert result is True
+        # mimi lapse で消え、sakura が新規挙手で残る
+        assert "mimi" not in d._handraise_states
+        assert "sakura" in d._handraise_states
+
+    def test_returns_false_for_unknown_intent_no_handraising(self, monkeypatch):
+        """handraising なし + check_intent=unknown の通常発話で False。
+
+        WHY: dispatcher が触らなかった発話は wake 経路を通常通り走らせる。
+        この境界条件をピンポイントで保証 (= 関数末尾の暗黙経路をカバー)。
+        """
+        d = Dispatcher()
+        monkeypatch.setattr(
+            "lab_lounge.router.check_intent",
+            lambda text, character_slug=None: IntentResult(
+                intent="unknown", target_slug=None, confidence=0.0,
+            ),
+        )
+        check_approval_mock = MagicMock()
+        monkeypatch.setattr(
+            "lab_lounge.router.check_approval", check_approval_mock,
+        )
+        result = d.on_segment_added(MagicMock(), "ねぇ、さくら、おはよう")
+        # handraising キャラ無し → check_approval は呼ばれない
+        check_approval_mock.assert_not_called()
+        # unknown → 通常発話扱い、wake 通す
+        assert result is False
 
 
 # ─── TestDispatcherHandraisePublish (Phase 0.5-A) ─────────────────

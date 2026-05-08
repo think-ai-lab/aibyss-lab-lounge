@@ -435,6 +435,139 @@ class TestBackgroundContinuousListenerOnSegmentAdded:
                 listener.stop(timeout=2.0)
 
 
+class TestBackgroundContinuousListenerSkipsWakeOnHandraiseProcessed:
+    """Phase 0.5-A 案 W'-2: on_segment_added 戻り値 True で wake 判定を skip する。
+
+    実走で観察された 3 重発火 (BG LLM + fallback + wake_event) のうち、wake_event
+    経路を停止する核心ロジックの単体テスト。``_run_loop`` の中身を直接呼び出すと
+    sounddevice 起動が必要になるため、callback 発火 + skip 判定 + ``_evaluate_wake``
+    呼出の一連のロジックを純粋に再現して検証する (= 既存 ``test_callback_signature_is_two_args``
+    のスタイル踏襲)。
+
+    実装側 (wake_word.py:_run_loop) の対応箇所:
+
+        processed_by_handraise = False
+        if self._on_segment_added is not None:
+            try:
+                processed_by_handraise = bool(
+                    self._on_segment_added(segment, self._buffer.full_text())
+                )
+            except Exception as exc:
+                logger.warning("on_segment_added callback failed: %s", exc)
+
+        if processed_by_handraise:
+            continue  # ← _evaluate_wake をスキップ
+
+        if self._routing_paused.is_set():
+            continue
+
+        self._evaluate_wake(segment)
+    """
+
+    @staticmethod
+    def _simulate_run_loop_iteration(listener, segment) -> bool:
+        """_run_loop 1 周分の判定 (callback + skip + _evaluate_wake) を再現。
+
+        Returns:
+            bool: _evaluate_wake が呼ばれたら True、skip されたら False。
+        """
+        processed_by_handraise = False
+        if listener._on_segment_added is not None:
+            try:
+                processed_by_handraise = bool(
+                    listener._on_segment_added(segment, listener._buffer.full_text())
+                )
+            except Exception:
+                # _run_loop と同じく fail-open: 例外時は False のまま
+                pass
+
+        if processed_by_handraise:
+            return False  # skip されたので _evaluate_wake は呼ばれなかった
+
+        if listener._routing_paused.is_set():
+            return False
+
+        listener._evaluate_wake(segment)
+        return True
+
+    def test_evaluate_wake_skipped_when_callback_returns_true(self, monkeypatch):
+        """on_segment_added が True を返すと _evaluate_wake が呼ばれない。
+
+        WHY: 「(キャラ名)、どうぞ」の承認発話で dispatcher が granted を確定した
+        とき、同じ segment が wake_event として再評価されるのを防ぐ核心テスト。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="ミミ、どうぞ", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        # callback は「処理済」を表す True を返す
+        callback_calls: list = []
+
+        def callback(segment, full_text):
+            callback_calls.append((segment, full_text))
+            return True
+
+        listener._on_segment_added = callback
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is False  # skip された
+        assert len(callback_calls) == 1  # callback は呼ばれた
+        evaluate_wake_spy.assert_not_called()  # _evaluate_wake は呼ばれなかった
+
+    def test_evaluate_wake_called_when_callback_returns_false(self, monkeypatch):
+        """on_segment_added が False を返すと _evaluate_wake が呼ばれる。
+
+        WHY: 「ねぇ、さくら、おはよう」のような通常発話 (= dispatcher が触らない
+        segment) は wake 経路で別キャラへの呼びかけとして処理させる経路を保つ。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        listener._on_segment_added = lambda segment, full_text: False
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is True
+        evaluate_wake_spy.assert_called_once_with(seg)
+
+    def test_evaluate_wake_called_when_callback_raises(self, monkeypatch):
+        """on_segment_added が例外を投げても _evaluate_wake は呼ばれる (fail-open)。
+
+        WHY: dispatcher 側のバグで wake 経路が完全停止する事故を防ぐ安全弁。
+        観察される側面 (= 通常応答経路) を生かす方が配信品質上のダメージが小さい。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        def callback_raises(segment, full_text):
+            raise RuntimeError("simulated dispatcher bug")
+
+        listener._on_segment_added = callback_raises
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        # 例外時も _evaluate_wake は呼ばれる
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+        assert evaluated is True
+        evaluate_wake_spy.assert_called_once_with(seg)
+
+
 class TestBackgroundContinuousListenerRoutingPause:
     """set_routing_paused のフラグ動作テスト (スレッド起動なし)。"""
 
