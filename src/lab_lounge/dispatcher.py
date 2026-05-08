@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from .character_status import CharacterStatus, CharacterStatusManager
 from .wake_word import WakeWordResult
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,7 @@ class Dispatcher:
         on_handraise_approved: Callable[
             [str, "HandraiseBgResult | None", Any, str], None
         ] | None = None,
+        status_manager: CharacterStatusManager | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
         max_age_sec: float = DRAIN_MAX_AGE_SEC,
     ) -> None:
@@ -317,6 +319,13 @@ class Dispatcher:
                 ``(slug, bg_result, transcript_snapshot, trace_id)``。run_loop が
                 bg_result の chunks を再生 + bubble.update("answering") を発行。
                 bg_result が None の場合は run_loop が同期 fallback (再生成) する。
+            status_manager: 全キャラのステータス (Ready/Thinking/ToolCalling/Raisehand/
+                Talking) を一元管理する CharacterStatusManager (Phase 0.5-B-α)。
+                本クラスは handraise 経路 (start / approval_granted / approval_denied /
+                lapse_timeout) で Raisehand / Ready を反映する。HUD dashboard は
+                Manager の subscriber を経由して character.status.update event を
+                購読する。None 時は status 反映スキップ (= 後方互換、既存テストは
+                引数なしで動作)。
             max_events:  queue の最大保持件数。超過分は古いものから破棄
             max_age_sec: enqueue から N 秒以上経過した event を drain 時に破棄
         """
@@ -342,6 +351,9 @@ class Dispatcher:
         self._on_handraise_started = on_handraise_started
         self._on_handraise_phrase_pending_release = on_handraise_phrase_pending_release
         self._on_handraise_approved = on_handraise_approved
+        # Phase 0.5-B-α: 全キャラ状態を一元管理する Manager (handraise 経路で
+        # Raisehand / Ready を反映)。None 時は status 反映スキップ (後方互換)。
+        self._status_manager = status_manager
         self._max_events = max_events
         self._max_age_sec = max_age_sec
 
@@ -888,6 +900,12 @@ class Dispatcher:
             "Dispatcher._start_handraise: slug=%s phrase=%r trace_id=%s se_pending=%s",
             target_slug, phrase_text, state.trace_id, state.se_pending,
         )
+        # Phase 0.5-B-α: 挙手状態を CharacterStatusManager に反映 (HUD 用)。
+        # publish 順序: status.update (Ready→Raisehand) → bubble.update(handraise) →
+        # handraise.update。HUD 側は status.update を先に観察してから bubble の
+        # 詳細を処理する流れと整合。
+        if self._status_manager is not None:
+            self._status_manager.set_status(target_slug, CharacterStatus.RAISEHAND)
         # publish + 物理通知も Lock 外 (callback の長時間処理が dispatcher を止めない)
         self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="handraise")
         self._publish_handraise_update()
@@ -979,6 +997,12 @@ class Dispatcher:
             "Dispatcher.on_approval_granted: slug=%s bg_result=%s",
             target_slug, "ready" if bg_result is not None else "none",
         )
+        # Phase 0.5-B-α: 承認時点で Raisehand → Ready に戻す。
+        # WHY: 承認 → TTS chunks 生成 → 再生開始までに 2-3 秒の gap がある。その間
+        # Ready (= ニュートラル) を維持する方が HUD の精度が上がる。Talking への
+        # 上書きは run_loop の _spawn_handraise_response_playback で行われる。
+        if self._status_manager is not None:
+            self._status_manager.set_status(target_slug, CharacterStatus.READY)
         self._publish_handraise_update()
         # Phase 0.5-A フェーズ 7: 承認後の TTS 再生 + bubble.update("answering") を
         # run_loop に委譲。dispatcher は state 管理のみで、IO は run_loop の責務。
@@ -1016,6 +1040,9 @@ class Dispatcher:
             "Dispatcher.on_approval_denied: slug=%s consecutive_denials=%d",
             target_slug, denials_after,
         )
+        # Phase 0.5-B-α: 却下 → Raisehand → Ready
+        if self._status_manager is not None:
+            self._status_manager.set_status(target_slug, CharacterStatus.READY)
         # bubble.update("denied") の text を bubble_messages から取得 (フォールバックあり)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "denied")
@@ -1042,6 +1069,9 @@ class Dispatcher:
             del self._handraise_states[target_slug]
 
         logger.info("Dispatcher.on_lapse_timeout: slug=%s", target_slug)
+        # Phase 0.5-B-α: lapse → Raisehand → Ready (consecutive_denials は変動なし)
+        if self._status_manager is not None:
+            self._status_manager.set_status(target_slug, CharacterStatus.READY)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "lapsed")
         self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000, category="handraise")
