@@ -459,6 +459,60 @@ class TestBubbleUpdateTtlMs:
         assert ev["links"] == [parent]
 
 
+class TestBubbleUpdateCategory:
+    """Phase 0.5-A 8-10 で追加された category 引数の挙動を確認する。
+
+    category は V2 HUD 側で表示エリアを分岐させるためのフィールド:
+      - "speech":    通常応答 + 承認後応答
+      - "handraise": 挙手系 (handraise/denied/lapsed/cancelled)
+    None なら payload に含めない (受信側 default = "speech" 解釈、後方互換)。
+    """
+
+    def test_category_in_payload_when_set(self):
+        """category を渡すと payload.category に格納される。"""
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…",
+            category="speech", **COMMON,
+        )
+        assert ev["payload"]["category"] == "speech"
+
+    def test_category_omitted_when_none(self):
+        """category=None (default) なら payload に category キーが含まれない (後方互換)。"""
+        ev = build_bubble_update(
+            character="mimi", step="thinking", text="…", **COMMON,
+        )
+        assert "category" not in ev["payload"]
+
+    def test_category_speech_validates(self):
+        """category="speech" でスキーマ検証を通る (通常応答パス)。"""
+        ev = build_bubble_update(
+            character="mimi", step="answering", text="わたくしの見解は…",
+            category="speech", **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["category"] == "speech"
+
+    def test_category_handraise_validates(self):
+        """category="handraise" + step="handraise" でスキーマ検証を通る (挙手系)。"""
+        ev = build_bubble_update(
+            character="sakura", step="handraise", text="あ、わたくし……",
+            category="handraise", **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["category"] == "handraise"
+        assert ev["payload"]["step"] == "handraise"
+
+    def test_category_with_ttl_ms(self):
+        """category と ttl_ms を同時に渡せる (denied/lapsed パス)。"""
+        ev = build_bubble_update(
+            character="mimi", step="denied", text="また今度",
+            ttl_ms=2000, category="handraise", **COMMON,
+        )
+        validate_event(ev)
+        assert ev["payload"]["category"] == "handraise"
+        assert ev["payload"]["ttl_ms"] == 2000
+
+
 class TestDispatcherHandraiseUpdate:
     """build_dispatcher_handraise_update — Phase 0.5-A で導入。
     HUD のデバッグ dashboard 用 (配信画面非表示)。dispatcher.queue.update の兄弟。

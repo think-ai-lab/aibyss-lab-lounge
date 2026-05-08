@@ -164,7 +164,12 @@ def _spawn_handraise_response_playback(
     q.put(None)  # sentinel — 最終 chunk 再生後 worker が done bubble を発行して終了
 
     def _publish_bubble_for_handraise(character: str, step: str, text: str) -> None:
-        """handraise 応答中の bubble.update を毎回新 trace_id で発行。"""
+        """handraise 応答中の bubble.update を毎回新 trace_id で発行。
+
+        Phase 0.5-A 8-10 (A2 確定): 承認後応答 (answering/speaking/done) は category="speech"。
+        WHY: 挙手バブル (category="handraise") は承認時に消費され、応答は通常応答エリア
+        で表示する設計 (UI 一貫性優先)。HUD 側の switch 文を単純に保てる。
+        """
         try:
             event = build_bubble_update(
                 character=character,
@@ -173,6 +178,7 @@ def _spawn_handraise_response_playback(
                 stream_id=session_stream_id,
                 session_id=session_id_root,
                 trace_id=_new_uuid(),
+                category="speech",
             )
             publish(event)
         except Exception as exc:  # noqa: BLE001
@@ -463,6 +469,7 @@ def _create_handraise_runner_and_callbacks(
                 logger.debug("answering text 抽出失敗 (空文字で続行): %s", exc)
 
         # bubble.update("answering") を発行 (TTS chunk 1 再生開始の直前タイミング)
+        # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech" (UI 一貫性優先)。
         try:
             event = build_bubble_update(
                 character=slug,
@@ -471,6 +478,7 @@ def _create_handraise_runner_and_callbacks(
                 stream_id=session_stream_id,
                 session_id=session_id_root,
                 trace_id=bg_trace_id,
+                category="speech",
             )
             publish(event)
         except Exception as exc:  # noqa: BLE001
@@ -871,7 +879,7 @@ def run_loop(
             except Exception as exc:
                 logger.warning("dispatcher.handraise.update publish 失敗: %s", exc)
 
-        def _publish_bubble_from_dispatcher(character, step, text, ttl_ms):
+        def _publish_bubble_from_dispatcher(character, step, text, ttl_ms, category):
             """Dispatcher 発の ``bubble.update`` を Redis Stream に publish する。
 
             通常応答中の bubble.update (ターン毎 trace_id) と区別するため、
@@ -879,6 +887,9 @@ def run_loop(
             ない概念)。Dispatcher 側から ``handraise / denied / lapsed`` の 3 種類が
             発行される。``answering`` は run_loop が承認時に別経路で発行する
             (フェーズ 7 で接続)。
+
+            Phase 0.5-A 8-10: ``category`` は dispatcher 側で "handraise" を明示して
+            渡してくる。本 callback はそのまま forward する (ロジック非介入)。
             """
             try:
                 event = build_bubble_update(
@@ -889,6 +900,7 @@ def run_loop(
                     session_id=session_id_root,
                     trace_id=_new_uuid(),
                     ttl_ms=ttl_ms,
+                    category=category,
                 )
                 publish(event)
             except Exception as exc:
@@ -1027,12 +1039,18 @@ def run_loop(
             _filler_thread: threading.Thread | None = None
 
             def _publish_bubble_safe(character: str, step: str, text: str) -> None:
-                """bubble.update を publish する。失敗は warning log のみ。"""
+                """bubble.update を publish する。失敗は warning log のみ。
+
+                Phase 0.5-A 8-10: 通常応答 playback worker から呼ばれる (speaking/done/
+                pose_change)。すべて category="speech" 固定。挙手系の bubble はこの
+                経路を通らない (dispatcher 経由)。
+                """
                 try:
                     event = build_bubble_update(
                         character=character,
                         step=step,
                         text=text,
+                        category="speech",
                         **turn_common,
                     )
                     publish(event)
