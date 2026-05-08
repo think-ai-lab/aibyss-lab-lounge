@@ -474,6 +474,7 @@ def _create_handraise_runner_and_callbacks(
     status_manager: "CharacterStatusManager | None" = None,
     on_tts_chunk_ready_ref: "list | None" = None,
     on_pose_ready_ref: "list | None" = None,
+    playback_queue_ref: "list | None" = None,
 ):
     """Phase 0.5-A フェーズ 7: 4 つの callback と bg_runner を生成する factory。
 
@@ -498,6 +499,13 @@ def _create_handraise_runner_and_callbacks(
                            (= A1 修正の最終配線)。
         on_pose_ready_ref: 同様に target キャラの pose 切替予約 callback の
                            mutable list。
+        playback_queue_ref: Phase 0.5-B-β-2 commit 3 で追加。
+                           ``list[queue.Queue | None]`` で渡す。on_handraise_close
+                           callback が ``ref[0].put({"_drain": True})`` で playback
+                           queue に drain task を投入し、却下/lapse 時の残 chunks を
+                           破棄する経路。on_tts_chunk_ready_ref / on_pose_ready_ref
+                           と同じ late binding パターンで、ターン毎に再構築される
+                           _playback_queue を最新参照する。
 
     【WHY: mutable list ラッパー (= late binding) を使う】
     factory はセッション開始時 1 回だけ呼ばれる。一方 ``_on_tts_chunk`` /
@@ -838,11 +846,63 @@ def _create_handraise_runner_and_callbacks(
             daemon=True,
         ).start()
 
+    def on_handraise_close(slug: str, reason: str) -> None:
+        """却下/lapse 時の close 通知 (Phase 0.5-B-β-2 commit 3)。
+
+        dispatcher.on_approval_denied / on_lapse_timeout から発火される
+        ``Dispatcher.on_handraise_close`` callback の本体。以下を実行することで
+        案 A の音声漏れ (= 挙手中に流れた ask_character の対話 TTS) を最小化する:
+
+        1. ``cancel_bg_tts(session_id)`` で ask_character の bg_tts daemon thread
+           + 導入セリフ TTS + on_chunk 投入を阻止する。
+        2. ``playback_queue_ref[0].put({"_drain": True})`` で playback queue 内の
+           未処理 chunks を破棄する (= _run_playback_worker の drain 経路)。
+
+        【WHY: 既に subprocess 中 / 再生中の chunks は止められない】
+        VOICEPEAK 合成中の subprocess.run と play_audio_fn block 中の chunk は
+        OS レベルで止められない。実用上、却下後の音声漏れは「再生中の 1 chunk +
+        合成済キュー先頭の 1 chunk」程度まで縮小する (= 通常応答 TTS 数十秒分が
+        漏れる Phase 0.5-A 状態と比べると劇的に改善)。
+
+        【WHY: ask_character の cancel と queue drain を両方走らせる】
+        cancel_bg_tts だけでは「合成済で playback queue に乗っている chunks」が
+        残る。queue drain だけでは「これから合成される bg_tts thread が打ち消されない」。
+        両方を走らせることで、両系統の音声漏れ source を阻止できる。
+
+        Args:
+            slug:   close 対象 (= 却下/lapse された) target キャラ slug
+            reason: ``"denied"`` (= ルカが却下) or ``"lapsed"`` (= タイムアウト)
+        """
+        from .mcp_servers.ask_character import cancel_bg_tts
+
+        n = cancel_bg_tts(session_id_root)
+
+        # playback queue に drain task 投入。late binding で最新の queue 参照を
+        # 取得 (= ターン外なら ref[0] が None で no-op、ターン中なら queue にアクセス)。
+        drained = False
+        if playback_queue_ref is not None:
+            current_q = playback_queue_ref[0]
+            if current_q is not None:
+                try:
+                    current_q.put({"_drain": True})
+                    drained = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "挙手 close drain task 投入失敗 [character=%s reason=%s]: %s",
+                        slug, reason, exc,
+                    )
+
+        logger.info(
+            "挙手 close [character=%s reason=%s]: bg_tts cancel=%d drain=%s",
+            slug, reason, n, drained,
+        )
+
     return (
         bg_runner,
         on_handraise_started,
         on_handraise_phrase_pending_release,
         on_handraise_approved,
+        on_handraise_close,
     )
 
 
@@ -1012,6 +1072,36 @@ def _run_playback_worker(
     current_pose: str | None = None
     while True:
         task = q.get()
+        # Phase 0.5-B-β-2 commit 3: drain task の処理 (= 却下/lapse 時の残 chunks 破棄)。
+        # run_loop の on_handraise_close callback が q.put({"_drain": True}) で
+        # 投入する。q.queue (= 内部 deque) を q.mutex 保護下で iterate し、None
+        # sentinel と _drain task 自体は維持して、通常 task のみ破棄する。
+        # 「現在再生中の chunk」(= play_audio_fn block 中) は止められないが、
+        # まだ playback worker が pop していない queue 内の未再生 chunks は本処理で
+        # 破棄できる。drain 後 continue で通常処理続行 (= ターン全体は続ける、
+        # 後続の None sentinel まで待つ)。
+        if isinstance(task, dict) and task.get("_drain"):
+            discarded = 0
+            with q.mutex:
+                # 内部 deque を直接操作。queue.Queue の標準的な「peek/iter」イディオム。
+                # collections.deque と異なり queue.Queue 自体は iter API を提供しない
+                # ため、mutex 保護下で popleft → 維持 list に振り分けて再構築する。
+                kept: list = []
+                while q.queue:
+                    item = q.queue.popleft()
+                    if item is None or (
+                        isinstance(item, dict) and item.get("_drain")
+                    ):
+                        # sentinel と他の drain task は維持 (= 後続の cleanup 経路で消費)
+                        kept.append(item)
+                    else:
+                        discarded += 1
+                q.queue.extend(kept)
+            logger.info(
+                "playback worker drain: discarded=%d remaining=%d",
+                discarded, len(q.queue),
+            )
+            continue
         if task is None:
             # 最終チャンク再生完了後: speaking を発行していれば done_delay 秒待って done publish
             if speaking_published and last_character is not None:
@@ -1330,13 +1420,17 @@ def run_loop(
         # 中身は ターンループ内 (_on_tts_chunk 構築直後) で [0] に書き込む。
         # IDLE 中 (= ターン外) の挙手では [0] = 前回ターンの closure or None で、
         # _playback_queue 自体が None なので安全 (= 既存ガードで no-op)。
+        # Phase 0.5-B-β-2 commit 3: 同パターンで _current_playback_queue を追加。
+        # on_handraise_close callback が drain task を投入する経路の最新参照。
         _current_on_tts_chunk: list = [None]
         _current_on_pose_ready: list = [None]
+        _current_playback_queue: list = [None]
         (
             _bg_runner,
             _on_handraise_started,
             _on_handraise_phrase_pending_release,
             _on_handraise_approved,
+            _on_handraise_close,
         ) = _create_handraise_runner_and_callbacks(
             session_stream_id=session_stream_id,
             session_id_root=session_id_root,
@@ -1344,6 +1438,7 @@ def run_loop(
             status_manager=status_manager,
             on_tts_chunk_ready_ref=_current_on_tts_chunk,
             on_pose_ready_ref=_current_on_pose_ready,
+            playback_queue_ref=_current_playback_queue,
         )
 
         dispatcher = Dispatcher(
@@ -1354,6 +1449,7 @@ def run_loop(
             on_handraise_started=_on_handraise_started,
             on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
             on_handraise_approved=_on_handraise_approved,
+            on_handraise_close=_on_handraise_close,
             status_manager=status_manager,
         )
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、
@@ -1613,8 +1709,11 @@ def run_loop(
             # 書き込み、bg_runner._body から ref[0] 経由で参照可能にする。
             # これにより通常応答ターンと並行する挙手 BG LLM の ask_character ツールが
             # 同じ _playback_queue (= 通常応答用) に対話 TTS chunk を投入できる。
+            # Phase 0.5-B-β-2 commit 3: 同パターンで _current_playback_queue も
+            # 更新。on_handraise_close callback が drain task を投入する先となる。
             _current_on_tts_chunk[0] = _on_tts_chunk
             _current_on_pose_ready[0] = _on_pose_ready
+            _current_playback_queue[0] = _playback_queue
 
             try:
                 result = run_pipeline(

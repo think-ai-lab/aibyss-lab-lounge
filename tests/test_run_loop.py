@@ -330,6 +330,174 @@ class TestRunPlaybackWorkerOnLastChunkPlayed:
         assert steps == ["speaking", "done"]
 
 
+# ─── Phase 0.5-B-β-2 commit 3: playback queue drain (却下/lapse cleanup) ──────
+
+
+class TestPlaybackWorkerDrain:
+    """_run_playback_worker の drain task 対応 (Phase 0.5-B-β-2 commit 3)。
+
+    on_handraise_close callback が q.put({"_drain": True}) で投入する drain task
+    を受信した worker は、queue 内の通常 task を全破棄 (= 案 A の音声漏れ最小化)。
+    None sentinel と他の drain task は維持して、通常の cleanup 経路 (= None 受信
+    時の done bubble publish) は機能し続ける。
+    """
+
+    def _start_worker(self, q, *, publish_fn=None, play_fn=None, cleanup_fn=None,
+                      done_delay=0.01):
+        publish_fn = publish_fn or MagicMock()
+        play_fn = play_fn or MagicMock()
+        cleanup_fn = cleanup_fn or MagicMock()
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "done_delay_seconds": done_delay,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread, publish_fn, play_fn, cleanup_fn
+
+    def test_drain_task_discards_pending_chunks(self):
+        """drain task 受信時、queue 内の通常 task を全破棄して再生されない。
+
+        WHY: 却下/lapse 時の音声漏れ最小化の核心。drain task を最初に置くこと
+        で、続けて投入される 3 件の通常 task は受信時点で q.queue 内に残って
+        おり、drain で破棄される。play_fn は一度も呼ばれない (= 残音声ゼロ)。
+        """
+        import queue as queue_mod
+        q: queue_mod.Queue = queue_mod.Queue()
+
+        # 順序が重要: 通常 task 3 件 + drain task + None を put
+        # worker が起動する前に全部 enqueue することで、worker は drain task を
+        # 取り出した時点で q.queue 内に通常 task 2 件 + None が残っている状態
+        # になる (= 1 件目は worker が get で取り出して再生中の可能性、テストで
+        # は MagicMock 即時 return なので即時完了 → 2 件目を drain 前に処理)
+        # → タイミング依存を避けるため、drain task を **先に** 置く。
+        q.put({"_drain": True})
+        for i in range(3):
+            q.put({
+                "url": f"file:///{i}.wav", "text": f"t{i}",
+                "is_last": False, "character": "mimi",
+            })
+        q.put(None)
+
+        thread, publish_fn, play_fn, _ = self._start_worker(q)
+        thread.join(timeout=2.0)
+
+        # drain で 3 件全破棄、None で終了。play_fn は一度も呼ばれない
+        assert play_fn.call_count == 0
+        # speaking publish も 0 回 (= speaking_published=False で done もスキップ)
+        speaking_calls = [
+            c for c in publish_fn.call_args_list if c.args[1] == "speaking"
+        ]
+        assert speaking_calls == []
+
+    def test_drain_task_keeps_none_sentinel(self):
+        """drain task 受信後、None sentinel は維持されて通常終了経路を通る。
+
+        WHY: drain は queue cleanup 専用で、worker 自体の終了は None sentinel が
+        担う設計。drain で None まで破棄してしまうと worker が無限待ちになる。
+        """
+        import queue as queue_mod
+        q: queue_mod.Queue = queue_mod.Queue()
+
+        # drain task → None の順 (= 残 task ゼロで drain、None で正常終了)
+        q.put({"_drain": True})
+        q.put(None)
+
+        thread, _, _, _ = self._start_worker(q)
+        thread.join(timeout=2.0)
+
+        # worker が無限待ちせず終了する (= None sentinel が drain で破棄されていない)
+        assert not thread.is_alive()
+
+    def test_drain_task_no_op_when_empty(self):
+        """queue が空状態で drain task を受信しても crash せず continue する。
+
+        WHY: 却下時に既に playback queue が空 (= まだ ask_character TTS が投入
+        されていない、or 既に再生完了) のシナリオで、drain は no-op で安全に通る。
+        その後 None sentinel で worker は正常終了する。
+        """
+        import queue as queue_mod
+        q: queue_mod.Queue = queue_mod.Queue()
+
+        # 空 queue → drain → None
+        q.put({"_drain": True})
+        q.put(None)
+
+        thread, _, _, _ = self._start_worker(q)
+        thread.join(timeout=2.0)
+
+        # 例外なく完了 (= no-op drain + 正常終了)
+        assert not thread.is_alive()
+
+
+class TestHandraiseCloseFlow:
+    """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
+
+    def _factory(self, **overrides):
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+        defaults = dict(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+        )
+        defaults.update(overrides)
+        return _create_handraise_runner_and_callbacks(**defaults)
+
+    def test_factory_returns_five_callables_including_on_handraise_close(self):
+        """factory 戻り値 tuple が 5 要素 (旧 4 + on_handraise_close) になる。
+
+        WHY: β-2-3 で戻り値を 4 → 5 要素に拡張した。run_loop と既存テスト
+        (test_dispatcher_receives_phase7_callbacks) が unpack する側で同期更新
+        されているか保証する。
+        """
+        bg_runner, on_started, on_release, on_approved, on_close = self._factory()
+        assert callable(bg_runner)
+        assert callable(on_started)
+        assert callable(on_release)
+        assert callable(on_approved)
+        assert callable(on_close)
+
+    def test_on_handraise_close_invokes_cancel_bg_tts_and_drain(self, monkeypatch):
+        """on_handraise_close 起動で cancel_bg_tts(session_id) + drain task 投入。
+
+        WHY: 案 A の音声漏れ最小化の核心経路。dispatcher 経由で本 callback が
+        呼ばれた時、ask_character の bg_tts キャンセル (= 未起動 thread 阻止) +
+        playback queue drain (= 投入済 chunks 破棄) の両方が実行されることを保証。
+        """
+        import queue as queue_mod
+
+        # cancel_bg_tts を spy
+        cancel_calls: list[str] = []
+        monkeypatch.setattr(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts",
+            lambda session_id: cancel_calls.append(session_id) or 0,
+        )
+
+        # 実 queue.Queue を渡して drain task 投入を観測
+        playback_q: queue_mod.Queue = queue_mod.Queue()
+        playback_ref: list = [playback_q]
+
+        _, _, _, _, on_close = self._factory(
+            session_id_root="ses1-test",
+            playback_queue_ref=playback_ref,
+        )
+        on_close("mimi", "denied")
+
+        # cancel_bg_tts(session_id="ses1-test") で呼ばれた
+        assert cancel_calls == ["ses1-test"]
+        # playback queue に drain task が投入された
+        assert not playback_q.empty()
+        item = playback_q.get_nowait()
+        assert isinstance(item, dict)
+        assert item.get("_drain") is True
+
+
 class TestInitListenerBgContinuous:
     """Block 0: _init_listener の bg-continuous 分岐テスト。
 
@@ -463,6 +631,9 @@ class TestRunLoopBgContinuousWiring:
     def test_dispatcher_receives_phase7_callbacks(self, monkeypatch):
         """Phase 0.5-A フェーズ 7: bg_runner / on_handraise_started /
         on_handraise_phrase_pending_release / on_handraise_approved も渡される。
+
+        Phase 0.5-B-β-2 commit 3 で on_handraise_close も追加 (= 却下/lapse 時の
+        cleanup callback)。factory の戻り値 tuple 4 → 5 要素拡張に整合する。
         """
         from lab_lounge.run_loop import run_loop
 
@@ -478,10 +649,12 @@ class TestRunLoopBgContinuousWiring:
         assert "on_handraise_started" in dispatcher_kwargs
         assert "on_handraise_phrase_pending_release" in dispatcher_kwargs
         assert "on_handraise_approved" in dispatcher_kwargs
+        assert "on_handraise_close" in dispatcher_kwargs
         assert callable(dispatcher_kwargs["bg_runner"])
         assert callable(dispatcher_kwargs["on_handraise_started"])
         assert callable(dispatcher_kwargs["on_handraise_phrase_pending_release"])
         assert callable(dispatcher_kwargs["on_handraise_approved"])
+        assert callable(dispatcher_kwargs["on_handraise_close"])
 
     def test_dispatcher_receives_status_manager(self, monkeypatch):
         """Phase 0.5-B-α: Dispatcher 生成時に status_manager (CharacterStatusManager)
@@ -582,12 +755,14 @@ class TestCreateHandraiseRunnerAndCallbacks:
         defaults.update(overrides)
         return _create_handraise_runner_and_callbacks(**defaults)
 
-    def test_returns_four_callables(self):
-        bg_runner, on_started, on_release, on_approved = self._factory()
+    def test_returns_five_callables(self):
+        """factory 戻り値 tuple が 5 要素 (Phase 0.5-B-β-2 commit 3 で +1)。"""
+        bg_runner, on_started, on_release, on_approved, on_close = self._factory()
         assert callable(bg_runner)
         assert callable(on_started)
         assert callable(on_release)
         assert callable(on_approved)
+        assert callable(on_close)
 
     def test_on_handraise_started_idle_calls_spawn(self, monkeypatch):
         """se_pending=False で _spawn_handraise_phrase_playback を呼ぶ (padding=0)。"""
@@ -601,7 +776,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
         )
-        _, on_started, _, _ = self._factory()
+        _, on_started, _, _, _ = self._factory()
         on_started("mimi", Path("/tmp/x.wav"), False)
         assert spawn_calls == [("mimi", Path("/tmp/x.wav"), 0.0)]
 
@@ -613,7 +788,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop._spawn_handraise_phrase_playback",
             lambda *a, **kw: spawn_calls.append(a),
         )
-        _, on_started, _, _ = self._factory()
+        _, on_started, _, _, _ = self._factory()
         on_started("mimi", Path("/tmp/x.wav"), True)
         assert spawn_calls == []
 
@@ -630,7 +805,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
         )
-        _, _, on_release, _ = self._factory()
+        _, _, on_release, _, _ = self._factory()
         on_release("sakura", Path("/tmp/x.wav"))
         assert spawn_calls == [("sakura", Path("/tmp/x.wav"), 0.7)]
 
@@ -672,7 +847,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
 
         # bg_result.result.events に llm.final がある (= 案 W'-1 の実態に合わせて
         # Pydantic JSON 文字列形式)
@@ -748,7 +923,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             lambda llm_result, **kw: llm_result,
         )
 
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
 
         # 実走で観察された JSON 文字列を再現 (= sakura の応答)
         raw_json = (
@@ -815,7 +990,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             lambda llm_result, **kw: llm_result,
         )
 
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
 
         # JSON ではない生テキスト (= ダミー LLM モード等)
         plain_text = "ダミー応答: 最近のAI倫理について深く考えています。"
@@ -852,7 +1027,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop._approved_synthesize_fallback",
             lambda slug, snap, trace, **kw: called.append((slug, snap, trace)),
         )
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
         on_approved("mimi", None, "snap", "trace-x")
         # daemon thread 内 fallback なのでポーリング待機
         for _ in range(40):
@@ -871,7 +1046,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             lambda slug, snap, trace, **kw: called.append(slug),
         )
         bg = HandraiseBgResult(chunks=[], result=None, trace_id="x")
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -899,7 +1074,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": ""}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -937,7 +1112,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": "test"}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -976,7 +1151,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": "test"}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved = self._factory()
+        _, _, _, on_approved, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -1010,7 +1185,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
         )
 
-        bg_runner, _, _, _ = self._factory()
+        bg_runner, _, _, _, _ = self._factory()
         cancel_event = threading.Event()
         thread = bg_runner(
             target_slug="mimi",
