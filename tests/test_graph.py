@@ -661,3 +661,54 @@ class TestBuildPipelineGraphTtsOnly:
         node_names = set(graph.get_graph().nodes)
         assert "routing" not in node_names
         assert "generation" not in node_names
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A): disable_tools での選択的ツール除外
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestLoadMcpToolsDisableTools:
+    """_load_mcp_tools の disable_tools 引数 (Phase 0.5-A バグ 3 修正、案 A)。
+
+    fallback パス + ask_character + 並行 TTS の deadlock を回避するため、
+    fallback パス経由で disable_tools=["ask_character"] が渡されたときに
+    Agent ツールリストから ask_character を除外する仕組みを保証する。
+    """
+
+    def test_default_includes_ask_character(self, monkeypatch):
+        """disable_tools 未指定時は ask_character が登録される (= 既存挙動)。"""
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools = _load_mcp_tools(character_slug="mimi")
+        tool_names = {getattr(t, "name", "") for t in tools}
+        assert "ask_character_tool" in tool_names
+
+    def test_disable_tools_excludes_ask_character(self, monkeypatch):
+        """disable_tools=['ask_character'] で Agent から ask_character が除外される。
+
+        WHY: fallback パス + ask_character + 並行 TTS の deadlock 回避の核心。
+        """
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools = _load_mcp_tools(
+            character_slug="mimi",
+            disable_tools=["ask_character"],
+        )
+        tool_names = {getattr(t, "name", "") for t in tools}
+        assert "ask_character_tool" not in tool_names
+        # 他のツール (= web_search) は残る
+        assert "web_search_tool" in tool_names
+
+    def test_disable_tools_none_equals_default(self, monkeypatch):
+        """disable_tools=None は disable_tools 未指定と同じ挙動。"""
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools_none = _load_mcp_tools(character_slug="mimi", disable_tools=None)
+        tools_default = _load_mcp_tools(character_slug="mimi")
+        names_none = {getattr(t, "name", "") for t in tools_none}
+        names_default = {getattr(t, "name", "") for t in tools_default}
+        assert names_none == names_default

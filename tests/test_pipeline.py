@@ -482,6 +482,57 @@ class TestRunPipelineWithLangSmith:
         mock_graph.assert_not_called()
 
 
+class TestRunPipelineDisableTools:
+    """Phase 0.5-A バグ 3 修正 (案 A): run_pipeline に disable_tools 引数を伝播。
+
+    _approved_synthesize_fallback (= LLM 失敗時の救済パス) で
+    disable_tools=["ask_character"] が渡された時、graph._generation_node の
+    Agent 構築時に ask_character ツールが除外されることを保証する。
+    """
+
+    def test_disable_tools_passed_to_run_graph(self, monkeypatch):
+        """run_pipeline(disable_tools=[...]) → run_graph に伝播される。"""
+        monkeypatch.setenv("L2_USE_REAL_LLM", "true")
+        captured: list[dict] = []
+
+        def fake_run_graph(text, **kwargs):
+            captured.append(dict(kwargs))
+            return MagicMock(
+                text="ok", model="x", input_tokens=0, output_tokens=0,
+                latency_ms=0, finish_reason="stop",
+            )
+
+        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+            with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
+                run_pipeline(
+                    "テスト",
+                    disable_tools=["ask_character"],
+                    **COMMON,
+                )
+
+        assert len(captured) == 1
+        assert captured[0].get("disable_tools") == ["ask_character"]
+
+    def test_disable_tools_default_is_none(self, monkeypatch):
+        """disable_tools を渡さなければ run_graph に None が伝播 (= 既存挙動互換)。"""
+        monkeypatch.setenv("L2_USE_REAL_LLM", "true")
+        captured: list[dict] = []
+
+        def fake_run_graph(text, **kwargs):
+            captured.append(dict(kwargs))
+            return MagicMock(
+                text="ok", model="x", input_tokens=0, output_tokens=0,
+                latency_ms=0, finish_reason="stop",
+            )
+
+        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+            with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
+                run_pipeline("テスト", **COMMON)
+
+        assert len(captured) == 1
+        assert captured[0].get("disable_tools") is None
+
+
 # ─── Phase 0.5-A 案 W'-1: LLM-only / TTS-only パイプライン ───────
 
 

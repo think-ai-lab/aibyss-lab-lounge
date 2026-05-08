@@ -171,6 +171,7 @@ def run_pipeline(
     on_pose_ready=None,
     stream_context: str | None = None,
     suppress_bubble_answering: bool = False,
+    disable_tools: list[str] | None = None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -197,6 +198,12 @@ def run_pipeline(
                          抑制する。挙手 BG 先行生成では承認時に run_loop が
                          TTS 開始時刻と同期して bubble を発行する設計のため、
                          graph 側の二重発行を避ける。デフォルト False で既存挙動。
+        disable_tools:   Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A) で追加。
+                         Agent から除外するツール名のリスト (例: ["ask_character"])。
+                         fallback パス (= _approved_synthesize_fallback) で
+                         ask_character ツールを除外し、並行する他キャラ TTS との
+                         deadlock を回避する (logs/runs/run_loop_20260508_181051.log
+                         で観察されたハングの対処)。デフォルト None で既存挙動。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
@@ -212,6 +219,7 @@ def run_pipeline(
         on_pose_ready=on_pose_ready,
         stream_context=stream_context,
         suppress_bubble_answering=suppress_bubble_answering,
+        disable_tools=disable_tools,
     )
 
 
@@ -227,6 +235,7 @@ def _run_pipeline_graph(
     on_pose_ready=None,
     stream_context: str | None = None,
     suppress_bubble_answering: bool = False,
+    disable_tools: list[str] | None = None,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -259,6 +268,7 @@ def _run_pipeline_graph(
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
         "suppress_bubble_answering": suppress_bubble_answering,
+        "disable_tools": disable_tools,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -382,6 +392,10 @@ def _run_pipeline_graph_llm_only(
         # WHY: 承認時に run_loop が answering bubble を発行する設計のため、graph 側で
         # 二重発行しないよう内部固定で抑制する
         "suppress_bubble_answering": True,
+        # disable_tools: LLM-only モードでは ask_character ツール起動の余地が
+        # あるが、本セッションではデフォルト None で既存挙動 (= bg_result=ready
+        # 経路では ask_character 使える)。fallback パスは別途 disable_tools を渡す。
+        "disable_tools": None,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -491,6 +505,8 @@ def run_pipeline_tts_only(
         "on_pose_ready": on_pose_ready,
         # _tts_node 内では使われないが型整合
         "suppress_bubble_answering": True,
+        # disable_tools は TTS-only モードでは使われないが型整合のため None
+        "disable_tools": None,
         # _tts_node が読む値群
         "character_slug": llm_result.speaker,
         "llm_text": llm_text,
