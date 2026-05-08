@@ -54,8 +54,9 @@ load_dotenv()
 
 from .audio_io import RecordError, SilenceError, play_audio_file, record_to_file
 from .bus import publish
+from .character_status import CharacterStatus, CharacterStatusManager
 from .emitter import _transcribe_audio
-from .events import build_bubble_update
+from .events import build_bubble_update, build_character_status_update
 from .log_setup import setup_logging
 from .pipeline import PipelineResult, run_pipeline
 from .stream_context import load_stream_context
@@ -67,6 +68,73 @@ logger = logging.getLogger(__name__)
 
 def _new_uuid() -> str:
     return str(uuid4())
+
+
+# ─── Phase 0.5-B-α: CharacterStatusManager 連携ヘルパー ──────────────
+
+
+def _extract_llm_response_text(events: list[dict]) -> str:
+    """events から llm.final の payload.text を取得し、JSON 形式なら response 部分のみ抽出する。
+
+    Phase 0.5-B-α: character.status.update の metadata.text として送る発話全文を
+    取得するためのヘルパー。Phase 0.5-A バグ 4 修正で確立した _parse_voicepeak_json
+    による response 抽出ロジックを再利用して、HUD dashboard に生 JSON が出ないように
+    する (= bubble.update でも同じ抽出をしている)。
+
+    WHY: llm.final.text は Pydantic JSON 文字列 ({"response":"...","emotion":...,
+    "speed":...,"pose":"..."}) なので、character.status.update の text に生 JSON を
+    詰めると HUD で読めなくなる。response 部分のみを抽出して人が読める text にする。
+
+    Args:
+        events: PipelineResult.events または bg_result.result.events のリスト
+
+    Returns:
+        LLM response text。llm.final が無い / text が空 の場合は空文字を返す
+        (= caller 側で「if llm_text:」で判定可能)。
+    """
+    from .tts import _parse_voicepeak_json
+
+    for ev in events:
+        if ev.get("type") == "llm.final":
+            text_raw = ev.get("payload", {}).get("text", "")
+            if text_raw:
+                # _parse_voicepeak_json は parse 失敗時 (= JSON でない / response 無し)
+                # でも (text, None, None, None) で元テキストをそのまま返す
+                response_text, _, _, _ = _parse_voicepeak_json(text_raw)
+                return response_text or ""
+            break
+    return ""
+
+
+def _build_talking_metadata(
+    character: str,
+    llm_text: str | None,
+    pose: str | None,
+) -> dict:
+    """Talking 状態の metadata を構築する (Phase 0.5-B-α)。
+
+    HUD dashboard で立ち絵 + 発話全文を表示するため、両方を含める (= ルカ追加要件)。
+    どちらも None / 空の場合は metadata から omit する設計:
+    - 「空 string や None キー」を含めるより HUD 側で「未取得」を判定しやすい
+    - publish payload も小さく抑えられる
+
+    Args:
+        character: キャラ slug (= 現状 metadata 内には含めず、log 用識別のみ。
+                   character は status.update event の payload top-level にある)
+        llm_text:  発話全文 (= _extract_llm_response_text 等で取得した response text)
+        pose:      現在の立ち絵 (= chunk task の pose / _pending_poses 等から取得)
+
+    Returns:
+        {"pose": str, "text": str} のうち、値がある field のみ含む dict。
+        両方 None / 空 の場合は空 dict (= "metadata なし" と区別したい場合は呼出側で
+        判定して None を渡す方針)。
+    """
+    metadata: dict = {}
+    if pose:
+        metadata["pose"] = pose
+    if llm_text:
+        metadata["text"] = llm_text
+    return metadata
 
 
 # ─── Phase 0.5-A フェーズ 7: 挙手 BG LLM + handraise 再生統合 ────────
@@ -139,6 +207,8 @@ def _spawn_handraise_response_playback(
     *,
     session_stream_id: str,
     session_id_root: str,
+    status_manager: "CharacterStatusManager | None" = None,
+    talking_metadata: "dict | None" = None,
 ) -> "threading.Thread":
     """承認後の TTS chunks を専用 mini playback worker で再生する (Phase 0.5-A フェーズ 7)。
 
@@ -148,12 +218,21 @@ def _spawn_handraise_response_playback(
     chunks は dispatcher の HandraiseBgResult.chunks (各 dict は ``_run_playback_worker``
     が読む形式: ``{"url", "text", "is_last", "character", "pose"?}``)。
 
+    Phase 0.5-B-α: status_manager + talking_metadata が指定された場合、worker 起動
+    直前に Talking 反映、worker thread 終了 finally で Ready 反映。挙手承認応答 +
+    fallback パス両方で同じ仕組みを再利用 (= 呼出側が引数を伝播するだけ)。
+
     Args:
         slug:               挙手キャラ slug (worker 名 + ログ用)
         chunks:             再生する TTS chunks の list (BG LLM 先行生成済)
         trace_id:           bubble.update 発行時の handraise 単位 trace_id
         session_stream_id:  bubble.update の stream_id
         session_id_root:    bubble.update の session_id
+        status_manager:     CharacterStatusManager (Phase 0.5-B-α)。None 時は
+                            status 反映スキップ (後方互換、テストで未注入時の挙動維持)。
+        talking_metadata:   Talking 反映時の metadata ({"pose": str, "text": str})。
+                            None 時は metadata なしで Talking 反映 (= HUD は status のみ
+                            観察)。
 
     Returns:
         起動した daemon thread。
@@ -206,15 +285,33 @@ def _spawn_handraise_response_playback(
                 "handraise playback set_pose 失敗 (無視): %s", exc,
             )
 
+    # Phase 0.5-B-α: Talking 反映 (worker 起動直前)
+    # WHY: worker thread 内では status_manager にアクセスする経路がなく、
+    # かつ「playback 開始 = Talking」のタイミングを明示するため、起動直前で反映。
+    if status_manager is not None:
+        status_manager.set_status(
+            slug, CharacterStatus.TALKING, metadata=talking_metadata,
+        )
+
+    def _worker_with_status_tracking() -> None:
+        """worker 本体 + finally で Ready 反映する wrapper (Phase 0.5-B-α)。
+
+        chunks 再生完了 / worker 内例外のいずれでも finally 経路で Ready に戻す。
+        """
+        try:
+            _run_playback_worker(
+                q,
+                publish_bubble_fn=_publish_bubble_for_handraise,
+                play_audio_fn=play_audio_file,
+                cleanup_audio_fn=_cleanup_audio,
+                set_pose_fn=_set_pose_safe,
+            )
+        finally:
+            if status_manager is not None:
+                status_manager.set_status(slug, CharacterStatus.READY)
+
     t = threading.Thread(
-        target=_run_playback_worker,
-        args=(q,),
-        kwargs={
-            "publish_bubble_fn": _publish_bubble_for_handraise,
-            "play_audio_fn": play_audio_file,
-            "cleanup_audio_fn": _cleanup_audio,
-            "set_pose_fn": _set_pose_safe,
-        },
+        target=_worker_with_status_tracking,
         daemon=True,
         name=f"handraise-playback-{slug}",
     )
@@ -230,6 +327,7 @@ def _approved_synthesize_fallback(
     session_stream_id: str,
     session_id_root: str,
     stream_context: "str | None" = None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> None:
     """挙手承認時に bg_result が無効だった場合の同期 fallback (Phase 0.5-A フェーズ 7)。
 
@@ -332,6 +430,24 @@ def _approved_synthesize_fallback(
         slug, len(chunks), total_chars,
     )
 
+    # Phase 0.5-B-α: fallback パスでも Talking 状態を反映する。
+    # llm_text は events から (= バグ 4 修正で確立した経路を再利用)、pose は chunks[0]。
+    # WHY: HUD dashboard 要件は経路 (BG ready / fallback) によらず「Talking 中の
+    # キャラ + text + pose」を見せること。fallback はレアパスだが、起きた場合に
+    # HUD が「黙ったまま再生される」状態にならないよう同じ metadata を構築。
+    fallback_llm_text = ""
+    try:
+        # run_pipeline の result は本関数では受け取っていないため、最後の chunks の
+        # 中身では full text を構築できない。代わりに chunks の text を結合する
+        # (= 各 chunk text を順に連結すると概ね full response に近い)。
+        # 厳密な full LLM response が欲しい場合は run_pipeline の戻り値を取得する
+        # 経路追加が必要だが、本 commit では chunk text 結合で代用 (commit 5 で改善)。
+        fallback_llm_text = "".join(c.get("text", "") for c in chunks)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("fallback talking metadata text 抽出失敗 (空文字で続行): %s", exc)
+    fallback_pose = chunks[0].get("pose") if chunks else None
+    fallback_metadata = _build_talking_metadata(slug, fallback_llm_text, fallback_pose)
+
     # 蓄積した chunks を専用 mini playback worker で再生 (bg_result 経路と同じ仕組み)。
     # worker が speaking → done の bubble.update を発行しつつ、wav を順次再生する。
     _spawn_handraise_response_playback(
@@ -340,6 +456,8 @@ def _approved_synthesize_fallback(
         fallback_trace_id,
         session_stream_id=session_stream_id,
         session_id_root=session_id_root,
+        status_manager=status_manager,
+        talking_metadata=fallback_metadata if fallback_metadata else None,
     )
 
 
@@ -348,6 +466,7 @@ def _create_handraise_runner_and_callbacks(
     session_stream_id: str,
     session_id_root: str,
     stream_context: "str | None",
+    status_manager: "CharacterStatusManager | None" = None,
 ):
     """Phase 0.5-A フェーズ 7: 4 つの callback と bg_runner を生成する factory。
 
@@ -506,6 +625,7 @@ def _create_handraise_runner_and_callbacks(
                     session_stream_id=session_stream_id,
                     session_id_root=session_id_root,
                     stream_context=stream_context,
+                    status_manager=status_manager,
                 ),
                 name=f"approved-fallback-{slug}",
                 daemon=True,
@@ -549,6 +669,7 @@ def _create_handraise_runner_and_callbacks(
                     session_stream_id=session_stream_id,
                     session_id_root=session_id_root,
                     stream_context=stream_context,
+                    status_manager=status_manager,
                 ),
                 name=f"approved-fallback-{slug}",
                 daemon=True,
@@ -612,6 +733,7 @@ def _create_handraise_runner_and_callbacks(
                     session_stream_id=session_stream_id,
                     session_id_root=session_id_root,
                     stream_context=stream_context,
+                    status_manager=status_manager,
                 )
                 return
 
@@ -626,6 +748,7 @@ def _create_handraise_runner_and_callbacks(
                     session_stream_id=session_stream_id,
                     session_id_root=session_id_root,
                     stream_context=stream_context,
+                    status_manager=status_manager,
                 )
                 return
 
@@ -639,12 +762,21 @@ def _create_handraise_runner_and_callbacks(
                 "挙手承認 playback worker 起動 [character=%s]",
                 slug,
             )
+            # Phase 0.5-B-α: Talking metadata 構築 (HUD で立ち絵 + 発話全文を表示)。
+            # answering_text は既に bg_result.result.events から抽出済 (line 上方)、
+            # pose は first_chunk.pose を再利用 (graph._tts_node 内で chunk に埋め込み済)。
+            first_chunk_pose = chunks[0].get("pose") if chunks else None
+            talking_metadata = _build_talking_metadata(
+                slug, answering_text, first_chunk_pose,
+            )
             _spawn_handraise_response_playback(
                 slug,
                 chunks,
                 bg_trace_id,
                 session_stream_id=session_stream_id,
                 session_id_root=session_id_root,
+                status_manager=status_manager,
+                talking_metadata=talking_metadata if talking_metadata else None,
             )
 
         threading.Thread(
@@ -968,6 +1100,13 @@ def run_loop(
     # で queue に event が積まれ、メインスレッドの dispatcher.wait_for_next_event()
     # で取り出される。応答中も録音は継続される。
     dispatcher = None
+    # Phase 0.5-B-α: 全キャラ状態を一元管理する CharacterStatusManager は
+    # bg-continuous モードのみで生成。他 backend (porcupine / speech / sherpa /
+    # continuous / keyboard) では None で動作 (= status 反映スキップ、後方互換)。
+    # WHY: 挙手機能 (= Raisehand 状態) や bg LLM (= Thinking) は bg-continuous
+    # でしか動かないため、Manager 自体も bg-continuous 限定。それ以外の backend で
+    # 「Talking 状態を出したい」要件が出たら別途対応。
+    status_manager: "CharacterStatusManager | None" = None
     if effective_backend == "bg-continuous":
         from .dispatcher import (
             DRAIN_MAX_AGE_SEC,
@@ -1085,8 +1224,53 @@ def run_loop(
             except Exception as exc:
                 logger.warning("bubble.update(%s) from dispatcher publish 失敗: %s", step, exc)
 
+        # ─── Phase 0.5-B-α: CharacterStatusManager 生成 + publish closure 接続 ──
+        # 全キャラ状態 (Ready/Thinking/ToolCalling/Raisehand/Talking) を一元管理。
+        # subscribe で character.status.update event を Redis Stream に publish し、
+        # HUD dashboard (= V2 nautilus-v2、別リポ) が状態を可視化する土台を作る。
+        status_manager = CharacterStatusManager()
+
+        def _publish_character_status(
+            slug: str,
+            new_status: "CharacterStatus",
+            old_status: "CharacterStatus",
+            metadata: "dict | None",
+        ) -> None:
+            """状態変化時に character.status.update event を bus に publish する。
+
+            queue.update / handraise.update と同じく、状態変化は特定ターンに紐付か
+            ないため毎回新 trace_id を生成。失敗は warning ログのみで状態管理本体は
+            続行 (= bus 障害でアプリが止まらない fail-open)。
+
+            Args:
+                slug:        キャラ slug
+                new_status:  遷移後の CharacterStatus
+                old_status:  遷移前の CharacterStatus
+                metadata:    Talking 時の {"pose": str, "text": str} 等。他状態は None。
+            """
+            try:
+                event = build_character_status_update(
+                    character=slug,
+                    status=new_status.value,
+                    stream_id=session_stream_id,
+                    session_id=session_id_root,
+                    trace_id=_new_uuid(),
+                    previous_status=old_status.value,
+                    metadata=metadata,
+                )
+                publish(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "character.status.update publish 失敗 [character=%s]: %s",
+                    slug, exc,
+                )
+
+        status_manager.subscribe(_publish_character_status)
+
         # Phase 0.5-A フェーズ 7: BG LLM 起動 + handraise 物理通知の 4 callback を
         # factory 経由で生成 (session 識別子 + 配信文脈を closure として捕捉)。
+        # Phase 0.5-B-α: status_manager も factory に注入し、挙手承認応答経路で
+        # Talking + Ready を反映できるようにする。
         (
             _bg_runner,
             _on_handraise_started,
@@ -1096,6 +1280,7 @@ def run_loop(
             session_stream_id=session_stream_id,
             session_id_root=session_id_root,
             stream_context=stream_context,
+            status_manager=status_manager,
         )
 
         dispatcher = Dispatcher(
@@ -1106,6 +1291,7 @@ def run_loop(
             on_handraise_started=_on_handraise_started,
             on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
             on_handraise_approved=_on_handraise_approved,
+            status_manager=status_manager,
         )
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、
         # 検知された wake_event は dispatcher.on_wake_detected で queue に積まれる。
@@ -1136,6 +1322,12 @@ def run_loop(
             listener.set_routing_paused(False)
             if dispatcher is not None:
                 dispatcher.on_pipeline_complete(completed_slug=completed_slug)
+        # Phase 0.5-B-α: 通常応答完了 → Ready (Thinking / Talking のいずれからでも)
+        # bg-continuous 以外の backend (porcupine 等) では status_manager=None で no-op。
+        # WHY: completed_slug 不明時 (= pipeline 例外で speaker 不明) は status 反映
+        # スキップ (= 誤って他キャラを Ready にするのを防ぐ fail-safe)。
+        if status_manager is not None and completed_slug:
+            status_manager.set_status(completed_slug, CharacterStatus.READY)
 
     turn = 0
     try:
@@ -1332,6 +1524,21 @@ def run_loop(
                     # これがないと、chunk 1 で special_doya に切り替わった後、
                     # chunk 2/3 で neutral に逆戻りしてしまう。
                     chunk_pose = _pending_poses.pop(character, None)
+                    # Phase 0.5-B-α: 第 1 chunk = 物理再生開始直前 → Talking 反映 (HUD 用)。
+                    # WHY chunk_count == 1 限定: 後続 chunk で metadata が変わる (pose=None
+                    # 等) と publish が重複する。chunk 1 のみで反映すれば「最初の chunk
+                    # 投入 = Talking 開始」が明確で publish も 1 回。
+                    # WHY text=None: 本 commit では graph 側から full LLM response を渡せる
+                    # 経路がないため、chunk_text (= 最初の chunk のみ) では発話「全文」に
+                    # ならない。commit 5 で graph 経由の full response 渡し対応後に text 追加。
+                    if status_manager is not None and _chunk_count[0] == 1:
+                        talking_metadata = _build_talking_metadata(
+                            character, llm_text=None, pose=chunk_pose,
+                        )
+                        status_manager.set_status(
+                            character, CharacterStatus.TALKING,
+                            metadata=talking_metadata or None,
+                        )
                     task = {
                         "url": url,
                         "text": chunk_text,
