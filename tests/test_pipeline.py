@@ -764,3 +764,69 @@ class TestRunPipelineTtsOnly:
         assert state["tts_provider"] == "voicepeak"
         assert state["tts_voice"] == "Miyamai Moca"
         assert state["tts_speaker"] == "chisame"
+
+
+# ─── TestRunPipelineStatusManager (Phase 0.5-B-α) ──────────────
+
+
+class TestRunPipelineStatusManager:
+    """Phase 0.5-B-α: run_pipeline 系の status_manager 透過渡し検証。"""
+
+    def test_run_pipeline_passes_status_manager_to_graph(self, monkeypatch):
+        """run_pipeline(status_manager=...) で _run_pipeline_graph に透過渡しされる。"""
+        from lab_lounge.pipeline import run_pipeline
+
+        captured: dict = {}
+
+        def fake_graph(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        sentinel_manager = object()  # CharacterStatusManager の代わりの sentinel
+        run_pipeline(
+            "test text",
+            status_manager=sentinel_manager,
+            **COMMON,
+        )
+
+        # _run_pipeline_graph に同じ object が渡されている
+        assert captured.get("status_manager") is sentinel_manager
+
+    def test_run_pipeline_default_status_manager_is_none(self, monkeypatch):
+        """status_manager 未指定時は None が透過 (= 既存テスト互換)。"""
+        from lab_lounge.pipeline import run_pipeline
+
+        captured: dict = {}
+
+        def fake_graph(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        run_pipeline("test text", **COMMON)
+        # default = None (= 既存挙動互換)
+        assert captured.get("status_manager") is None
+
+    def test_run_pipeline_llm_only_passes_status_manager(self, monkeypatch):
+        """run_pipeline_llm_only(status_manager=...) でも透過。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        captured: dict = {}
+
+        def fake_graph_llm_only(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph_llm_only", fake_graph_llm_only)
+
+        sentinel_manager = object()
+        run_pipeline_llm_only(
+            "test text",
+            status_manager=sentinel_manager,
+            **COMMON,
+        )
+
+        assert captured.get("status_manager") is sentinel_manager

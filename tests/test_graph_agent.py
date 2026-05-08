@@ -185,6 +185,77 @@ class TestBubbleToolCallbackHandler:
 
         assert len(published) == 0
 
+    # ─── Phase 0.5-B-α: status_manager 連携テスト ─────────────
+
+    def test_on_tool_start_sets_tool_calling(self):
+        """on_tool_start で status_manager に TOOL_CALLING が反映される。"""
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "retrieve_memory_tool"}, "test")
+
+        assert manager.get_status("mimi") == CharacterStatus.TOOL_CALLING
+
+    def test_on_tool_end_sets_thinking_back(self):
+        """on_tool_end で status_manager に THINKING が反映される (= TOOL_CALLING → THINKING)。"""
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        manager.set_status("mimi", CharacterStatus.TOOL_CALLING)
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+        # LangChain は引数構造が揺れるため *args/**kwargs を受ける設計。引数なしで呼べる
+        handler.on_tool_end()
+
+        assert manager.get_status("mimi") == CharacterStatus.THINKING
+
+    def test_unknown_tool_no_status_change(self):
+        """TOOL_MESSAGE_KEY に無いツールでは status 変化なし (= bubble.update と同様の判定)。"""
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        manager.set_status("mimi", CharacterStatus.THINKING)
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "unknown_tool"}, "test")
+
+        # status は THINKING のまま (= TOOL_CALLING に変化しない)
+        assert manager.get_status("mimi") == CharacterStatus.THINKING
+
+    def test_status_manager_none_no_op(self):
+        """status_manager=None で例外なく動く (= 既存呼出経路の互換性確認)。"""
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )  # status_manager=None (default)
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "retrieve_memory_tool"}, "test")
+            handler.on_tool_end()
+        # 例外なく完了
+
 
 class TestAskCharacterToolRegistration:
     """ask_character ツール登録を検証する (Phase 3)。"""
