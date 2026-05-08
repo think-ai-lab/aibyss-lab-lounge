@@ -94,6 +94,18 @@ _previous_targets: dict[str, str] = {}  # session_id → 直前 target の displ
 #     残りの chunks が再生されないのを防ぐ (途中切れ防止)
 _bg_tts_events: dict[str, list[threading.Event]] = {}
 
+# Phase 0.5-B-β-2: 却下/lapse 時の bg_tts キャンセルフラグ。run_loop の
+# on_handraise_close callback が cancel_bg_tts(session_id) を呼ぶと、該当
+# session の Event が set される。導入セリフ TTS / _wrapped_on_chunk_ready /
+# _bg_tts_synthesize の各箇所で is_set() チェックして以降の処理を skip する。
+#
+# 【WHY: VOICEPEAK 合成中の subprocess は止められない】
+# 既に subprocess.run(voicepeak.exe ...) で合成中の chunk は OS レベルで止め
+# られない。本フラグで阻止できるのは「未起動の bg_tts thread」「未投入の
+# chunk」「導入セリフ TTS の起動」の 3 種類。再生中の chunk は最後まで流れる
+# が、バッファ済の未再生 chunks は β-2-3 の playback queue drain で破棄する。
+_bg_cancel_flags: dict[str, threading.Event] = {}
+
 
 def _reset_session_state(session_id: str) -> None:
     """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
@@ -132,6 +144,46 @@ def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
         return
     with _ask_state_lock:
         _bg_tts_events.setdefault(session_id, []).append(event)
+
+
+def cancel_bg_tts(session_id: str) -> int:
+    """指定 session の bg_tts cancel flag を set する (Phase 0.5-B-β-2)。
+
+    run_loop の on_handraise_close callback (= 却下/lapse 時) から呼ばれる。
+    本関数で阻止できるのは以下 3 種類:
+      - 未起動の _bg_tts_synthesize daemon thread の tts_synthesize 呼出
+      - _wrapped_on_chunk_ready の on_tts_chunk 投入
+      - 導入セリフ TTS の起動 (set_ask_character_context 後の最初の _ask_character_impl
+        呼出より前にキャンセルされた場合)
+
+    既に subprocess.run(voicepeak.exe ...) で合成中の chunk は OS レベルで止め
+    られない。再生中の chunk も止められない (playback worker が play_audio_file で
+    block 中)。これらは β-2-3 の playback queue drain でも破棄できないが、未投入
+    の chunks (= まだ queue に乗っていない、もしくは合成中の VOICEPEAK の次の
+    chunk) は本フラグで阻止できる。
+
+    Args:
+        session_id: cancel 対象の session_id (空文字なら no-op で 0 返却)
+
+    Returns:
+        cancel flag set 時点で session に登録されていた bg_tts event 数
+        (= 影響を受ける可能性のある bg_tts thread 数の指標)。0 は「未登録」または
+        「対象なし」を示す (= 呼出側が「効果なかった」と判別する用途、現状ログのみ)。
+    """
+    if not session_id:
+        return 0
+    with _ask_state_lock:
+        flag = _bg_cancel_flags.get(session_id)
+        if flag is None:
+            return 0
+        flag.set()
+        # 影響範囲は登録済 bg_tts event 数で示す (= 起動済 bg_tts thread の概数)
+        n = len(_bg_tts_events.get(session_id, []))
+    logger.info(
+        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d",
+        session_id, n,
+    )
+    return n
 
 
 def wait_bg_tts_complete(session_id: str, timeout: float = 180.0) -> None:
@@ -190,6 +242,13 @@ def set_ask_character_context(
     # graph.py の _generation_node がターン開始時に 1 回呼ぶ前提。
     session_id = (common or {}).get("session_id", "")
     _reset_session_state(session_id)
+    # Phase 0.5-B-β-2: cancel flag を session_id 単位でクリーンに作る。前ターンで
+    # set されていた flag を継承すると、今ターンの bg_tts が起動直後に skip され
+    # てしまうため、新規 Event で上書きする。session_id 空文字なら no-op (= 後方
+    # 互換、テスト等で session_id 未指定パターンに対応)。
+    if session_id:
+        with _ask_state_lock:
+            _bg_cancel_flags[session_id] = threading.Event()
 
 
 def reset_ask_character_context() -> None:
@@ -205,6 +264,7 @@ def reset_ask_character_context() -> None:
         _ask_counts.clear()
         _previous_targets.clear()
         _bg_tts_events.clear()
+        _bg_cancel_flags.clear()
 
 
 # ─── MCP サーバー ──────────────────────────────────────────────────
@@ -301,6 +361,15 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
     # 発生しない (= 直前の発話が続いている間に wait する形になる)。
     wait_bg_tts_complete(session_id)
 
+    # Phase 0.5-B-β-2: cancel flag を取得して closure に保持する。run_loop の
+    # on_handraise_close callback から cancel_bg_tts(session_id) で set される可能性が
+    # ある。導入セリフ TTS / _wrapped_on_chunk_ready / _bg_tts_synthesize の
+    # 各箇所で is_set() チェックして以降の処理を skip する。
+    # _bg_tts_synthesize は別 thread (= contextvars 引き継ぎ問題あり) で走るため、
+    # ここでメインスレッドの dict から取得して closure 経由で渡す。
+    with _ask_state_lock:
+        cancel_flag = _bg_cancel_flags.get(session_id)
+
     ask_index, previous_target_display = _next_ask_state(session_id)
 
     logger.info(
@@ -396,27 +465,36 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     # 4a-4. 導入セリフ TTS → 再生完了を待つ (並行して協働先 LLM が走る)
     if on_tts_chunk and use_real_tts and caller_char and intro_response_text:
-        try:
-            from ..tts import synthesize as tts_synthesize
-
-            intro_done = threading.Event()
-            _chunk_done_event_var.set(intro_done)
-
-            logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
-            tts_synthesize(
-                intro_response_text,
-                provider=caller_char.tts_provider,
-                voice=caller_char.tts_voice,
-                speaker=caller_char.slug,
-                output_dir=tts_output_dir,
-                on_chunk_ready=on_tts_chunk,
+        # Phase 0.5-B-β-2: cancel flag set されていれば導入セリフ TTS スキップ。
+        # 既に却下/lapse されている場合 (= 稀だが、_generate_intro 中に挙手中
+        # キャラが lapse する等) は導入セリフを流す意味がない。
+        if cancel_flag is not None and cancel_flag.is_set():
+            logger.info(
+                "ask_character 導入セリフ TTS skip (cancel flag set): session=%s",
+                session_id,
             )
+        else:
+            try:
+                from ..tts import synthesize as tts_synthesize
 
-            logger.info("ask_character 導入セリフ再生待ち...")
-            intro_done.wait(timeout=120)
-            logger.info("ask_character 導入セリフ再生完了")
-        except Exception as exc:
-            logger.warning("導入セリフ TTS 失敗: %s", exc)
+                intro_done = threading.Event()
+                _chunk_done_event_var.set(intro_done)
+
+                logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
+                tts_synthesize(
+                    intro_response_text,
+                    provider=caller_char.tts_provider,
+                    voice=caller_char.tts_voice,
+                    speaker=caller_char.slug,
+                    output_dir=tts_output_dir,
+                    on_chunk_ready=on_tts_chunk,
+                )
+
+                logger.info("ask_character 導入セリフ再生待ち...")
+                intro_done.wait(timeout=120)
+                logger.info("ask_character 導入セリフ再生完了")
+            except Exception as exc:
+                logger.warning("導入セリフ TTS 失敗: %s", exc)
 
     # 4a-5. 協働先 LLM の完了を待つ (導入再生中に並行実行されていたので大部分は完了済み)
     collab_thread.join(timeout=120)
@@ -533,6 +611,13 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         _, _, _, target_pose = _parse_voicepeak_json(response_text)
 
         def _wrapped_on_chunk_ready(url: str, chunk_text: str, is_last: bool, character: str) -> None:
+            # Phase 0.5-B-β-2: cancel flag set されていれば chunk 投入 skip。
+            # bg_tts thread の合成は止められないが、playback queue への投入を阻止
+            # することで「却下後に target の応答音声が流れ続ける」状況を防ぐ。
+            # answering bubble / pose 予約 / TALKING ステータスも合わせて skip する
+            # (= これらは「target が話す」前提の演出なので、cancel 後は不要)。
+            if cancel_flag is not None and cancel_flag.is_set():
+                return
             # 本応答 TTS の最初のチャンクが投入される直前のフック
             if not first_chunk_seen[0]:
                 first_chunk_seen[0] = True
@@ -592,6 +677,18 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
         def _bg_tts_synthesize() -> None:
             try:
+                # Phase 0.5-B-β-2: cancel flag set されていれば tts_synthesize 起動
+                # を skip。VOICEPEAK の subprocess.run は止められないが、起動前なら
+                # 完全に阻止できる (= 一番早い cancel タイミング、CPU/GPU 浪費なし)。
+                # finally で bg_tts_done.set() + status_manager READY 反映が走るため、
+                # 状態整合性は維持される。
+                if cancel_flag is not None and cancel_flag.is_set():
+                    logger.info(
+                        "ask_character 協働応答 TTS skip (cancel flag set): "
+                        "target=%s session=%s",
+                        character_slug, session_id,
+                    )
+                    return
                 from ..tts import synthesize as tts_synthesize
                 tts_synthesize(
                     response_text,

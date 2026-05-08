@@ -496,6 +496,114 @@ class TestLlmOnlyTtsPenetration:
         mock_synth.assert_not_called()
 
 
+# ─── Phase 0.5-B-β-2 commit 2: cancel_bg_tts API + bg_tts キャンセルガード ────
+# 却下/lapse 時に ask_character の bg_tts daemon thread を阻止する経路。run_loop
+# の on_handraise_close callback (β-2-3 で実装) が cancel_bg_tts(session_id) を
+# 呼ぶと、該当 session の Event が set される。導入セリフ TTS / _wrapped_on_chunk_ready
+# / _bg_tts_synthesize の 3 箇所で is_set() チェックして以降の処理を skip する。
+# 既に subprocess 中の VOICEPEAK 合成は止められないが、未起動 thread / 未投入
+# chunk / 導入セリフ起動を阻止することで、案 A の音声漏れを最小化する。
+
+
+class TestCancelBgTts:
+    """cancel_bg_tts API + bg_tts キャンセルガード (Phase 0.5-B-β-2 commit 2)。"""
+
+    def test_cancel_bg_tts_returns_zero_for_unknown_session(self):
+        """未登録 session_id で 0 を返す (= flag が無いので set もしない)。
+
+        WHY: dispatcher の on_handraise_close から呼ばれる際、稀に session_id が
+        既にクリーンアップ済 (= 別ターン開始等) のケースで安全に no-op で帰る。
+        """
+        from lab_lounge.mcp_servers.ask_character import cancel_bg_tts
+
+        result = cancel_bg_tts("unknown_session_xyz")
+        assert result == 0
+
+    def test_cancel_bg_tts_empty_session_no_op(self):
+        """空文字 session_id で no-op で 0 を返す。
+
+        WHY: テスト等で session_id 未指定 (= 空文字) で呼ばれるパターンに対応。
+        """
+        from lab_lounge.mcp_servers.ask_character import cancel_bg_tts
+
+        result = cancel_bg_tts("")
+        assert result == 0
+
+    def test_cancel_bg_tts_sets_flag_and_returns_count(self):
+        """set_ask_character_context 後、cancel_bg_tts で flag set + count 返却。
+
+        WHY: 登録済 session に対する cancel の本来の動作。flag set されると、
+        以降の bg_tts ガード (= ask_character.py の 3 箇所) が False → return で
+        skip 動作する。count は影響範囲を示す診断値 (= 登録済 bg_tts events 数)。
+        """
+        import threading
+
+        from lab_lounge.mcp_servers.ask_character import (
+            _ask_state_lock,
+            _bg_cancel_flags,
+            _register_bg_tts_event,
+            cancel_bg_tts,
+        )
+
+        session_id = "ss-cancel-test"
+        set_ask_character_context(
+            common={"session_id": session_id, "stream_id": "s1", "trace_id": "t1"},
+        )
+
+        # bg_tts events を 2 つ登録 (= bg_tts thread 2 つ起動済の状態を模擬)
+        ev1 = threading.Event()
+        ev2 = threading.Event()
+        _register_bg_tts_event(session_id, ev1)
+        _register_bg_tts_event(session_id, ev2)
+
+        # cancel 実行
+        result = cancel_bg_tts(session_id)
+
+        # flag が set されている
+        with _ask_state_lock:
+            assert _bg_cancel_flags[session_id].is_set()
+        # 戻り値 = 登録済 bg_tts events 数 (= 影響範囲指標)
+        assert result == 2
+
+    def test_cancel_blocks_subsequent_bg_tts_synthesize(self, monkeypatch):
+        """cancel_bg_tts 後の _ask_character_impl で tts.synthesize 起動が skip される。
+
+        WHY: end-to-end の整合性確認。flag set 状態で _ask_character_impl を呼ぶと、
+        ask_character.py:376 (導入セリフ) と _bg_tts_synthesize の冒頭ガードで
+        tts.synthesize が一切呼ばれない (= VOICEPEAK 合成も起動しない、CPU/GPU
+        浪費なし)。実走では「却下後にミミ様の問いかけが流れない」「ちさめの応答も
+        流れない」状態になる (= 案 A の音声漏れの最小化)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _ask_character_impl,
+            cancel_bg_tts,
+            wait_bg_tts_complete,
+        )
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "ss-cancel-integ"
+        set_ask_character_context(
+            on_tts_chunk=MagicMock(),
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+        # 予め cancel (= 「ask_character 起動時には既に却下されている」シナリオ)
+        cancel_bg_tts(session_id)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize") as mock_synth:
+            _ask_character_impl("chisame", "質問")
+            # bg_tts thread の完了 (= cancel ガードで早期 return) を待つ
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ (caller=mimi) も本応答 (target=chisame) も両方 skip される
+        mock_synth.assert_not_called()
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
