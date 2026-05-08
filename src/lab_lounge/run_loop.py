@@ -516,11 +516,23 @@ def _create_handraise_runner_and_callbacks(
         bg_trace_id = bg_result.trace_id or trace_id or _new_uuid()
 
         # answering bubble の text を pipeline_result.events から抽出
+        # WHY (バグ 4 修正、実走 logs/runs/run_loop_20260508_184930.log で発覚):
+        # llm.final.text は Pydantic JSON 文字列 ({"response":"...","emotion":{...},
+        # "speed":...,"pose":"..."}) なので、bubble.text に生 JSON が表示される
+        # のを防ぐため response 部分のみを取り出す。通常応答パスでは graph._tts_node
+        # 内で _parse_voicepeak_json により処理されるが、案 W'-1 で run_loop が
+        # bubble.update を発行する経路では、ここで明示的に parse する必要がある。
+        from .tts import _parse_voicepeak_json
         answering_text = ""
         try:
             for ev in bg_result.result.events:
                 if ev.get("type") == "llm.final":
-                    answering_text = ev.get("payload", {}).get("text", "")
+                    llm_text_raw = ev.get("payload", {}).get("text", "")
+                    if llm_text_raw:
+                        # _parse_voicepeak_json は parse 失敗時 (= JSON でない /
+                        # response key 無し) でも (text, None, None, None) で
+                        # 元テキストをそのまま返す → fallback ロジック不要
+                        answering_text, _, _, _ = _parse_voicepeak_json(llm_text_raw)
                     break
         except Exception as exc:  # noqa: BLE001
             logger.debug("answering text 抽出失敗 (空文字で続行): %s", exc)

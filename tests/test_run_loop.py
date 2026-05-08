@@ -650,11 +650,20 @@ class TestCreateHandraiseRunnerAndCallbacks:
 
         _, _, _, on_approved = self._factory()
 
-        # bg_result.result.events に llm.final がある
+        # bg_result.result.events に llm.final がある (= 案 W'-1 の実態に合わせて
+        # Pydantic JSON 文字列形式)
         fake_result = MagicMock()
         fake_result.events = [
             {"type": "utterance.final"},
-            {"type": "llm.final", "payload": {"text": "わたくしの見解は…"}},
+            {
+                "type": "llm.final",
+                "payload": {
+                    "text": (
+                        '{"response": "わたくしの見解は…",'
+                        ' "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+                    ),
+                },
+            },
         ]
         bg = HandraiseBgResult(
             chunks=[],  # LLM-only なので空
@@ -677,6 +686,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
         ]
         assert len(bubble_calls) == 1
         assert bubble_calls[0]["payload"]["character"] == "mimi"
+        # バグ 4 修正: bubble.text は JSON の response 部分のみ (= 生 JSON 文字列ではない)
         assert bubble_calls[0]["payload"]["text"] == "わたくしの見解は…"
         # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech"
         assert bubble_calls[0]["payload"]["category"] == "speech"
@@ -686,6 +696,130 @@ class TestCreateHandraiseRunnerAndCallbacks:
         assert len(spawn_calls) == 1
         assert spawn_calls[0][0] == "mimi"
         assert spawn_calls[0][2] == "bg-abc"  # bg_trace_id 引継ぎ
+
+    def test_on_handraise_approved_bubble_text_is_response_only_not_raw_json(
+        self, monkeypatch,
+    ):
+        """W'-1 バグ 4 修正: bubble.text は LLM 応答 JSON の response フィールドのみ。
+
+        WHY: 実走 logs/runs/run_loop_20260508_184930.log で
+        bubble.update [character=sakura step=answering] の payload.text に
+        生 JSON 全体 ({"response":"...","emotion":{...},...}) が入っていた。
+        通常応答パスでは _tts_node 内で _parse_voicepeak_json で処理されるが、
+        W'-1 で run_loop が bubble を発行する経路では明示的に parse する必要が
+        ある (= バグ 4 の核心テスト)。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        published: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish",
+            lambda ev: published.append(ev),
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only",
+            lambda llm_result, **kw: llm_result,
+        )
+
+        _, _, _, on_approved = self._factory()
+
+        # 実走で観察された JSON 文字列を再現 (= sakura の応答)
+        raw_json = (
+            '{"response":"ん〜……AI倫理って、深く考えれば考えるほど、答えが'
+            '一つじゃないって気づきますよねぇ。",'
+            '"emotion":{"happy":30,"sad":10,"angry":0,"whisper":40,"cool":20},'
+            '"speed":90,"pose":"special_whisper"}'
+        )
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": raw_json}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-x")
+        on_approved("sakura", bg, "snap", "trace-x")
+
+        # daemon thread が走るので bubble 発行を待つ
+        for _ in range(40):
+            if any(
+                e.get("payload", {}).get("step") == "answering"
+                for e in published
+                if e.get("type") == "bubble.update"
+            ):
+                break
+            time.sleep(0.05)
+
+        bubble_calls = [
+            e for e in published
+            if e.get("type") == "bubble.update"
+            and e.get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_calls) == 1
+        bubble_text = bubble_calls[0]["payload"]["text"]
+        # 期待: response 部分のみ (= response key の値)
+        assert bubble_text == (
+            "ん〜……AI倫理って、深く考えれば考えるほど、答えが一つじゃないって気づきますよねぇ。"
+        )
+        # 確認: 生 JSON のキー文字列 (= "emotion" / "pose" 等) が含まれていない
+        assert '"emotion"' not in bubble_text
+        assert '"pose"' not in bubble_text
+        assert '"response"' not in bubble_text
+
+    def test_on_handraise_approved_bubble_text_fallback_when_not_json(
+        self, monkeypatch,
+    ):
+        """parse 失敗時 (= 生テキスト等) は元テキストをそのまま使う (fallback)。
+
+        WHY: _parse_voicepeak_json は JSON でない / response key 無しの場合、
+        (元テキスト, None, None, None) を返す → bubble.text には元テキストが
+        そのまま入る (= 過去動作との後方互換)。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        published: list = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish",
+            lambda ev: published.append(ev),
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only",
+            lambda llm_result, **kw: llm_result,
+        )
+
+        _, _, _, on_approved = self._factory()
+
+        # JSON ではない生テキスト (= ダミー LLM モード等)
+        plain_text = "ダミー応答: 最近のAI倫理について深く考えています。"
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": plain_text}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-x")
+        on_approved("sakura", bg, "snap", "trace-x")
+
+        for _ in range(40):
+            if any(
+                e.get("payload", {}).get("step") == "answering"
+                for e in published
+                if e.get("type") == "bubble.update"
+            ):
+                break
+            time.sleep(0.05)
+
+        bubble_calls = [
+            e for e in published
+            if e.get("type") == "bubble.update"
+            and e.get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_calls) == 1
+        # parse 失敗時は元テキストをそのまま使う
+        assert bubble_calls[0]["payload"]["text"] == plain_text
 
     def test_on_handraise_approved_with_none_result_uses_fallback(self, monkeypatch):
         """bg_result=None でフォールバックスレッドが起動する。"""
