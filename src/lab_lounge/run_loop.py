@@ -393,6 +393,11 @@ def _approved_synthesize_fallback(
             on_tts_chunk_ready=on_chunk,
             stream_context=stream_context,
             suppress_bubble_answering=False,  # graph 側で answering bubble 発行
+            # Phase 0.5-B-α: fallback パスでも _generation_node が Thinking 反映する
+            # ように status_manager を透過渡し。BubbleToolCallbackHandler は
+            # disable_tools=["ask_character"] で ask_character のみ除外、他ツールは
+            # 通常通り起動 → ToolCalling 反映する。
+            status_manager=status_manager,
             # WHY (バグ 3 修正、案 A、実走 logs/runs/run_loop_20260508_181051.log で発覚):
             # fallback パスでは ask_character ツールを Agent から除外する。
             # 通常応答ターン (= chisame の callout 応答) が並行 TTS 再生中に
@@ -537,6 +542,9 @@ def _create_handraise_runner_and_callbacks(
                     trace_id=bg_trace_id,
                     speaker_hint=target_slug,
                     stream_context=stream_context,
+                    # Phase 0.5-B-α: BG LLM 経路でも graph._generation_node が
+                    # Thinking 反映 (= 挙手中キャラの thinking が HUD に出る)。
+                    status_manager=status_manager,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -1572,6 +1580,10 @@ def run_loop(
                     on_pose_ready=_on_pose_ready if not skip_playback else None,
                     # 配信文脈は起動時1回ロード済み、全ターン同じ値を渡す
                     stream_context=stream_context,
+                    # Phase 0.5-B-α: graph._generation_node + BubbleToolCallbackHandler
+                    # で Thinking / ToolCalling 反映に使う (= 通常応答経路)。
+                    # bg-continuous 以外の backend では status_manager=None で no-op。
+                    status_manager=status_manager,
                 )
             except Exception as exc:
                 logger.error("Pipeline 失敗: %s", exc)

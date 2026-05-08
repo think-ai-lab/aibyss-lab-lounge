@@ -172,6 +172,7 @@ def run_pipeline(
     stream_context: str | None = None,
     suppress_bubble_answering: bool = False,
     disable_tools: list[str] | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -220,6 +221,7 @@ def run_pipeline(
         stream_context=stream_context,
         suppress_bubble_answering=suppress_bubble_answering,
         disable_tools=disable_tools,
+        status_manager=status_manager,
     )
 
 
@@ -236,6 +238,7 @@ def _run_pipeline_graph(
     stream_context: str | None = None,
     suppress_bubble_answering: bool = False,
     disable_tools: list[str] | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -269,6 +272,9 @@ def _run_pipeline_graph(
         "on_pose_ready": on_pose_ready,
         "suppress_bubble_answering": suppress_bubble_answering,
         "disable_tools": disable_tools,
+        # Phase 0.5-B-α: status_manager は run_loop から透過渡し。
+        # _generation_node が Thinking、BubbleToolCallbackHandler が ToolCalling を反映。
+        "status_manager": status_manager,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -309,6 +315,7 @@ def run_pipeline_llm_only(
     utterance_meta: dict[str, Any] | None = None,
     speaker_hint: str | None = None,
     stream_context: str | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """LLM のみ先行実行 (TTS ノード抜き、Phase 0.5-A 案 W'-1)。
 
@@ -344,6 +351,7 @@ def run_pipeline_llm_only(
         utterance_meta=utterance_meta,
         speaker_hint=speaker_hint,
         stream_context=stream_context,
+        status_manager=status_manager,
     )
 
 
@@ -356,6 +364,7 @@ def _run_pipeline_graph_llm_only(
     utterance_meta: dict[str, Any] | None = None,
     speaker_hint: str | None = None,
     stream_context: str | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """LLM-only パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph_llm_only, PipelineGraphState
@@ -396,6 +405,9 @@ def _run_pipeline_graph_llm_only(
         # あるが、本セッションではデフォルト None で既存挙動 (= bg_result=ready
         # 経路では ask_character 使える)。fallback パスは別途 disable_tools を渡す。
         "disable_tools": None,
+        # Phase 0.5-B-α: status_manager は run_loop の bg_runner から透過渡し。
+        # BG LLM 経路でも _generation_node が Thinking 反映する。
+        "status_manager": status_manager,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -507,6 +519,10 @@ def run_pipeline_tts_only(
         "suppress_bubble_answering": True,
         # disable_tools は TTS-only モードでは使われないが型整合のため None
         "disable_tools": None,
+        # Phase 0.5-B-α: TTS-only モードでは _generation_node を通らないため
+        # status_manager は使われない (= 型整合のため None で埋める)。
+        # Talking 反映は run_loop の _spawn_handraise_response_playback 内で別途行う。
+        "status_manager": None,
         # _tts_node が読む値群
         "character_slug": llm_result.speaker,
         "llm_text": llm_text,

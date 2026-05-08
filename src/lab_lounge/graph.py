@@ -24,6 +24,7 @@ import operator
 import os
 from typing import Annotated, Any, TypedDict
 
+from .character_status import CharacterStatus, CharacterStatusManager
 from .llm import LLMResult, call_llm
 
 logger = logging.getLogger(__name__)
@@ -411,9 +412,18 @@ class BubbleToolCallbackHandler:
         "ask_character_tool": "ask_character",
     }
 
-    def __init__(self, character_slug: str, common: dict):
+    def __init__(
+        self,
+        character_slug: str,
+        common: dict,
+        status_manager: "CharacterStatusManager | None" = None,
+    ):
         self._character_slug = character_slug
         self._common = common
+        # Phase 0.5-B-α: ツール呼び出し時に Thinking → ToolCalling、終了時に
+        # ToolCalling → Thinking を反映する。None 時は status 反映スキップ
+        # (= 既存テスト互換、status_manager 未注入時の挙動維持)。
+        self._status_manager = status_manager
 
     # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
     def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
@@ -421,10 +431,26 @@ class BubbleToolCallbackHandler:
     def on_chat_model_start(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_llm_end(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_tool_end(self, *args, **kwargs) -> None: pass  # noqa: E704
+
+    def on_tool_end(self, *args, **kwargs) -> None:
+        """ツール呼び出し終了時に CharacterStatus を Thinking に戻す (Phase 0.5-B-α)。
+
+        WHY: tool 終了 → LLM 応答生成 (Thinking) → 第 1 chunk 再生 (Talking) の流れ。
+        LangChain の引数構造は Agent / tool 種別で揺らぐため `*args, **kwargs` で受ける。
+        bubble.update は発行しない (= 「searching」の表示はそのまま、次の "answering"
+        bubble は _generation_node の終盤で発行される)。
+        """
+        if self._status_manager is not None:
+            self._status_manager.set_status(
+                self._character_slug, CharacterStatus.THINKING,
+            )
 
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs) -> None:
-        """ツール呼び出し開始時にbubble.updateを発行する。"""
+        """ツール呼び出し開始時にbubble.updateを発行する。
+
+        Phase 0.5-B-α: status_manager に ToolCalling 状態を反映する
+        (= HUD で「ツール呼出中」表示の根拠データ)。
+        """
         from .pipeline import _load_bubble_messages
         from .events import build_bubble_update
         from .bus import publish
@@ -433,6 +459,13 @@ class BubbleToolCallbackHandler:
         msg_key = self.TOOL_MESSAGE_KEY.get(tool_name)
         if not msg_key:
             return  # 未知のツールは無視 (fail-open)
+
+        # Phase 0.5-B-α: Thinking → ToolCalling 反映 (TOOL_MESSAGE_KEY に登録された
+        # 既知ツールのみ。未知ツールは無視 = bubble.update も skip)。
+        if self._status_manager is not None:
+            self._status_manager.set_status(
+                self._character_slug, CharacterStatus.TOOL_CALLING,
+            )
 
         char_msgs = _load_bubble_messages().get(self._character_slug, {})
         text = char_msgs.get(msg_key, "検索中…")
@@ -464,6 +497,7 @@ def run_graph(
     character_slug: str | None = None,
     common: dict | None = None,
     disable_tools: "list[str] | None" = None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
@@ -510,6 +544,7 @@ def run_graph(
                 character_slug=character_slug,
                 common=common,
                 system_prompt=system_prompt,
+                status_manager=status_manager,
             )
 
     # 従来互換: 単一ノード構成
@@ -541,6 +576,7 @@ def _run_agent(
     character_slug: str | None = None,
     common: dict | None = None,
     system_prompt: str | None = None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> LLMResult:
     """ReAct Agent を実行し、LLMResult に変換する。
 
@@ -560,8 +596,12 @@ def _run_agent(
     if run_metadata:
         config["metadata"] = run_metadata
     # bubble.update コールバック (Agent がツールを呼んだとき HUD に動的表示)
+    # Phase 0.5-B-α: status_manager を Handler に渡し、tool 起動/終了で
+    # Thinking ↔ ToolCalling を反映できるようにする。
     if character_slug and common:
-        handler = BubbleToolCallbackHandler(character_slug, common)
+        handler = BubbleToolCallbackHandler(
+            character_slug, common, status_manager=status_manager,
+        )
         config["callbacks"] = [handler]
 
     try:
@@ -721,6 +761,11 @@ class PipelineGraphState(TypedDict):
     # 除外し、並行する TTS 再生との deadlock を回避する (logs/runs/run_loop_20260508_181051.log
     # で観察されたハングの対処)。デフォルト None で全ツール有効 = 既存挙動。
     disable_tools: "list[str] | None"
+    # Phase 0.5-B-α: 全キャラ状態を一元管理する CharacterStatusManager。
+    # _generation_node が「LLM 推論中 = Thinking」、BubbleToolCallbackHandler が
+    # 「ツール実行中 = ToolCalling」を反映するため、pipeline → graph で透過渡し。
+    # None 時は status 反映スキップ (= 後方互換、テストで未注入時の挙動維持)。
+    status_manager: "CharacterStatusManager | None"
 
     # ノード出力
     character_slug: str
@@ -1062,6 +1107,17 @@ def _generation_node(state: PipelineGraphState) -> dict:
     utt_event_id = state["events"][0]["event_id"]
 
     if state["use_real_llm"]:
+        # Phase 0.5-B-α: LLM 推論開始 → Thinking 反映 (HUD 用)。
+        # WHY: graph 内で反映することで run_pipeline (通常応答) と
+        # run_pipeline_llm_only (BG LLM) 両経路を 1 箇所でカバー。run_loop 側に
+        # 分散させると経路ごとに反映漏れが発生しやすい。state.get で None
+        # フォールバック (status_manager 未注入時は no-op、後方互換)。
+        _gen_status_manager = state.get("status_manager")
+        if _gen_status_manager is not None and state.get("character_slug"):
+            _gen_status_manager.set_status(
+                state["character_slug"], CharacterStatus.THINKING,
+            )
+
         # Sprint Axis D Block 3: retrieve_memory ツール用のセッションコンテキストをセット
         if _is_rag_enabled():
             from .mcp_servers.retrieve_memory import set_retrieval_context
@@ -1112,6 +1168,9 @@ def _generation_node(state: PipelineGraphState) -> dict:
             # バグ 3 修正 (案 A): fallback パスでは disable_tools=["ask_character"] が
             # 指定される。state.get で None フォールバック (= 既存挙動互換)。
             disable_tools=state.get("disable_tools"),
+            # Phase 0.5-B-α: status_manager を Agent / BubbleToolCallbackHandler に
+            # 透過渡し。tool 起動時の Thinking ↔ ToolCalling 反映に使う。
+            status_manager=_gen_status_manager,
         )
         write_llm_response(_llm_result.text)
         llm_text = _llm_result.text
