@@ -453,6 +453,48 @@ class Dispatcher:
                         slug, exc,
                     )
 
+    def flush_pending_handraise_releases(self) -> None:
+        """挙手 wav の遅延再生を即時フラッシュする (Phase 0.5-A フェーズ 8-11)。
+
+        通常応答の最終 chunk 物理再生完了直後 (= done_delay 5.0s 待機の前) に呼ばれること
+        を想定。handraise wav の再生開始を 5 秒早めて視聴者の体感を改善する
+        (実走 C-1 で観察した「sakura 挙手 wav が 6.5 秒遅れ」の解消)。
+
+        本メソッドは「handraise wav release のみ」を担当する。state 遷移
+        (RESPONDING → IDLE) や queue notify_all は ``on_pipeline_complete`` に残す。
+        WHY: 物理再生完了直後はまだ done bubble 発行前で、State 上は RESPONDING のままが
+        正しい (= 次の挙手判定で se_pending=True を維持できる正常な振る舞い)。
+
+        冪等性: flush 内で ``se_pending=False`` に巻き戻すため、後続の
+        ``on_pipeline_complete`` は pending_releases が空となり no-op として安全に動く。
+        逆に flush が呼ばれない経路 (= worker 異常終了 / 例外で sentinel に到達せず等)
+        で残った分は ``on_pipeline_complete`` 側のロジックが救済する (= 二重防御)。
+
+        Lock 設計: Lock 内で pending_releases を集めて se_pending=False に巻き戻し、
+        Lock 外で release callback を発火する (既存パターン踏襲、deadlock 回避)。
+        """
+        pending_releases: list[tuple[str, "Path | None"]] = []
+        with self._lock:
+            for slug, st in self._handraise_states.items():
+                if st.se_pending and st.phrase_path is not None:
+                    pending_releases.append((slug, st.phrase_path))
+                    st.se_pending = False
+
+        if pending_releases:
+            logger.info(
+                "Dispatcher.flush_pending_handraise_releases: pending=%d (early release)",
+                len(pending_releases),
+            )
+        for slug, path in pending_releases:
+            if self._on_handraise_phrase_pending_release is not None:
+                try:
+                    self._on_handraise_phrase_pending_release(slug, path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "flush_pending_handraise_releases callback failed: slug=%s err=%s",
+                        slug, exc,
+                    )
+
     def wait_for_next_event(self, timeout: float | None = None) -> WakeWordResult | None:
         """
         次の wake_event を待機して取り出す (メインスレッドが呼ぶ)。

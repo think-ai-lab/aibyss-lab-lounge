@@ -626,6 +626,7 @@ def _run_playback_worker(
     cleanup_audio_fn,
     set_pose_fn=None,
     done_delay_seconds: float = 5.0,
+    on_last_chunk_played=None,
 ) -> None:
     """
     再生ワーカー: キューから task dict を受け取り、音声再生と bubble publish を調停する。
@@ -637,12 +638,15 @@ def _run_playback_worker(
        - play_audio_fn(url) で再生（ブロッキング）
        - cleanup_audio_fn(url) で後始末
     2. None sentinel 受信時:
-       - speaking を 1 回以上 publish 済みなら done_delay_seconds 秒待って
-         publish_bubble_fn(last_character, "done", "") を呼んで break
+       - speaking を 1 回以上 publish 済みなら:
+         - on_last_chunk_played() callback を発火 (Phase 0.5-A 8-11、done_delay の前)
+         - done_delay_seconds 秒待って publish_bubble_fn(last_character, "done", "") を呼ぶ
+         - break
        - 未 publish なら即 break（bubble は V2 安全弁で消える）
 
     Sprint Axis D Block 1: OBS セリフテロップ表示
     Phase 3: 立ち絵切替を再生時点に移動 (TTS 生成時点ではなく)
+    Phase 0.5-A 8-11: on_last_chunk_played callback で挙手 wav 早期再生を実現
 
     Args:
         q:                   queue.Queue[dict | None] — task dict または None sentinel
@@ -653,6 +657,11 @@ def _run_playback_worker(
         cleanup_audio_fn:    (url: str) -> None  — 再生後のファイル削除等
         set_pose_fn:         (character: str, pose: str) -> None  — OBS 立ち絵切替 (optional)
         done_delay_seconds:  最終チャンク再生完了から done publish までの待機秒数
+        on_last_chunk_played: () -> None  — Phase 0.5-A 8-11: 最終 chunk 物理再生完了直後
+                              (done_delay sleep の前) に発火する callback。
+                              dispatcher.flush_pending_handraise_releases を渡すことで
+                              RESPONDING 中保留された挙手 wav を 5 秒早く release する。
+                              None (default) なら従来挙動 (= done_delay → done bubble の直列)。
     """
     speaking_published = False
     last_character: str | None = None
@@ -663,6 +672,18 @@ def _run_playback_worker(
         if task is None:
             # 最終チャンク再生完了後: speaking を発行していれば done_delay 秒待って done publish
             if speaking_published and last_character is not None:
+                # Phase 0.5-A 8-11: done_delay の "前" に flush callback を発火する。
+                # 通常応答の最終 chunk 物理再生完了直後に挙手 wav を release することで、
+                # 視聴者体感を「応答終了 → 6.5 秒空 → 挙手 wav」から「応答終了 → 1.5 秒
+                # → 挙手 wav」へ短縮する (実走 C-1 で観察した遅延の解消)。
+                # done bubble の発行タイミング (5 秒後) は維持し、V2 HUD UX への影響なし。
+                if on_last_chunk_played is not None:
+                    try:
+                        on_last_chunk_played()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "_run_playback_worker on_last_chunk_played failed: %s", exc,
+                        )
                 time.sleep(done_delay_seconds)
                 publish_bubble_fn(last_character, "done", "")
             break
@@ -1078,6 +1099,14 @@ def run_loop(
                     except Exception as exc:
                         logger.warning("OBS pose 切替失敗: %s → %s (%s)", character_slug, pose, exc)
 
+                # Phase 0.5-A 8-11: bg-continuous モード時のみ flush callback を渡す。
+                # WHY: dispatcher が存在しない backend (continuous / speech-activated) では
+                # 挙手機能自体が動かないため flush 対象が無く、None でよい (= 従来挙動)。
+                _on_last_chunk_played_cb = (
+                    dispatcher.flush_pending_handraise_releases
+                    if dispatcher is not None
+                    else None
+                )
                 _playback_thread = threading.Thread(
                     target=_run_playback_worker,
                     args=(_playback_queue,),
@@ -1086,6 +1115,7 @@ def run_loop(
                         "play_audio_fn": play_audio_file,
                         "cleanup_audio_fn": _cleanup_audio,
                         "set_pose_fn": _set_pose_safe,
+                        "on_last_chunk_played": _on_last_chunk_played_cb,
                     },
                     daemon=True,
                 )
