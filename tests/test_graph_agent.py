@@ -204,8 +204,14 @@ class TestBubbleToolCallbackHandler:
 
         assert manager.get_status("mimi") == CharacterStatus.TOOL_CALLING
 
-    def test_on_tool_end_sets_thinking_back(self):
-        """on_tool_end で status_manager に THINKING が反映される (= TOOL_CALLING → THINKING)。"""
+    def test_on_tool_end_is_no_op(self):
+        """on_tool_end は status を変化させない (Phase 0.5-B-α follow-up)。
+
+        commit 5 では TOOL_CALLING → THINKING を反映していたが、LangChain Agent
+        が web_search 完了後に hang する症状 (実走 TAKE 1/2) を観察したため、本実装
+        を no-op に戻した (= commit 5 partial revert)。TOOL_CALLING 状態は次の chunk
+        投入で TALKING に上書きされるため、HUD dashboard の表示は連続して動作する。
+        """
         from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
         from lab_lounge.graph import BubbleToolCallbackHandler
 
@@ -220,7 +226,8 @@ class TestBubbleToolCallbackHandler:
         # LangChain は引数構造が揺れるため *args/**kwargs を受ける設計。引数なしで呼べる
         handler.on_tool_end()
 
-        assert manager.get_status("mimi") == CharacterStatus.THINKING
+        # status は TOOL_CALLING のまま (= no-op、第 1 chunk 投入で TALKING に上書き)
+        assert manager.get_status("mimi") == CharacterStatus.TOOL_CALLING
 
     def test_unknown_tool_no_status_change(self):
         """TOOL_MESSAGE_KEY に無いツールでは status 変化なし (= bubble.update と同様の判定)。"""
