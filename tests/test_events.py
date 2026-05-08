@@ -9,6 +9,7 @@ import pytest
 
 from lab_lounge.events import (
     build_bubble_update,
+    build_character_status_update,
     build_dispatcher_handraise_update,
     build_dispatcher_queue_update,
     build_llm_final,
@@ -641,5 +642,114 @@ class TestDispatcherHandraiseUpdate:
         )
         # extra_field がそのまま残る (= events.py が dict の中身を変えない)
         assert ev["payload"]["handraise_states"][0]["extra_field"] == "xxx"
+
+
+# ─── TestCharacterStatusUpdate (Phase 0.5-B-α) ─────────────────────
+
+
+class TestCharacterStatusUpdate:
+    """build_character_status_update の payload schema + 後方互換性検証 (Phase 0.5-B-α)。
+
+    bubble.update (進捗) と分離した「キャラクター内部状態」の event。
+    HUD dashboard が subscribe して全キャラ状態を可視化する想定。
+    """
+
+    def test_minimum_required_fields(self):
+        """character + status のみで schema 通る (= optional 不要時)。"""
+        ev = build_character_status_update(
+            character="mimi", status="thinking", **COMMON,
+        )
+        validate_event(ev)
+        assert ev["type"] == "character.status.update"
+        assert ev["payload"]["character"] == "mimi"
+        assert ev["payload"]["status"] == "thinking"
+        # optional 未指定なら payload に含まれない (受信側 default 挙動を維持)
+        assert "previous_status" not in ev["payload"]
+        assert "metadata" not in ev["payload"]
+        assert "snapshot" not in ev["payload"]
+
+    def test_with_previous_status(self):
+        """previous_status を含めると payload に出現。"""
+        ev = build_character_status_update(
+            character="mimi", status="talking",
+            previous_status="thinking", **COMMON,
+        )
+        assert ev["payload"]["previous_status"] == "thinking"
+
+    def test_with_metadata(self):
+        """metadata dict が payload にそのまま載る (= Talking 時の {pose, text})。"""
+        meta = {"pose": "smile", "text": "こんにちは、ルカさま"}
+        ev = build_character_status_update(
+            character="mimi", status="talking", metadata=meta, **COMMON,
+        )
+        assert ev["payload"]["metadata"] == meta
+
+    def test_with_snapshot(self):
+        """snapshot dict が payload にそのまま載る (= HUD startup 用)。"""
+        snap = {
+            "mimi": {"status": "talking", "metadata": {"pose": "smile"}},
+            "chisame": {"status": "ready", "metadata": None},
+        }
+        ev = build_character_status_update(
+            character="mimi", status="talking", snapshot=snap, **COMMON,
+        )
+        assert ev["payload"]["snapshot"] == snap
+
+    def test_metadata_and_snapshot_both(self):
+        """metadata + snapshot 両方含めても schema 通る。"""
+        ev = build_character_status_update(
+            character="mimi", status="talking",
+            metadata={"pose": "smile"},
+            snapshot={"mimi": {"status": "talking", "metadata": None}},
+            **COMMON,
+        )
+        validate_event(ev)
+        assert "metadata" in ev["payload"]
+        assert "snapshot" in ev["payload"]
+
+    def test_event_id_is_uuid(self):
+        """event_id が UUIDv4 形式。"""
+        ev = build_character_status_update(
+            character="mimi", status="ready", **COMMON,
+        )
+        assert UUID_PATTERN.match(ev["event_id"]), f"UUID 形式でない: {ev['event_id']}"
+
+    def test_ver_type_source(self):
+        """type / source / ver が固定値。"""
+        ev = build_character_status_update(
+            character="mimi", status="ready", **COMMON,
+        )
+        assert ev["ver"] == "0.1"
+        assert ev["type"] == "character.status.update"
+        assert ev["source"] == "lab-lounge"
+
+    def test_no_stream_idx(self):
+        """Guardrail G-1: stream_idx を含めない。"""
+        ev = build_character_status_update(
+            character="mimi", status="ready", **COMMON,
+        )
+        assert "stream_idx" not in ev
+
+    def test_status_values_serialize(self):
+        """5 値 (ready/thinking/tool_calling/raisehand/talking) すべて schema 通る。"""
+        for status_value in ["ready", "thinking", "tool_calling", "raisehand", "talking"]:
+            ev = build_character_status_update(
+                character="mimi", status=status_value, **COMMON,
+            )
+            validate_event(ev)
+            assert ev["payload"]["status"] == status_value
+
+    def test_payload_passes_through_unchanged(self):
+        """events.py が status / metadata の中身に介入しない (= 任意データで schema 通る、
+        受信側 V2 でフォールバック解釈する設計)。"""
+        ev = build_character_status_update(
+            character="mimi", status="future_status_added_later",
+            metadata={"future_field": "xxx"},
+            **COMMON,
+        )
+        # 介入しない: status は free-form、metadata の中身も変えない
+        validate_event(ev)
+        assert ev["payload"]["status"] == "future_status_added_later"
+        assert ev["payload"]["metadata"]["future_field"] == "xxx"
 
 

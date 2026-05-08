@@ -94,6 +94,25 @@ def _summarize_event(event: dict[str, Any]) -> str:
             f"cooldown_slugs={list(cooldowns.keys())}"
         )
 
+    if type_ == "character.status.update":
+        # Phase 0.5-B-α 導入。Ready/Thinking/ToolCalling/Raisehand/Talking の遷移を
+        # ログで観察可能にする。Talking 時は metadata の pose / text を簡略表示
+        # (text は長文になりうるので _LOG_TEXT_PREVIEW_CHARS で truncate)。
+        char = payload.get("character", "?")
+        status = payload.get("status", "?")
+        prev = payload.get("previous_status", "?")
+        metadata = payload.get("metadata") or {}
+        meta_parts = []
+        if "pose" in metadata:
+            meta_parts.append(f"pose={metadata['pose']}")
+        if "text" in metadata:
+            text = metadata["text"]
+            preview = text[:_LOG_TEXT_PREVIEW_CHARS]
+            suffix = "..." if len(text) > _LOG_TEXT_PREVIEW_CHARS else ""
+            meta_parts.append(f"text={preview!r}{suffix}")
+        meta_summary = f" [{', '.join(meta_parts)}]" if meta_parts else ""
+        return f"character={char} status={prev}->{status}{meta_summary}"
+
     return "(no summary)"
 
 
