@@ -55,6 +55,22 @@ _chunk_done_event_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
 _on_pose_ready_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ask_char_on_pose_ready", default=None,
 )
+# Phase 0.5-B-β-1 commit 4: target キャラのステータスを HUD dashboard (V2 /status)
+# に反映するための CharacterStatusManager 参照。set_ask_character_context で
+# graph._generation_node から注入される。bridge filler 投入時に target を THINKING、
+# 本応答 chunk 1 投入時に TALKING (metadata: pose + full response_text)、
+# bg_tts 合成完了時に READY に反映する。
+#
+# 【WHY: caller でなく target だけ反映する】
+# caller (= mimi が ask_character を起動する側) のステータスは通常応答経路の
+# graph._generation_node (THINKING) / BubbleToolCallbackHandler (TOOL_CALLING) /
+# graph._tts_node (TALKING) で既に反映される。target (= chisame の音声が ask_character
+# 経由で playback queue に入って流れている数十秒) のステータスは Phase 0.5-B-α では
+# 未配線 (= ask_character.py に set_status 呼出が 0 件) で、HUD カードが READY のまま
+# だった。本 commit でこの穴を埋める。
+_status_manager_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "ask_char_status_manager", default=None,
+)
 
 # ─── ターン状態 (session_id をキーにした module-level dict) ──────────
 # contextvars ではなく dict + Lock で管理する理由:
@@ -151,6 +167,7 @@ def set_ask_character_context(
     common: dict | None = None,
     caller_slug: str = "",
     on_pose_ready: Callable | None = None,
+    status_manager: Any = None,
 ) -> None:
     """Agent 実行前にコンテキストをセットする。graph.py の _generation_node から呼ばれる。
 
@@ -159,12 +176,16 @@ def set_ask_character_context(
                        (slug: str, pose: str) -> None。
                        graph.py の _tts_node が caller の pose 切替で使うものと
                        同じ関数 (_on_pose_ready) を渡す想定。
+        status_manager: Phase 0.5-B-β-1 commit 4 で追加。target キャラの HUD
+                       ステータス反映に使う CharacterStatusManager。None なら
+                       ステータス反映 no-op (= 後方互換、Phase 0.5-B-α 以前と同じ)。
     """
     _on_tts_chunk_var.set(on_tts_chunk)
     _tts_output_dir_var.set(tts_output_dir)
     _common_var.set(common or {})
     _caller_slug_var.set(caller_slug)
     _on_pose_ready_var.set(on_pose_ready)
+    _status_manager_var.set(status_manager)
     # ターン開始時に呼出し回数と直前 target をリセット (各ターン独立にカウント)。
     # graph.py の _generation_node がターン開始時に 1 回呼ぶ前提。
     session_id = (common or {}).get("session_id", "")
@@ -179,6 +200,7 @@ def reset_ask_character_context() -> None:
     _caller_slug_var.set("")
     _chunk_done_event_var.set(None)
     _on_pose_ready_var.set(None)
+    _status_manager_var.set(None)
     with _ask_state_lock:
         _ask_counts.clear()
         _previous_targets.clear()
@@ -421,6 +443,24 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     target_char.slug, exc,
                 )
 
+        # Phase 0.5-B-β-1 commit 4: target キャラの HUD ステータスを THINKING に反映。
+        # 上の _publish_bubble("thinking") と対になる V2 SSE event (= /status の
+        # CharacterStatusManager 経由) を発火する。bridge filler が再生されている
+        # 間 HUD カードが「考え中」(黄色) で表示される。bg_tts 合成失敗時は
+        # _bg_tts_synthesize の finally で READY に戻る (= ステータス stuck 防止)。
+        _status_manager_for_target = _status_manager_var.get()
+        if _status_manager_for_target is not None:
+            try:
+                from ..character_status import CharacterStatus
+                _status_manager_for_target.set_status(
+                    target_char.slug, CharacterStatus.THINKING,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ask_character target THINKING 反映失敗 (%s): %s",
+                    target_char.slug, exc,
+                )
+
         # 5-b. target の bridge filler を再生キュー投入する (応答 TTS の合成中の空白を埋める)。
         # 「caller の問いかけ完了 → 即 target の応答が始まる」と target の VOICEPEAK 合成
         # (1 チャンク目 ~22 秒) を待つ間に視聴者の耳が空白を感じる。bridge filler
@@ -479,6 +519,10 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         # 引き継がれない可能性があるため、ここで値を取得してクロージャ経由で
         # _bg_tts_synthesize に渡す。
         on_pose_ready = _on_pose_ready_var.get()
+        # Phase 0.5-B-β-1 commit 4: status_manager も同じく contextvars 引き継ぎ
+        # 問題に対処するためメインスレッドで取得し、クロージャ経由で
+        # _wrapped_on_chunk_ready / _bg_tts_synthesize から参照する。
+        status_manager_capture = _status_manager_var.get()
 
         # response_text から pose を事前に抽出 (_wrapped_on_chunk_ready で使用)。
         # 本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
@@ -517,6 +561,33 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                             "ask_character target pose 予約失敗 (%s): %s",
                             target_char.slug, exc,
                         )
+                # Phase 0.5-B-β-1 commit 4: target の HUD ステータスを TALKING に
+                # 反映。本応答 chunk 1 が playback queue に投入されるタイミングで
+                # 反映 → V2 HUD カードが緑色 + 発話全文 (response_text) と pose
+                # を metadata に表示。closure キャプチャ (status_manager_capture)
+                # で contextvars の daemon thread 引継ぎ問題を回避済み。
+                #
+                # metadata の構造は graph._tts_node が通常応答経路で渡す形と統一
+                # (= V2 SSE 受信側で同じ shape として扱える):
+                #   - pose: target_pose (None なら null、HUD 側で fallback 描画)
+                #   - text: response_text (= 協働先 LLM の full レスポンス)
+                if status_manager_capture is not None:
+                    try:
+                        from ..character_status import CharacterStatus
+                        talking_metadata: dict[str, Any] = {
+                            "pose": target_pose if target_pose else None,
+                            "text": response_text,
+                        }
+                        status_manager_capture.set_status(
+                            target_char.slug,
+                            CharacterStatus.TALKING,
+                            metadata=talking_metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ask_character target TALKING 反映失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
             on_tts_chunk(url, chunk_text, is_last, character)
 
         def _bg_tts_synthesize() -> None:
@@ -536,6 +607,21 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     character_slug, exc,
                 )
             finally:
+                # Phase 0.5-B-β-1 commit 4: target の HUD ステータスを READY に
+                # 戻す。bg_tts 合成完了 = target の発話が終わった瞬間。例外時も
+                # finally で確実に Ready にする (= HUD カードが talking のまま
+                # stuck するのを防ぐ、UI 上の整合性を保つ)。
+                if status_manager_capture is not None:
+                    try:
+                        from ..character_status import CharacterStatus
+                        status_manager_capture.set_status(
+                            target_char.slug, CharacterStatus.READY,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ask_character target READY 反映失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
                 bg_tts_done.set()
 
         _register_bg_tts_event(session_id, bg_tts_done)
