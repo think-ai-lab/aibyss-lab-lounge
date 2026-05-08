@@ -253,6 +253,7 @@ def call_llm(
     provider: str = "openai",
     context: str | None = None,
     system_prompt: str | None = None,
+    caller_slug: str | None = None,
     **kwargs,
 ) -> LLMResult:
     """
@@ -264,6 +265,11 @@ def call_llm(
         provider:      LLM プロバイダ（現在 "openai" のみ対応）
         context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
         system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
+        caller_slug:   応答を生成するキャラ slug。ログ強化 L-3 (Phase 0.5-A 後) で
+                       追加。本セッション/ターン内で複数キャラの LLM 呼出が並列に
+                       走るときに「どのキャラの呼出か」をログで識別できるよう
+                       にする (e.g., 通常応答中の ask_character や挙手 BG LLM)。
+                       None なら "?" 表示 (= 旧経路 / フォールバック)。
         **kwargs:      プロバイダ固有のオプション（temperature 等）
 
     Returns:
@@ -280,21 +286,24 @@ def call_llm(
             f"未対応の provider: {provider!r}。対応プロバイダ: {supported}"
         )
 
+    char_tag = f"[character={caller_slug or '?'}]"
     logger.info(
-        "LLM 呼び出し開始: provider=%s model=%s rag=%s",
-        provider, model, context is not None,
+        "LLM 呼び出し開始 %s: provider=%s model=%s rag=%s",
+        char_tag, provider, model, context is not None,
     )
     if context is not None:
         kwargs["context"] = context
     if system_prompt is not None:
         kwargs["system_prompt"] = system_prompt
     result: LLMResult = fn(text, model=model, **kwargs)
+    # ログ強化 L-3: text 全文出力をやめ、長さ + 冒頭 60 文字 preview に変更。
+    # 全文は llm.final payload に残るため、ログ調査時の手掛かりは preview で十分。
+    text_preview = result.text[:60].replace("\n", " ")
+    text_suffix = "..." if len(result.text) > 60 else ""
     logger.info(
-        "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s text=%s",
-        result.latency_ms,
-        result.input_tokens,
-        result.output_tokens,
-        result.finish_reason,
-        result.text,
+        "LLM 呼び出し完了 %s: latency_ms=%d input_tokens=%d output_tokens=%d "
+        "finish_reason=%s text_len=%d text=%r%s",
+        char_tag, result.latency_ms, result.input_tokens, result.output_tokens,
+        result.finish_reason, len(result.text), text_preview, text_suffix,
     )
     return result

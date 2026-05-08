@@ -45,7 +45,11 @@ class LLMGraphState(TypedDict):
 # ─── ノード実装（従来互換） ──────────────────────────────────────
 
 def _llm_node(state: LLMGraphState) -> LLMGraphState:
-    """LLM を呼び出してテキストを生成するノード。"""
+    """LLM を呼び出してテキストを生成するノード。
+
+    旧経路 (= 単一ノードフォールバック)。LLMGraphState は character_slug を持たないため、
+    ログ強化 L-3 の caller_slug は None 渡し (= 旧挙動維持、ログ "?" 表示)。
+    """
     result = call_llm(
         state["text"],
         model=state["model"],
@@ -615,13 +619,18 @@ def _run_agent(
             finish_reason="stop",
         )
     except Exception as exc:
-        logger.error("Agent 実行失敗: %s。単一ノードにフォールバック。", exc)
+        logger.error(
+            "Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。",
+            character_slug or "?", exc,
+        )
         # フォールバック: 従来の単一ノード構成 (system_prompt を引き継ぐ)
+        # ログ強化 L-3: caller_slug でログにキャラ識別を残す
         return call_llm(
             text,
             model=model,
             provider="openai",
             system_prompt=system_prompt,
+            caller_slug=character_slug,
         )
 
 

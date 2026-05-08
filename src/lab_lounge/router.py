@@ -30,6 +30,24 @@ logger = logging.getLogger(__name__)
 
 _LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5-20251001")
 
+# ログ強化 L-3 (Phase 0.5-A 後): ルーティング/判定ログに「どの発話に対する判定か」
+# が分かるように発話テキスト先頭をログに含める。長すぎると 1 行が見にくいので
+# 30 文字で打ち切る。
+_LOG_TEXT_PREVIEW_CHARS = 30
+
+
+def _text_preview(text: str | None) -> str:
+    """ログ用の発話テキスト preview を整形する。
+
+    repr で改行・特殊文字をエスケープし、30 文字超は ... で切り詰め。
+    None / 空文字は空文字を返す (= ログでは省略される側で安全)。
+    """
+    if not text:
+        return ""
+    if len(text) > _LOG_TEXT_PREVIEW_CHARS:
+        return repr(text[:_LOG_TEXT_PREVIEW_CHARS]) + "..."
+    return repr(text)
+
 
 @dataclass(frozen=True)
 class RoutingDecision:
@@ -220,7 +238,11 @@ def _route_by_llm(
     if answer is None:
         return None
 
-    logger.info("LLM ルーター応答: %r (model=%s)", answer, model)
+    # ログ強化 L-3: text preview を含めて「何の発話への応答か」を識別容易に
+    logger.info(
+        "LLM ルーター応答: %r (model=%s text=%s)",
+        answer, model, _text_preview(text),
+    )
 
     if answer == "none":
         return "none"
@@ -229,7 +251,10 @@ def _route_by_llm(
         if answer == c.slug:
             return c
 
-    logger.warning("LLM ルーター応答 %r が候補に一致しない。", answer)
+    logger.warning(
+        "LLM ルーター応答 %r が候補に一致しない (text=%s)。",
+        answer, _text_preview(text),
+    )
     return None
 
 
@@ -252,13 +277,23 @@ def route(
     """
     characters = get_all_characters()
 
+    # ログ強化 L-3: ルーティング系ログに発話 text preview を含めて「どの発話に対する
+    # 判定か」を識別容易にする (= 連続するルーティング呼出を log で trace しやすく)
+    text_p = _text_preview(text)
+
     # 1. name_hint (ウェイクワード検知)
     if name_hint:
         matched = _match_by_hint(name_hint, characters)
         if matched:
-            logger.info("ルーティング: name_hint=%r → %s", name_hint, matched.slug)
+            logger.info(
+                "ルーティング: name_hint=%r → %s (text=%s)",
+                name_hint, matched.slug, text_p,
+            )
             return RoutingDecision(speaker=matched.slug, reason="name_hint")
-        logger.warning("name_hint=%r に一致するキャラクターなし。テキストマッチへ。", name_hint)
+        logger.warning(
+            "name_hint=%r に一致するキャラクターなし。テキストマッチへ。 (text=%s)",
+            name_hint, text_p,
+        )
 
     # 2. テキスト内のキャラクター名マッチ
     all_matches = _find_all_matches(text, characters)
@@ -266,41 +301,52 @@ def route(
     if len(all_matches) == 1:
         # 単一名 → 即確定
         matched = all_matches[0]
-        logger.info("ルーティング: テキストマッチ(単一) → %s", matched.slug)
+        logger.info(
+            "ルーティング: テキストマッチ(単一) → %s (text=%s)",
+            matched.slug, text_p,
+        )
         return RoutingDecision(speaker=matched.slug, reason="text_match")
 
     if len(all_matches) >= 2 and _is_llm_router_enabled():
         # 3. 複数名検出 → LLM ルーティング
         logger.info(
-            "複数キャラクター検出: %s → LLM ルーターへ委譲",
-            [c.slug for c in all_matches],
+            "複数キャラクター検出: %s → LLM ルーターへ委譲 (text=%s)",
+            [c.slug for c in all_matches], text_p,
         )
         llm_result = _route_by_llm(text, all_matches)
         if isinstance(llm_result, CharacterConfig):
-            logger.info("ルーティング: LLM ルーター → %s", llm_result.slug)
+            logger.info(
+                "ルーティング: LLM ルーター → %s (text=%s)",
+                llm_result.slug, text_p,
+            )
             return RoutingDecision(speaker=llm_result.slug, reason="llm_router")
         if llm_result == "none":
             # LLM が「呼びかけなし（全て言及）」と判定 → デフォルト扱い
             # 意図ゲートは呼ばれず、ContinuousListener はバッファ保持のまま次へ
             default = get_default_character()
             logger.info(
-                "ルーティング: LLM ルーター → 呼びかけなし → デフォルト(%s)",
-                default.slug,
+                "ルーティング: LLM ルーター → 呼びかけなし → デフォルト(%s) (text=%s)",
+                default.slug, text_p,
             )
             return RoutingDecision(speaker=default.slug, reason="default")
         # llm_result is None (API 失敗 / パース失敗) → 従来パターンマッチでフォールバック
-        logger.warning("LLM ルーター失敗。パターンマッチへフォールバック。")
+        logger.warning(
+            "LLM ルーター失敗。パターンマッチへフォールバック。 (text=%s)", text_p,
+        )
 
     # 複数名でも LLM 無効/失敗時、または 0 マッチ時 → 従来ロジック
     if all_matches:
         matched = _match_by_text(text, characters)
         if matched:
-            logger.info("ルーティング: テキストマッチ → %s", matched.slug)
+            logger.info(
+                "ルーティング: テキストマッチ → %s (text=%s)",
+                matched.slug, text_p,
+            )
             return RoutingDecision(speaker=matched.slug, reason="text_match")
 
     # 4. デフォルト
     default = get_default_character()
-    logger.info("ルーティング: デフォルト → %s", default.slug)
+    logger.info("ルーティング: デフォルト → %s (text=%s)", default.slug, text_p)
     return RoutingDecision(speaker=default.slug, reason="default")
 
 
@@ -418,7 +464,11 @@ def _check_intent_for_character(
         logger.warning("意図ゲート: LLM 呼び出し失敗 → unknown (fail-open)")
         return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
 
-    logger.info("意図ゲート応答: %r (model=%s char=%s)", answer, model, character_slug)
+    # ログ強化 L-3: text preview 追加で「何の発話への判定か」識別容易に
+    logger.info(
+        "意図ゲート応答: %r (model=%s char=%s text=%s)",
+        answer, model, character_slug, _text_preview(text),
+    )
 
     if answer == "callout":
         return IntentResult(intent="callout", target_slug=character_slug, confidence=1.0)
@@ -535,7 +585,12 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
         logger.warning("interjection_candidate: LLM 呼び出し失敗 → unknown (fail-open)")
         return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
 
-    logger.info("interjection_candidate 応答: %r (model=%s)", answer, model)
+    # ログ強化 L-3: text preview + 候補 slugs を追加して「何の発話に対する候補判定か」
+    # 「候補から漏れた slug が無いか」を識別容易に
+    logger.info(
+        "interjection_candidate 応答: %r (model=%s candidates=%s text=%s)",
+        answer, model, candidate_slugs, _text_preview(text),
+    )
 
     # Phase 0.5-A フェーズ 8 実走対応: LLM が指示を完全には守らず理由付きで返すケース
     # (例: "none\n\n**理由**: ...") に備えて、最初のトークンで候補を判定する。
@@ -634,9 +689,11 @@ def check_approval(
         logger.warning("check_approval: LLM 呼び出し失敗 → None (fail-open: 通常処理へ)")
         return None
 
+    # ログ強化 L-3: text preview を追加して「ルカの何の発話に対する承認/却下判定か」
+    # 識別容易に
     logger.info(
-        "check_approval 応答: %r (model=%s candidates=%s)",
-        answer, model, candidate_slugs,
+        "check_approval 応答: %r (model=%s candidates=%s text=%s)",
+        answer, model, candidate_slugs, _text_preview(text),
     )
 
     if answer == "none":

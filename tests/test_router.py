@@ -808,3 +808,37 @@ class TestCheckApproval:
         with patch("lab_lounge.router._call_router_llm", return_value="none") as mock_llm:
             check_approval("テスト", ["mimi"])
         assert mock_llm.call_args.args[0] == "gpt-5.4-nano"
+
+
+# ─── ログ強化 L-3: _text_preview helper ───────────────────────────
+
+
+class TestTextPreview:
+    """ログ強化 L-3 (Phase 0.5-A 後): _text_preview の挙動検証。"""
+
+    def test_short_text_returned_as_repr(self):
+        """30 文字以内なら repr で返す (... 付加なし)。"""
+        from lab_lounge.router import _text_preview
+        assert _text_preview("こんにちは") == "'こんにちは'"
+
+    def test_long_text_truncated_with_ellipsis(self):
+        """30 文字超は切り詰め + ... 付加。"""
+        from lab_lounge.router import _text_preview
+        long_text = "あ" * 100
+        result = _text_preview(long_text)
+        assert result.endswith("...")
+        # 30 文字 + 引用符 + ... の長さ程度
+        assert len(result) < 50
+
+    def test_empty_text_returns_empty(self):
+        """None / 空文字は空文字 (= ログでは省略される)。"""
+        from lab_lounge.router import _text_preview
+        assert _text_preview("") == ""
+        assert _text_preview(None) == ""
+
+    def test_special_chars_escaped_via_repr(self):
+        """改行や特殊文字は repr でエスケープされる (1 行ログ維持)。"""
+        from lab_lounge.router import _text_preview
+        # 改行を含む短い文字列でもエスケープされる
+        result = _text_preview("hello\nworld")
+        assert "\\n" in result  # repr で改行が \\n になる
