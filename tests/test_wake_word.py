@@ -466,7 +466,7 @@ class TestBackgroundContinuousListenerSkipsWakeOnHandraiseProcessed:
 
     @staticmethod
     def _simulate_run_loop_iteration(listener, segment) -> bool:
-        """_run_loop 1 周分の判定 (callback + skip + _evaluate_wake) を再現。
+        """_run_loop 1 周分の判定 (callback + skip + buffer クリア + _evaluate_wake) を再現。
 
         Returns:
             bool: _evaluate_wake が呼ばれたら True、skip されたら False。
@@ -482,6 +482,8 @@ class TestBackgroundContinuousListenerSkipsWakeOnHandraiseProcessed:
                 pass
 
         if processed_by_handraise:
+            # バグ 2 修正: 承認/却下/lapse/新規挙手のいずれでも buffer をクリア
+            listener._buffer.clear()
             return False  # skip されたので _evaluate_wake は呼ばれなかった
 
         if listener._routing_paused.is_set():
@@ -566,6 +568,58 @@ class TestBackgroundContinuousListenerSkipsWakeOnHandraiseProcessed:
         evaluated = self._simulate_run_loop_iteration(listener, seg)
         assert evaluated is True
         evaluate_wake_spy.assert_called_once_with(seg)
+
+    def test_buffer_cleared_when_callback_returns_true(self, monkeypatch):
+        """W'-2 拡張 (バグ 2 修正): callback=True で buffer がクリアされる。
+
+        WHY: 承認発話「ちさめさん、どうぞ」で wake skip するが buffer を維持すると、
+        次の発話 (例: Whisper ハルシネーション) で buffer の name が router に拾われ
+        wake_event 経路に乗って多重発火する。実走 logs/runs/run_loop_20260508_180741.log
+        で観察された症状の対処。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        # buffer に「ちさめさん、どうぞ」相当の承認発話が蓄積されている状態を模擬
+        seg = TranscriptSegment(text="ちさめさん、どうぞ", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+        assert len(listener._buffer) == 1  # 前提: buffer に 1 segment
+
+        listener._on_segment_added = lambda segment, full_text: True
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is False  # _evaluate_wake は呼ばれなかった (skip)
+        evaluate_wake_spy.assert_not_called()
+        # バグ 2 修正の核心: buffer がクリアされている (= 次の発話で残らない)
+        assert len(listener._buffer) == 0
+
+    def test_buffer_preserved_when_callback_returns_false(self, monkeypatch):
+        """通常発話 (callback=False) では buffer は維持される。
+
+        WHY: 関係ない発話 (= dispatcher が触らない segment) は wake 経路を走らせる
+        ため、buffer に文脈を残す必要がある (= 既存の wake 検知ロジックの前提)。
+        バグ 2 修正でクリア対象を「processed=True」のみに限定する。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        listener._on_segment_added = lambda segment, full_text: False
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is True  # _evaluate_wake が呼ばれた
+        # buffer は維持される (= _evaluate_wake 内のクリアロジックは spy 化で動かない)
+        assert len(listener._buffer) == 1
 
 
 class TestBackgroundContinuousListenerRoutingPause:

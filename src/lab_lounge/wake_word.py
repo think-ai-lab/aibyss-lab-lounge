@@ -1361,6 +1361,19 @@ class BackgroundContinuousListener:
                             " (segment=%r)",
                             segment.text[:40],
                         )
+                        # WHY (バグ 2 修正、実走 logs/runs/run_loop_20260508_180741.log
+                        # で発覚): 挙手系で消費した segment は buffer からも除去する。
+                        # クリアしないと、次の発話 (例: Whisper ハルシネーション
+                        # 「お嬢様のお祭りをお祭りします」) で buffer に残った承認発話
+                        # 「ちさめさん、どうぞ」が name_hint='chisame' として router に
+                        # 拾われ、wake_event_queue に投入されて多重発火する症状が発生
+                        # した (= 旧 W'-2 の不完全さ)。
+                        #
+                        # 新規挙手 (interjection_candidate 確定) のケースでも buffer を
+                        # クリアする。続発話の文脈を BG LLM の入力に反映させたい場合は
+                        # Phase 0.5-B 観察 2 (snapshot hybrid) で transcript_snapshot を
+                        # 段階的に更新する設計で対応する (= バグ 2 のスコープ外)。
+                        self._buffer.clear()
                         continue
 
                     # 応答中は wake 判定をスキップ (バッファ蓄積のみ継続)
