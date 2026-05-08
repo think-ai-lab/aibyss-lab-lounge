@@ -283,6 +283,7 @@ class Dispatcher:
         on_handraise_approved: Callable[
             [str, "HandraiseBgResult | None", Any, str], None
         ] | None = None,
+        on_handraise_close: Callable[[str, str], None] | None = None,
         status_manager: CharacterStatusManager | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
         max_age_sec: float = DRAIN_MAX_AGE_SEC,
@@ -319,6 +320,13 @@ class Dispatcher:
                 ``(slug, bg_result, transcript_snapshot, trace_id)``。run_loop が
                 bg_result の chunks を再生 + bubble.update("answering") を発行。
                 bg_result が None の場合は run_loop が同期 fallback (再生成) する。
+            on_handraise_close: 却下 (``on_approval_denied``) / lapse
+                (``on_lapse_timeout``) 時、Lock 解除後に呼ばれる close 通知 callback
+                (Phase 0.5-B-β-2)。引数 ``(target_slug, reason)`` で、reason は
+                ``"denied"`` / ``"lapsed"``。run_loop は本 callback で ask_character
+                の bg_tts キャンセル + playback queue drain を実行し、案 A の音声漏れ
+                (= 挙手中に流れた対話 TTS が却下後も再生キューに残る問題) を最小化する。
+                None 時は通知スキップ (= 後方互換、Phase 0.5-A 以前と同じ挙動)。
             status_manager: 全キャラのステータス (Ready/Thinking/ToolCalling/Raisehand/
                 Talking) を一元管理する CharacterStatusManager (Phase 0.5-B-α)。
                 本クラスは handraise 経路 (start / approval_granted / approval_denied /
@@ -351,6 +359,9 @@ class Dispatcher:
         self._on_handraise_started = on_handraise_started
         self._on_handraise_phrase_pending_release = on_handraise_phrase_pending_release
         self._on_handraise_approved = on_handraise_approved
+        # Phase 0.5-B-β-2: 却下/lapse 時の close 通知 callback。run_loop が
+        # ask_character bg_tts キャンセル + playback queue drain を実行する。
+        self._on_handraise_close = on_handraise_close
         # Phase 0.5-B-α: 全キャラ状態を一元管理する Manager (handraise 経路で
         # Raisehand / Ready を反映)。None 時は status 反映スキップ (後方互換)。
         self._status_manager = status_manager
@@ -1043,6 +1054,19 @@ class Dispatcher:
         # Phase 0.5-B-α: 却下 → Raisehand → Ready
         if self._status_manager is not None:
             self._status_manager.set_status(target_slug, CharacterStatus.READY)
+        # Phase 0.5-B-β-2: close 通知 (= run_loop が ask_character の bg_tts キャンセル
+        # + playback queue drain を実行する経路)。bubble.update 発行より前に呼ぶこと
+        # で、視聴者向け描画より先に音声 cleanup を起動する (= 表示が「却下」に切り
+        # 替わった瞬間にすでに残音声の破棄要求が出ている状態を作る)。callback 内
+        # の例外は Lock 外なので dispatcher を止めない (= warning ログのみ)。
+        if self._on_handraise_close is not None:
+            try:
+                self._on_handraise_close(target_slug, "denied")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "on_handraise_close callback failed (denied, slug=%s): %s",
+                    target_slug, exc,
+                )
         # bubble.update("denied") の text を bubble_messages から取得 (フォールバックあり)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "denied")
@@ -1072,6 +1096,17 @@ class Dispatcher:
         # Phase 0.5-B-α: lapse → Raisehand → Ready (consecutive_denials は変動なし)
         if self._status_manager is not None:
             self._status_manager.set_status(target_slug, CharacterStatus.READY)
+        # Phase 0.5-B-β-2: close 通知 (= on_approval_denied と同様)。reason="lapsed"
+        # で run_loop に「タイムアウト由来の close」と区別を伝える (= 将来的に
+        # cooldown / metric を分けたい場合の基盤)。
+        if self._on_handraise_close is not None:
+            try:
+                self._on_handraise_close(target_slug, "lapsed")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "on_handraise_close callback failed (lapsed, slug=%s): %s",
+                    target_slug, exc,
+                )
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "lapsed")
         self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000, category="handraise")
