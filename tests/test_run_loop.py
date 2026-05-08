@@ -1032,6 +1032,120 @@ class TestCreateHandraiseRunnerAndCallbacks:
         # result は llm_only_calls の戻り値そのまま
         assert completed[0].result is not None
 
+    # ─── Phase 0.5-B-β-1 commit 3: ask_character 対話 TTS の BG LLM 経路配線 ──
+    # WHY: factory に on_tts_chunk_ready_ref / on_pose_ready_ref (= mutable list)
+    # を渡すと、bg_runner._body が ref[0] 経由で最新ターンの _on_tts_chunk /
+    # _on_pose_ready closure を取得して run_pipeline_llm_only に渡す。これが A1
+    # (ask_character TTS 投入欠落) の最終配線。
+
+    def test_factory_accepts_on_tts_chunk_ready_ref_kwarg(self):
+        """factory が on_tts_chunk_ready_ref キーワード引数を受け付ける (Phase 0.5-B-β-1 commit 3)。
+
+        WHY: ターン毎に再構築される _on_tts_chunk closure を mutable list 経由で
+        参照するため、factory のシグネチャ拡張が必要。本テストは API 受付のみ確認。
+        """
+        cb_ref: list = [None]
+        bg_runner, *_ = self._factory(on_tts_chunk_ready_ref=cb_ref)
+        assert callable(bg_runner)
+
+    def test_factory_accepts_on_pose_ready_ref_kwarg(self):
+        """factory が on_pose_ready_ref キーワード引数を受け付ける (Phase 0.5-B-β-1 commit 3)。"""
+        pose_ref: list = [None]
+        bg_runner, *_ = self._factory(on_pose_ready_ref=pose_ref)
+        assert callable(bg_runner)
+
+    def test_bg_runner_passes_callbacks_to_pipeline_when_ref_set(self, monkeypatch):
+        """bg_runner._body が ref[0] の最新値を run_pipeline_llm_only に渡す
+        (Phase 0.5-B-β-1 commit 3、A1 修正の最終配線)。
+
+        WHY: ターン中 (= _on_tts_chunk / _on_pose_ready 構築済み) に挙手 BG LLM が
+        起動した場合、ref[0] には最新 closure が入っている。bg_runner はこれを
+        run_pipeline_llm_only に渡し、ask_character ツール内で対話 TTS が起動
+        する経路が完成する。
+        """
+        import threading
+        llm_only_calls: list[dict] = []
+
+        def fake_llm_only(text, **kwargs):
+            llm_only_calls.append(dict(kwargs))
+            return MagicMock(events=[
+                {"type": "utterance.final"},
+                {"type": "llm.final", "payload": {"text": "llm 結果"}},
+            ])
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_llm_only", fake_llm_only,
+        )
+
+        def my_tts_cb(url, chunk_text, is_last, character):
+            pass
+
+        def my_pose_cb(slug, pose):
+            pass
+
+        # ref[0] に最新 closure をセットした状態で factory 経由 bg_runner 起動
+        tts_ref: list = [my_tts_cb]
+        pose_ref: list = [my_pose_cb]
+        bg_runner, *_ = self._factory(
+            on_tts_chunk_ready_ref=tts_ref,
+            on_pose_ready_ref=pose_ref,
+        )
+
+        cancel_event = threading.Event()
+        thread = bg_runner(
+            target_slug="mimi",
+            transcript_snapshot="hello",
+            cancel_event=cancel_event,
+            on_complete=lambda r: None,
+        )
+        thread.join(timeout=5.0)
+
+        # 1 回呼出 + 渡された callback が run_pipeline_llm_only に届いている
+        assert len(llm_only_calls) == 1
+        assert llm_only_calls[0].get("on_tts_chunk_ready") is my_tts_cb
+        assert llm_only_calls[0].get("on_pose_ready") is my_pose_cb
+
+    def test_bg_runner_passes_none_to_pipeline_when_ref_unset(self, monkeypatch):
+        """bg_runner._body が ref 未指定 / ref[0]=None の場合、pipeline に None を渡す
+        (Phase 0.5-B-β-1 commit 3 後方互換)。
+
+        WHY: ref を渡さない既存呼出元 (= テスト等) では従来通り on_tts_chunk_ready=None
+        で run_pipeline_llm_only が呼ばれる。挙手中 IDLE ターン外も ref[0]=None
+        になる想定で、安全に no-op で通る。
+        """
+        import threading
+        llm_only_calls: list[dict] = []
+
+        def fake_llm_only(text, **kwargs):
+            llm_only_calls.append(dict(kwargs))
+            return MagicMock(events=[
+                {"type": "utterance.final"},
+                {"type": "llm.final", "payload": {"text": "x"}},
+            ])
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_llm_only", fake_llm_only,
+        )
+
+        # ref 未指定 (= 既存呼出パターン) と ref[0]=None の両ケース
+        for ref_kwargs in [
+            {},  # ref 未指定
+            {"on_tts_chunk_ready_ref": [None], "on_pose_ready_ref": [None]},
+        ]:
+            llm_only_calls.clear()
+            bg_runner, *_ = self._factory(**ref_kwargs)
+            cancel_event = threading.Event()
+            thread = bg_runner(
+                target_slug="mimi",
+                transcript_snapshot="x",
+                cancel_event=cancel_event,
+                on_complete=lambda r: None,
+            )
+            thread.join(timeout=5.0)
+            assert len(llm_only_calls) == 1
+            assert llm_only_calls[0].get("on_tts_chunk_ready") is None
+            assert llm_only_calls[0].get("on_pose_ready") is None
+
 
 class TestApprovedSynthesizeFallback:
     """Phase 0.5-A フェーズ 7: _approved_synthesize_fallback の単体テスト。"""
