@@ -605,3 +605,59 @@ class TestRoutingNodeStreamContextMerge:
         assert "オクタメイド" in merged
         # 配信文脈見出しが入っていないこと (= キャラ素体のみ)
         assert "## 本日の配信" not in merged
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 0.5-A 案 W'-1: LLM-only / TTS-only グラフ
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBuildPipelineGraphLlmOnly:
+    """_build_pipeline_graph_llm_only のグラフ構造を検証する (Phase 0.5-A 案 W'-1)。
+
+    挙手 BG 先行で TTS ノードを除外したグラフ (routing → generation → END)。
+    """
+
+    def test_llm_only_graph_has_two_nodes(self):
+        """ノードは routing + generation の 2 つ (tts は除外)。"""
+        from lab_lounge.graph import _build_pipeline_graph_llm_only
+        graph = _build_pipeline_graph_llm_only()
+        node_names = set(graph.get_graph().nodes) - {"__start__", "__end__"}
+        assert node_names == {"routing", "generation"}
+
+    def test_llm_only_graph_has_no_tts_node(self):
+        """tts ノードが含まれない (= 案 W'-1 の核心: TTS 不実行)。
+
+        WHY: snappy-bentley 実走で観察された 3 重発火 + VOICEPEAK FIFO 競合の
+        根本原因 (= BG LLM が TTS まで先行) を解消するための分離。
+        """
+        from lab_lounge.graph import _build_pipeline_graph_llm_only
+        graph = _build_pipeline_graph_llm_only()
+        node_names = set(graph.get_graph().nodes)
+        assert "tts" not in node_names
+
+
+class TestBuildPipelineGraphTtsOnly:
+    """_build_pipeline_graph_tts_only のグラフ構造を検証する (Phase 0.5-A 案 W'-1)。
+
+    挙手承認時に LLM 結果を再利用して TTS のみ実行するグラフ (tts → END)。
+    """
+
+    def test_tts_only_graph_has_one_node(self):
+        """ノードは tts のみ (= 単独 TTS 再利用経路)。"""
+        from lab_lounge.graph import _build_pipeline_graph_tts_only
+        graph = _build_pipeline_graph_tts_only()
+        node_names = set(graph.get_graph().nodes) - {"__start__", "__end__"}
+        assert node_names == {"tts"}
+
+    def test_tts_only_graph_has_no_routing_or_generation(self):
+        """routing / generation が含まれない (= LLM 再実行しない)。
+
+        WHY: BG LLM で生成済みのテキストを再利用するための経路で、LLM トークン
+        消費を二重化しないための設計判断。
+        """
+        from lab_lounge.graph import _build_pipeline_graph_tts_only
+        graph = _build_pipeline_graph_tts_only()
+        node_names = set(graph.get_graph().nodes)
+        assert "routing" not in node_names
+        assert "generation" not in node_names

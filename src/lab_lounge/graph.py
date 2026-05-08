@@ -1202,3 +1202,100 @@ def run_pipeline_graph(initial_state: PipelineGraphState) -> PipelineGraphState:
     """
     graph = _build_pipeline_graph()
     return graph.invoke(initial_state)
+
+
+# ─── Phase 0.5-A 案 W'-1: LLM-only / TTS-only グラフ ──────────────
+
+
+def _build_pipeline_graph_llm_only():
+    """LLM-only パイプライングラフを構築する (Phase 0.5-A 案 W'-1)。
+
+    routing → generation → END で TTS ノードを除外する。挙手 BG 先行生成で
+    「承認確率に賭けて LLM だけ走らせ、TTS は承認後に同期実行」する分離戦略の
+    実装基盤。
+
+    【WHY: TTS を分けたい理由】
+    案 W' 適用前 (snappy-bentley): bg_runner は run_pipeline 全体 (LLM + 内蔵 TTS)
+    を走らせていた。承認が来た瞬間に bg_chunks は完成済で playback worker に流す
+    だけで済むのでレイテンシは最小だが、副作用として、却下/lapse 時に TTS で生成
+    済の wav が破棄され、VOICEPEAK FIFO の貴重なリソース (= シーケンシャル 1 並列)
+    を消費した後に「使わない」結果になる。さらに 3 重発火 (BG (1) + fallback (2) +
+    wake (3)) が同時並走すると VOICEPEAK FIFO に 3 ジョブが直列に積まれ、合計
+    30 秒以上の遅延が実走で観察された (logs/runs/run_loop_20260508_154959.log)。
+    LLM-only に分けることで、却下/lapse 時に「LLM トークンは捨てるが TTS 合成は
+    走らせない」状態を作り、VOICEPEAK 競合を緩和する。
+
+    【WHY: グラフ分離 vs フラグ分岐】
+    _tts_node に「LLM only モード」フラグを足す案 (= state["skip_tts"]) も検討
+    したが、graph 構造を保ったまま条件分岐すると langgraph の compile 結果が
+    複雑化し、既存テストの構造仮定が壊れる可能性がある。グラフ自体を別ビルド
+    する方が「LLM only と LLM+TTS は別グラフ」と明示的に表現でき、_tts_node の
+    ロジック変更を伴わない (= 既存 TTS 経路の回帰リスクを下げる)。
+
+    Raises:
+        ImportError: langgraph が未インストール
+    """
+    from langgraph.graph import END, StateGraph
+
+    builder = StateGraph(PipelineGraphState)
+    builder.add_node("routing", _routing_node)
+    builder.add_node("generation", _generation_node)
+    builder.set_entry_point("routing")
+    builder.add_edge("routing", "generation")
+    builder.add_edge("generation", END)
+    return builder.compile()
+
+
+def run_pipeline_graph_llm_only(initial_state: PipelineGraphState) -> PipelineGraphState:
+    """LLM-only パイプライングラフを実行し、最終状態を返す (Phase 0.5-A 案 W'-1)。
+
+    final_state["events"] には utterance.final + llm.final の 2 件のみ含まれる
+    (tts.done は含まれない)。bubble は routing で thinking、suppress_bubble_answering
+    で answering 抑制 (= run_loop が承認時に発行する設計)。
+
+    Raises:
+        ImportError: langgraph が未インストール
+    """
+    graph = _build_pipeline_graph_llm_only()
+    return graph.invoke(initial_state)
+
+
+def _build_pipeline_graph_tts_only():
+    """TTS-only パイプライングラフを構築する (Phase 0.5-A 案 W'-1)。
+
+    LLM 結果を initial_state に注入して TTS ノードのみ実行する。挙手承認時に
+    BG LLM で先行生成した結果を再利用して TTS を走らせる経路で使う。
+
+    【WHY: tts.synthesize 直接呼出ではなく graph 再利用】
+    _tts_node 内には pose 切替 (_parse_voicepeak_json + set_pose) /
+    ask_character 協働 TTS 完了待ち (wait_bg_tts_complete) /
+    build_tts_done event publish などの周辺ロジックが詰まっている。
+    tts.synthesize 直接呼出ではこれらを再実装する必要があり、コード重複と
+    保守負荷が増える。グラフ再利用なら新規実装ゼロ、テストも graph レベルで整合。
+
+    Raises:
+        ImportError: langgraph が未インストール
+    """
+    from langgraph.graph import END, StateGraph
+
+    builder = StateGraph(PipelineGraphState)
+    builder.add_node("tts", _tts_node)
+    builder.set_entry_point("tts")
+    builder.add_edge("tts", END)
+    return builder.compile()
+
+
+def run_pipeline_graph_tts_only(initial_state: PipelineGraphState) -> PipelineGraphState:
+    """TTS-only パイプライングラフを実行し、最終状態を返す (Phase 0.5-A 案 W'-1)。
+
+    initial_state には ``llm_text`` + ``character_slug`` + ``events``
+    (utterance.final + llm.final) を事前に詰めておく必要がある。詳細は
+    ``pipeline.run_pipeline_tts_only`` を参照。
+
+    final_state["events"] は initial_state["events"] + tts.done の追加分。
+
+    Raises:
+        ImportError: langgraph が未インストール
+    """
+    graph = _build_pipeline_graph_tts_only()
+    return graph.invoke(initial_state)

@@ -344,57 +344,56 @@ def _create_handraise_runner_and_callbacks(
         cancel_event: "threading.Event",
         on_complete,
     ) -> "threading.Thread":
-        """BG LLM スレッドを起動して thread を返す。
+        """BG LLM スレッドを起動して thread を返す (Phase 0.5-A 案 W'-1)。
 
-        承認確率に賭けて LLM + graph 内 TTS まで先行生成する設計。
-        cancel_aware_chunk_hook で chunk 投入時に cancel チェックして、cancel 済
-        なら chunk のファイル削除 + bg_chunks への蓄積をスキップする。
+        承認確率に賭けて LLM のみ先行生成する分離設計。TTS は承認時に
+        ``on_handraise_approved`` 内で同期実行する (= ``run_pipeline_tts_only``
+        経由で graph._tts_node を再利用)。これにより却下/lapse 時の VOICEPEAK
+        FIFO 投入を回避し、3 重発火時の VOICEPEAK 競合を緩和する。
+
+        【WHY: cancel_aware_chunk_hook が無くなった】
+        旧 bg_runner は run_pipeline (LLM + 内蔵 TTS) を走らせ、TTS chunk 投入時
+        に cancel_event を観察して途中破棄していた。LLM-only 化により TTS 自体
+        が走らず、chunk 投入経路が無くなった。代わりに cancel_event は run_loop
+        の承認パス側で「BG が走り終わる前に lapse/denied → state pop 後は
+        run_loop が bg_result を受け取らないので結果的に無視」という形で間接的
+        に機能する (= dispatcher._bg_set_result で state None ガード済)。
+
+        【WHY: trace_id を新規発番】
+        BG LLM の trace_id は「BG が独自に走らせた LLM 推論」を識別する単位。
+        承認時に run_loop は bg_result.trace_id を引き継いで TTS / playback /
+        bubble の trace_id を統一する (= 既存の HandraiseBgResult.trace_id 引継ぎ
+        ロジック維持)。
+
+        Args:
+            target_slug:        挙手中キャラ slug
+            transcript_snapshot: 挙手判定時の TranscriptBuffer 文字列
+            cancel_event:       却下/lapse 時に set される threading.Event
+            on_complete:        BG LLM 完了時に呼ばれる callback。
+                                ``on_complete(HandraiseBgResult)`` の形。
+
+        Returns:
+            BG LLM スレッド (daemon)。run_loop main thread はこれを join しない。
         """
         from .dispatcher import HandraiseBgResult
+        from .pipeline import run_pipeline_llm_only
 
         bg_trace_id = _new_uuid()
-        bg_chunks: list[dict] = []
-
-        def cancel_aware_chunk_hook(url, chunk_text, is_last, character, pose=None):
-            """on_tts_chunk_ready ラッパー。cancel 観察粒度はここ 1 箇所のみ。"""
-            if cancel_event.is_set():
-                # cancel 済 → chunk のファイルを削除して蓄積スキップ
-                # (ベストエフォート: 削除失敗は warning 不要、disk 上の孤立ファイルは
-                #  運用 cleanup で対応)
-                try:
-                    from .audio_io import _uri_to_path
-                    p = Path(_uri_to_path(url))
-                    if p.is_file():
-                        p.unlink()
-                except Exception:
-                    pass
-                return
-            chunk: dict = {
-                "url": url,
-                "text": chunk_text,
-                "is_last": is_last,
-                "character": character,
-            }
-            if pose is not None:
-                chunk["pose"] = pose
-            bg_chunks.append(chunk)
 
         def _body() -> None:
             try:
-                result = run_pipeline(
+                result = run_pipeline_llm_only(
                     transcript_snapshot if isinstance(transcript_snapshot, str)
                     else str(transcript_snapshot or ""),
                     stream_id=session_stream_id,
                     session_id=session_id_root,
                     trace_id=bg_trace_id,
                     speaker_hint=target_slug,
-                    on_tts_chunk_ready=cancel_aware_chunk_hook,
                     stream_context=stream_context,
-                    suppress_bubble_answering=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "BG LLM 失敗: slug=%s trace_id=%s err=%s",
+                    "BG LLM 失敗 [character=%s]: trace_id=%s err=%s",
                     target_slug, bg_trace_id, exc,
                 )
                 on_complete(HandraiseBgResult(
@@ -402,15 +401,26 @@ def _create_handraise_runner_and_callbacks(
                 ))
                 return
 
+            if cancel_event.is_set():
+                # 完了直後 cancel 観察ログ。state は既に pop 済 → on_handraise_approved
+                # に乗らないので結果は無視されるが、調査のためログだけ残す。
+                logger.info(
+                    "BG LLM 完了後に cancel 観察 [character=%s]: trace_id=%s",
+                    target_slug, bg_trace_id,
+                )
+
             on_complete(HandraiseBgResult(
-                chunks=bg_chunks,
+                # WHY: chunks は LLM-only モードでは常に空 (= TTS が走らないため)。
+                # 承認時に on_handraise_approved が run_pipeline_tts_only を呼び、
+                # その中で chunks を生成する。
+                chunks=[],
                 result=result,
                 trace_id=bg_trace_id,
             ))
 
         thread = threading.Thread(
             target=_body,
-            name=f"BG-LLM-{target_slug}",
+            name=f"BG-LLM-only-{target_slug}",
             daemon=True,
         )
         thread.start()
@@ -432,16 +442,35 @@ def _create_handraise_runner_and_callbacks(
         _spawn_handraise_phrase_playback(slug, phrase_path, padding_sec=padding)
 
     def on_handraise_approved(slug, bg_result, transcript_snapshot, trace_id) -> None:
-        """承認時の応答開始: bubble.update("answering") 発行 + chunks 再生。
+        """承認時の応答開始 (Phase 0.5-A 案 W'-1: TTS-only graph で LLM 結果再利用)。
 
-        bg_result が None or chunks 空 (BG 失敗 / 起動前 grant) なら
-        ``_approved_synthesize_fallback`` で同期再生成にフォールバック。
+        bg_result.result が ready なら ``run_pipeline_tts_only(bg_result.result)``
+        を別 daemon thread で呼び、生成された chunks を ``_spawn_handraise_response_playback``
+        で再生する。bg_result が None / result が None / llm.final.text が空 なら
+        ``_approved_synthesize_fallback`` で同期再生成にフォールバック (LLM 失敗
+        時の救済として残す)。
+
+        【WHY: daemon thread 化】
+        dispatcher.on_approval_granted は本 callback を Lock 解放後に同期呼び出し
+        する。この callback で同期 TTS (数秒〜十数秒) を実行すると dispatcher の
+        callback 戻り遅延が長くなり、wait_for_next_event の通知タイミングや次の
+        on_segment_added 受領 (= 録音継続スレッド) に遅延を波及させる懸念がある。
+        daemon thread に切り出して即座に return するのが安全。
+
+        【WHY: fallback パスを残す】
+        LLM 失敗 / result=None / llm_text 空 / TTS 失敗 / chunks 空 のケースで
+        ``_approved_synthesize_fallback`` (run_pipeline 同期再実行) で救済する。
+        BG LLM-only に分離した結果、bg_result が高確率で ready になるが、API
+        呼出失敗 / Gemini 異常応答 / 例外などの稀ケースで救済が必要。
         """
-        if bg_result is None or not bg_result.chunks:
+        from .pipeline import run_pipeline_tts_only
+
+        # bg_result / result が無効ならフォールバック (LLM 失敗時の救済)
+        if bg_result is None or bg_result.result is None:
             logger.info(
-                "挙手承認: bg_result %s → fallback パス slug=%s",
-                "未生成" if bg_result is None else "chunks 空",
+                "挙手承認 [character=%s]: bg_result %s → fallback パス",
                 slug,
+                "未生成" if bg_result is None else "result=None",
             )
             threading.Thread(
                 target=lambda: _approved_synthesize_fallback(
@@ -457,18 +486,36 @@ def _create_handraise_runner_and_callbacks(
 
         # bg_trace_id を引き継ぐ (handraise 単位の trace_id 一貫性)
         bg_trace_id = bg_result.trace_id or trace_id or _new_uuid()
+
         # answering bubble の text を pipeline_result.events から抽出
         answering_text = ""
-        if bg_result.result is not None:
-            try:
-                for ev in bg_result.result.events:
-                    if ev.get("type") == "llm.final":
-                        answering_text = ev.get("payload", {}).get("text", "")
-                        break
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("answering text 抽出失敗 (空文字で続行): %s", exc)
+        try:
+            for ev in bg_result.result.events:
+                if ev.get("type") == "llm.final":
+                    answering_text = ev.get("payload", {}).get("text", "")
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("answering text 抽出失敗 (空文字で続行): %s", exc)
 
-        # bubble.update("answering") を発行 (TTS chunk 1 再生開始の直前タイミング)
+        if not answering_text:
+            # llm.final が無い or text が空 → fallback パスで救済
+            logger.warning(
+                "挙手承認 [character=%s]: llm.final.text 空 → fallback パス",
+                slug,
+            )
+            threading.Thread(
+                target=lambda: _approved_synthesize_fallback(
+                    slug, transcript_snapshot, trace_id,
+                    session_stream_id=session_stream_id,
+                    session_id_root=session_id_root,
+                    stream_context=stream_context,
+                ),
+                name=f"approved-fallback-{slug}",
+                daemon=True,
+            ).start()
+            return
+
+        # bubble.update("answering") を発行 (TTS 開始直前タイミング)
         # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech" (UI 一貫性優先)。
         try:
             event = build_bubble_update(
@@ -486,14 +533,79 @@ def _create_handraise_runner_and_callbacks(
                 "bubble.update(answering) from approval publish 失敗: %s", exc,
             )
 
-        # chunks を専用 mini playback worker で再生
-        _spawn_handraise_response_playback(
-            slug,
-            list(bg_result.chunks),
-            bg_trace_id,
-            session_stream_id=session_stream_id,
-            session_id_root=session_id_root,
-        )
+        # TTS-only graph で TTS 実行 + chunks 蓄積 → playback worker (daemon thread)
+        def _tts_and_play() -> None:
+            chunks: list[dict] = []
+
+            def on_chunk(url, chunk_text, is_last, character, pose=None):
+                """on_tts_chunk_ready 用、chunks 蓄積。"""
+                chunk: dict = {
+                    "url": url,
+                    "text": chunk_text,
+                    "is_last": is_last,
+                    "character": character,
+                }
+                if pose is not None:
+                    chunk["pose"] = pose
+                chunks.append(chunk)
+
+            logger.info(
+                "挙手承認 TTS 同期実行 開始 [character=%s]: trace_id=%s text_len=%d",
+                slug, bg_trace_id, len(answering_text),
+            )
+            try:
+                run_pipeline_tts_only(
+                    bg_result.result,
+                    on_tts_chunk_ready=on_chunk,
+                    # WHY: pose は _tts_node 内で即時 set_pose に倒す (= on_pose_ready=None)。
+                    # 専用 mini playback worker は pending pose dict を持たないため、
+                    # chunk task に pose 埋め込む経路が無い。即時 set_pose で十分。
+                    on_pose_ready=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "挙手承認 TTS 同期実行失敗 [character=%s]: %s → fallback パス",
+                    slug, exc,
+                )
+                _approved_synthesize_fallback(
+                    slug, transcript_snapshot, trace_id,
+                    session_stream_id=session_stream_id,
+                    session_id_root=session_id_root,
+                    stream_context=stream_context,
+                )
+                return
+
+            if not chunks:
+                # ダミー TTS モード or TTS 出力なし → fallback パスで救済
+                logger.warning(
+                    "挙手承認 TTS [character=%s]: chunks 空 → fallback パス",
+                    slug,
+                )
+                _approved_synthesize_fallback(
+                    slug, transcript_snapshot, trace_id,
+                    session_stream_id=session_stream_id,
+                    session_id_root=session_id_root,
+                    stream_context=stream_context,
+                )
+                return
+
+            logger.info(
+                "挙手承認 TTS 同期実行 完了 [character=%s]: chunks=%d",
+                slug, len(chunks),
+            )
+            _spawn_handraise_response_playback(
+                slug,
+                chunks,
+                bg_trace_id,
+                session_stream_id=session_stream_id,
+                session_id_root=session_id_root,
+            )
+
+        threading.Thread(
+            target=_tts_and_play,
+            name=f"approved-tts-{slug}",
+            daemon=True,
+        ).start()
 
     return (
         bg_runner,

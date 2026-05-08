@@ -610,11 +610,18 @@ class TestCreateHandraiseRunnerAndCallbacks:
         on_release("sakura", Path("/tmp/x.wav"))
         assert spawn_calls == [("sakura", Path("/tmp/x.wav"), 0.7)]
 
-    def test_on_handraise_approved_with_chunks_publishes_and_plays(self, monkeypatch):
-        """bg_result 有 + chunks 有で answering bubble 発行 + chunks 再生。"""
+    def test_on_handraise_approved_with_llm_result_runs_tts_only_and_plays(self, monkeypatch):
+        """W'-1: bg_result.result が ready なら TTS-only graph で TTS 実行 + chunks 再生。
+
+        新設計 (W'-1): bg_runner は LLM のみ先行 → bg_result.chunks は常に空。
+        承認時 on_handraise_approved は run_pipeline_tts_only を呼んで chunks を
+        生成し、_spawn_handraise_response_playback で再生する。
+        """
         from lab_lounge.dispatcher import HandraiseBgResult
         published: list = []
         spawn_calls: list[tuple] = []
+        tts_only_calls: list[tuple] = []
+
         monkeypatch.setattr(
             "lab_lounge.run_loop.publish",
             lambda ev: published.append(ev),
@@ -625,21 +632,42 @@ class TestCreateHandraiseRunnerAndCallbacks:
                 (slug, list(chunks), trace_id)
             ),
         )
+
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            """run_pipeline_tts_only の差し替え。on_chunk で chunks を流す。"""
+            tts_only_calls.append((llm_result, on_tts_chunk_ready, on_pose_ready))
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "わたくしの見解は", True, "mimi", None)
+            return llm_result
+
+        # WHY: import 経路を on_handraise_approved 内の局所 import に合わせる必要が
+        # ある。`from .pipeline import run_pipeline_tts_only` 後の局所名を差し替えるため、
+        # lab_lounge.pipeline.run_pipeline_tts_only と lab_lounge.run_loop の両方を
+        # patch する必要はなく、lab_lounge.pipeline をパッチすれば局所 import で取得される。
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+
         _, _, _, on_approved = self._factory()
 
-        # bg_result.result.events 内の llm.final から text を取る
+        # bg_result.result.events に llm.final がある
         fake_result = MagicMock()
         fake_result.events = [
             {"type": "utterance.final"},
             {"type": "llm.final", "payload": {"text": "わたくしの見解は…"}},
-            {"type": "tts.done"},
         ]
         bg = HandraiseBgResult(
-            chunks=[{"url": "u1", "text": "x", "is_last": True, "character": "mimi"}],
+            chunks=[],  # LLM-only なので空
             result=fake_result,
             trace_id="bg-abc",
         )
         on_approved("mimi", bg, "snap", "trace-orig")
+
+        # daemon thread 内で _tts_and_play が走るので待機
+        for _ in range(40):
+            if spawn_calls:
+                break
+            time.sleep(0.05)
 
         # bubble.update("answering") が 1 回発行
         bubble_calls = [
@@ -651,11 +679,13 @@ class TestCreateHandraiseRunnerAndCallbacks:
         assert bubble_calls[0]["payload"]["character"] == "mimi"
         assert bubble_calls[0]["payload"]["text"] == "わたくしの見解は…"
         # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech"
-        # WHY: 挙手バブルは消費され、応答は通常応答エリアで表示する設計
         assert bubble_calls[0]["payload"]["category"] == "speech"
-        # chunks 再生も呼ばれる
+        # run_pipeline_tts_only が呼ばれた (= TTS-only graph 経由)
+        assert len(tts_only_calls) == 1
+        # _spawn_handraise_response_playback が呼ばれた
         assert len(spawn_calls) == 1
         assert spawn_calls[0][0] == "mimi"
+        assert spawn_calls[0][2] == "bg-abc"  # bg_trace_id 引継ぎ
 
     def test_on_handraise_approved_with_none_result_uses_fallback(self, monkeypatch):
         """bg_result=None でフォールバックスレッドが起動する。"""
@@ -674,8 +704,8 @@ class TestCreateHandraiseRunnerAndCallbacks:
         assert len(called) == 1
         assert called[0] == ("mimi", "snap", "trace-x")
 
-    def test_on_handraise_approved_with_empty_chunks_uses_fallback(self, monkeypatch):
-        """bg_result 有だが chunks 空でも fallback に流れる。"""
+    def test_on_handraise_approved_with_empty_result_uses_fallback(self, monkeypatch):
+        """W'-1: bg_result はあるが result=None なら fallback (= LLM 失敗時の救済)。"""
         from lab_lounge.dispatcher import HandraiseBgResult
         called: list[str] = []
         monkeypatch.setattr(
@@ -690,6 +720,159 @@ class TestCreateHandraiseRunnerAndCallbacks:
                 break
             time.sleep(0.05)
         assert called == ["mimi"]
+
+    def test_on_handraise_approved_with_empty_llm_text_falls_back(self, monkeypatch):
+        """W'-1: bg_result.result はあるが llm.final.text が空なら fallback。
+
+        WHY: BG LLM が成功してもテキストが空文字列なケース (= API 異常応答 etc.)
+        に対する救済。TTS-only graph に空 text を渡すと _tts_node 内で例外になる
+        ので、事前に判定して fallback パスに流す。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        called: list[str] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._approved_synthesize_fallback",
+            lambda slug, snap, trace, **kw: called.append(slug),
+        )
+        # llm.final.text が空文字列
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": ""}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
+        _, _, _, on_approved = self._factory()
+        on_approved("mimi", bg, "snap", "trace-x")
+        for _ in range(40):
+            if called:
+                break
+            time.sleep(0.05)
+        assert called == ["mimi"]
+
+    def test_on_handraise_approved_tts_exception_falls_back(self, monkeypatch):
+        """W'-1: TTS-only graph 実行が例外で失敗したら fallback パスに流れる。
+
+        WHY: VOICEPEAK 起動失敗 / Gemini API 一時障害などの稀ケース。daemon thread
+        内で例外を catch して fallback パスで救済。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        called: list[str] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._approved_synthesize_fallback",
+            lambda slug, snap, trace, **kw: called.append(slug),
+        )
+        # publish は副作用ありなので noop に
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish", lambda ev: None,
+        )
+
+        def raising_tts_only(*args, **kwargs):
+            raise RuntimeError("simulated TTS failure")
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", raising_tts_only,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": "test"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
+        _, _, _, on_approved = self._factory()
+        on_approved("mimi", bg, "snap", "trace-x")
+        for _ in range(40):
+            if called:
+                break
+            time.sleep(0.05)
+        assert called == ["mimi"]
+
+    def test_on_handraise_approved_chunks_empty_after_tts_falls_back(self, monkeypatch):
+        """W'-1: TTS-only graph 完了したが chunks が 0 件なら fallback パスに流れる。
+
+        WHY: ダミー TTS モード (L2_USE_REAL_TTS=false) または TTS 出力が無いケース
+        の救済。on_tts_chunk_ready が呼ばれず chunks=[] のまま完了したら fallback
+        で実音声を生成し直す。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        called: list[str] = []
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._approved_synthesize_fallback",
+            lambda slug, snap, trace, **kw: called.append(slug),
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish", lambda ev: None,
+        )
+
+        # chunks を流さずに完了 (= chunks=[] のまま)
+        def empty_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", empty_tts_only,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": "test"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
+        _, _, _, on_approved = self._factory()
+        on_approved("mimi", bg, "snap", "trace-x")
+        for _ in range(40):
+            if called:
+                break
+            time.sleep(0.05)
+        assert called == ["mimi"]
+
+    def test_bg_runner_uses_run_pipeline_llm_only(self, monkeypatch):
+        """W'-1: bg_runner が run_pipeline_llm_only を呼ぶ (run_pipeline は呼ばない)。"""
+        import threading
+        llm_only_calls: list = []
+        run_pipeline_calls: list = []
+        completed: list = []
+
+        # run_pipeline_llm_only を spy 化、ダミー PipelineResult を返す
+        def fake_llm_only(text, **kwargs):
+            llm_only_calls.append((text, kwargs))
+            return MagicMock(events=[
+                {"type": "utterance.final"},
+                {"type": "llm.final", "payload": {"text": "llm 結果"}},
+            ])
+
+        def fake_run_pipeline(*args, **kwargs):
+            run_pipeline_calls.append((args, kwargs))
+            raise RuntimeError("run_pipeline should not be called from bg_runner")
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_llm_only", fake_llm_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
+        )
+
+        bg_runner, _, _, _ = self._factory()
+        cancel_event = threading.Event()
+        thread = bg_runner(
+            target_slug="mimi",
+            transcript_snapshot="テスト発話",
+            cancel_event=cancel_event,
+            on_complete=lambda r: completed.append(r),
+        )
+        thread.join(timeout=5.0)
+
+        # run_pipeline_llm_only が呼ばれ、run_pipeline (旧) は呼ばれていない
+        assert len(llm_only_calls) == 1
+        assert llm_only_calls[0][0] == "テスト発話"
+        assert llm_only_calls[0][1]["speaker_hint"] == "mimi"
+        assert run_pipeline_calls == []
+        # on_complete が呼ばれた
+        assert len(completed) == 1
+        # chunks は LLM-only なので常に空
+        assert completed[0].chunks == []
+        # result は llm_only_calls の戻り値そのまま
+        assert completed[0].result is not None
 
 
 class TestApprovedSynthesizeFallback:
