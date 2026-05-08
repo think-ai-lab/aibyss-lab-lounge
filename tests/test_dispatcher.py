@@ -735,6 +735,42 @@ class TestDispatcherApprovalFlow:
         d.on_approval_denied("nonexistent")
         assert d._cooldowns == {}  # 冪等: cooldown も加算されない
 
+    # ─── Phase 0.5-B-β-2 commit 1: on_handraise_close callback (denied) ──
+
+    def test_denied_invokes_on_handraise_close_with_denied(self, monkeypatch):
+        """on_approval_denied で on_handraise_close(slug, "denied") が呼ばれる
+        (Phase 0.5-B-β-2 commit 1)。
+
+        WHY: run_loop が本 callback を受けて ask_character の bg_tts キャンセル +
+        playback queue drain を実行する経路を保証 (= β-2-2 / β-2-3 で実装する
+        run_loop 側の機能が dispatcher 経由で起動できるようにする)。
+        """
+        close_calls: list[tuple[str, str]] = []
+        d = Dispatcher(
+            on_handraise_close=lambda slug, reason: close_calls.append((slug, reason)),
+        )
+        self._setup_handraise(monkeypatch, d)
+        d.on_approval_denied("mimi")
+        assert close_calls == [("mimi", "denied")], (
+            f"close callback が (slug='mimi', reason='denied') で 1 回呼ばれること: "
+            f"{close_calls}"
+        )
+
+    def test_denied_safe_when_callback_none(self, monkeypatch):
+        """on_handraise_close=None でも on_approval_denied が例外なく完了 (後方互換)。
+
+        WHY: Phase 0.5-A 以前の Dispatcher 構築 (= callback 未指定) で動作する
+        ことを保証する後方互換テスト。本 callback 追加で既存呼出が壊れない
+        ことを確認する。
+        """
+        d = Dispatcher()  # on_handraise_close 未指定
+        self._setup_handraise(monkeypatch, d)
+        # 例外なく完了する
+        d.on_approval_denied("mimi")
+        # 既存挙動 (= state pop + cooldown 加算) も維持されている
+        assert d._handraise_states == {}
+        assert d._cooldowns["mimi"].consecutive_denials == 1
+
     def test_no_op_when_use_handraise_false(self, monkeypatch):
         """L2_USE_HANDRAISE=false 時は state を直接 set しても API は no-op。"""
         monkeypatch.setenv("L2_USE_HANDRAISE", "false")
@@ -800,6 +836,33 @@ class TestDispatcherLapse:
     def test_lapse_idempotent_on_unknown_slug(self, monkeypatch):
         d = Dispatcher()
         d.on_lapse_timeout("nonexistent")  # 例外なく動く
+
+    # ─── Phase 0.5-B-β-2 commit 1: on_handraise_close callback (lapsed) ──
+
+    def test_lapse_invokes_on_handraise_close_with_lapsed(self, monkeypatch):
+        """on_lapse_timeout で on_handraise_close(slug, "lapsed") が呼ばれる
+        (Phase 0.5-B-β-2 commit 1)。
+
+        WHY: lapse は denied と異なる扱い (= cooldown 加算なし) だが、close 通知
+        の必要性は同じ (= ask_character bg_tts キャンセル + playback queue drain)。
+        reason="lapsed" で run_loop に区別を伝え、将来的な metric 分離の基盤を作る。
+        """
+        _patch_filler(monkeypatch, slug="mimi")
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {"mimi": {"lapsed": "静かに"}},
+        )
+        close_calls: list[tuple[str, str]] = []
+        d = Dispatcher(
+            on_handraise_close=lambda slug, reason: close_calls.append((slug, reason)),
+        )
+        timers = _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        timers[0].fire()  # FakeTimer の手動発火 = lapse 通知
+        assert close_calls == [("mimi", "lapsed")], (
+            f"close callback が (slug='mimi', reason='lapsed') で 1 回呼ばれること: "
+            f"{close_calls}"
+        )
 
     def test_lapse_uses_default_text_for_octamaid(self, monkeypatch):
         """bubble_messages に該当キャラがない場合は default フォールバック。"""
