@@ -1155,6 +1155,11 @@ def _generation_node(state: PipelineGraphState) -> dict:
         # 直前に切り替えるためのコールバック。caller の最終応答 pose 切替と
         # 同じ仕組み (= playback worker の _pending_pose 経由) を target にも
         # 適用する。
+        # Phase 0.5-B-β-1 commit 4: status_manager も注入することで、ask_character
+        # 内部で target キャラの THINKING/TALKING/READY を HUD dashboard
+        # (V2 /status) に反映できるようにする。Phase 0.5-B-α では caller のステータス
+        # 反映 (= graph._generation_node / _tts_node) のみ実装されており、target は
+        # 未配線で HUD カードが READY のままだった穴を埋める。
         from .mcp_servers.ask_character import set_ask_character_context
         set_ask_character_context(
             on_tts_chunk=state["on_tts_chunk_ready"],
@@ -1162,6 +1167,7 @@ def _generation_node(state: PipelineGraphState) -> dict:
             common=common,
             caller_slug=state["character_slug"],
             on_pose_ready=state.get("on_pose_ready"),
+            status_manager=_gen_status_manager,
         )
 
         _run_meta = build_run_metadata(

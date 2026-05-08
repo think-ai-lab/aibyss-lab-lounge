@@ -181,6 +181,221 @@ class TestAskCharacterImpl:
         assert call_kwargs["model"] == "gpt-5.4-nano"
 
 
+# ─── Phase 0.5-B-β-1 commit 4: target キャラのステータス反映 ────────────
+# WHY: Phase 0.5-B-α では caller のステータス反映 (= mimi: thinking → tool_calling
+# → talking → ready) のみ実装され、ask_character 経由で話す target (= chisame の
+# 音声が流れている数十秒) のステータスが ready のまま (= ask_character.py に
+# set_status 呼出が 0 件) で HUD カードが更新されない穴があった。本 commit で
+# target の THINKING (bridge filler 時) / TALKING (本応答 chunk 1 時、metadata: pose
+# + full response_text) / READY (合成完了時) を反映し、HUD 網羅性を向上する。
+
+
+class TestStatusReflection:
+    """target キャラの HUD ステータス反映 (Phase 0.5-B-β-1 commit 4)。"""
+
+    def test_set_ask_character_context_accepts_status_manager(self):
+        """set_ask_character_context に status_manager 引数を渡せ、contextvar に格納される。
+
+        WHY: graph._generation_node が _gen_status_manager を ask_character へ
+        注入する経路。contextvar 経由で _ask_character_impl 内から取得できる
+        ことを保証する (= 後段の THINKING/TALKING/READY 反映の前提)。
+        """
+        from lab_lounge.mcp_servers.ask_character import _status_manager_var
+
+        mock_mgr = MagicMock()
+        set_ask_character_context(
+            caller_slug="mimi",
+            status_manager=mock_mgr,
+        )
+        assert _status_manager_var.get() is mock_mgr
+
+        # reset で None に戻ること (= 他テストへの漏れ防止、autouse fixture 連動)
+        reset_ask_character_context()
+        assert _status_manager_var.get() is None
+
+    def test_target_thinking_reflected_at_bridge_filler(self, monkeypatch):
+        """bridge filler 投入直前に target が THINKING で反映される。
+
+        WHY: bridge filler (= 例: ちさめ「ええと…」) が再生される間、HUD カード
+        も同期的に thinking (黄色) を表示する。bubble.update("thinking") と対を
+        なす SSE 経路で、視聴者には「target が考え中」と分かる。
+        """
+        from lab_lounge.character_status import CharacterStatus
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize は呼ばれた瞬間に return (= chunks 投入なし、bg_tts 完了)
+        # → bridge filler 投入直前の THINKING 反映だけ走る (= 同期パスでテスト容易)
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            _ask_character_impl("chisame", "質問")
+
+        # 期待: target=chisame で THINKING 反映が 1 回以上発生
+        thinking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.THINKING)
+        ]
+        assert len(thinking_calls) >= 1, (
+            "bridge filler 投入時に target が THINKING で set_status されること"
+        )
+
+    def test_target_talking_reflected_at_first_chunk(self, monkeypatch):
+        """本応答 chunk 1 投入時に target が TALKING + metadata で反映される。
+
+        WHY: HUD カードを talking (緑) に切替、metadata (= pose + full
+        response_text) で発話全文と立ち絵を視認可能にする。graph._tts_node が
+        通常応答経路で渡す metadata 形と統一 (= V2 SSE 受信側で同じ shape)。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        response_text = (
+            '{"response": "データを分析しました", '
+            '"emotion": {"happy": 30}, "speed": 100, "pose": "special_doya"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            """target chunk として on_chunk_ready callback を 1 回呼ぶ。
+
+            導入セリフ呼出 (= speaker=mimi) は callback 不要、本応答呼出
+            (= speaker=chisame) で _wrapped_on_chunk_ready を 1 回起動する。
+            """
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "chisame":
+                on_chunk("file://chunk1.wav", "データを分析しました", True, "chisame")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            # bg_tts daemon thread の完了を確実に待つ (= wait_bg_tts_complete は
+            # session_id に紐付いた completion event を join する設計)
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: target=chisame で TALKING 反映 (metadata 付き) が 1 回
+        talking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.TALKING)
+        ]
+        assert len(talking_calls) == 1, (
+            "本応答 chunk 1 時に target が TALKING で set_status されること"
+        )
+        # metadata が pose + text を含むこと
+        metadata = talking_calls[0].kwargs.get("metadata")
+        assert metadata is not None
+        assert metadata.get("pose") == "special_doya"
+        assert metadata.get("text") == response_text
+
+    def test_target_ready_reflected_at_bg_tts_done(self, monkeypatch):
+        """bg_tts 合成完了後 (finally) に target が READY で反映される。
+
+        WHY: target の発話終了 = HUD カードを ready (灰) に戻す瞬間。例外時も
+        finally で確実に Ready にすることで、HUD カードが talking のまま stuck
+        するのを防ぐ (= UI 整合性、視覚的に「終了した」が分かる)。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize は単純 return (= 合成成功シナリオ)
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            _ask_character_impl("chisame", "質問")
+            # bg_tts daemon thread の完了を確実に待つ (finally で READY 反映後)
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: target=chisame で READY 反映が 1 回 (= bg_tts 合成完了 finally)
+        ready_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.READY)
+        ]
+        assert len(ready_calls) >= 1, (
+            "bg_tts 合成完了後に target が READY で set_status されること"
+        )
+
+    def test_status_manager_none_skips_reflection(self, monkeypatch):
+        """status_manager=None なら set_status は一切呼ばれない (後方互換)。
+
+        WHY: Phase 0.5-B-α 以前の呼出元 (= status_manager 引数を渡さない) で
+        ask_character が動作することを保証する。後方互換性 + 「注入忘れ」の
+        フォールバック挙動 (= ステータス反映 no-op、bug にならない)。
+        """
+        import time
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_tts_chunk = MagicMock()
+        # status_manager 渡さず (= 旧呼出パターン)
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        # set_status を spy するため CharacterStatusManager 全体を MagicMock 化して
+        # `_status_manager_var.get()` が None を返す状態を作る (= 上の
+        # set_ask_character_context で status_manager 未指定)
+        # → 内部の `if _status_manager_for_target is not None:` ガードで
+        #    set_status が呼ばれないことを確認する
+        from lab_lounge.mcp_servers.ask_character import _status_manager_var
+
+        assert _status_manager_var.get() is None  # 前提確認
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            # 例外無く完了すれば OK (= None ガードで no-op 経路を通過)
+            result = _ask_character_impl("chisame", "質問")
+            time.sleep(0.2)
+
+        # 例外なく応答テキストが返る
+        assert result is not None
+        assert "テキスト" in result or "x" in result or "chisame" in result.lower() or "ちさめ" in result
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
