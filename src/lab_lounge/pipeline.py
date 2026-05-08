@@ -285,3 +285,222 @@ def _run_pipeline_graph(
 
 # レガシーパイプライン (_run_pipeline_legacy) は Sprint Axis D で廃止。
 # LangGraph は必須依存。パイプラインは _run_pipeline_graph のみ使用。
+
+
+# ─── Phase 0.5-A 案 W'-1: LLM-only / TTS-only パイプライン ───────
+
+
+def run_pipeline_llm_only(
+    text: str,
+    *,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    utterance_meta: dict[str, Any] | None = None,
+    speaker_hint: str | None = None,
+    stream_context: str | None = None,
+) -> PipelineResult:
+    """LLM のみ先行実行 (TTS ノード抜き、Phase 0.5-A 案 W'-1)。
+
+    挙手 BG 先行生成で使う。承認確率に賭けて LLM だけ走らせ、TTS 合成は承認後に
+    run_loop が ``run_pipeline_tts_only(llm_result)`` を呼ぶ設計。これにより
+    却下/lapse 時に VOICEPEAK FIFO への投入を回避し、3 重発火時の VOICEPEAK
+    競合を緩和する (= 案 W'-1 の核心)。
+
+    【WHY: run_pipeline と分けた理由】
+    既存 run_pipeline は引数 ``suppress_bubble_answering=True`` で挙動を切り替えて
+    いたが、「TTS を skip するか否か」は graph 構造そのものに影響する設計判断
+    (= TTS ノードが呼ばれるか否か) なので、引数フラグではなく独立 API にした方が
+    責務が明確。既存 run_pipeline の挙動には一切手を入れない (= 通常応答ターン
+    経路の回帰なし)。
+
+    【WHY: 引数を絞った】
+    on_tts_chunk_ready / on_pose_ready / suppress_bubble_answering は LLM-only
+    モードでは TTS ノードが走らないため意味を持たない。引数を残すと利用側を
+    混乱させる (= 「渡したのに動かない」)。suppress_bubble_answering は内部で
+    True 固定 (= BG 経路では承認時に run_loop が answering bubble を発行する
+    設計、graph 側の二重発行を防ぐ)。
+
+    Returns:
+        PipelineResult: events に [utterance.final, llm.final] の 2 件を含む。
+                        tts.done は含まれない。承認時に ``run_pipeline_tts_only``
+                        にこの result を渡して TTS を実行する。
+    """
+    return _run_pipeline_graph_llm_only(
+        text,
+        stream_id=stream_id,
+        session_id=session_id,
+        trace_id=trace_id,
+        utterance_meta=utterance_meta,
+        speaker_hint=speaker_hint,
+        stream_context=stream_context,
+    )
+
+
+def _run_pipeline_graph_llm_only(
+    text: str,
+    *,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    utterance_meta: dict[str, Any] | None = None,
+    speaker_hint: str | None = None,
+    stream_context: str | None = None,
+) -> PipelineResult:
+    """LLM-only パイプライングラフ経由で実行する。"""
+    from .graph import run_pipeline_graph_llm_only, PipelineGraphState
+
+    common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
+
+    use_real_llm, llm_provider, llm_model = _get_llm_mode()
+    enable_rag, rag_top_k, kb_path = _get_rag_mode()
+    # TTS 設定は initial_state 型整合のため埋める (= LLM-only モードでは _tts_node
+    # が呼ばれないため値は使われない、dead value 容認)。
+    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+
+    initial_state: PipelineGraphState = {
+        "text": text,
+        "common": common,
+        "speaker_hint": speaker_hint,
+        "utterance_meta": utterance_meta,
+        "use_real_llm": use_real_llm,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "enable_rag": enable_rag,
+        "rag_top_k": rag_top_k,
+        "kb_path": kb_path,
+        "use_real_tts": use_real_tts,
+        "tts_provider": tts_provider,
+        "tts_voice": tts_voice,
+        "tts_speaker": tts_speaker,
+        "tts_output_dir": tts_output_dir,
+        "system_prompt": None,
+        "stream_context": stream_context,
+        # LLM-only モードでは callback は呼ばれない (= TTS ノード不在のため)
+        "on_tts_chunk_ready": None,
+        "on_pose_ready": None,
+        # WHY: 承認時に run_loop が answering bubble を発行する設計のため、graph 側で
+        # 二重発行しないよう内部固定で抑制する
+        "suppress_bubble_answering": True,
+        "character_slug": "",
+        "rag_context": None,
+        "rag_used": False,
+        "retrieved_doc_ids": [],
+        "retrieval_latency_ms": 0,
+        "answer_mode": "fallback",
+        "llm_text": "",
+        "llm_meta": {},
+        "tts_meta": {},
+        "events": [],
+    }
+
+    final_state = run_pipeline_graph_llm_only(initial_state)
+
+    return PipelineResult(
+        stream_id=stream_id,
+        session_id=session_id,
+        trace_id=trace_id,
+        speaker=final_state["character_slug"],
+        events=final_state["events"],
+    )
+
+
+def run_pipeline_tts_only(
+    llm_result: PipelineResult,
+    *,
+    on_tts_chunk_ready=None,
+    on_pose_ready=None,
+) -> PipelineResult:
+    """LLM 結果を再利用して TTS のみ実行 (Phase 0.5-A 案 W'-1)。
+
+    initial_state に llm_result.events から utterance.final + llm.final を注入
+    し、character_slug / llm_text / common (stream_id/session_id/trace_id) を
+    再構築。TTS-only graph (= tts → END) を invoke することで _tts_node 内の
+    全ロジック (pose 切替 / wait_bg / build_tts_done) を再利用する。
+
+    【WHY: tts.synthesize 直接呼出ではなく graph 再利用】
+    _tts_node 内には pose 切替 (_parse_voicepeak_json + set_pose) /
+    ask_character 協働 TTS 完了待ち (wait_bg_tts_complete) /
+    build_tts_done event publish などの周辺ロジックが詰まっている。
+    tts.synthesize 直接呼出ではこれらを再実装する必要があり、コード重複と
+    保守負荷が増える。グラフ再利用なら新規実装ゼロ。
+
+    Args:
+        llm_result:        run_pipeline_llm_only() の戻り値。events には
+                           [utterance.final, llm.final] が入っている前提。
+        on_tts_chunk_ready: TTS chunk 生成時 callback (= run_loop の playback queue
+                           投入)
+        on_pose_ready:     pose 予約 callback (= run_loop の _pending_poses 投入)
+
+    Returns:
+        PipelineResult: events に initial の 2 件 + tts.done の合計 3 件を含む
+    """
+    from .graph import run_pipeline_graph_tts_only, PipelineGraphState
+
+    common = dict(
+        stream_id=llm_result.stream_id,
+        session_id=llm_result.session_id,
+        trace_id=llm_result.trace_id,
+    )
+
+    # events から llm.final.text を抽出 (= _tts_node が state["llm_text"] として読む)。
+    # WHY: _tts_node:1112 で llm_event_id = state["events"][1]["event_id"] と
+    # 「2 番目の event」を期待しているため、events 配列を含めて events[1] が
+    # llm.final になる構造を保つ必要がある。
+    llm_text = ""
+    for ev in llm_result.events:
+        if ev.get("type") == "llm.final":
+            llm_text = ev.get("payload", {}).get("text", "")
+            break
+
+    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+
+    initial_state: PipelineGraphState = {
+        # text / utterance_meta は TTS-only では使われないが型整合のため埋める
+        "text": "",
+        "common": common,
+        "speaker_hint": None,
+        "utterance_meta": None,
+        # LLM 設定は使われない
+        "use_real_llm": False,
+        "llm_provider": "",
+        "llm_model": "",
+        "enable_rag": False,
+        "rag_top_k": 0,
+        "kb_path": "",
+        # TTS 設定 (_tts_node が読む)
+        "use_real_tts": use_real_tts,
+        "tts_provider": tts_provider,
+        "tts_voice": tts_voice,
+        "tts_speaker": tts_speaker,
+        "tts_output_dir": tts_output_dir,
+        "system_prompt": None,
+        "stream_context": None,
+        "on_tts_chunk_ready": on_tts_chunk_ready,
+        "on_pose_ready": on_pose_ready,
+        # _tts_node 内では使われないが型整合
+        "suppress_bubble_answering": True,
+        # _tts_node が読む値群
+        "character_slug": llm_result.speaker,
+        "llm_text": llm_text,
+        # rag/answer_mode/llm_meta/tts_meta は TTS-only では使われない
+        "rag_context": None,
+        "rag_used": False,
+        "retrieved_doc_ids": [],
+        "retrieval_latency_ms": 0,
+        "answer_mode": "fallback",
+        "llm_meta": {},
+        "tts_meta": {},
+        # events は LLM 結果 (utterance.final + llm.final) をコピーして注入
+        "events": list(llm_result.events),
+    }
+
+    final_state = run_pipeline_graph_tts_only(initial_state)
+
+    return PipelineResult(
+        stream_id=llm_result.stream_id,
+        session_id=llm_result.session_id,
+        trace_id=llm_result.trace_id,
+        speaker=final_state["character_slug"],
+        events=final_state["events"],
+    )

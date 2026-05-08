@@ -480,3 +480,163 @@ class TestRunPipelineWithLangSmith:
         with patch("lab_lounge.graph.run_graph") as mock_graph:
             run_pipeline("テスト", **COMMON)
         mock_graph.assert_not_called()
+
+
+# ─── Phase 0.5-A 案 W'-1: LLM-only / TTS-only パイプライン ───────
+
+
+class TestRunPipelineLlmOnly:
+    """run_pipeline_llm_only: LLM のみ先行実行 (Phase 0.5-A 案 W'-1)。
+
+    既存 run_pipeline と異なり TTS ノードを実行しない。挙手 BG 先行生成で
+    使われ、承認時に run_pipeline_tts_only(llm_result) で TTS を再開する。
+    """
+
+    def test_returns_pipeline_result(self, mock_publish):
+        from lab_lounge.pipeline import run_pipeline_llm_only, PipelineResult
+        result = run_pipeline_llm_only("hello", **COMMON)
+        assert isinstance(result, PipelineResult)
+
+    def test_returns_two_events(self, mock_publish):
+        """events に utterance.final + llm.final の 2 件のみ含まれる。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        result = run_pipeline_llm_only("hello", **COMMON)
+        assert len(result.events) == 2
+
+    def test_event_types_in_order(self, mock_publish):
+        """types == [utterance.final, llm.final] (tts.done なし)。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        result = run_pipeline_llm_only("hello", **COMMON)
+        types = [ev["type"] for ev in result.events]
+        assert types == ["utterance.final", "llm.final"]
+
+    def test_no_tts_done_event(self, mock_publish):
+        """events に tts.done が含まれない (= TTS ノード非実行の証)。
+
+        WHY: 案 W'-1 の核心。BG LLM が TTS まで走らないので VOICEPEAK FIFO に
+        投入されない (= 却下/lapse 時のリソース無駄を防ぐ)。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        result = run_pipeline_llm_only("hello", **COMMON)
+        types = [ev["type"] for ev in result.events]
+        assert "tts.done" not in types
+
+    def test_publish_called_three_times(self, mock_publish):
+        """3 publish: utterance.final + bubble.update("thinking") + llm.final。
+
+        WHY: run_pipeline は 5 publish (= utterance + thinking + answering + llm + tts)
+        だが、run_pipeline_llm_only は TTS / answering を含まない (suppress=True)
+        ので 3 件まで。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        run_pipeline_llm_only("hello", **COMMON)
+        assert mock_publish.call_count == 3
+
+    def test_llm_links_utterance(self, mock_publish):
+        """llm.final.links に utterance.final.event_id が含まれる (因果関係保持)。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        result = run_pipeline_llm_only("hello", **COMMON)
+        utt_id = result.events[0]["event_id"]
+        llm_links = result.events[1]["links"]
+        assert utt_id in llm_links
+
+    def test_dummy_llm_text_format(self, mock_publish, monkeypatch):
+        """ダミーモード (L2_USE_REAL_LLM 未設定) で「ダミー応答: <input>」を返す。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        monkeypatch.delenv("L2_USE_REAL_LLM", raising=False)
+        result = run_pipeline_llm_only("天気の話", **COMMON)
+        assert result.events[1]["payload"]["text"] == "ダミー応答: 天気の話"
+
+    def test_speaker_hint_routes_correctly(self, mock_publish):
+        """speaker_hint='mimi' で result.speaker == 'mimi'。"""
+        from lab_lounge.pipeline import run_pipeline_llm_only
+        result = run_pipeline_llm_only("hello", speaker_hint="mimi", **COMMON)
+        assert result.speaker == "mimi"
+
+
+class TestRunPipelineTtsOnly:
+    """run_pipeline_tts_only: LLM 結果を再利用して TTS のみ実行 (Phase 0.5-A 案 W'-1)。
+
+    挙手承認時に run_loop が呼ぶ。TTS-only graph (= tts → END) を invoke して
+    _tts_node 内の全ロジック (pose 切替 / wait_bg / build_tts_done) を再利用する。
+    """
+
+    def test_returns_pipeline_result(self, mock_publish):
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only, PipelineResult,
+        )
+        llm_result = run_pipeline_llm_only("hello", **COMMON)
+        result = run_pipeline_tts_only(llm_result)
+        assert isinstance(result, PipelineResult)
+
+    def test_appends_tts_done_to_initial_events(self, mock_publish):
+        """initial events (2 件) + tts.done で計 3 件になる。"""
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        llm_result = run_pipeline_llm_only("hello", **COMMON)
+        assert len(llm_result.events) == 2  # 前提確認
+
+        result = run_pipeline_tts_only(llm_result)
+        assert len(result.events) == 3
+        types = [ev["type"] for ev in result.events]
+        assert types == ["utterance.final", "llm.final", "tts.done"]
+
+    def test_speaker_preserved_from_llm_result(self, mock_publish):
+        """result.speaker は llm_result.speaker を引き継ぐ。"""
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        llm_result = run_pipeline_llm_only("hello", speaker_hint="mimi", **COMMON)
+        result = run_pipeline_tts_only(llm_result)
+        assert result.speaker == "mimi"
+
+    def test_tts_done_text_matches_llm_final_text(self, mock_publish):
+        """tts.done.payload.text は llm.final.text と一致する (= TTS 入力の再利用)。
+
+        WHY: _tts_node は state["llm_text"] を TTS 入力として使い、build_tts_done
+        の text にも入れる。run_pipeline_tts_only は llm_result.events から llm.final
+        を抽出して state["llm_text"] に設定する。
+        """
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        llm_result = run_pipeline_llm_only("test 入力", **COMMON)
+        llm_text = llm_result.events[1]["payload"]["text"]
+
+        result = run_pipeline_tts_only(llm_result)
+        tts_text = result.events[2]["payload"]["text"]
+        assert tts_text == llm_text
+
+    def test_common_ids_preserved(self, mock_publish):
+        """stream_id / session_id / trace_id は llm_result から引き継がれる。"""
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        llm_result = run_pipeline_llm_only("hello", **COMMON)
+        result = run_pipeline_tts_only(llm_result)
+        assert result.stream_id == COMMON["stream_id"]
+        assert result.session_id == COMMON["session_id"]
+        assert result.trace_id == COMMON["trace_id"]
+
+    def test_on_tts_chunk_ready_callback_passed_through(self, mock_publish, monkeypatch):
+        """on_tts_chunk_ready callback が graph state に伝播される。
+
+        ダミー TTS モード (L2_USE_REAL_TTS 未設定) では callback は呼ばれないので、
+        ここでは「state の中で参照できる」ことを verify する。
+        """
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        chunks_received: list = []
+        def on_chunk(url, text, is_last, character, pose=None):
+            chunks_received.append((url, text, is_last, character))
+
+        llm_result = run_pipeline_llm_only("hello", **COMMON)
+        # ダミー TTS モードでは callback は呼ばれない (= chunks_received は空)。
+        # 重要なのは「呼出が例外無く完了する」こと (= callback が graph state に
+        # 渡される経路の sanity check)。
+        monkeypatch.delenv("L2_USE_REAL_TTS", raising=False)
+        result = run_pipeline_tts_only(llm_result, on_tts_chunk_ready=on_chunk)
+        # ダミーモードでも tts.done event は発行される (= dummy meta only)
+        assert any(ev["type"] == "tts.done" for ev in result.events)
