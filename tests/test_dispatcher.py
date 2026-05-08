@@ -20,6 +20,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from lab_lounge.character_status import (
+    CharacterStatus,
+    CharacterStatusManager,
+)
 from lab_lounge.dispatcher import (
     DRAIN_MAX_AGE_SEC,
     DRAIN_MAX_EVENTS,
@@ -1744,3 +1748,78 @@ class TestDispatcherOnPipelineCompleteLogging:
         d._state = DispatcherState.RESPONDING
         d.on_pipeline_complete(completed_slug="sakura")
         assert d.get_state() == DispatcherState.IDLE
+
+
+# ─── TestDispatcherStatusManager (Phase 0.5-B-α) ────────────────────
+
+
+class TestDispatcherStatusManager:
+    """Dispatcher の handraise 経路で CharacterStatusManager に状態を反映する検証
+    (Phase 0.5-B-α)。
+
+    Manager 注入は optional kwarg なので、既存テストの非破壊的拡張になっている
+    ことも合わせて確認する。実 timer の非決定性を回避するため _FakeTimer に差し替え。
+    """
+
+    def _make_dispatcher(self, manager: CharacterStatusManager, monkeypatch) -> Dispatcher:
+        """status_manager 注入 + lapse_timer を _FakeTimer に差し替えた Dispatcher。"""
+        d = Dispatcher(status_manager=manager)
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+        return d
+
+    def test_init_status_manager_optional(self):
+        """Dispatcher() で status_manager 引数なしでも動く (= 既存テスト回帰互換)。"""
+        d = Dispatcher()
+        assert d._status_manager is None
+
+    def test_start_handraise_sets_raisehand(self, monkeypatch):
+        """_start_handraise (on_interjection_candidate 経由) で RAISEHAND が反映される。"""
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+
+    def test_approval_granted_resets_to_ready(self, monkeypatch):
+        """on_approval_granted で Manager に READY が反映される (Raisehand → Ready)。"""
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_approval_granted("mimi")
+        assert manager.get_status("mimi") == CharacterStatus.READY
+
+    def test_approval_denied_resets_to_ready(self, monkeypatch):
+        """on_approval_denied で Manager に READY が反映される (Raisehand → Ready)。"""
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_approval_denied("mimi")
+        assert manager.get_status("mimi") == CharacterStatus.READY
+
+    def test_lapse_timeout_resets_to_ready(self, monkeypatch):
+        """on_lapse_timeout で Manager に READY が反映される (Raisehand → Ready)。"""
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_lapse_timeout("mimi")
+        assert manager.get_status("mimi") == CharacterStatus.READY
+
+    def test_callback_fires_on_raisehand_to_ready(self, monkeypatch):
+        """Manager の on_status_changed callback が遷移で発火する (metadata=None)。"""
+        callback = MagicMock()
+        manager = CharacterStatusManager(on_status_changed=callback)
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_approval_granted("mimi")
+        # 2 回 callback 発火: ready→raisehand, raisehand→ready
+        assert callback.call_count == 2
+        first_call = callback.call_args_list[0]
+        assert first_call.args == (
+            "mimi", CharacterStatus.RAISEHAND, CharacterStatus.READY, None,
+        )
+        second_call = callback.call_args_list[1]
+        assert second_call.args == (
+            "mimi", CharacterStatus.READY, CharacterStatus.RAISEHAND, None,
+        )
