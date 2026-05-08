@@ -86,3 +86,36 @@ class TestCallLlm:
         with patch.dict(llm_mod._PROVIDERS, {"openai": mock_fn}):
             call_llm("テスト", model="gpt-4o", provider="openai")
         mock_fn.assert_called_once_with("テスト", model="gpt-4o")
+
+    def test_caller_slug_logged(self, caplog):
+        """ログ強化 L-3: caller_slug が指定されるとログに [character=...] が含まれる。"""
+        import logging
+        mock_fn = _mock_openai(FAKE_RESULT)
+        with patch.dict(llm_mod._PROVIDERS, {"openai": mock_fn}):
+            with caplog.at_level(logging.INFO, logger="lab_lounge.llm"):
+                call_llm(
+                    "テスト", model="gpt-4o-mini", provider="openai",
+                    caller_slug="mimi",
+                )
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "[character=mimi]" in joined
+
+    def test_caller_slug_none_logs_question_mark(self, caplog):
+        """caller_slug 未指定時はログに [character=?] と表示される (= 旧経路 / 不明)。"""
+        import logging
+        mock_fn = _mock_openai(FAKE_RESULT)
+        with patch.dict(llm_mod._PROVIDERS, {"openai": mock_fn}):
+            with caplog.at_level(logging.INFO, logger="lab_lounge.llm"):
+                call_llm("テスト", model="gpt-4o-mini", provider="openai")
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "[character=?]" in joined
+
+    def test_caller_slug_not_forwarded_to_adapter(self):
+        """caller_slug は llm.py 内のログ用なので adapter には渡らない (= 副作用なし)。"""
+        mock_fn = _mock_openai(FAKE_RESULT)
+        with patch.dict(llm_mod._PROVIDERS, {"openai": mock_fn}):
+            call_llm(
+                "テスト", model="gpt-4o", provider="openai", caller_slug="sakura",
+            )
+        # adapter には caller_slug は渡らない (= 既存 adapter の互換性維持)
+        mock_fn.assert_called_once_with("テスト", model="gpt-4o")

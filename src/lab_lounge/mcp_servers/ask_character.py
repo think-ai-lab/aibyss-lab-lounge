@@ -596,18 +596,28 @@ def _run_collaboration_agent(
         from langgraph.prebuilt import create_react_agent
     except ImportError:
         # LangGraph なし → 単純 LLM 呼出しにフォールバック
+        # ログ強化 L-3: caller_slug=character_slug (target = 応答する側) でログ識別
         from ..llm import call_llm
-        result = call_llm(question, model=model, provider=provider, system_prompt=combined_prompt)
+        result = call_llm(
+            question, model=model, provider=provider,
+            system_prompt=combined_prompt,
+            caller_slug=character_slug,
+        )
         return result.text
 
     # ツールセットから ask_character を除外 (再帰防止)
-    all_tools = _load_mcp_tools()
+    # ログ強化 L-3: ask_character のターゲット (= target、応答する側) を渡してログ識別
+    all_tools = _load_mcp_tools(character_slug=character_slug)
     collab_tools = [t for t in all_tools if t.name != "ask_character_tool"]
 
     if not collab_tools:
         # ツールなし → 単純 LLM 呼出し
         from ..llm import call_llm
-        result = call_llm(question, model=model, provider=provider, system_prompt=combined_prompt)
+        result = call_llm(
+            question, model=model, provider=provider,
+            system_prompt=combined_prompt,
+            caller_slug=character_slug,
+        )
         return result.text
 
     # retrieve_memory 用の contextvars をセット (協働先も記憶検索できるように)
@@ -731,11 +741,14 @@ def _generate_intro(
         )
 
     try:
+        # ログ強化 L-3: 導入セリフは caller (= 質問する側) が target に対して話すもの
+        # なので、caller_slug=caller_char.slug でログ識別する。
         result = call_llm(
             intro_prompt,
             model=filler_model,
             provider=filler_provider,
             system_prompt=caller_system_prompt,
+            caller_slug=caller_char.slug,
         )
         intro = result.text.strip()
         if intro:
