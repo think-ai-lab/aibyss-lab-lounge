@@ -316,6 +316,8 @@ def run_pipeline_llm_only(
     speaker_hint: str | None = None,
     stream_context: str | None = None,
     status_manager=None,
+    on_tts_chunk_ready=None,
+    on_pose_ready=None,
 ) -> PipelineResult:
     """LLM のみ先行実行 (TTS ノード抜き、Phase 0.5-A 案 W'-1)。
 
@@ -331,12 +333,30 @@ def run_pipeline_llm_only(
     責務が明確。既存 run_pipeline の挙動には一切手を入れない (= 通常応答ターン
     経路の回帰なし)。
 
-    【WHY: 引数を絞った】
-    on_tts_chunk_ready / on_pose_ready / suppress_bubble_answering は LLM-only
-    モードでは TTS ノードが走らないため意味を持たない。引数を残すと利用側を
-    混乱させる (= 「渡したのに動かない」)。suppress_bubble_answering は内部で
-    True 固定 (= BG 経路では承認時に run_loop が answering bubble を発行する
-    設計、graph 側の二重発行を防ぐ)。
+    【WHY: 当初は callback 引数を絞っていた】(Phase 0.5-A 案 W'-1)
+    LLM-only モードでは graph._tts_node が走らないため、最終応答 TTS の callback
+    は意味を持たなかった。``suppress_bubble_answering`` は内部で True 固定
+    (= BG 経路では承認時に run_loop が answering bubble を発行する設計、graph 側
+    の二重発行を防ぐ)。
+
+    【WHY: on_tts_chunk_ready / on_pose_ready を後追いで受けるようにした】
+    (Phase 0.5-B-β-1)
+    ask_character ツール経由の対話 TTS は graph._tts_node を経由せず、ツール内で
+    直接 ``tts.synthesize(on_chunk_ready=...)`` を呼ぶ独立経路。BG LLM 経路でも
+    callback を渡せば ask_character の対話 TTS が playback queue に届くようになる
+    (= A1 修正、ミミ様導入セリフ + 協働応答 TTS が再生される)。最終応答 TTS は
+    依然 graph 構造 (= _tts_node 不在) で suppress される (= 案 W'-1 不変)。
+    pipeline.py:404-407 の設計者コメント「LLM-only モードでは ask_character ツール
+    起動の余地がある」と整合。
+
+    Args:
+        on_tts_chunk_ready: ask_character 内の対話 TTS chunk 投入用 callback
+                            (= run_loop の ``_on_tts_chunk``)。signature は
+                            ``(url: str, chunk_text: str, is_last: bool, character: str) -> None``。
+                            None (default) なら従来挙動 (= 対話 TTS スキップ)。
+        on_pose_ready:      target キャラの pose 切替予約 callback
+                            (= run_loop の ``_on_pose_ready``)。signature は
+                            ``(slug: str, pose: str) -> None``。None なら従来挙動。
 
     Returns:
         PipelineResult: events に [utterance.final, llm.final] の 2 件を含む。
@@ -352,6 +372,8 @@ def run_pipeline_llm_only(
         speaker_hint=speaker_hint,
         stream_context=stream_context,
         status_manager=status_manager,
+        on_tts_chunk_ready=on_tts_chunk_ready,
+        on_pose_ready=on_pose_ready,
     )
 
 
@@ -365,8 +387,15 @@ def _run_pipeline_graph_llm_only(
     speaker_hint: str | None = None,
     stream_context: str | None = None,
     status_manager=None,
+    on_tts_chunk_ready=None,
+    on_pose_ready=None,
 ) -> PipelineResult:
-    """LLM-only パイプライングラフ経由で実行する。"""
+    """LLM-only パイプライングラフ経由で実行する。
+
+    Phase 0.5-B-β-1 で ``on_tts_chunk_ready`` / ``on_pose_ready`` を受け付け開始。
+    本 commit (β-1-1) では signature のみ拡張し、initial_state への伝播は β-1-2 で
+    実装する (= signature 拡張と内部 wiring を分けて段階的に検証)。
+    """
     from .graph import run_pipeline_graph_llm_only, PipelineGraphState
 
     common = dict(stream_id=stream_id, session_id=session_id, trace_id=trace_id)
