@@ -242,6 +242,7 @@ def build_bubble_update(
     trace_id: str,
     links: list[str] | None = None,
     ttl_ms: int | None = None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     """
     bubble.update イベントを組み立てて検証する。
@@ -260,15 +261,25 @@ def build_bubble_update(
                    Phase 0.5 では denied/lapsed=2000ms を想定し、handraise 自体は
                    None (承認/却下/lapse まで保持) で発行する。
                    payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
+        category:  V2 HUD 側で表示エリアを分岐させるための種別フィールド (Phase 0.5-A 8-10)。
+                     - "speech":    通常応答 + 承認後応答 (thinking/searching/answering/
+                                    speaking/done/pose_change)
+                     - "handraise": 挙手系 (handraise/denied/lapsed/cancelled)
+                   None 時は payload に含めない (受信側 default = "speech" 解釈、後方互換)。
+                   step は「進捗状態」、category は「分岐軸」として独立した概念。step 拡張で
+                   将来の bubble 種別が増えても category 固定で受信側ロジックを単純に保てる。
+                   payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
     """
     payload: dict[str, Any] = {
         "character": character,
         "step": step,
         "text": text,
     }
-    # ttl_ms はオプション。None 時は payload に含めない (受信側 default 挙動を維持)。
+    # ttl_ms / category はオプション。None 時は payload に含めない (受信側 default 挙動を維持)。
     if ttl_ms is not None:
         payload["ttl_ms"] = ttl_ms
+    if category is not None:
+        payload["category"] = category
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),

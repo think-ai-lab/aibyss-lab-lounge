@@ -56,8 +56,15 @@ def _publish_bubble(
     character_slug: str,
     common: dict,
     links: list[str] | None = None,
+    *,
+    category: str = "speech",
 ) -> None:
-    """bubble.update イベントを発行する。"""
+    """bubble.update イベントを発行する。
+
+    category はデフォルト "speech" (通常応答パス: thinking/searching/answering 等)。
+    挙手系 (handraise/denied/lapsed/cancelled) を発行する経路は dispatcher が直接
+    build_bubble_update を呼ぶため、本 helper は通常応答用に最適化する (Phase 0.5-A 8-10)。
+    """
     messages = _load_bubble_messages()
     char_msgs = messages.get(character_slug, {})
     text = char_msgs.get(step, "")
@@ -68,6 +75,7 @@ def _publish_bubble(
             step=step,
             text=text,
             links=links,
+            category=category,
             **common,
         )
         publish(bubble)

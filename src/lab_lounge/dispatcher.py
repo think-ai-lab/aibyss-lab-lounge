@@ -582,11 +582,12 @@ class Dispatcher:
         step: str,
         text: str,
         ttl_ms: int | None = None,
+        category: str | None = None,
     ) -> None:
         """
         on_bubble_update callback を呼び出す (Phase 0.5-A)。
 
-        Lock 外で呼ばれることを前提に、引数 (character, step, text, ttl_ms) を
+        Lock 外で呼ばれることを前提に、引数 (character, step, text, ttl_ms, category) を
         callback にそのまま渡す。run_loop 側で ``build_bubble_update(...)`` を
         呼び出して bus に publish する想定。callback で例外が出ても dispatcher
         本体は止めない。
@@ -598,11 +599,15 @@ class Dispatcher:
             text:      bubble 表示テキスト
             ttl_ms:    自動消去ミリ秒。None なら次 step まで保持。Phase 0.5-A は
                        denied/lapsed=2000ms / handraise=None を想定
+            category:  Phase 0.5-A 8-10: V2 HUD 側で表示エリアを分岐させる種別。
+                       Dispatcher が発行するのは挙手系のみのため、呼出元は
+                       "handraise" を渡す。None なら events.py 側で payload に
+                       含めず、受信側 default 解釈 (= speech 扱い、後方互換)。
         """
         if self._on_bubble_update is None:
             return
         try:
-            self._on_bubble_update(character, step, text, ttl_ms)
+            self._on_bubble_update(character, step, text, ttl_ms, category)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Dispatcher: on_bubble_update callback failed: %s", exc,
@@ -789,7 +794,7 @@ class Dispatcher:
             target_slug, phrase_text, state.trace_id, state.se_pending,
         )
         # publish + 物理通知も Lock 外 (callback の長時間処理が dispatcher を止めない)
-        self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None)
+        self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="handraise")
         self._publish_handraise_update()
         # フェーズ 7: handraise wav の物理再生は run_loop の責務。dispatcher は
         # 「IDLE 中なら即再生して」という意思を se_pending=False で伝えるだけ。
@@ -919,7 +924,7 @@ class Dispatcher:
         # bubble.update("denied") の text を bubble_messages から取得 (フォールバックあり)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "denied")
-        self._publish_bubble_update(target_slug, "denied", text, ttl_ms=2000)
+        self._publish_bubble_update(target_slug, "denied", text, ttl_ms=2000, category="handraise")
         self._publish_handraise_update()
 
     def on_lapse_timeout(self, target_slug: str) -> None:
@@ -944,5 +949,5 @@ class Dispatcher:
         logger.info("Dispatcher.on_lapse_timeout: slug=%s", target_slug)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "lapsed")
-        self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000)
+        self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000, category="handraise")
         self._publish_handraise_update()

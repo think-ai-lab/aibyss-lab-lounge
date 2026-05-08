@@ -520,6 +520,9 @@ class TestCreateHandraiseRunnerAndCallbacks:
         assert len(bubble_calls) == 1
         assert bubble_calls[0]["payload"]["character"] == "mimi"
         assert bubble_calls[0]["payload"]["text"] == "わたくしの見解は…"
+        # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech"
+        # WHY: 挙手バブルは消費され、応答は通常応答エリアで表示する設計
+        assert bubble_calls[0]["payload"]["category"] == "speech"
         # chunks 再生も呼ばれる
         assert len(spawn_calls) == 1
         assert spawn_calls[0][0] == "mimi"

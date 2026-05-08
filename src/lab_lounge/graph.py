@@ -390,6 +390,7 @@ class BubbleToolCallbackHandler:
                 character=self._character_slug,
                 step="searching",
                 text=text,
+                category="speech",  # Phase 0.5-A 8-10: 通常応答パス (Agent ツール) は speech
                 **self._common,
             )
             publish(event)
