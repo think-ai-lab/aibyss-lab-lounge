@@ -1443,3 +1443,111 @@ class TestDispatcherApprovedCallback:
         d.on_interjection_candidate("mimi", transcript_snapshot="t")
         d.on_approval_granted("mimi")  # 例外なく完了
         assert d._handraise_states == {}
+
+
+# ─── TestDispatcherFlushPendingHandraiseReleases (Phase 0.5-A 8-11) ──────
+
+
+class TestDispatcherFlushPendingHandraiseReleases:
+    """flush_pending_handraise_releases メソッドの挙動 (Phase 0.5-A フェーズ 8-11)。
+
+    通常応答の最終 chunk 物理再生完了直後に呼ばれて、RESPONDING 中保留された
+    handraise wav を 5 秒早く release する経路。on_pipeline_complete との
+    冪等性 / state 遷移分離が設計上の要点。
+    """
+
+    def _setup_responding_with_pending_handraise(
+        self, monkeypatch, d: Dispatcher,
+    ) -> None:
+        """RESPONDING 中に挙手された state を準備する (se_pending=True)。"""
+        _patch_filler(monkeypatch, slug="mimi", text="挙手")
+        _patch_lapse_timer(monkeypatch, d)
+        # RESPONDING 中に挙手 → se_pending=True で state がセットされる
+        d._state = DispatcherState.RESPONDING
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+
+    def test_flush_releases_pending_handraise(self, monkeypatch):
+        """se_pending=True かつ phrase_path 有の handraise を release callback で発火する。"""
+        release_calls: list[tuple] = []
+        d = Dispatcher(
+            on_handraise_phrase_pending_release=lambda slug, path: release_calls.append((slug, path)),
+        )
+        self._setup_responding_with_pending_handraise(monkeypatch, d)
+        # 前提: se_pending=True
+        assert d._handraise_states["mimi"].se_pending is True
+
+        d.flush_pending_handraise_releases()
+
+        assert len(release_calls) == 1
+        assert release_calls[0][0] == "mimi"
+        # 二重発火防止: se_pending が False に巻き戻されている
+        assert d._handraise_states["mimi"].se_pending is False
+
+    def test_flush_idempotent_with_on_pipeline_complete(self, monkeypatch):
+        """flush 後に on_pipeline_complete を呼んでも release callback は再発火しない。
+
+        flush 内で se_pending=False に巻き戻すため、後続の on_pipeline_complete は
+        pending_releases が空となり no-op として安全に動く (二重発火防止)。
+        """
+        release_calls: list[tuple] = []
+        d = Dispatcher(
+            on_handraise_phrase_pending_release=lambda slug, path: release_calls.append((slug, path)),
+        )
+        self._setup_responding_with_pending_handraise(monkeypatch, d)
+
+        d.flush_pending_handraise_releases()
+        assert len(release_calls) == 1  # 1 回だけ発火
+
+        # その後 on_pipeline_complete を呼んでも再発火しない
+        d.on_pipeline_complete()
+        assert len(release_calls) == 1  # 不変
+
+    def test_flush_does_not_change_state(self, monkeypatch):
+        """flush 単体では state を変えない (RESPONDING のまま)。
+
+        WHY: 物理再生完了直後はまだ done bubble 発行前で、State 上は RESPONDING のまま
+        が正しい (= 次の挙手判定で se_pending=True を維持できる)。
+        state 遷移 (RESPONDING → IDLE) は on_pipeline_complete の責務として残す。
+        """
+        d = Dispatcher(on_handraise_phrase_pending_release=lambda *a: None)
+        self._setup_responding_with_pending_handraise(monkeypatch, d)
+        assert d.get_state() == DispatcherState.RESPONDING
+
+        d.flush_pending_handraise_releases()
+
+        # state は RESPONDING のまま (IDLE にはならない)
+        assert d.get_state() == DispatcherState.RESPONDING
+
+    def test_flush_no_pending_is_noop(self, monkeypatch):
+        """se_pending=True の handraise が無ければ release callback は発火しない (no-op)。"""
+        release_calls: list[tuple] = []
+        d = Dispatcher(
+            on_handraise_phrase_pending_release=lambda slug, path: release_calls.append((slug, path)),
+        )
+        # IDLE 中に挙手 → se_pending=False で state がセットされる (即再生経路)
+        _patch_filler(monkeypatch, slug="mimi")
+        _patch_lapse_timer(monkeypatch, d)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        assert d._handraise_states["mimi"].se_pending is False
+
+        d.flush_pending_handraise_releases()
+
+        # IDLE 中の挙手は se_pending=False なので flush 対象外
+        assert release_calls == []
+
+    def test_flush_callback_exception_does_not_propagate(self, monkeypatch):
+        """release callback の例外が flush 外に伝播しない。
+
+        callback で例外が出ても dispatcher 本体は止めない (既存 callback パターン踏襲)。
+        例外発生後の他キャラの release は引き続き処理される。
+        """
+
+        def failing_callback(slug, path):
+            raise RuntimeError("boom")
+
+        d = Dispatcher(on_handraise_phrase_pending_release=failing_callback)
+        self._setup_responding_with_pending_handraise(monkeypatch, d)
+
+        d.flush_pending_handraise_releases()  # 例外なく完了
+        # se_pending は False に巻き戻されている (二重発火防止は保証される)
+        assert d._handraise_states["mimi"].se_pending is False

@@ -194,6 +194,136 @@ class TestRunPlaybackWorker:
         assert steps == ["speaking", "speaking", "done"]
 
 
+class TestRunPlaybackWorkerOnLastChunkPlayed:
+    """_run_playback_worker の on_last_chunk_played callback の挙動 (Phase 0.5-A 8-11)。
+
+    最終 chunk 物理再生完了直後 (= None sentinel 受信時、time.sleep(done_delay) の前) に
+    callback を発火することで、handraise wav の遅延再生を 5 秒早めることが目的。
+    本クラスはタイミング順序と冪等性を検証する。
+    """
+
+    def _start_worker(
+        self,
+        q,
+        *,
+        on_last_chunk_played=None,
+        publish_fn=None,
+        play_fn=None,
+        cleanup_fn=None,
+        done_delay=0.05,
+    ):
+        publish_fn = publish_fn or MagicMock()
+        play_fn = play_fn or MagicMock()
+        cleanup_fn = cleanup_fn or MagicMock()
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "done_delay_seconds": done_delay,
+                "on_last_chunk_played": on_last_chunk_played,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread, publish_fn, play_fn, cleanup_fn
+
+    def test_callback_fires_before_done_delay_sleep(self):
+        """sentinel 受信時、callback 発火 → time.sleep(done_delay) → done publish の順。
+
+        handraise wav の遅延再生を 5 秒早めるためには、callback が done_delay 待機の
+        "前" に発火することが必須 (= 5 秒の sleep 中に handraise wav が並列再生される)。
+        """
+        q: queue.Queue = queue.Queue()
+        events: list[tuple[str, float]] = []
+
+        def callback():
+            events.append(("callback", time.monotonic()))
+
+        def publish_fn(character, step, text):
+            events.append((f"publish:{step}", time.monotonic()))
+
+        thread, _, _, _ = self._start_worker(
+            q, on_last_chunk_played=callback, publish_fn=publish_fn,
+            done_delay=0.2,
+        )
+
+        q.put({"url": "file:///a.wav", "text": "x", "is_last": True, "character": "mimi"})
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # 順序: speaking → callback → done (callback と done の間に done_delay 0.2s)
+        names = [e[0] for e in events]
+        assert names == ["publish:speaking", "callback", "publish:done"]
+        # callback と done の間隔が done_delay 以上
+        callback_t = events[1][1]
+        done_t = events[2][1]
+        assert done_t - callback_t >= 0.18  # done_delay=0.2 で margin 0.02
+
+    def test_callback_not_fired_when_no_speaking_published(self):
+        """speaking 未発行 (空 task のみ) なら callback も done publish も発火しない。
+
+        既存の break 経路 (空 sentinel で即終了) を維持する (回帰)。
+        """
+        q: queue.Queue = queue.Queue()
+        callback_calls: list[None] = []
+
+        def callback():
+            callback_calls.append(None)
+
+        thread, publish_fn, _, _ = self._start_worker(
+            q, on_last_chunk_played=callback,
+        )
+
+        # speaking なしで sentinel のみ
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        assert callback_calls == []  # callback も発火しない
+        assert publish_fn.call_count == 0  # done bubble も発行されない
+
+    def test_callback_exception_does_not_propagate(self):
+        """callback 内例外で worker が止まらない。done bubble も予定通り発行される。"""
+        q: queue.Queue = queue.Queue()
+
+        def failing_callback():
+            raise RuntimeError("flush failed")
+
+        publish_fn = MagicMock()
+        thread, _, _, _ = self._start_worker(
+            q, on_last_chunk_played=failing_callback, publish_fn=publish_fn,
+        )
+
+        q.put({"url": "file:///a.wav", "text": "x", "is_last": True, "character": "mimi"})
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        # done publish は callback 例外を吸収して通常通り発行される
+        steps = [c.args[1] for c in publish_fn.call_args_list]
+        assert steps == ["speaking", "done"]
+
+    def test_default_none_preserves_existing_behavior(self):
+        """on_last_chunk_played=None (default) で既存挙動が壊れない (回帰)。"""
+        q: queue.Queue = queue.Queue()
+        publish_fn = MagicMock()
+
+        thread, _, _, _ = self._start_worker(
+            q, on_last_chunk_played=None, publish_fn=publish_fn,
+        )
+
+        q.put({"url": "file:///a.wav", "text": "x", "is_last": True, "character": "mimi"})
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        # speaking → done のみ (callback 経路は無し)
+        steps = [c.args[1] for c in publish_fn.call_args_list]
+        assert steps == ["speaking", "done"]
+
+
 class TestInitListenerBgContinuous:
     """Block 0: _init_listener の bg-continuous 分岐テスト。
 
