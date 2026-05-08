@@ -669,6 +669,135 @@ class TestRunPipelineLlmOnly:
         types = [ev["type"] for ev in result.events]
         assert types == ["utterance.final", "llm.final"]
 
+    # ─── Phase 0.5-B-β-1 commit 2: initial_state 伝播 (callback wiring) ──
+    # WHY: β-1-1 の signature 拡張だけでは内部に届かなかった callback を、graph
+    # state の initial_state に乗せて _generation_node まで運ぶ。これにより
+    # set_ask_character_context(on_tts_chunk=state["on_tts_chunk_ready"]) が
+    # non-None の callback を受け取り、ask_character.py:376 の gating が True に
+    # なって対話 TTS が起動する (= A1 修正の中核)。
+
+    def test_initial_state_propagates_on_tts_chunk_ready(
+        self, mock_publish, monkeypatch,
+    ):
+        """initial_state['on_tts_chunk_ready'] に渡された callback が乗る (Phase 0.5-B-β-1 commit 2)。
+
+        WHY: β-1-1 で signature 拡張済み、本 commit (β-1-2) で initial_state まで
+        伝播。spy で graph state を覗いて wiring を検証する。LangGraph 実行は元の
+        run_pipeline_graph_llm_only に委譲するので既存挙動は壊さない。
+        """
+        from lab_lounge import graph as graph_mod
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        captured_states: list[dict] = []
+        original_fn = graph_mod.run_pipeline_graph_llm_only
+
+        def spy(initial_state):
+            # initial_state を保存 (元の関数も呼んで既存挙動維持)
+            captured_states.append(dict(initial_state))
+            return original_fn(initial_state)
+
+        monkeypatch.setattr(graph_mod, "run_pipeline_graph_llm_only", spy)
+
+        def my_callback(url, chunk_text, is_last, character):
+            pass
+
+        run_pipeline_llm_only("hello", on_tts_chunk_ready=my_callback, **COMMON)
+
+        assert len(captured_states) == 1, "graph 実行は 1 回"
+        assert captured_states[0]["on_tts_chunk_ready"] is my_callback, (
+            "渡された callback がそのまま initial_state に乗ること"
+        )
+
+    def test_initial_state_propagates_on_pose_ready(
+        self, mock_publish, monkeypatch,
+    ):
+        """initial_state['on_pose_ready'] に渡された callback が乗る (Phase 0.5-B-β-1 commit 2)。
+
+        WHY: target キャラの pose 切替予約 callback も同様に伝播させる必要がある。
+        ask_character ツールが target chunk 1 投入直前に on_pose_ready を呼ぶ設計
+        (ask_character.py:481) のため。
+        """
+        from lab_lounge import graph as graph_mod
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        captured_states: list[dict] = []
+        original_fn = graph_mod.run_pipeline_graph_llm_only
+
+        def spy(initial_state):
+            captured_states.append(dict(initial_state))
+            return original_fn(initial_state)
+
+        monkeypatch.setattr(graph_mod, "run_pipeline_graph_llm_only", spy)
+
+        def my_pose_cb(slug, pose):
+            pass
+
+        run_pipeline_llm_only("hello", on_pose_ready=my_pose_cb, **COMMON)
+
+        assert len(captured_states) == 1
+        assert captured_states[0]["on_pose_ready"] is my_pose_cb
+
+    def test_callbacks_propagated_independently_in_initial_state(
+        self, mock_publish, monkeypatch,
+    ):
+        """on_tts_chunk_ready と on_pose_ready が独立に initial_state に乗る (Phase 0.5-B-β-1 commit 2)。
+
+        WHY: 両 callback は別々の用途 (= TTS chunk 投入 / pose 切替予約) を持ち、
+        片方だけ渡されたケースでも他方は None で渡される必要がある。
+        ask_character.py 内部では両者を別 contextvar で参照する設計のため、
+        互いに独立して伝播することを保証する。
+
+        【スコープの境界】
+        本テストは pipeline.py の責務 (= 引数を initial_state に乗せる) を直接
+        保証する。graph._generation_node が initial_state を読んで
+        ``set_ask_character_context(on_tts_chunk=state["on_tts_chunk_ready"])`` を
+        呼ぶ経路 (graph.py:1158-1165) は graph.py の既存実装で、本 commit 範囲外。
+        end-to-end の wiring (= run_loop → pipeline → graph → ask_character) は
+        β-1-5 の統合テストで検証する。
+        """
+        from lab_lounge import graph as graph_mod
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        captured_states: list[dict] = []
+        original_fn = graph_mod.run_pipeline_graph_llm_only
+
+        def spy(initial_state):
+            captured_states.append(dict(initial_state))
+            return original_fn(initial_state)
+
+        monkeypatch.setattr(graph_mod, "run_pipeline_graph_llm_only", spy)
+
+        def cb_tts(url, chunk_text, is_last, character):
+            pass
+
+        def cb_pose(slug, pose):
+            pass
+
+        # 3 パターン: 両方、tts のみ、pose のみ
+        run_pipeline_llm_only(
+            "hello",
+            on_tts_chunk_ready=cb_tts,
+            on_pose_ready=cb_pose,
+            **COMMON,
+        )
+        run_pipeline_llm_only(
+            "hello", on_tts_chunk_ready=cb_tts, **COMMON,
+        )
+        run_pipeline_llm_only(
+            "hello", on_pose_ready=cb_pose, **COMMON,
+        )
+
+        assert len(captured_states) == 3
+        # 両方渡し
+        assert captured_states[0]["on_tts_chunk_ready"] is cb_tts
+        assert captured_states[0]["on_pose_ready"] is cb_pose
+        # tts のみ → pose は None (= デフォルト)
+        assert captured_states[1]["on_tts_chunk_ready"] is cb_tts
+        assert captured_states[1]["on_pose_ready"] is None
+        # pose のみ → tts は None (= デフォルト)
+        assert captured_states[2]["on_tts_chunk_ready"] is None
+        assert captured_states[2]["on_pose_ready"] is cb_pose
+
 
 class TestRunPipelineTtsOnly:
     """run_pipeline_tts_only: LLM 結果を再利用して TTS のみ実行 (Phase 0.5-A 案 W'-1)。

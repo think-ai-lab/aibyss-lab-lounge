@@ -424,15 +424,26 @@ def _run_pipeline_graph_llm_only(
         "tts_output_dir": tts_output_dir,
         "system_prompt": None,
         "stream_context": stream_context,
-        # LLM-only モードでは callback は呼ばれない (= TTS ノード不在のため)
-        "on_tts_chunk_ready": None,
-        "on_pose_ready": None,
+        # Phase 0.5-B-β-1 commit 2: 渡された callback を graph state に乗せる。
+        # 当初設計 (= Phase 0.5-A 案 W'-1) では None 固定だったが、graph._tts_node
+        # が走らないこと (= 最終応答 TTS の suppress) と、ask_character ツールが
+        # 内部で同期 TTS を投入する経路は別系統である事実を踏まえ、callback を
+        # 伝播するよう変更。
+        # - graph._tts_node は LLM-only graph に存在しない (graph.py:1406-) → 最終
+        #   応答 TTS の callback 経路は呼ばれない (= 案 W'-1 不変)
+        # - graph._generation_node が set_ask_character_context(on_tts_chunk=...)
+        #   経由で ask_character ツールに渡す → ツール内 tts.synthesize の
+        #   on_chunk_ready 経由で playback queue に届く (= A1 修正の核心)
+        "on_tts_chunk_ready": on_tts_chunk_ready,
+        "on_pose_ready": on_pose_ready,
         # WHY: 承認時に run_loop が answering bubble を発行する設計のため、graph 側で
         # 二重発行しないよう内部固定で抑制する
         "suppress_bubble_answering": True,
         # disable_tools: LLM-only モードでは ask_character ツール起動の余地が
         # あるが、本セッションではデフォルト None で既存挙動 (= bg_result=ready
         # 経路では ask_character 使える)。fallback パスは別途 disable_tools を渡す。
+        # Phase 0.5-B-β-1: ask_character の対話 TTS は on_tts_chunk_ready 経由で
+        # playback queue に届くようになった (= 上記 callback 伝播)。
         "disable_tools": None,
         # Phase 0.5-B-α: status_manager は run_loop の bg_runner から透過渡し。
         # BG LLM 経路でも _generation_node が Thinking 反映する。
