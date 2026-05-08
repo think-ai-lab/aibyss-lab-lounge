@@ -396,6 +396,106 @@ class TestStatusReflection:
         assert "テキスト" in result or "x" in result or "chisame" in result.lower() or "ちさめ" in result
 
 
+# ─── Phase 0.5-B-β-1 commit 5: BG LLM → ask_character → playback queue 貫通 ──
+# end-to-end wiring を統合的に保証する。pipeline.py / run_loop.py / graph.py /
+# ask_character.py の修正が全て繋がっていれば、run_pipeline_llm_only 経由で渡された
+# callback が ask_character ツール起動時に呼ばれる (= A1 主機能修正)。callback=None
+# なら TTS スキップ (= バグ前の状態を再現する後方互換テスト)。
+#
+# 注意: dummy mode (= L2_USE_REAL_LLM 未設定) では graph._generation_node の
+# Agent 実行 (= ask_character ツール呼出) に入らないため、テストでは
+# set_ask_character_context で contextvars を直接セット → _ask_character_impl を
+# 直接呼ぶ形で wiring の最終セグメントを確認する。pipeline.py の引数 →
+# initial_state → set_ask_character_context までの上流 wiring は β-1-1 / β-1-2 の
+# tests/test_pipeline.py で検証済み。run_pipeline_llm_only 自体の events 不変性
+# (= tts.done が含まれないこと) は TestRunPipelineLlmOnly に追加した
+# test_no_tts_done_event_with_callback_set で別途検証。
+
+
+class TestLlmOnlyTtsPenetration:
+    """end-to-end wiring 統合テスト: BG LLM 経路の対話 TTS callback 起動 (Phase 0.5-B-β-1 commit 5)。"""
+
+    def test_callback_invoked_when_set(self, monkeypatch):
+        """contextvars 経由の callback が ask_character の対話 TTS で起動される。
+
+        WHY: pipeline.py / run_loop.py / graph.py / ask_character.py の wiring が
+        全て繋がっていれば、ask_character ツール起動時に渡された callback が
+        呼ばれる。複数回 (= bridge filler + 本応答 chunks) で呼ばれることで、
+        バグ修正前 (= 0 回) と区別。
+        """
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "ss1"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "テスト応答", "emotion": {"happy": 50}, '
+            '"speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            """on_chunk_ready が渡された TTS 呼出 (= 本応答) で chunk 1 投入。"""
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # ask_character.py:441 の bridge filler 投入 (= 1 回、空 text で chunk 投入)
+        # + 本応答 chunk 1 投入 (= fake_synth → _wrapped_on_chunk_ready → on_tts_chunk)
+        # の最低 2 回 (= 修正前は 0 回) 呼ばれる
+        assert len(callback_invocations) >= 2, (
+            f"callback が 2 回以上呼ばれること (実際: {len(callback_invocations)} 回)"
+        )
+
+    def test_no_callback_skips_tts(self, monkeypatch):
+        """callback=None (= Phase 0.5-A 以前のバグ状態) で tts.synthesize 呼ばれない。
+
+        WHY: A1 バグの本体 (= 「導入セリフ + 協働応答 TTS が完全スキップ」) を
+        再現する後方互換テスト。本 commit 群のロールバック (= 部分 revert) 後の
+        挙動を保証することで、partial revert デバッグパターン (= memory
+        feedback_partial_revert_debug_pattern.md) の整合性を確保する。
+        ask_character.py:376 / :408 の gating `if on_tts_chunk and use_real_tts:`
+        で False になり、tts.synthesize は一切呼ばれない。
+        """
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        # callback=None で contextvars セット (= バグ再現状態)
+        set_ask_character_context(
+            on_tts_chunk=None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize") as mock_synth:
+            _ask_character_impl("chisame", "質問")
+
+        # gating False → tts.synthesize 一切呼ばれない (= バグ前の状態)
+        mock_synth.assert_not_called()
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
