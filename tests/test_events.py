@@ -155,6 +155,19 @@ class TestLlmFinal:
         # スキーマ検証も通る
         validate_event(ev)
 
+    def test_character_in_payload_when_set(self):
+        """ログ強化 L-2: character を渡すと payload.character に格納される。"""
+        ev = build_llm_final(
+            text="response", links=[], character="mimi", **COMMON,
+        )
+        assert ev["payload"]["character"] == "mimi"
+        validate_event(ev)
+
+    def test_character_omitted_when_none(self):
+        """character=None (default) なら payload に含まれない (後方互換)。"""
+        ev = build_llm_final(text="dummy", links=[], **COMMON)
+        assert "character" not in ev["payload"]
+
 
 class TestTtsDone:
     def test_schema_valid(self):
@@ -212,6 +225,26 @@ class TestTtsDone:
         assert payload["speaker"] == "Nanami"
         # スキーマ検証も通る
         validate_event(ev)
+
+    def test_character_in_payload_when_set(self):
+        """ログ強化 L-2: character を渡すと payload.character に格納される。
+
+        speaker (= voicepeak narrator) と独立した aibyss キャラ slug 用フィールド。
+        """
+        ev = build_tts_done(
+            text="dummy", links=[],
+            speaker="Haruno Sora",
+            character="sakura",
+            **COMMON,
+        )
+        assert ev["payload"]["speaker"] == "Haruno Sora"
+        assert ev["payload"]["character"] == "sakura"
+        validate_event(ev)
+
+    def test_character_omitted_when_none(self):
+        """character=None (default) なら payload に含まれない (後方互換)。"""
+        ev = build_tts_done(text="dummy", links=[], **COMMON)
+        assert "character" not in ev["payload"]
 
 
 class TestDispatcherQueueUpdate:

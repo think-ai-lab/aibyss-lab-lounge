@@ -104,12 +104,22 @@ def _is_rag_enabled() -> bool:
     return os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
 
 
-def _load_mcp_tools():
-    """MCP サーバーからツールを LangChain ツールとして読み込む。"""
+def _load_mcp_tools(character_slug: str | None = None):
+    """MCP サーバーからツールを LangChain ツールとして読み込む。
+
+    Args:
+        character_slug: 呼出元キャラ slug。ログ強化 L-2 (Phase 0.5-A 後) で追加。
+                        ターン毎に Agent 構築されるため、ログを「どのキャラの Agent
+                        のためのツール登録か」識別できるようにする。
+    """
+    # ログ強化 L-2: 3 行に分かれていたツール登録ログを 1 行に集約 (冗長削減)。
+    # 失敗時のみ warning で個別に出す。
+    char_tag = f"[character={character_slug or '?'}]"
     try:
         from langchain_core.tools import tool as lc_tool
 
         tools = []
+        registered: list[str] = []  # ログ用、登録成功したツール名 (1 行集約)
 
         # web_search ツール
         try:
@@ -121,9 +131,9 @@ def _load_mcp_tools():
                 return web_search(query)
 
             tools.append(web_search_tool)
-            logger.info("ツール登録完了: web_search")
+            registered.append("web_search")
         except Exception as exc:
-            logger.warning("web_search ツール読み込み失敗: %s", exc)
+            logger.warning("web_search ツール読み込み失敗 %s: %s", char_tag, exc)
 
         # retrieve_memory ツール (L2_ENABLE_RAG=true のとき)
         if _is_rag_enabled():
@@ -136,9 +146,9 @@ def _load_mcp_tools():
                     return retrieve_memory(query)
 
                 tools.append(retrieve_memory_tool)
-                logger.info("ツール登録完了: retrieve_memory (RAG 有効)")
+                registered.append("retrieve_memory(RAG)")
             except Exception as exc:
-                logger.warning("retrieve_memory ツール読み込み失敗: %s", exc)
+                logger.warning("retrieve_memory ツール読み込み失敗 %s: %s", char_tag, exc)
 
         # ask_character ツール (常に登録)
         try:
@@ -150,20 +160,22 @@ def _load_mcp_tools():
                 return ask_character(character_slug, question)
 
             tools.append(ask_character_tool)
-            logger.info("ツール登録完了: ask_character")
+            registered.append("ask_character")
         except Exception as exc:
-            logger.warning("ask_character ツール読み込み失敗: %s", exc)
+            logger.warning("ask_character ツール読み込み失敗 %s: %s", char_tag, exc)
 
         if not tools:
-            logger.warning("有効なツールが 0 件。ツールなしで続行。")
+            logger.warning("有効なツールが 0 件 %s。ツールなしで続行。", char_tag)
+        else:
+            logger.info("ツール登録完了 %s: %s", char_tag, ", ".join(registered))
 
         return tools
 
     except ImportError as exc:
-        logger.warning("ツール読み込み失敗 (import): %s", exc)
+        logger.warning("ツール読み込み失敗 %s (import): %s", char_tag, exc)
         return []
     except Exception as exc:
-        logger.warning("ツール読み込み失敗: %s。ツールなしで続行。", exc)
+        logger.warning("ツール読み込み失敗 %s: %s。ツールなしで続行。", char_tag, exc)
         return []
 
 
@@ -272,9 +284,13 @@ def _build_agent_graph(
             " uv sync --extra llm でインストールしてください。"
         ) from exc
 
-    tools = _load_mcp_tools()
+    # ログ強化 L-2: character_slug を渡して、ツール登録ログにキャラ情報を含める
+    tools = _load_mcp_tools(character_slug=character_slug)
     if not tools:
-        logger.info("ツールなし。単一ノード構成にフォールバック。")
+        logger.info(
+            "ツールなし [character=%s]。単一ノード構成にフォールバック。",
+            character_slug or "?",
+        )
         return None
 
     # Skills 定義ファイルから行動判断基準を読み込み、system_prompt と結合
@@ -314,10 +330,11 @@ def _build_agent_graph(
         kwargs["response_format"] = response_schema
 
     agent = create_agent(**kwargs)
+    # ログ強化 L-2: キャラ識別子を先頭に出して、ターン毎にどのキャラの Agent か判別容易に
     logger.info(
-        "Agent 構築完了 (新 API): tools=%d model=%s skills=%s "
+        "Agent 構築完了 (新 API) [character=%s]: tools=%d model=%s skills=%s "
         "parallel_tool_calls=%s structured_output=%s",
-        len(tools), model, bool(skills_text),
+        character_slug or "?", len(tools), model, bool(skills_text),
         False if provider in ("openai", "anthropic") else "(provider非対応)",
         response_schema.__name__ if response_schema else "(無効)",
     )
@@ -435,9 +452,10 @@ def run_graph(
         ImportError:  langgraph が未インストール
         RuntimeError: Graph が result を返さなかった場合
     """
+    # ログ強化 L-2: キャラ識別子を先頭に出して、どのターンの Graph 実行かパッと分かるように
     logger.info(
-        "Graph 実行開始: model=%s provider=%s tools=%s",
-        model, provider, _is_tools_enabled(),
+        "Graph 実行開始 [character=%s]: model=%s provider=%s tools=%s",
+        character_slug or "?", model, provider, _is_tools_enabled(),
     )
 
     if _is_tools_enabled():
@@ -466,7 +484,8 @@ def run_graph(
     result = final_state["result"]
     if result is None:
         raise RuntimeError("Graph が LLMResult を返しませんでした")
-    logger.info("Graph 実行完了")
+    # ログ強化 L-2: 単一ノードフォールバック経路でもキャラ識別子を出す
+    logger.info("Graph 実行完了 [character=%s]", character_slug or "?")
     return result
 
 
@@ -577,9 +596,15 @@ def _run_agent(
                     usage = getattr(msg, "usage_metadata", None) or {}
                     break
 
+        # ログ強化 L-2: キャラ識別子を先頭に出して、ターン毎にどのキャラの応答か判別容易に。
+        # text は全文出していたが、ログが長くなりがちなので冒頭のみ + 文字数で代替表示
+        # (= 失敗時の手掛かりとしては十分、payload の text が真の発信内容)。
+        text_preview = response_text[:60].replace("\n", " ")
+        text_suffix = "..." if len(response_text) > 60 else ""
         logger.info(
-            "Agent 実行完了: latency_ms=%d source=%s text=%s",
-            latency_ms, source, response_text,
+            "Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r%s",
+            character_slug or "?", latency_ms, source, len(response_text),
+            text_preview, text_suffix,
         )
         return LLMResult(
             text=response_text,
@@ -1045,7 +1070,12 @@ def _generation_node(state: PipelineGraphState) -> dict:
         llm_text = f"ダミー応答: {text}"
         llm_meta = {}
 
-    llm = build_llm_final(text=llm_text, seq=1, links=[utt_event_id], **llm_meta, **common)
+    # ログ強化 L-2: payload に character を含めて bus ログ + V2 受信側で識別容易に
+    llm = build_llm_final(
+        text=llm_text, seq=1, links=[utt_event_id],
+        character=state["character_slug"],
+        **llm_meta, **common,
+    )
     publish(llm)
 
     # Phase 0.5-A フェーズ 7: BG LLM モード (挙手の先行生成) では、承認時に run_loop
@@ -1113,7 +1143,13 @@ def _tts_node(state: PipelineGraphState) -> dict:
     else:
         tts_meta = dict(speaker=state["tts_speaker"])
 
-    tts = build_tts_done(text=llm_text, seq=2, links=[llm_event_id], **tts_meta, **common)
+    # ログ強化 L-2: payload に character を含めて bus ログ + V2 受信側で識別容易に。
+    # speaker (= voicepeak narrator) は既存フィールド、character (= aibyss slug) は新規。
+    tts = build_tts_done(
+        text=llm_text, seq=2, links=[llm_event_id],
+        character=character_slug,
+        **tts_meta, **common,
+    )
     publish(tts)
 
     # bubble: done は run_loop.py の _playback_worker が最終チャンク再生 + 5 秒後に発行する

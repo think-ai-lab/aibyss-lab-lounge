@@ -410,7 +410,9 @@ class TestBuildAgentGraphWithStructuredOutput:
         # _load_mcp_tools が空でない tool list を返すよう mock
         mock_tool = MagicMock()
         mock_tool.name = "fake_tool"
-        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda: [mock_tool])
+        # ログ強化 L-2 で _load_mcp_tools(character_slug=...) のシグネチャに変わったため
+        # **kwargs を受け取れるようにする (mock の引数互換維持)
+        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda **_kw: [mock_tool])
 
         # _get_llm_for_agent も mock (実 LLM 呼出を避ける)
         mock_llm = MagicMock()
@@ -448,7 +450,9 @@ class TestBuildAgentGraphWithStructuredOutput:
 
         mock_tool = MagicMock()
         mock_tool.name = "fake_tool"
-        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda: [mock_tool])
+        # ログ強化 L-2 で _load_mcp_tools(character_slug=...) のシグネチャに変わったため
+        # **kwargs を受け取れるようにする (mock の引数互換維持)
+        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda **_kw: [mock_tool])
         mock_llm = MagicMock()
         mock_llm.bind_tools.return_value = mock_llm
         monkeypatch.setattr(graph_mod, "_get_llm_for_agent", lambda *a: mock_llm)
