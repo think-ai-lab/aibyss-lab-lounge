@@ -1123,8 +1123,21 @@ def _generation_node(state: PipelineGraphState) -> dict:
         # run_pipeline_llm_only (BG LLM) 両経路を 1 箇所でカバー。run_loop 側に
         # 分散させると経路ごとに反映漏れが発生しやすい。state.get で None
         # フォールバック (status_manager 未注入時は no-op、後方互換)。
+        #
+        # Phase 0.5-B-α 修正 (commit 8): BG LLM パス (suppress_bubble_answering=True)
+        # では Thinking 反映をスキップ。挙手 BG 経路では Raisehand 状態を承認まで
+        # 維持して、HUD dashboard で「挙手中」を視覚化するため。実走
+        # logs/runs/run_loop_20260508_231134.log で sakura/mimi が
+        # ready→raisehand→thinking と 0.3 秒以内に Thinking に上書きされ、ダッシュ
+        # ボードを見たときには既に Thinking 表示になっていた症状への対処。
+        # 承認後は run_loop 側で Talking に直接上書き (Raisehand → Ready → Talking)。
+        # 通常応答ターン (suppress_bubble_answering=False) では従来通り Thinking 反映。
         _gen_status_manager = state.get("status_manager")
-        if _gen_status_manager is not None and state.get("character_slug"):
+        if (
+            _gen_status_manager is not None
+            and state.get("character_slug")
+            and not state.get("suppress_bubble_answering")
+        ):
             _gen_status_manager.set_status(
                 state["character_slug"], CharacterStatus.THINKING,
             )
