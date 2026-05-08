@@ -407,7 +407,7 @@ class Dispatcher:
         # publish は Lock 外で呼ぶ (callback の長時間処理が dispatcher を止めない)
         self._publish_queue_update(queue_copy)
 
-    def on_pipeline_complete(self) -> None:
+    def on_pipeline_complete(self, completed_slug: str | None = None) -> None:
         """
         run_loop が pipeline (LLM + TTS + 再生) 完了時に呼ぶ。
 
@@ -418,6 +418,11 @@ class Dispatcher:
         - Phase 0.5-A フェーズ 7: 応答中に挙手したキャラ (se_pending=True) の
           handraise wav を「IDLE に戻ったタイミング」で run_loop へ release 通知し、
           多重再生防止のため se_pending を False に巻き戻す
+
+        Args:
+            completed_slug: 完了した応答のキャラ slug。ログ強化 L-4 (Phase 0.5-A 後)
+                            で追加。「どの応答の完了か」をログで識別できるようにする。
+                            None 時は ? 表示 (= 旧経路 / 単独の状態リセット時)。
         """
         pending_releases: list[tuple[str, "Path | None"]] = []
         with self._lock:
@@ -434,8 +439,12 @@ class Dispatcher:
                 # queue に残り → 次の wait_for_next_event を起こす
                 self._event_available.notify_all()
 
+        # ログ強化 L-4: 完了したキャラ slug を先頭に出して、複数並行する応答の
+        # うちどの完了か識別容易に
         logger.info(
-            "Dispatcher.on_pipeline_complete: state→IDLE evicted=%d remaining=%d pending_releases=%d",
+            "Dispatcher.on_pipeline_complete [character=%s]: state→IDLE "
+            "evicted=%d remaining=%d pending_releases=%d",
+            completed_slug or "?",
             evicted, len(queue_copy), len(pending_releases),
         )
         if evicted > 0:

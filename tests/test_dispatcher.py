@@ -1551,3 +1551,40 @@ class TestDispatcherFlushPendingHandraiseReleases:
         d.flush_pending_handraise_releases()  # 例外なく完了
         # se_pending は False に巻き戻されている (二重発火防止は保証される)
         assert d._handraise_states["mimi"].se_pending is False
+
+
+# ─── ログ強化 L-4: on_pipeline_complete の completed_slug ──────────
+
+
+class TestDispatcherOnPipelineCompleteLogging:
+    """ログ強化 L-4: on_pipeline_complete に completed_slug を渡せて、
+    ログに [character=...] が含まれることを検証する。
+    """
+
+    def test_completed_slug_appears_in_log(self, caplog):
+        """completed_slug 指定でログに [character=mimi] が含まれる。"""
+        import logging
+        d = Dispatcher()
+        with caplog.at_level(logging.INFO, logger="lab_lounge.dispatcher"):
+            d.on_pipeline_complete(completed_slug="mimi")
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "[character=mimi]" in joined
+
+    def test_no_completed_slug_logs_question_mark(self, caplog):
+        """completed_slug 未指定でログに [character=?] と表示される (= 後方互換)。"""
+        import logging
+        d = Dispatcher()
+        with caplog.at_level(logging.INFO, logger="lab_lounge.dispatcher"):
+            d.on_pipeline_complete()
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "[character=?]" in joined
+
+    def test_completed_slug_does_not_change_behavior(self, monkeypatch):
+        """completed_slug 引数は logging のみへの影響、state 遷移挙動は不変。
+
+        既存テストの後方互換維持を担保する。
+        """
+        d = Dispatcher()
+        d._state = DispatcherState.RESPONDING
+        d.on_pipeline_complete(completed_slug="sakura")
+        assert d.get_state() == DispatcherState.IDLE
