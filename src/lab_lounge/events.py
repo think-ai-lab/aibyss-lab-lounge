@@ -156,8 +156,33 @@ def build_llm_final(
     retrieval_latency_ms: int = 0,
     retrieved_doc_count: int = 0,
     retrieved_doc_ids: list[str] | None = None,
+    character: str | None = None,
 ) -> dict[str, Any]:
-    """llm.final イベントを組み立てて検証する。"""
+    """llm.final イベントを組み立てて検証する。
+
+    Args:
+        character: 応答キャラクター slug (mimi/chisame/sakura/octamaid/ruka 等)。
+                   ログ強化 L-2 (Phase 0.5-A 後) で payload に追加。受信側 V2 や
+                   bus.publish ログで「どのキャラの llm.final か」を直接読めるよう
+                   にする。None 時は payload に含めない (受信側 default 解釈、後方
+                   互換)。schema は payload 内に追加制約なしのため変更不要。
+    """
+    payload: dict[str, Any] = {
+        "text": text,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "latency_ms": latency_ms,
+        "finish_reason": finish_reason,
+        "rag_used": rag_used,
+        "answer_mode": answer_mode,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "retrieved_doc_count": retrieved_doc_count,
+        "retrieved_doc_ids": retrieved_doc_ids if retrieved_doc_ids is not None else [],
+    }
+    # character はオプション。None 時は payload に含めない (後方互換)。
+    if character is not None:
+        payload["character"] = character
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -169,19 +194,7 @@ def build_llm_final(
         "source": "lab-lounge",
         "seq": seq,
         "links": links,
-        "payload": {
-            "text": text,
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "latency_ms": latency_ms,
-            "finish_reason": finish_reason,
-            "rag_used": rag_used,
-            "answer_mode": answer_mode,
-            "retrieval_latency_ms": retrieval_latency_ms,
-            "retrieved_doc_count": retrieved_doc_count,
-            "retrieved_doc_ids": retrieved_doc_ids if retrieved_doc_ids is not None else [],
-        },
+        "payload": payload,
     }
     validate_event(event)
     return event
@@ -202,8 +215,20 @@ def build_tts_done(
     format: str = "opus",
     sample_rate: int = 24000,
     speaker: str = "dummy",
+    character: str | None = None,
 ) -> dict[str, Any]:
-    """tts.done イベントを組み立てて検証する。"""
+    """tts.done イベントを組み立てて検証する。
+
+    Args:
+        speaker:   音声合成エンジンの voice/narrator (e.g., "Haruno Sora", キャラ slug
+                   と同等の場合もある)。既存フィールド、後方互換維持。
+        character: aibyss キャラ slug (mimi/chisame/sakura/octamaid/ruka 等)。
+                   ログ強化 L-2 (Phase 0.5-A 後) で payload に追加。speaker と概念が
+                   異なるケース (= voicepeak narrator がキャラ slug と異なる将来の
+                   構成) に備えて独立フィールドとして持つ。None 時は payload に
+                   含めない (受信側 default 解釈、後方互換)。schema は payload 内に
+                   追加制約なしのため変更不要。
+    """
     payload: dict[str, Any] = {
         "text": text,
         "audio_url": audio_url,
@@ -215,6 +240,9 @@ def build_tts_done(
     }
     if chunk_audio_urls:
         payload["chunk_audio_urls"] = chunk_audio_urls
+    # character はオプション。None 時は payload に含めない (後方互換)。
+    if character is not None:
+        payload["character"] = character
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
