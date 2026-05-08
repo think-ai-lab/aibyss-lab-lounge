@@ -1532,21 +1532,10 @@ def run_loop(
                     # これがないと、chunk 1 で special_doya に切り替わった後、
                     # chunk 2/3 で neutral に逆戻りしてしまう。
                     chunk_pose = _pending_poses.pop(character, None)
-                    # Phase 0.5-B-α: 第 1 chunk = 物理再生開始直前 → Talking 反映 (HUD 用)。
-                    # WHY chunk_count == 1 限定: 後続 chunk で metadata が変わる (pose=None
-                    # 等) と publish が重複する。chunk 1 のみで反映すれば「最初の chunk
-                    # 投入 = Talking 開始」が明確で publish も 1 回。
-                    # WHY text=None: 本 commit では graph 側から full LLM response を渡せる
-                    # 経路がないため、chunk_text (= 最初の chunk のみ) では発話「全文」に
-                    # ならない。commit 5 で graph 経由の full response 渡し対応後に text 追加。
-                    if status_manager is not None and _chunk_count[0] == 1:
-                        talking_metadata = _build_talking_metadata(
-                            character, llm_text=None, pose=chunk_pose,
-                        )
-                        status_manager.set_status(
-                            character, CharacterStatus.TALKING,
-                            metadata=talking_metadata or None,
-                        )
+                    # Phase 0.5-B-α (commit 9): 通常応答経路の Talking 反映は graph._tts_node
+                    # 内に集約 (= full LLM response を metadata.text に含めるため)。
+                    # 旧 commit 4 ではここで chunk_count == 1 時に reflect していたが、
+                    # chunk_text のみで full text を含められなかったため graph 側に移動。
                     task = {
                         "url": url,
                         "text": chunk_text,

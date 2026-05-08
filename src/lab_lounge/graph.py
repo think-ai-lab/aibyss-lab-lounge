@@ -1242,14 +1242,41 @@ def _tts_node(state: PipelineGraphState) -> dict:
     llm_event_id = state["events"][1]["event_id"]
     character_slug = state["character_slug"]
 
-    # LLM JSON 応答から pose を抽出して OBS 立ち絵を切り替え
+    # LLM JSON 応答から response 本文 + pose を抽出
     # on_pose_ready コールバックがあれば遅延適用 (本命応答の再生開始タイミングで切替)
     # なければ従来通り即時切替 (run_once.py 等の互換性)
-    _, _, _, pose_value = _parse_voicepeak_json(llm_text)
+    response_text, _, _, pose_value = _parse_voicepeak_json(llm_text)
     if state.get("on_pose_ready"):
         state["on_pose_ready"](character_slug, pose_value or "neutral")
     else:
         set_pose(character_slug, pose_value or "neutral")
+
+    # Phase 0.5-B-α (commit 9): TTS 合成開始 → Talking 反映 (HUD 用、ルカ要件)。
+    # WHY: graph 内で full LLM response (= response_text) + 立ち絵 (= pose_value) を
+    # 取得済み。run_loop の chunk 1 投入時点では chunk_text (= 最初の chunk のみ、
+    # 数文程度) しか取れず、HUD dashboard で発話全文を表示するルカ要件を満たせない。
+    # graph._tts_node 内で集約して反映することで、metadata={"pose", "text"} に
+    # full response を含められる。run_loop._on_tts_chunk の Talking 反映は本 commit
+    # で削除し、graph 側に集約 (= 重複 publish 回避)。
+    # WHY suppress_bubble_answering=True (= 挙手 BG パス) では skip: BG パスでは
+    # run_pipeline_llm_only 経由で _tts_node を通らないため理論上ここには来ないが、
+    # 念のため安全側で skip (= 挙手承認応答経路は run_loop の
+    # _spawn_handraise_response_playback で別途 Talking 反映する設計を維持)。
+    status_manager = state.get("status_manager")
+    if (
+        status_manager is not None
+        and character_slug
+        and not state.get("suppress_bubble_answering")
+    ):
+        talking_metadata: dict[str, Any] = {}
+        if pose_value:
+            talking_metadata["pose"] = pose_value
+        if response_text:
+            talking_metadata["text"] = response_text
+        status_manager.set_status(
+            character_slug, CharacterStatus.TALKING,
+            metadata=talking_metadata or None,
+        )
 
     if state["use_real_tts"]:
         # caller の最終応答 TTS を投入する前に、ask_character がバックグラウンド
