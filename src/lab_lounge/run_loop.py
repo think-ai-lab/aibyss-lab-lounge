@@ -472,6 +472,8 @@ def _create_handraise_runner_and_callbacks(
     session_id_root: str,
     stream_context: "str | None",
     status_manager: "CharacterStatusManager | None" = None,
+    on_tts_chunk_ready_ref: "list | None" = None,
+    on_pose_ready_ref: "list | None" = None,
 ):
     """Phase 0.5-A フェーズ 7: 4 つの callback と bg_runner を生成する factory。
 
@@ -483,6 +485,27 @@ def _create_handraise_runner_and_callbacks(
         session_stream_id: 当該セッションの stream_id (handraise イベントに付与)
         session_id_root:   当該セッションの session_id
         stream_context:    配信文脈 markdown (run_pipeline に渡す)
+        status_manager:    Phase 0.5-B-α で追加。挙手承認応答経路で Talking +
+                           Ready を反映するために bg_runner / approved callback
+                           で参照する。
+        on_tts_chunk_ready_ref: Phase 0.5-B-β-1 commit 3 で追加。
+                           ``list[Callable | None]`` (= 1 要素の mutable list)
+                           で渡す。bg_runner._body は ``ref[0]`` 経由で最新の
+                           ``_on_tts_chunk`` closure を取得し、
+                           ``run_pipeline_llm_only(on_tts_chunk_ready=ref[0])``
+                           に渡す。これにより BG LLM 経路の ask_character ツール
+                           で対話 TTS chunk が playback queue に届くようになる
+                           (= A1 修正の最終配線)。
+        on_pose_ready_ref: 同様に target キャラの pose 切替予約 callback の
+                           mutable list。
+
+    【WHY: mutable list ラッパー (= late binding) を使う】
+    factory はセッション開始時 1 回だけ呼ばれる。一方 ``_on_tts_chunk`` /
+    ``_on_pose_ready`` は run_loop の **ターン毎の内側 closure として再構築**
+    される (= run_loop.py:1509, 1514)。factory が直接 callable を受け取ると、
+    最初のターン以降の closure 更新を反映できない (= 古い closure を保持し続ける)。
+    mutable list の [0] 経由で参照すれば、run_loop がターンごとに ``ref[0]`` を
+    上書きすることで、bg_runner._body は常に最新の closure を見られる。
 
     Returns:
         (bg_runner, on_handraise_started, on_handraise_phrase_pending_release,
@@ -534,6 +557,22 @@ def _create_handraise_runner_and_callbacks(
 
         def _body() -> None:
             try:
+                # Phase 0.5-B-β-1 commit 3: ask_character の対話 TTS を BG LLM
+                # 経路でも playback queue に届けるため、最新ターンの _on_tts_chunk
+                # / _on_pose_ready を mutable list ref 経由で取得して渡す。
+                #
+                # 参照タイミング: bg_runner が起動するのは挙手検知時 (= ターン中、
+                # _playback_queue が有効) なので ref[0] は通常 non-None。IDLE 中の
+                # 挙手では ref[0] が None (= 前回ターン終了時に明示クリアされていない
+                # 場合も既存実装の `if _playback_queue is not None:` で安全)。
+                _tts_cb = (
+                    on_tts_chunk_ready_ref[0]
+                    if on_tts_chunk_ready_ref else None
+                )
+                _pose_cb = (
+                    on_pose_ready_ref[0]
+                    if on_pose_ready_ref else None
+                )
                 result = run_pipeline_llm_only(
                     transcript_snapshot if isinstance(transcript_snapshot, str)
                     else str(transcript_snapshot or ""),
@@ -545,6 +584,12 @@ def _create_handraise_runner_and_callbacks(
                     # Phase 0.5-B-α: BG LLM 経路でも graph._generation_node が
                     # Thinking 反映 (= 挙手中キャラの thinking が HUD に出る)。
                     status_manager=status_manager,
+                    # Phase 0.5-B-β-1 commit 3: ask_character の対話 TTS を BG LLM
+                    # 経路でも playback queue に届けるための callback。
+                    # graph._tts_node は LLM-only graph 不在のため呼ばれず、案 W'-1
+                    # の最終応答 TTS suppress は構造的に維持される。
+                    on_tts_chunk_ready=_tts_cb,
+                    on_pose_ready=_pose_cb,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -1279,6 +1324,14 @@ def run_loop(
         # factory 経由で生成 (session 識別子 + 配信文脈を closure として捕捉)。
         # Phase 0.5-B-α: status_manager も factory に注入し、挙手承認応答経路で
         # Talking + Ready を反映できるようにする。
+        # Phase 0.5-B-β-1 commit 3: ask_character の対話 TTS を BG LLM 経路でも
+        # playback queue に届けるため、_on_tts_chunk / _on_pose_ready の最新を
+        # bg_runner から参照できる mutable list ラッパーを factory に渡す。
+        # 中身は ターンループ内 (_on_tts_chunk 構築直後) で [0] に書き込む。
+        # IDLE 中 (= ターン外) の挙手では [0] = 前回ターンの closure or None で、
+        # _playback_queue 自体が None なので安全 (= 既存ガードで no-op)。
+        _current_on_tts_chunk: list = [None]
+        _current_on_pose_ready: list = [None]
         (
             _bg_runner,
             _on_handraise_started,
@@ -1289,6 +1342,8 @@ def run_loop(
             session_id_root=session_id_root,
             stream_context=stream_context,
             status_manager=status_manager,
+            on_tts_chunk_ready_ref=_current_on_tts_chunk,
+            on_pose_ready_ref=_current_on_pose_ready,
         )
 
         dispatcher = Dispatcher(
@@ -1553,6 +1608,13 @@ def run_loop(
                     except ImportError:
                         pass
                     _playback_queue.put(task)
+
+            # Phase 0.5-B-β-1 commit 3: 最新ターンの closure を mutable list ref に
+            # 書き込み、bg_runner._body から ref[0] 経由で参照可能にする。
+            # これにより通常応答ターンと並行する挙手 BG LLM の ask_character ツールが
+            # 同じ _playback_queue (= 通常応答用) に対話 TTS chunk を投入できる。
+            _current_on_tts_chunk[0] = _on_tts_chunk
+            _current_on_pose_ready[0] = _on_pose_ready
 
             try:
                 result = run_pipeline(
