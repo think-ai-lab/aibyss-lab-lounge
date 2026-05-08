@@ -737,6 +737,28 @@ class TestRunPipelineLlmOnly:
         assert len(captured_states) == 1
         assert captured_states[0]["on_pose_ready"] is my_pose_cb
 
+    def test_no_tts_done_event_with_callback_set(self, mock_publish):
+        """run_pipeline_llm_only(on_tts_chunk_ready=cb) でも events に tts.done なし
+        (Phase 0.5-B-β-1 commit 5、案 W'-1 不変性の保証)。
+
+        WHY: 案 W'-1 の核 (= 最終応答 TTS suppress、却下/lapse 時の VOICEPEAK FIFO
+        投入回避) が β-1-1〜β-1-4 の修正で壊れていないことを保証する。callback を
+        渡しても LLM-only graph に _tts_node が存在しないため、build_tts_done は
+        publish されない (= ask_character の対話 TTS は graph._tts_node を経由しない
+        独立経路で playback queue に届くだけ)。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        def mock_cb(url, chunk_text, is_last, character):
+            pass
+
+        result = run_pipeline_llm_only("hello", on_tts_chunk_ready=mock_cb, **COMMON)
+
+        # events に utterance.final + llm.final のみ、tts.done なし
+        types = [ev["type"] for ev in result.events]
+        assert "tts.done" not in types
+        assert types == ["utterance.final", "llm.final"]
+
     def test_callbacks_propagated_independently_in_initial_state(
         self, mock_publish, monkeypatch,
     ):
