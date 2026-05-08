@@ -640,3 +640,76 @@ class TestRunPipelineTtsOnly:
         result = run_pipeline_tts_only(llm_result, on_tts_chunk_ready=on_chunk)
         # ダミーモードでも tts.done event は発行される (= dummy meta only)
         assert any(ev["type"] == "tts.done" for ev in result.events)
+
+    def test_tts_settings_inherit_from_character_config(self, mock_publish, monkeypatch):
+        """W'-1 バグ 1 修正: TTS 設定 (provider/voice/speaker) が character config から引かれる。
+
+        WHY: 環境変数のデフォルト (= Voidoll = octamaid voice) ではなく、character
+        config から正しい voice を引かないと、「sakura の応答が octamaid voice で
+        合成される」バグになる (logs/runs/run_loop_20260508_180426.log で実際観察)。
+        通常応答パスの _routing_node:781-783 と同じく character config を引く。
+        """
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        captured: list[dict] = []
+
+        def fake_run_pipeline_graph_tts_only(initial_state):
+            captured.append(dict(initial_state))
+            # 適当な final state を返す (= initial に tts.done を追加)
+            result = dict(initial_state)
+            result["events"] = list(initial_state["events"]) + [
+                {"type": "tts.done", "event_id": "x", "seq": 2},
+            ]
+            return result
+
+        monkeypatch.setattr(
+            "lab_lounge.graph.run_pipeline_graph_tts_only",
+            fake_run_pipeline_graph_tts_only,
+        )
+        # 環境変数を意図的に octamaid (Voidoll) のデフォルトにしてバグ再現条件を作る
+        monkeypatch.setenv("L2_TTS_PROVIDER", "voicevox")
+        monkeypatch.setenv("L2_TTS_VOICE", "89")
+        monkeypatch.setenv("L2_TTS_SPEAKER", "Voidoll")
+
+        # sakura で LLM のみ実行 → TTS-only に渡す
+        llm_result = run_pipeline_llm_only("hello", speaker_hint="sakura", **COMMON)
+        run_pipeline_tts_only(llm_result)
+
+        assert len(captured) == 1
+        state = captured[0]
+        # character config から sakura の voicepeak / Haruno Sora を引いている
+        assert state["tts_provider"] == "voicepeak"
+        assert state["tts_voice"] == "Haruno Sora"
+        # tts_speaker は character.slug (= 環境変数の Voidoll ではない)
+        assert state["tts_speaker"] == "sakura"
+        # character_slug も llm_result から伝播
+        assert state["character_slug"] == "sakura"
+
+    def test_tts_settings_for_chisame(self, mock_publish, monkeypatch):
+        """chisame の TTS 設定確認 (Miyamai Moca voicepeak)。"""
+        from lab_lounge.pipeline import (
+            run_pipeline_llm_only, run_pipeline_tts_only,
+        )
+        captured: list[dict] = []
+
+        def fake_run_pipeline_graph_tts_only(initial_state):
+            captured.append(dict(initial_state))
+            result = dict(initial_state)
+            result["events"] = list(initial_state["events"]) + [
+                {"type": "tts.done", "event_id": "x", "seq": 2},
+            ]
+            return result
+
+        monkeypatch.setattr(
+            "lab_lounge.graph.run_pipeline_graph_tts_only",
+            fake_run_pipeline_graph_tts_only,
+        )
+
+        llm_result = run_pipeline_llm_only("hello", speaker_hint="chisame", **COMMON)
+        run_pipeline_tts_only(llm_result)
+
+        state = captured[0]
+        assert state["tts_provider"] == "voicepeak"
+        assert state["tts_voice"] == "Miyamai Moca"
+        assert state["tts_speaker"] == "chisame"

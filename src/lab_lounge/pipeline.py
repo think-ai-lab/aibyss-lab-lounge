@@ -453,7 +453,18 @@ def run_pipeline_tts_only(
             llm_text = ev.get("payload", {}).get("text", "")
             break
 
-    use_real_tts, tts_provider, tts_voice, tts_speaker, tts_output_dir = _get_tts_mode()
+    # WHY (バグ 1 修正、実走 logs/runs/run_loop_20260508_180426.log で発覚):
+    # TTS 設定はキャラ別に異なる (= sakura: voicepeak Haruno Sora、chisame:
+    # voicepeak Miyamai Moca、mimi: voicepeak Asumi Ririse、octamaid: voicevox
+    # Voidoll)。環境変数の _get_tts_mode() デフォルト値 (= L2_TTS_PROVIDER=voicevox
+    # / L2_TTS_VOICE=89 / L2_TTS_SPEAKER=Voidoll) をそのまま使うと、「sakura の
+    # 応答が octamaid (Voidoll) voice で合成される」バグになる。実走で実際に
+    # 「TTS 開始: speaker=Voidoll」が観察され、ルカが「オクタメイドが応答した」
+    # と報告した症状の正体。通常応答パスの _routing_node:781-783 と同じく
+    # character config から正しい設定を引いて initial_state に詰める。
+    from .characters import get_character
+    character = get_character(llm_result.speaker)
+    use_real_tts, _, _, _, tts_output_dir = _get_tts_mode()
 
     initial_state: PipelineGraphState = {
         # text / utterance_meta は TTS-only では使われないが型整合のため埋める
@@ -468,11 +479,11 @@ def run_pipeline_tts_only(
         "enable_rag": False,
         "rag_top_k": 0,
         "kb_path": "",
-        # TTS 設定 (_tts_node が読む)
+        # TTS 設定 (_tts_node が読む) — character config からキャラ別に引く
         "use_real_tts": use_real_tts,
-        "tts_provider": tts_provider,
-        "tts_voice": tts_voice,
-        "tts_speaker": tts_speaker,
+        "tts_provider": character.tts_provider,
+        "tts_voice": character.tts_voice,
+        "tts_speaker": character.slug,
         "tts_output_dir": tts_output_dir,
         "system_prompt": None,
         "stream_context": None,
