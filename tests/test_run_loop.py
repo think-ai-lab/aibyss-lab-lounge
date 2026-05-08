@@ -1732,7 +1732,7 @@ class TestApprovedFlowLoggingProgression:
             "lab_lounge.run_loop.publish", lambda ev: None,
         )
 
-        _, _, _, on_approved = _create_handraise_runner_and_callbacks(
+        _, _, _, on_approved, _ = _create_handraise_runner_and_callbacks(
             session_stream_id="s1", session_id_root="ses1", stream_context=None,
         )
 
@@ -1859,7 +1859,7 @@ class TestStatusManagerWiring:
     def test_create_factory_accepts_status_manager(self):
         """_create_handraise_runner_and_callbacks が status_manager 引数を受け取れる。"""
         manager = CharacterStatusManager()
-        bg_runner, on_started, on_phrase_pending, on_approved = (
+        bg_runner, on_started, on_phrase_pending, on_approved, on_close = (
             _create_handraise_runner_and_callbacks(
                 session_stream_id="s1",
                 session_id_root="ss1",
@@ -1871,10 +1871,11 @@ class TestStatusManagerWiring:
         assert callable(on_started)
         assert callable(on_phrase_pending)
         assert callable(on_approved)
+        assert callable(on_close)
 
     def test_create_factory_status_manager_optional(self):
         """status_manager 引数なしでも factory が動く (= 既存テスト互換)。"""
-        bg_runner, on_started, on_phrase_pending, on_approved = (
+        bg_runner, on_started, on_phrase_pending, on_approved, on_close = (
             _create_handraise_runner_and_callbacks(
                 session_stream_id="s1",
                 session_id_root="ss1",
