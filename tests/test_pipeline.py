@@ -604,6 +604,71 @@ class TestRunPipelineLlmOnly:
         result = run_pipeline_llm_only("hello", speaker_hint="mimi", **COMMON)
         assert result.speaker == "mimi"
 
+    # ─── Phase 0.5-B-β-1 commit 1: callback 引数受付 (signature 拡張) ──
+    # WHY: ask_character の対話 TTS を BG LLM 経路でも playback queue に届けるため、
+    # on_tts_chunk_ready / on_pose_ready を受け付ける signature 拡張。本 commit
+    # (β-1-1) では signature のみ拡張し、callback は initial_state にまだ渡らない
+    # (= β-1-2 で伝播)。よってここでは「引数を渡してもクラッシュしない」「呼ばれ
+    # ない」ことを保証する。
+
+    def test_accepts_on_tts_chunk_ready_kwarg(self, mock_publish):
+        """on_tts_chunk_ready 引数を渡しても挙動が壊れない (Phase 0.5-B-β-1 commit 1)。
+
+        β-1-1 では signature 拡張のみで内部挙動は変えない。callback は
+        initial_state に渡されないため、graph._tts_node 不在の LLM-only グラフでは
+        呼ばれない (= 既存の 2 events 結果と同じ)。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        callback_invocations: list[tuple] = []
+
+        def cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        result = run_pipeline_llm_only("hello", on_tts_chunk_ready=cb, **COMMON)
+
+        assert result is not None
+        # β-1-1 では initial_state が None 固定のため callback は呼ばれない
+        assert callback_invocations == []
+        # 既存挙動 (2 events) を維持
+        assert len(result.events) == 2
+
+    def test_accepts_on_pose_ready_kwarg(self, mock_publish):
+        """on_pose_ready 引数を渡しても挙動が壊れない (Phase 0.5-B-β-1 commit 1)。
+
+        β-1-1 では signature 拡張のみで内部挙動は変えない。pose callback も
+        β-1-2 で initial_state に伝播されるまで呼ばれない。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        pose_invocations: list[tuple] = []
+
+        def cb(slug, pose):
+            pose_invocations.append((slug, pose))
+
+        result = run_pipeline_llm_only("hello", on_pose_ready=cb, **COMMON)
+
+        assert result is not None
+        assert pose_invocations == []
+        assert len(result.events) == 2
+
+    def test_callbacks_default_to_none_for_backward_compat(self, mock_publish):
+        """callback 引数なしでも既存挙動 (Phase 0.5-B-β-1 commit 1 後方互換)。
+
+        WHY: 既存 (Phase 0.5-A) の呼出元 (run_loop の bg_runner._body) は
+        callback なしで run_pipeline_llm_only を呼んでいる。引数追加で既存呼出が
+        壊れないことを保証する (= 後方互換)。
+        """
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        # 既存 (Phase 0.5-A) と同じ呼出 (= callback 引数なし)
+        result = run_pipeline_llm_only("hello", **COMMON)
+
+        assert result is not None
+        assert len(result.events) == 2
+        types = [ev["type"] for ev in result.events]
+        assert types == ["utterance.final", "llm.final"]
+
 
 class TestRunPipelineTtsOnly:
     """run_pipeline_tts_only: LLM 結果を再利用して TTS のみ実行 (Phase 0.5-A 案 W'-1)。
