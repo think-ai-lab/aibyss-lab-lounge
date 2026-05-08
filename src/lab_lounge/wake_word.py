@@ -1332,11 +1332,36 @@ class BackgroundContinuousListener:
                     # ここでは check_intent を呼ばない (役割分担)。一方 _evaluate_wake は
                     # 既存の callout/mention/unknown 判定 (= wake 経路) として残しており、
                     # 両者は独立した責務 (前者: 挙手、後者: wake) で重複呼出は発生しない。
+                    #
+                    # Phase 0.5-A 案 W'-2: callback 戻り値が True の場合 (= dispatcher が
+                    # 本 segment を挙手系で消費した = granted/denied/lapse/新規 candidate)、
+                    # 同一 segment が _evaluate_wake で wake_event_queue に二重投入される
+                    # のを防ぐため wake 判定を skip する。実走で観察された 3 重発火
+                    # (BG LLM + fallback + wake_event) のうち wake_event 経路を停止させる
+                    # 経路。詳細は dispatcher.on_segment_added の Returns docstring 参照。
+                    processed_by_handraise = False
                     if self._on_segment_added is not None:
                         try:
-                            self._on_segment_added(segment, self._buffer.full_text())
+                            # bool() で念のため型ガード (戻り値が None/falsy で fail-open)
+                            processed_by_handraise = bool(
+                                self._on_segment_added(segment, self._buffer.full_text())
+                            )
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("on_segment_added callback failed: %s", exc)
+                            # WHY (fail-open): callback 例外時は processed_by_handraise を
+                            # False のまま続行する。dispatcher 側のバグが wake 経路を完全
+                            # 停止させる事故を防ぐ安全弁 (= 観察の前に通常応答が止まる方が
+                            # 配信品質上ダメージが大きい)。
+
+                    if processed_by_handraise:
+                        # ログ強化 L-4: dispatcher 側で詳細ログが出ているのでここは
+                        # segment.text の冒頭のみ。grep で「3 重発火が消えた」の確認用。
+                        logger.info(
+                            "BG: on_segment_added が挙手系で消費 → wake 判定スキップ"
+                            " (segment=%r)",
+                            segment.text[:40],
+                        )
+                        continue
 
                     # 応答中は wake 判定をスキップ (バッファ蓄積のみ継続)
                     if self._routing_paused.is_set():

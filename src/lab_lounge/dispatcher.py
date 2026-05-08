@@ -686,7 +686,7 @@ class Dispatcher:
         self,
         segment: Any,            # TranscriptSegment (循環 import 回避で Any)
         buffer_full_text: str,
-    ) -> None:
+    ) -> bool:
         """BG Listener から segment 追加時に呼ばれる callback (Phase 0.5-A)。
 
         フェーズ 6 で BackgroundContinuousListener.start(on_segment_added=...)
@@ -694,7 +694,7 @@ class Dispatcher:
         結果に応じた API を呼び出す。
 
         判定の優先順位:
-          1. ``self._use_handraise=False`` → 機能 off で即 return
+          1. ``self._use_handraise=False`` → 機能 off で即 return False
           2. handraising キャラあり → ``check_approval`` を試す
              - granted/denied なら on_approval_granted/denied を呼ぶ
              - None (関係ない発話) → utterance_count_since 加算 (lapse 判定)
@@ -706,12 +706,45 @@ class Dispatcher:
             segment:           TranscriptSegment (現状未使用、フェーズ 7 で
                               segment.text などを使う可能性あり)
             buffer_full_text:  TranscriptBuffer.full_text() (LLM 判定対象テキスト)
+
+        Returns:
+            bool: True=本 segment を「挙手系処理として確定的に消費」した。
+                  Listener 側で ``_evaluate_wake`` を skip して wake_event 経路への
+                  二重発火を防止する (= 案 W'-2)。
+
+                  True を返す経路:
+                    - granted: check_approval が承認 (= 「(キャラ名)、どうぞ」)
+                    - denied:  check_approval が却下 (= 「いや、いいわ」)
+                    - 自動 lapse 発火: 今回の発話で utterance_count が閾値到達
+                    - interjection_candidate 新規挙手確定
+
+                  False を返す経路:
+                    - 機能 off (= L2_USE_HANDRAISE=false)
+                    - handraising キャラあり / approval=None / lapse 発火なし
+                      (= +1 加算のみ。自然な雑談中に名前呼びで別ターンを発火させたい)
+                    - interjection_candidate 既存の slug への重複 (= 冪等 no-op、
+                      state 変化なし → wake 判定を阻害しない)
+                    - 上記いずれにも該当しない通常発話 (= unknown)
+
+            **WHY (戻り値設計)**:
+              snappy-bentley 実走で観察された 3 重発火パターンでは、ルカが
+              「さくらさん、どうぞ」と発話した瞬間、その同一 segment が:
+                (a) 本関数で check_approval=granted → on_approval_granted 呼出
+                (b) 同時に Listener._evaluate_wake → router.route(name_hint=sakura)
+                    → wake_event_queue 投入 → run_loop の (3) 通常応答ターン発火
+              という二重消費を起こしていた。Dispatcher が「発話を一意に解釈して
+              状態遷移を行った」segment と、「Dispatcher が触らなかった」segment を
+              戻り値で区別することで、Listener 側で wake 判定を選択的に skip 可能。
         """
         if not self._use_handraise:
-            return  # 機能 off
+            return False  # 機能 off → wake 経路は通常通り走らせる
 
         # 関数内 import で循環回避 (router.py 側で dispatcher を import する将来拡張に備える)
         from . import router as _router
+
+        # 「processed」= 本 segment を挙手系で消費したか。複数の経路で True に
+        # 倒し得るので bool 1 つに集約 (= or 結合と同等)。
+        processed = False
 
         # handraising キャラがあれば check_approval を先に試す
         with self._lock:
@@ -724,7 +757,7 @@ class Dispatcher:
                     self.on_approval_granted(approval.target_slug)
                 else:
                     self.on_approval_denied(approval.target_slug)
-                return  # 承認/却下確定 → 通常意図ゲート不要
+                return True  # 承認/却下確定 → wake skip (W'-2)
 
             # check_approval が None (関係ない発話) → utterance_count_since 加算
             # 同時に複数の slug が utterance lapse 条件超過する可能性があるため、
@@ -735,19 +768,30 @@ class Dispatcher:
                     state.utterance_count_since += 1
                     if state.utterance_count_since >= self._lapse_utterance_count:
                         slugs_to_lapse.append(slug)
-            for slug in slugs_to_lapse:
-                self.on_lapse_timeout(slug)
+            if slugs_to_lapse:
+                for slug in slugs_to_lapse:
+                    self.on_lapse_timeout(slug)
+                # WHY: 自動 lapse 発火は dispatcher の状態遷移なので wake skip 対象。
+                # ただし「+1 加算のみで lapse なし」は processed=False のまま (= 自然な
+                # 雑談中に名前呼びで別ターンを発火させたい設計)。
+                processed = True
 
         # interjection_candidate 判定 (handraising キャラ無し or 該当発話なし)
         intent = _router.check_intent(buffer_full_text, character_slug=None)
         if intent.intent == "interjection_candidate" and intent.target_slug:
             with self._lock:
                 if intent.target_slug in self._handraise_states:
-                    return  # 既に handraising 中 → 冪等
+                    # 既に handraising 中 → 冪等 no-op。state 変化していないので
+                    # wake 判定は阻害しない方針。ただし lapse 発火由来の processed=True
+                    # は保つ (= 同一 segment で別 slug の lapse があった場合も skip)。
+                    return processed
             self.on_interjection_candidate(
                 intent.target_slug,
                 transcript_snapshot=buffer_full_text,
             )
+            return True  # 新規挙手確定 → wake skip (W'-2)
+
+        return processed
 
     def _create_lapse_timer(
         self,
