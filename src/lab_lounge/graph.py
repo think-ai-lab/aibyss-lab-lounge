@@ -433,17 +433,28 @@ class BubbleToolCallbackHandler:
     def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
 
     def on_tool_end(self, *args, **kwargs) -> None:
-        """ツール呼び出し終了時に CharacterStatus を Thinking に戻す (Phase 0.5-B-α)。
+        """ツール呼び出し終了時の no-op (LangChain CallbackHandler 互換用)。
 
-        WHY: tool 終了 → LLM 応答生成 (Thinking) → 第 1 chunk 再生 (Talking) の流れ。
-        LangChain の引数構造は Agent / tool 種別で揺らぐため `*args, **kwargs` で受ける。
-        bubble.update は発行しない (= 「searching」の表示はそのまま、次の "answering"
-        bubble は _generation_node の終盤で発行される)。
+        【経緯】
+        Phase 0.5-B-α commit 5 では「TOOL_CALLING → THINKING」を反映していたが、
+        LangChain Agent が web_search 完了後に LLM 応答生成で hang する症状を観察
+        (logs/runs/run_loop_20260508_{222342, 224907, 225127}.log)。
+        実走 TAKE 1 (web_search 15936 chars) と TAKE 2 (web_search 2217 chars) の
+        両方でフィラー無限ループが発生し、Phase 0.5-A 末尾 (= 同コードでこの実装が
+        なかった) では同じ web_search サイズで正常応答していたことから、本実装の
+        微妙なタイミング差が Agent の internal state machine に影響していると推定。
+
+        【判断】
+        commit 5 partial revert として on_tool_end を no-op に戻す
+        (= Phase 0.5-A の挙動と同等)。他の状態反映経路 (= on_tool_start で TOOL_CALLING、
+        _generation_node 入口で THINKING) は維持。
+
+        【HUD dashboard への影響】
+        「TOOL_CALLING のまま → 第 1 chunk 投入で TALKING に直接遷移」となり、
+        「Tool 後の Thinking」の中間状態は視覚化されない。ただし TOOL_CALLING 自体が
+        「考え中 / 検索中」相当の表示で十分機能するため実用上は問題なし。
         """
-        if self._status_manager is not None:
-            self._status_manager.set_status(
-                self._character_slug, CharacterStatus.THINKING,
-            )
+        pass
 
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs) -> None:
         """ツール呼び出し開始時にbubble.updateを発行する。
