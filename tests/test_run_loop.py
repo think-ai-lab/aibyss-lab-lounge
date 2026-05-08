@@ -498,6 +498,152 @@ class TestHandraiseCloseFlow:
         assert item.get("_drain") is True
 
 
+# ─── Phase 0.5-B-β-2 commit 4: 却下/lapse drain 貫通テスト ───────────────
+
+
+class TestLlmOnlyAskCharacterDenialDrain:
+    """却下/lapse 経由の cancel_bg_tts + drain 統合テスト (Phase 0.5-B-β-2 commit 4)。
+
+    β-2-1 (= dispatcher の on_handraise_close 発火) → β-2-3 (= factory の
+    on_handraise_close 実装で cancel_bg_tts + drain) → β-2-2 (= ask_character の
+    bg_tts キャンセル) の貫通動作を保証する。run_loop 全体を起動せず、
+    dispatcher と factory を直接結合して却下/lapse 経路を観測する。
+    """
+
+    class _FakeTimer:
+        """threading.Timer 差替用 (= test_dispatcher._FakeTimer 相当のローカル版)。"""
+
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval = interval
+            self.function = function
+            self.args = args or []
+            self.kwargs = kwargs or {}
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+        def fire(self) -> None:
+            """手動発火 = lapse_timer のタイムアウトをシミュレート。"""
+            self.function(*self.args, **self.kwargs)
+
+    def _build_dispatcher_with_close(self, monkeypatch, *, slug: str = "mimi",
+                                     session_id_root: str = "ses1"):
+        """factory + Dispatcher を結合し、cancel_bg_tts を spy 化したセットを返す。
+
+        test_dispatcher._patch_filler / _patch_lapse_timer 相当の mock を class 内
+        helper としてインラインに書く (= test ファイル間の dependency を避ける)。
+        """
+        import queue as queue_mod
+        from pathlib import Path
+
+        from lab_lounge.dispatcher import Dispatcher
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        # cancel_bg_tts を spy (= ask_character module の関数を差し替え、
+        # factory の on_handraise_close 内 import で取得される側を patch)
+        cancel_calls: list[str] = []
+
+        def _spy_cancel(s_id):
+            cancel_calls.append(s_id)
+            return 0
+
+        monkeypatch.setattr(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts", _spy_cancel,
+        )
+
+        # filler を mock (= test_dispatcher._patch_filler 相当、handraise wav の
+        # 物理ファイル参照を回避するため select_filler_phrase をスタブ化)
+        fake_path = Path(f"/tmp/{slug}_handraise.wav")
+        fake_phrase = MagicMock()
+        fake_phrase.text = "挙手します"
+        monkeypatch.setattr(
+            "lab_lounge.filler.select_filler_phrase",
+            lambda s, category="opener", **kw: (fake_path, fake_phrase, 0),
+        )
+
+        # bubble_messages を mock
+        monkeypatch.setattr(
+            "lab_lounge.dispatcher._load_bubble_messages",
+            lambda: {slug: {"denied": "また今度", "lapsed": "静かに"}},
+        )
+
+        # factory で 5 callable 取得 (= playback_queue_ref を渡して drain 観測可能に)
+        playback_q: queue_mod.Queue = queue_mod.Queue()
+        playback_ref: list = [playback_q]
+
+        _, _, _, _, on_close = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1",
+            session_id_root=session_id_root,
+            stream_context=None,
+            playback_queue_ref=playback_ref,
+        )
+
+        d = Dispatcher(on_handraise_close=on_close)
+
+        # lapse_timer を _FakeTimer で差し替え (= test_dispatcher._patch_lapse_timer 相当)
+        fake_timers: list = []
+
+        def fake_create(target_slug: str, delay_sec: float):
+            t = self._FakeTimer(
+                delay_sec,
+                d.on_lapse_timeout,
+                args=[target_slug],
+            )
+            fake_timers.append(t)
+            return t
+
+        monkeypatch.setattr(d, "_create_lapse_timer", fake_create)
+        return d, cancel_calls, playback_q, fake_timers
+
+    def test_denial_triggers_cancel_and_drain_via_dispatcher(self, monkeypatch):
+        """dispatcher.on_approval_denied → on_handraise_close → cancel_bg_tts + drain。
+
+        WHY: β-2 全 commit の最終的な統合動作を保証する。dispatcher 経由で
+        却下を起こすと、ask_character の bg_tts キャンセル + playback queue の
+        drain task 投入が両方走る (= 案 A の音声漏れ最小化が end-to-end で機能)。
+        """
+        d, cancel_calls, playback_q, _ = self._build_dispatcher_with_close(
+            monkeypatch, session_id_root="ses1-denial",
+        )
+
+        # handraise 状態を作る (= on_interjection_candidate 経由)
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # 却下発火
+        d.on_approval_denied("mimi")
+
+        # cancel_bg_tts(session_id="ses1-denial") が呼ばれた
+        assert cancel_calls == ["ses1-denial"]
+        # playback queue に drain task が投入された
+        assert not playback_q.empty()
+        item = playback_q.get_nowait()
+        assert isinstance(item, dict)
+        assert item.get("_drain") is True
+
+    def test_lapse_triggers_cancel_and_drain_via_dispatcher(self, monkeypatch):
+        """dispatcher.on_lapse_timeout → on_handraise_close → cancel_bg_tts + drain。
+
+        WHY: lapse (= タイムアウト) も denial と同じ cleanup 経路を通ること。
+        reason="lapsed" で run_loop は識別できるが、現状の cleanup ロジックは
+        denial と同じ (= 将来の metric 分離の基盤は β-2-1 で確保済み)。
+        """
+        d, cancel_calls, playback_q, timers = self._build_dispatcher_with_close(
+            monkeypatch, session_id_root="ses1-lapse",
+        )
+
+        d.on_interjection_candidate("mimi", transcript_snapshot="t")
+        # lapse 発火 (= FakeTimer の手動発火 = on_lapse_timeout 呼出)
+        timers[0].fire()
+
+        assert cancel_calls == ["ses1-lapse"]
+        assert not playback_q.empty()
+        item = playback_q.get_nowait()
+        assert isinstance(item, dict)
+        assert item.get("_drain") is True
+
+
 class TestInitListenerBgContinuous:
     """Block 0: _init_listener の bg-continuous 分岐テスト。
 
