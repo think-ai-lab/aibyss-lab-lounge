@@ -906,6 +906,9 @@ class TestApprovedSynthesizeFallback:
         # Phase 0.5-A フェーズ 8 修正: chunks 蓄積用 callback が渡される (再生のために必須)
         assert "on_tts_chunk_ready" in kw
         assert callable(kw["on_tts_chunk_ready"])
+        # Phase 0.5-A バグ 3 修正 (案 A): fallback パスでは ask_character ツールを
+        # 無効化して並行 TTS との deadlock を回避する
+        assert kw.get("disable_tools") == ["ask_character"]
 
     def test_run_pipeline_exception_is_swallowed(self, monkeypatch):
         """run_pipeline 例外は warning ログのみで例外は伝播しない。"""

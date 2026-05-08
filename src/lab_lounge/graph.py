@@ -108,14 +108,26 @@ def _is_rag_enabled() -> bool:
     return os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
 
 
-def _load_mcp_tools(character_slug: str | None = None):
+def _load_mcp_tools(
+    character_slug: str | None = None,
+    disable_tools: "list[str] | None" = None,
+):
     """MCP サーバーからツールを LangChain ツールとして読み込む。
 
     Args:
         character_slug: 呼出元キャラ slug。ログ強化 L-2 (Phase 0.5-A 後) で追加。
                         ターン毎に Agent 構築されるため、ログを「どのキャラの Agent
                         のためのツール登録か」識別できるようにする。
+        disable_tools:  特定ツールを除外するためのリスト (例: ["ask_character"])。
+                        Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A) で追加。
+                        実走 logs/runs/run_loop_20260508_181051.log で観察された
+                        fallback パス + ask_character + 並行 TTS の deadlock を
+                        回避するため、_approved_synthesize_fallback 経路で
+                        ["ask_character"] を渡して同ツールを無効化する。
+                        通常応答ターン (= bg_result=ready 経路) では None で
+                        全ツール有効 (= キャラ間協働応答が動作)。
     """
+    disable_set = set(disable_tools or [])
     # ログ強化 L-2: 3 行に分かれていたツール登録ログを 1 行に集約 (冗長削減)。
     # 失敗時のみ warning で個別に出す。
     char_tag = f"[character={character_slug or '?'}]"
@@ -126,21 +138,22 @@ def _load_mcp_tools(character_slug: str | None = None):
         registered: list[str] = []  # ログ用、登録成功したツール名 (1 行集約)
 
         # web_search ツール
-        try:
-            from .mcp_servers.web_search import web_search
+        if "web_search" not in disable_set:
+            try:
+                from .mcp_servers.web_search import web_search
 
-            @lc_tool
-            def web_search_tool(query: str) -> str:
-                """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
-                return web_search(query)
+                @lc_tool
+                def web_search_tool(query: str) -> str:
+                    """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
+                    return web_search(query)
 
-            tools.append(web_search_tool)
-            registered.append("web_search")
-        except Exception as exc:
-            logger.warning("web_search ツール読み込み失敗 %s: %s", char_tag, exc)
+                tools.append(web_search_tool)
+                registered.append("web_search")
+            except Exception as exc:
+                logger.warning("web_search ツール読み込み失敗 %s: %s", char_tag, exc)
 
         # retrieve_memory ツール (L2_ENABLE_RAG=true のとき)
-        if _is_rag_enabled():
+        if _is_rag_enabled() and "retrieve_memory" not in disable_set:
             try:
                 from .mcp_servers.retrieve_memory import retrieve_memory
 
@@ -154,24 +167,30 @@ def _load_mcp_tools(character_slug: str | None = None):
             except Exception as exc:
                 logger.warning("retrieve_memory ツール読み込み失敗 %s: %s", char_tag, exc)
 
-        # ask_character ツール (常に登録)
-        try:
-            from .mcp_servers.ask_character import ask_character
+        # ask_character ツール (基本は常に登録、disable_tools で fallback パス時に無効化)
+        if "ask_character" not in disable_set:
+            try:
+                from .mcp_servers.ask_character import ask_character
 
-            @lc_tool
-            def ask_character_tool(character_slug: str, question: str) -> str:
-                """他のAITuberキャラクターに質問する。自分の専門外の質問や、別の視点が欲しい場合に使用する。character_slug は相手の識別子 (mimi/chisame/sakura/ruka/octamaid)。自分自身には質問しないこと。1 応答で最大 2 回まで。"""
-                return ask_character(character_slug, question)
+                @lc_tool
+                def ask_character_tool(character_slug: str, question: str) -> str:
+                    """他のAITuberキャラクターに質問する。自分の専門外の質問や、別の視点が欲しい場合に使用する。character_slug は相手の識別子 (mimi/chisame/sakura/ruka/octamaid)。自分自身には質問しないこと。1 応答で最大 2 回まで。"""
+                    return ask_character(character_slug, question)
 
-            tools.append(ask_character_tool)
-            registered.append("ask_character")
-        except Exception as exc:
-            logger.warning("ask_character ツール読み込み失敗 %s: %s", char_tag, exc)
+                tools.append(ask_character_tool)
+                registered.append("ask_character")
+            except Exception as exc:
+                logger.warning("ask_character ツール読み込み失敗 %s: %s", char_tag, exc)
 
         if not tools:
             logger.warning("有効なツールが 0 件 %s。ツールなしで続行。", char_tag)
         else:
-            logger.info("ツール登録完了 %s: %s", char_tag, ", ".join(registered))
+            disabled_log = (
+                f" (disabled={sorted(disable_set)})" if disable_set else ""
+            )
+            logger.info(
+                "ツール登録完了 %s: %s%s", char_tag, ", ".join(registered), disabled_log,
+            )
 
         return tools
 
@@ -262,6 +281,7 @@ def _build_agent_graph(
     model: str,
     system_prompt: str | None = None,
     character_slug: str | None = None,
+    disable_tools: "list[str] | None" = None,
 ):
     """
     ツール付き ReAct Agent グラフを構築する。
@@ -279,6 +299,13 @@ def _build_agent_graph(
     新 API は tool-based structured output (ProviderStrategy) を使うため、
     Markdown コードブロック / 絵文字 / 装飾文字なしの strict JSON が返る
     (実測でレイテンシも -15% 短縮)。
+
+    Args:
+        provider:        LLM プロバイダ (openai/anthropic/google)
+        model:           モデル名
+        system_prompt:   キャラクター別 system prompt
+        character_slug:  キャラ slug (= ログ識別 + Skills 読込 + response_format)
+        disable_tools:   除外するツール名のリスト (= 案 W'-3 バグ 3 修正、案 A)
     """
     try:
         from langchain.agents import create_agent
@@ -289,7 +316,11 @@ def _build_agent_graph(
         ) from exc
 
     # ログ強化 L-2: character_slug を渡して、ツール登録ログにキャラ情報を含める
-    tools = _load_mcp_tools(character_slug=character_slug)
+    # バグ 3 修正: disable_tools を伝播して fallback パスでは ask_character を除外
+    tools = _load_mcp_tools(
+        character_slug=character_slug,
+        disable_tools=disable_tools,
+    )
     if not tools:
         logger.info(
             "ツールなし [character=%s]。単一ノード構成にフォールバック。",
@@ -432,6 +463,7 @@ def run_graph(
     run_metadata: dict | None = None,
     character_slug: str | None = None,
     common: dict | None = None,
+    disable_tools: "list[str] | None" = None,
 ) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
@@ -448,6 +480,9 @@ def run_graph(
         run_metadata:    LangGraph config["metadata"] に渡す dict (optional)
         character_slug:  キャラクター slug (Agent モード時の bubble.update 用)
         common:          stream_id/session_id/trace_id dict (Agent モード時の bubble.update 用)
+        disable_tools:   特定ツールを除外するリスト (= 案 W'-3 バグ 3 修正、案 A)。
+                         例: ["ask_character"] で ask_character ツールを Agent に
+                         登録しない。fallback パス専用 (= deadlock 回避)。
 
     Returns:
         LLMResult
@@ -463,7 +498,11 @@ def run_graph(
     )
 
     if _is_tools_enabled():
-        agent = _build_agent_graph(provider, model, system_prompt, character_slug=character_slug)
+        agent = _build_agent_graph(
+            provider, model, system_prompt,
+            character_slug=character_slug,
+            disable_tools=disable_tools,
+        )
         if agent is not None:
             return _run_agent(
                 agent, text, model,
@@ -677,6 +716,11 @@ class PipelineGraphState(TypedDict):
     # 同期して bubble.update("answering") を発行する」設計のため、graph 側では
     # 抑制する必要がある (= 二重発行防止)。デフォルト False で既存挙動を維持。
     suppress_bubble_answering: bool
+    # Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A): 特定の Agent ツールを除外する。
+    # 例: ["ask_character"] で fallback パス時に ask_character ツールを Agent から
+    # 除外し、並行する TTS 再生との deadlock を回避する (logs/runs/run_loop_20260508_181051.log
+    # で観察されたハングの対処)。デフォルト None で全ツール有効 = 既存挙動。
+    disable_tools: "list[str] | None"
 
     # ノード出力
     character_slug: str
@@ -1065,6 +1109,9 @@ def _generation_node(state: PipelineGraphState) -> dict:
             run_metadata=_run_meta,
             character_slug=state["character_slug"],
             common=common,
+            # バグ 3 修正 (案 A): fallback パスでは disable_tools=["ask_character"] が
+            # 指定される。state.get で None フォールバック (= 既存挙動互換)。
+            disable_tools=state.get("disable_tools"),
         )
         write_llm_response(_llm_result.text)
         llm_text = _llm_result.text

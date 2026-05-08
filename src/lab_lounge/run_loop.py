@@ -295,6 +295,17 @@ def _approved_synthesize_fallback(
             on_tts_chunk_ready=on_chunk,
             stream_context=stream_context,
             suppress_bubble_answering=False,  # graph 側で answering bubble 発行
+            # WHY (バグ 3 修正、案 A、実走 logs/runs/run_loop_20260508_181051.log で発覚):
+            # fallback パスでは ask_character ツールを Agent から除外する。
+            # 通常応答ターン (= chisame の callout 応答) が並行 TTS 再生中に
+            # mimi の挙手承認 → fallback パスで run_pipeline 起動 → LLM が
+            # ask_character ツールを呼ぶ → 導入セリフ TTS が VOICEPEAK FIFO に
+            # 投入されるが、現在再生中の chisame TTS の完了待ちで
+            # 「ask_character 導入セリフ再生待ち...」のままハング、という
+            # deadlock を観察した。fallback パスを「単独応答」に限定してこの
+            # 経路を断ち切る。bg_result=ready 経路 (= 通常パス) では disable_tools=None
+            # のままなので ask_character の協働応答は通常通り使える。
+            disable_tools=["ask_character"],
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
