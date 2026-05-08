@@ -244,3 +244,56 @@ class TestSummarizeEvent:
         s = _summarize_event(ev)
         # payload 無し → デフォルト値 (?) でフォールバック
         assert "character=?" in s
+
+    # ─── character.status.update (Phase 0.5-B-α) ──────────────────
+
+    def test_character_status_update_includes_status_transition(self):
+        """character.status.update: previous_status -> status の形式で summary。"""
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi",
+                "status": "thinking",
+                "previous_status": "ready",
+            },
+        }
+        s = _summarize_event(ev)
+        assert "character=mimi" in s
+        assert "status=ready->thinking" in s
+
+    def test_character_status_update_includes_metadata_pose_and_text(self):
+        """Talking 時の metadata (pose + text) が summary に含まれる。"""
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi",
+                "status": "talking",
+                "previous_status": "thinking",
+                "metadata": {"pose": "smile", "text": "こんにちは、ルカさま"},
+            },
+        }
+        s = _summarize_event(ev)
+        assert "pose=smile" in s
+        assert "text=" in s
+        assert "こんにちは" in s  # 先頭部分 (truncate されても残る)
+
+    def test_character_status_update_long_text_truncated(self):
+        """長文 text は preview chars (30) で truncate される。"""
+        long_text = "深海" * 100  # 200 文字
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi", "status": "talking",
+                "metadata": {"pose": "smile", "text": long_text},
+            },
+        }
+        s = _summarize_event(ev)
+        assert "..." in s  # truncate suffix
+        assert len(s) < 200  # 元の text より短い
+
+    def test_character_status_update_default_unknowns(self):
+        """payload 不完全時 character=? status=?->? で fallback。"""
+        ev = {"type": "character.status.update", "payload": {}}
+        s = _summarize_event(ev)
+        assert "character=?" in s
+        assert "status=?->?" in s

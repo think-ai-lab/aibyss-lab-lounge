@@ -427,3 +427,78 @@ def build_dispatcher_handraise_update(
     return event
 
 
+def build_character_status_update(
+    *,
+    character: str,
+    status: str,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    previous_status: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    character.status.update イベントを組み立てて検証する。
+
+    Phase 0.5-B-α で導入。CharacterStatusManager の subscribe callback から発行され、
+    HUD dashboard が「全キャラの現在状態」(Ready/Thinking/ToolCalling/Raisehand/Talking)
+    を可視化するためのイベント。bubble.update (進捗 step) とは概念的に分離され、
+    こちらは「内部状態」を表す (= Ready 状態も明示 publish 可能)。
+
+    Args:
+        character:        対象キャラ slug (mimi/chisame/sakura/octamaid/ruka)
+        status:           遷移後の状態文字列 (CharacterStatus.value:
+                          "ready"/"thinking"/"tool_calling"/"raisehand"/"talking")
+        previous_status:  遷移前の状態 (= デバッグ用、HUD で「どこから来たか」可視化)。
+                          None 時は payload に含めない (後方互換、初期遷移ケース等)。
+        metadata:         status 固有の追加情報。
+                          - Talking 時: {"pose": str, "text": str} を含める想定
+                            (= ルカ要件: HUD で立ち絵 + 発話全文を表示)
+                          - 他 status: 本 phase では None 想定 (将来 Thinking 時の
+                            prompt_summary や Raisehand 時の phrase 等を入れる余地)
+                          None 時は payload に含めない (受信側 default 挙動を維持)。
+        snapshot:         全キャラの状態 dict ({slug: {"status": str, "metadata": dict}})。
+                          HUD 起動時 / 同期ズレ修復時に「全状態を一括反映」する目的。
+                          毎 publish に含めると payload が肥大化するため、通常は None で
+                          差分のみ送る。Phase 0.5-C の観察 2 で「現在状態 snapshot を
+                          文脈に渡す」用途も想定。None 時は payload に含めない。
+
+    payload schema:
+        {
+            "character": str,                     # required
+            "status": str,                        # required, CharacterStatus.value
+            "previous_status": str (optional),
+            "metadata": dict (optional),          # Talking 時の {pose, text} 等
+            "snapshot": dict (optional),          # 全キャラ状態の atomic dict
+        }
+
+    bubble.update の category や ttl_ms 拡張パターンを踏襲し、event-envelope-0.1
+    の schema は変更不要 (payload は open-ended)。
+    """
+    payload: dict[str, Any] = {
+        "character": character,
+        "status": status,
+    }
+    # オプションフィールドは None 時に payload に含めない (= 受信側 default 挙動維持)
+    if previous_status is not None:
+        payload["previous_status"] = previous_status
+    if metadata is not None:
+        payload["metadata"] = metadata
+    if snapshot is not None:
+        payload["snapshot"] = snapshot
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "character.status.update",
+        "source": "lab-lounge",
+        "payload": payload,
+    }
+    validate_event(event)
+    return event
+
+
