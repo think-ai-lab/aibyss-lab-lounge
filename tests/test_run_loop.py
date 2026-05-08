@@ -1050,3 +1050,124 @@ class TestApprovedSynthesizeFallback:
         # 新 UUID が割り当てられている (空文字ではない)
         assert called[0]["trace_id"]
         assert len(called[0]["trace_id"]) == 36  # UUID4 形式
+
+
+# ─── Phase 0.5-A 案 W'-3: ログ強化境界テスト ──────────────────────
+
+
+class TestApprovedFlowLoggingProgression:
+    """Phase 0.5-A 案 W'-3: 挙手承認パス各経路のログ進行を caplog で検証。
+
+    実走時のシナリオ B/C 再走で「TTS 再生キュー投入」が出ない問題 (= 問題 5) を
+    確実に検出できるよう、各ステージにログを仕込んだことの単体保証。grep パターン
+    で「どの経路を通ったか」が 1 行で追跡可能になることを保証する。
+    """
+
+    def test_fallback_logs_chunks_count(self, monkeypatch, caplog):
+        """fallback パスで chunks 蓄積完了ログが出る (W'-3 ログ強化)。"""
+        import logging
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        # run_pipeline を spy 化、on_chunk callback で 2 chunks 流す
+        def fake_run_pipeline(text, **kw):
+            cb = kw.get("on_tts_chunk_ready")
+            if cb is not None:
+                cb("u1", "first chunk", False, "mimi", None)
+                cb("u2", "second chunk text", True, "mimi", None)
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
+        )
+        # _spawn_handraise_response_playback を no-op に (= playback 起動を抑止)
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: None,
+        )
+
+        with caplog.at_level(logging.INFO, logger="lab_lounge.run_loop"):
+            _approved_synthesize_fallback(
+                "mimi", "テスト発話", "trace-fb",
+                session_stream_id="s1", session_id_root="ses1", stream_context=None,
+            )
+
+        # 開始ログ + 蓄積完了ログの両方が出ること
+        starts = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and "fallback 同期再生成 開始" in r.getMessage()
+            and "[character=mimi]" in r.getMessage()
+        ]
+        completions = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and "fallback chunks 蓄積完了" in r.getMessage()
+            and "[character=mimi]" in r.getMessage()
+            and "count=2" in r.getMessage()
+        ]
+        assert len(starts) == 1
+        assert len(completions) == 1
+
+    def test_approved_tts_logs_progression(self, monkeypatch, caplog):
+        """承認 TTS 同期実行パスで「開始 → 完了 → playback 起動」順にログが出る。
+
+        WHY: シナリオ B/C 再走で「TTS まで完了したが playback まで到達したか」を
+        1 行 grep で追跡可能にするための保証。
+        """
+        import logging
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        # run_pipeline_tts_only spy: chunks を on_chunk で 1 件流す
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "test", True, "mimi", None)
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop.publish", lambda ev: None,
+        )
+
+        _, _, _, on_approved = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "utterance.final"},
+            {"type": "llm.final", "payload": {"text": "わたくしの見解は…"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        with caplog.at_level(logging.INFO, logger="lab_lounge.run_loop"):
+            on_approved("mimi", bg, "snap", "trace-orig")
+            # daemon thread 内で _tts_and_play が走る
+            for _ in range(40):
+                if any(
+                    "挙手承認 playback worker 起動" in r.getMessage()
+                    for r in caplog.records
+                ):
+                    break
+                time.sleep(0.05)
+
+        # 期待: 開始 → 完了 → playback 起動 の 3 ログが順序で出ている
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        starts = [m for m in msgs if "挙手承認 TTS 同期実行 開始" in m and "[character=mimi]" in m]
+        completes = [m for m in msgs if "挙手承認 TTS 同期実行 完了" in m and "[character=mimi]" in m]
+        playbacks = [m for m in msgs if "挙手承認 playback worker 起動" in m and "[character=mimi]" in m]
+        assert len(starts) == 1
+        assert len(completes) == 1
+        assert len(playbacks) == 1
+        # 順序確認: starts → completes → playbacks の index 関係
+        start_idx = msgs.index(starts[0])
+        complete_idx = msgs.index(completes[0])
+        playback_idx = msgs.index(playbacks[0])
+        assert start_idx < complete_idx < playback_idx

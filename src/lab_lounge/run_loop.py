@@ -277,6 +277,14 @@ def _approved_synthesize_fallback(
             chunk["pose"] = pose
         chunks.append(chunk)
 
+    # ログ強化 W'-3: fallback パス進入を実走で識別容易にする。W'-1 適用後は
+    # fallback は「LLM 失敗時の救済」のみに縮小されるため、このログ自体が稀。
+    # シナリオ B/C 再走時に出ていれば「BG LLM が失敗した」とすぐ判別可能。
+    logger.info(
+        "fallback 同期再生成 開始 [character=%s]: trace_id=%s text_len=%d",
+        slug, fallback_trace_id, len(text),
+    )
+
     try:
         run_pipeline(
             text,
@@ -290,7 +298,7 @@ def _approved_synthesize_fallback(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "挙手承認 fallback (run_pipeline 同期再生成) 失敗: slug=%s err=%s",
+            "挙手承認 fallback (run_pipeline 同期再生成) 失敗 [character=%s]: err=%s",
             slug, exc,
         )
         return
@@ -299,10 +307,19 @@ def _approved_synthesize_fallback(
         # TTS 出力なし (ダミー TTS モード or TTS 失敗)。再生はスキップするが、
         # graph 側で llm.final / tts.done は発行済 (bubble は thinking → answering で停止)。
         logger.warning(
-            "挙手承認 fallback: chunks 空 (TTS 出力なし) → 再生スキップ slug=%s",
+            "挙手承認 fallback [character=%s]: chunks 空 (TTS 出力なし) → 再生スキップ",
             slug,
         )
         return
+
+    # ログ強化 W'-3: chunks 蓄積完了をログに残す。W'-1 適用後は通常応答ターンの
+    # _on_tts_chunk 経由で「TTS チャンク再生キュー投入」ログが出るが、fallback は
+    # 専用 mini worker 経路なのでこのログがないと chunks 蓄積を直接観察できない。
+    total_chars = sum(len(c.get("text", "")) for c in chunks)
+    logger.info(
+        "fallback chunks 蓄積完了 [character=%s]: count=%d total_text_chars=%d",
+        slug, len(chunks), total_chars,
+    )
 
     # 蓄積した chunks を専用 mini playback worker で再生 (bg_result 経路と同じ仕組み)。
     # worker が speaking → done の bubble.update を発行しつつ、wav を順次再生する。
@@ -592,6 +609,12 @@ def _create_handraise_runner_and_callbacks(
             logger.info(
                 "挙手承認 TTS 同期実行 完了 [character=%s]: chunks=%d",
                 slug, len(chunks),
+            )
+            # ログ強化 W'-3: playback worker 起動を明示。実走時に「TTS は完了
+            # したが playback まで到達したか」を 1 行 grep で追跡可能にする。
+            logger.info(
+                "挙手承認 playback worker 起動 [character=%s]",
+                slug,
             )
             _spawn_handraise_response_playback(
                 slug,
