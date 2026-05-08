@@ -959,7 +959,7 @@ def run_loop(
         )
         logger.info("Block 0 + Phase 0.5-A: Dispatcher + BackgroundContinuousListener 起動完了")
 
-    def _bg_cleanup_pipeline() -> None:
+    def _bg_cleanup_pipeline(completed_slug: str | None = None) -> None:
         """bg-continuous モードでの pipeline 終了処理。
 
         - listener の routing_paused を解除して wake 判定を再開
@@ -968,11 +968,16 @@ def run_loop(
 
         Pipeline 成功・失敗を問わず必ず呼ぶ必要がある (routing_paused が True のまま
         放置されると wake 検知が永続的に止まり、wait_for_next_event が無限待機する)。
+
+        Args:
+            completed_slug: 完了したターンのキャラ slug。ログ強化 L-4 で追加。
+                            dispatcher.on_pipeline_complete のログに渡して識別容易に。
+                            失敗 path で slug 不明な場合は None で OK。
         """
         if effective_backend == "bg-continuous":
             listener.set_routing_paused(False)
             if dispatcher is not None:
-                dispatcher.on_pipeline_complete()
+                dispatcher.on_pipeline_complete(completed_slug=completed_slug)
 
     turn = 0
     try:
@@ -1156,9 +1161,11 @@ def run_loop(
                     time.sleep(0.5)
                 _chunk_count[0] += 1
                 _audio_name = url.rsplit("/", 1)[-1] if "/" in url else url
+                # ログ強化 L-4: character を含めて、ask_character や挙手承認応答中に
+                # 並行する複数 chunk のうちどのキャラのか識別容易に
                 logger.info(
-                    "TTS チャンク再生キュー投入: %s (chunk %d, is_last=%s, len=%d)",
-                    _audio_name, _chunk_count[0], is_last, len(chunk_text),
+                    "TTS チャンク再生キュー投入 [character=%s]: %s (chunk %d, is_last=%s, len=%d)",
+                    character, _audio_name, _chunk_count[0], is_last, len(chunk_text),
                 )
                 if _playback_queue is not None:
                     # 該当キャラの pose 予約があれば付与 (playback worker が再生直前に
@@ -1214,7 +1221,8 @@ def run_loop(
                 # (speaker_hint が不確定なケースもあり、補填 done は見送り)
                 # bg-continuous: routing_paused を解除して dispatcher を IDLE に戻す。
                 # これがないと次ターンの wait_for_next_event が永続的に blocking する。
-                _bg_cleanup_pipeline()
+                # ログ強化 L-4: 失敗 path でも speaker_hint があれば slug context として渡す
+                _bg_cleanup_pipeline(completed_slug=speaker_hint)
                 continue
 
             # LLM 応答を表示 + ログ記録
@@ -1268,7 +1276,8 @@ def run_loop(
             # bg-continuous: pipeline 成功 path の終端。
             # routing_paused 解除 + dispatcher 状態を IDLE に戻す + 期限切れ event を破棄。
             # queue に残っている event があれば次の wait_for_next_event で取り出される。
-            _bg_cleanup_pipeline()
+            # ログ強化 L-4: result.speaker を slug context として渡す (= 完了応答の識別)
+            _bg_cleanup_pipeline(completed_slug=result.speaker)
 
             turn += 1
 
