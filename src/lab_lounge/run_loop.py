@@ -812,10 +812,17 @@ def _create_handraise_runner_and_callbacks(
 
         # bg_result / result が無効ならフォールバック (LLM 失敗時の救済)
         if bg_result is None or bg_result.result is None:
+            # Phase 0.5-D-d-2: fallback 進入の状態を詳細ログ。
+            # progressing 経路で 30s 待ったが間に合わなかったケース、bg_runner 例外、
+            # その他 (= LLM API エラー) を区別できるようにする (= ログから根本原因を
+            # 特定する材料を増やす、配信事故時の調査効率向上)。
+            bg_result_state = (
+                "bg_result=None (BG 未起動 or 30s timeout)" if bg_result is None
+                else "result=None (BG LLM 失敗 or API エラー)"
+            )
             logger.info(
-                "挙手承認 [character=%s]: bg_result %s → fallback パス",
-                slug,
-                "未生成" if bg_result is None else "result=None",
+                "挙手承認 [character=%s]: %s → fallback 同期再生成 (真の救済パス)",
+                slug, bg_result_state,
             )
             threading.Thread(
                 target=lambda: _approved_synthesize_fallback(
@@ -1112,12 +1119,58 @@ def _create_handraise_runner_and_callbacks(
             slug, reason, n, drained,
         )
 
+    def on_approval_progressing(slug: str) -> None:
+        """承認時 BG LLM 未完了 → bridge filler 即時再生 (Phase 0.5-D-d-2)。
+
+        【WHY: PROGRESSING 中の bridge filler 即時再生】
+        実走テスト 6 回目 (logs/runs/run_loop_20260509_195508.log) で、ルカが
+        「ミミ様、どうぞ」承認時に BG LLM 未完了 → fallback で 41 秒沈黙の問題を観察。
+        bg_completed.wait(timeout=30s) 中の沈黙を target キャラの bridge filler
+        (4-8 秒程度の繋ぎセリフ) で埋めることで:
+          - 承認音声 → 即「ええと…」(= 自然な「呼ばれた感」のレスポンス)
+          - その間 BG LLM 完了待ち、完了後 streaming spawn で本応答開始
+          無音時間が 30 秒 → 4-8 秒に短縮 (= 配信事故レベルからの脱却)。
+
+        ★UX 違和感のトレードオフ: 「approval 前に target が考え始めた?」と視聴者が
+        感じる可能性あり。ただし 30 秒沈黙の配信事故レベルリスクと比較すると許容範囲。
+
+        ★R4 (= 通常応答 TTS 再生中の 3 重音声重なり防止) は dispatcher 側で
+        ``state.se_pending=True`` のキャラには callback を発火しないガードで実現済。
+        本関数は呼ばれた時点で「IDLE 中の挙手 progressing」として安全。
+
+        Args:
+            slug: 承認された target キャラ slug (= bridge filler を再生する対象)
+        """
+        try:
+            from .filler import select_filler_path
+            bridge_path, _ = select_filler_path(slug, "bridge")
+            if bridge_path is None:
+                logger.debug(
+                    "on_approval_progressing: bridge filler なし [character=%s]",
+                    slug,
+                )
+                return
+            # 直接 _spawn_handraise_phrase_playback で再生 (= 専用 mini playback worker、
+            # padding=0 で即時再生開始)。承認音声と TTS の重なりは許容 (= 案 W'-1
+            # 設計と整合、Lock 不要)。
+            _spawn_handraise_phrase_playback(slug, bridge_path, padding_sec=0.0)
+            logger.info(
+                "on_approval_progressing bridge filler 即時再生 [character=%s]: %s",
+                slug, bridge_path.name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "on_approval_progressing bridge filler 起動失敗 [character=%s]: %s",
+                slug, exc,
+            )
+
     return (
         bg_runner,
         on_handraise_started,
         on_handraise_phrase_pending_release,
         on_handraise_approved,
         on_handraise_close,
+        on_approval_progressing,
     )
 
 
@@ -1746,6 +1799,7 @@ def run_loop(
             _on_handraise_phrase_pending_release,
             _on_handraise_approved,
             _on_handraise_close,
+            _on_approval_progressing,  # Phase 0.5-D-d-2
         ) = _create_handraise_runner_and_callbacks(
             session_stream_id=session_stream_id,
             session_id_root=session_id_root,
@@ -1765,6 +1819,7 @@ def run_loop(
             on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
             on_handraise_approved=_on_handraise_approved,
             on_handraise_close=_on_handraise_close,
+            on_approval_progressing=_on_approval_progressing,  # Phase 0.5-D-d-2
             status_manager=status_manager,
         )
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、

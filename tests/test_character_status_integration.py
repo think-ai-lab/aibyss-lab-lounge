@@ -13,6 +13,7 @@ Manager + Dispatcher + run_loop の組み合わせで状態遷移と metadata �
 """
 
 import threading
+import time
 from unittest.mock import MagicMock
 
 from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
@@ -76,6 +77,12 @@ class TestHandraiseToTalkingFlow:
 
         # Phase 2: 承認 → Raisehand_Ready → Ready
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: daemon thread 完了 (= READY 反映) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            if manager.get_status("mimi") == CharacterStatus.READY:
+                break
+            time.sleep(0.01)
         assert manager.get_status("mimi") == CharacterStatus.READY
 
         # Phase 3: TTS chunks 再生開始 → Talking (with metadata)

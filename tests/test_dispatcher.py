@@ -1243,6 +1243,13 @@ class TestDispatcherHandraisePublish:
         _patch_lapse_timer(monkeypatch, d)
         d.on_interjection_candidate("mimi", transcript_snapshot="t")
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: on_approval_granted が daemon thread 化されたため、
+        # _approve_after_bg_complete 完了 (= 2 回目の publish) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            if len(calls) >= 2:
+                break
+            time.sleep(0.01)
         # start + grant で 2 回呼ばれる
         assert len(calls) == 2
         # grant 後は state 空
@@ -1628,6 +1635,12 @@ class TestDispatcherApprovedCallback:
         result = HandraiseBgResult(chunks=[{"x": 1}], trace_id="bg-abc")
         d._bg_set_result("mimi", result)
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: daemon thread 完了 (= callback 発火) を polling で待つ。
+        # bg_completed.set 済 (_bg_set_result 呼出後) なので 10-20ms で抜ける。
+        for _ in range(50):
+            if len(calls) >= 1:
+                break
+            time.sleep(0.01)
         assert len(calls) == 1
         slug, bg_result, transcript_snapshot, trace_id = calls[0]
         assert slug == "mimi"
@@ -1643,6 +1656,12 @@ class TestDispatcherApprovedCallback:
         d.on_interjection_candidate("mimi", transcript_snapshot="snap")
         # bg_runner=None なのでフォールバック (bg_result は None のまま)
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: daemon thread 完了 (= callback 発火) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            if len(calls) >= 1:
+                break
+            time.sleep(0.01)
         assert len(calls) == 1
         slug, bg_result, _, _ = calls[0]
         assert slug == "mimi"
@@ -1665,6 +1684,13 @@ class TestDispatcherApprovedCallback:
         self._setup(monkeypatch, d)
         d.on_interjection_candidate("mimi", transcript_snapshot="t")
         d.on_approval_granted("mimi")  # 例外なく完了
+        # Phase 0.5-D-d-2: daemon thread 完了 (= state pop) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            with d._lock:
+                if not d._handraise_states:
+                    break
+            time.sleep(0.01)
         assert d._handraise_states == {}
 
 
@@ -1862,6 +1888,12 @@ class TestDispatcherStatusManager:
         d = self._make_dispatcher(manager, monkeypatch)
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: daemon thread 完了 (= READY 反映) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            if manager.get_status("mimi") == CharacterStatus.READY:
+                break
+            time.sleep(0.01)
         assert manager.get_status("mimi") == CharacterStatus.READY
 
     def test_approval_denied_resets_to_ready(self, monkeypatch):
@@ -1949,6 +1981,13 @@ class TestDispatcherStatusManager:
         d = self._make_dispatcher(manager, monkeypatch)
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
         d.on_approval_granted("mimi")
+        # Phase 0.5-D-d-2: on_approval_granted が daemon thread 化されたため、
+        # 3 回目の callback (= raisehand_ready → ready) を polling で待つ。
+        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
+        for _ in range(50):
+            if callback.call_count >= 3:
+                break
+            time.sleep(0.01)
         # 3 回 callback 発火 (Phase 0.5-D-d-1):
         #   ready → raisehand_progressing
         #   raisehand_progressing → raisehand_ready (bg_completed 即 set 済)
@@ -2021,3 +2060,177 @@ class TestDispatcherStatusManager:
         # bg_runner=None なので bg_completed 即 set 済 → 即遷移、β-3-3 ガード未抵触)
         assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
         assert "mimi" in d._handraise_states
+
+    # ─── Phase 0.5-D-d-2: daemon thread + on_approval_progressing テスト ────
+
+    def test_approval_granted_bg_completed_already_set_runs_synchronously(self, monkeypatch):
+        """bg_completed 即 set 済 (= bg_runner=None) で on_approval_granted を呼ぶと、
+        daemon thread の wait は即 return → state pop 即実行 (Phase 0.5-D-d-2)。
+
+        既存テスト (test_granted_removes_state 等) と同じシナリオだが、daemon thread
+        化されたことを polling pattern で明示的に検証する。bg_completed.wait() は即
+        return するため、polling は通常 10-20ms で抜ける。
+        """
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_approval_granted("mimi")
+
+        # daemon thread 完了を polling で待つ
+        for _ in range(50):
+            with d._lock:
+                if "mimi" not in d._handraise_states:
+                    break
+            time.sleep(0.01)
+        assert "mimi" not in d._handraise_states
+
+    def test_approval_granted_with_uncompleted_bg_calls_on_approval_progressing(
+        self, monkeypatch,
+    ):
+        """承認時 bg_completed 未 set (= BG LLM 進行中) なら on_approval_progressing
+        callback が 1 回発火する (Phase 0.5-D-d-2)。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+
+        progressing_calls: list[str] = []
+        manager = CharacterStatusManager()
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=lambda **kw: fake_thread,
+            on_approval_progressing=lambda slug: progressing_calls.append(slug),
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+        # 永久 wait しないように timeout 短縮
+        d._approval_bg_completed_timeout = 5.0
+
+        # Phase 1: 挙手 (bg_completed 未 set)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        assert progressing_calls == []
+
+        # Phase 2: approval (bg_completed 未 set のまま) → progressing callback 発火
+        d.on_approval_granted("mimi")
+        assert progressing_calls == ["mimi"]
+
+        # Phase 3: bg_completed.set() → daemon thread の wait 完了 → state pop
+        result = HandraiseBgResult(chunks=[], trace_id="t1")
+        d._bg_set_result("mimi", result)
+
+        for _ in range(50):
+            with d._lock:
+                if "mimi" not in d._handraise_states:
+                    break
+            time.sleep(0.01)
+        assert "mimi" not in d._handraise_states
+
+    def test_approval_granted_with_completed_bg_does_not_call_progressing(
+        self, monkeypatch,
+    ):
+        """承認時 bg_completed 既 set (= BG LLM 完了済) なら on_approval_progressing
+        callback は発火しない (Phase 0.5-D-d-2)。
+
+        通常ケース (= ルカが「準備完了 ✓」HUD を見てから approval) で progressing
+        フラグが立たないことを確認する。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+
+        progressing_calls: list[str] = []
+        manager = CharacterStatusManager()
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=lambda **kw: fake_thread,
+            on_approval_progressing=lambda slug: progressing_calls.append(slug),
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+
+        # Phase 1: 挙手 + BG LLM 完了通知 (= bg_completed.set 済の状態を作る)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d._bg_set_result("mimi", HandraiseBgResult(chunks=[], trace_id="t1"))
+
+        # Phase 2: approval (= bg_completed 済) → progressing callback 発火しない
+        d.on_approval_granted("mimi")
+        for _ in range(50):
+            with d._lock:
+                if "mimi" not in d._handraise_states:
+                    break
+            time.sleep(0.01)
+        assert "mimi" not in d._handraise_states
+        assert progressing_calls == []  # ★重要: progressing 経路を通っていない
+
+    def test_approval_granted_se_pending_does_not_call_progressing(self, monkeypatch):
+        """se_pending=True のキャラには on_approval_progressing は発火しない (★R4)。
+
+        RESPONDING 中に挙手したキャラの承認時、通常応答 TTS が再生中なので bridge
+        filler 投入で 3 重音声重なり (= UX 崩壊) を防ぐためのガード。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+
+        progressing_calls: list[str] = []
+        manager = CharacterStatusManager()
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=lambda **kw: fake_thread,
+            on_approval_progressing=lambda slug: progressing_calls.append(slug),
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+        d._approval_bg_completed_timeout = 5.0
+
+        # _start_handraise を起こしてから state.se_pending を手動で True に
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        with d._lock:
+            d._handraise_states["mimi"].se_pending = True
+
+        # approval (= bg_completed 未 set + se_pending=True) → progressing 発火しない
+        d.on_approval_granted("mimi")
+        # bg_completed.set で daemon thread を起こして state pop させる
+        d._bg_set_result("mimi", HandraiseBgResult(chunks=[], trace_id="t1"))
+
+        for _ in range(50):
+            with d._lock:
+                if "mimi" not in d._handraise_states:
+                    break
+            time.sleep(0.01)
+        assert progressing_calls == []  # ★R4: se_pending=True でガード
+
+    def test_approval_granted_timeout_proceeds(self, monkeypatch):
+        """bg_completed が timeout 内に set されない場合、daemon thread は timeout 経過
+        後に _approve_after_bg_complete を実行する (Phase 0.5-D-d-2)。
+
+        timeout を 0.1s に短縮して時間効率確保 (= 本番は 30s)。bg_completed が永遠に
+        未 set でも、timeout 経過で state pop + on_handraise_approved 発火 → run_loop
+        側で fallback パスに流れる経路 (= 真の救済)。
+        """
+        manager = CharacterStatusManager()
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=lambda **kw: fake_thread,
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+        # timeout 短縮 (= 本番 30s → テスト 0.1s)
+        d._approval_bg_completed_timeout = 0.1
+
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        d.on_approval_granted("mimi")
+
+        # bg_completed は永遠に未 set のまま、timeout 経過 (~ 0.1s) で state pop
+        for _ in range(50):
+            with d._lock:
+                if "mimi" not in d._handraise_states:
+                    break
+            time.sleep(0.01)
+        assert "mimi" not in d._handraise_states
