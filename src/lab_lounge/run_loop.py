@@ -993,6 +993,32 @@ def _create_handraise_runner_and_callbacks(
                         "step": "answering",
                         "text": answering_text,
                     }
+                    # Phase 0.5-D-d-3 (= A4): caller の TALKING を物理再生開始時に発火する
+                    # inline metadata。bg_chunks 経路 (= ask_character target chunks) と
+                    # 同じ設計を caller 側にも適用 (= ask_character.py:1004-1010 の target
+                    # chunks pattern を caller chunks に複製)。
+                    #
+                    # 【WHY: 物理再生時に発火する理由】
+                    # caller の TALKING は streaming spawn 起動直前に talking_metadata で
+                    # 1 回反映されている (= run_loop.py:957) が、これは bg_chunks 即時再生と
+                    # 同期した「caller が話し始める瞬間」を視聴者に届ける。tts_only chunks の
+                    # first (= caller の〆セリフ) が再生される瞬間に再度 TALKING を発火する
+                    # ことで、caller の〆セリフ pose と text を最新値で HUD に反映する
+                    # (= bg_chunks の first pose は導入セリフのもの、〆セリフは別 pose の可能性)。
+                    #
+                    # 【冪等性】set_status は同 status + 同 metadata なら no-op、status 一致でも
+                    # metadata (= pose / text) が異なれば publish される (= 仕様通り、
+                    # character_status.py:208-209)。pose=None + text 空文字列のケースでは
+                    # inline metadata 自体を omit (= 既存の TALKING 反映を維持、HUD 不変)。
+                    if pose is not None or answering_text:
+                        chunk["_pre_play_status"] = {
+                            "slug": slug,
+                            "status": "TALKING",
+                            "metadata": {
+                                "pose": pose if pose else None,
+                                "text": answering_text,
+                            },
+                        }
 
                 # streaming queue に動的追加 (= worker が並行で再生)
                 _streaming_queue.put(chunk)
