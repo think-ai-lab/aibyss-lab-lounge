@@ -609,6 +609,26 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
     on_tts_chunk = _on_tts_chunk_var.get()
     tts_output_dir = _tts_output_dir_var.get()
     use_real_tts = os.environ.get("L2_USE_REAL_TTS", "false").lower() in ("true", "1", "yes")
+    # Phase 0.5-D-d-4 (= 中間実走 7 回目で発見した実装漏れ修正):
+    # defer モード (= BG LLM 経路) フラグを冒頭で取得して TTS エントリポイント条件
+    # に組み込む。defer モードでは on_tts_chunk callback は使わず buffer 蓄積する
+    # 設計のため、on_tts_chunk=None でも TTS を起動する必要がある。
+    #
+    # 【WHY: IDLE 中挙手で on_tts_chunk=None になる経路】
+    # ルカが IDLE 中に発話 → 挙手判定 → bg_runner 起動 (= 別 thread)。
+    # bg_runner._body は run_loop の `_current_on_tts_chunk[0]` を ref 経由で取得
+    # するが、IDLE 中 (= ターン外) では [0] = 前回ターンの closure or None。
+    # その値が run_pipeline_llm_only(on_tts_chunk_ready=...) 経由で graph state に乗り、
+    # graph._generation_node の set_ask_character_context(on_tts_chunk=...) で
+    # contextvars に set される。結果として ask_character 内で on_tts_chunk=None。
+    #
+    # 旧条件 `if on_tts_chunk and use_real_tts and ...:` だと defer モードでも
+    # on_tts_chunk=None で TTS が完全 skip → buffer 蓄積 0 → 承認時 bg_chunks=0 →
+    # mimi 〆セリフのみ再生 (= 中間実走 7 回目 take1/take2 の問題)。
+    #
+    # 中間実走 1〜6 回目では bg_result=none で fallback パスに行っていたため
+    # 発覚せず、案 C リファクタ完了 + D-d で承認パスが正常化したことで初めて表面化。
+    defer_chunks = _defer_chunks_var.get()
 
     # 4a. 導入セリフを LLM 生成 (emotion JSON 付き) → TTS → 再生完了を待つ
     #     + 並行してちさめ LLM を開始 (待ち時間を最小化)
@@ -660,7 +680,10 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
     logger.info("ask_character 協働先 LLM 並行開始: %s", character_slug)
 
     # 4a-4. 導入セリフ TTS → 再生完了を待つ (並行して協働先 LLM が走る)
-    if on_tts_chunk and use_real_tts and caller_char and intro_response_text:
+    # Phase 0.5-D-d-4: defer モード (= BG LLM 経路) では on_tts_chunk=None でも
+    # TTS を起動する。callback は使わず _wrapped_intro_chunk_ready 内の defer 分岐で
+    # _append_bg_chunk により buffer 蓄積される (= D-3-b 設計)。
+    if (defer_chunks or on_tts_chunk) and use_real_tts and caller_char and intro_response_text:
         # Phase 0.5-B-β-2: cancel flag set されていれば導入セリフ TTS スキップ。
         # 既に却下/lapse されている場合 (= 稀だが、_generate_intro 中に挙手中
         # キャラが lapse する等) は導入セリフを流す意味がない。
@@ -780,13 +803,19 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         response_text = collab_result[0] or ""
 
     # 5. 協働先の応答を TTS 合成 + 再生キュー投入
-    if on_tts_chunk and use_real_tts:
+    # Phase 0.5-D-d-4: defer モード (= BG LLM 経路) では on_tts_chunk=None でも
+    # TTS を起動する。本応答 TTS chunks は _wrapped_on_chunk_ready 内の defer 分岐
+    # で _append_bg_chunk により buffer 蓄積、bridge filler は下の elif _is_defer_mode
+    # で chunk dict + inline metadata で buffer 蓄積される (= D-2/D-3-c 設計)。
+    if (defer_chunks or on_tts_chunk) and use_real_tts:
         from ..pipeline import _publish_bubble, _load_bubble_messages
 
         # Phase 0.5-D-3-c: defer モード判定をローカルにキャプチャ。
         # 5-a の即時 thinking 発火 (= 通常モード) と、bridge filler 投入の defer 分岐
         # (= D-3-c) で同じ判定値を使う。
-        _is_defer_mode = _defer_chunks_var.get()
+        # Phase 0.5-D-d-4: 上で取得した defer_chunks を再利用しても良いが、本ローカル
+        # 変数 _is_defer_mode は周辺コードで複数箇所参照されているため変数名は維持。
+        _is_defer_mode = defer_chunks
 
         # 5-a. target の "考え中" bubble を発行する (filler 再生中のテロップ用)。
         # graph.py の _generation_node が caller の thinking bubble を出すのと同じ仕組みで、
