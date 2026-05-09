@@ -960,7 +960,7 @@ class TestApprovedAnsweringBubbleInlineMetadata:
             spy_spawn_streaming,
         )
 
-        _, _, _, on_approved, _ = _create_handraise_runner_and_callbacks(
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
             session_stream_id="s1", session_id_root="ses1", stream_context=None,
         )
 
@@ -1016,19 +1016,21 @@ class TestHandraiseCloseFlow:
         defaults.update(overrides)
         return _create_handraise_runner_and_callbacks(**defaults)
 
-    def test_factory_returns_five_callables_including_on_handraise_close(self):
-        """factory 戻り値 tuple が 5 要素 (旧 4 + on_handraise_close) になる。
+    def test_factory_returns_six_callables_including_progressing(self):
+        """factory 戻り値 tuple が 6 要素 (Phase 0.5-D-d-2 で +1、旧 5 要素から拡張)。
 
-        WHY: β-2-3 で戻り値を 4 → 5 要素に拡張した。run_loop と既存テスト
-        (test_dispatcher_receives_phase7_callbacks) が unpack する側で同期更新
-        されているか保証する。
+        WHY: Phase 0.5-D-d-2 で戻り値を 5 → 6 要素に拡張した (= bridge filler 即時
+        再生 callback ``on_approval_progressing`` の追加)。run_loop と既存テスト
+        が unpack する側で同期更新されているか保証する。Phase 0.5-B-β-2 commit 3
+        で 4 → 5 要素にした拡張パターンを踏襲。
         """
-        bg_runner, on_started, on_release, on_approved, on_close = self._factory()
+        bg_runner, on_started, on_release, on_approved, on_close, on_progressing = self._factory()
         assert callable(bg_runner)
         assert callable(on_started)
         assert callable(on_release)
         assert callable(on_approved)
         assert callable(on_close)
+        assert callable(on_progressing)
 
     def test_on_handraise_close_invokes_cancel_bg_tts_and_drain(self, monkeypatch):
         """on_handraise_close 起動で cancel_bg_tts(session_id) + drain task 投入。
@@ -1050,7 +1052,7 @@ class TestHandraiseCloseFlow:
         playback_q: queue_mod.Queue = queue_mod.Queue()
         playback_ref: list = [playback_q]
 
-        _, _, _, _, on_close = self._factory(
+        _, _, _, _, on_close, _ = self._factory(
             session_id_root="ses1-test",
             playback_queue_ref=playback_ref,
         )
@@ -1141,7 +1143,7 @@ class TestLlmOnlyAskCharacterDenialDrain:
         playback_q: queue_mod.Queue = queue_mod.Queue()
         playback_ref: list = [playback_q]
 
-        _, _, _, _, on_close = _create_handraise_runner_and_callbacks(
+        _, _, _, _, on_close, _ = _create_handraise_runner_and_callbacks(
             session_stream_id="s1",
             session_id_root=session_id_root,
             stream_context=None,
@@ -1468,14 +1470,82 @@ class TestCreateHandraiseRunnerAndCallbacks:
         defaults.update(overrides)
         return _create_handraise_runner_and_callbacks(**defaults)
 
-    def test_returns_five_callables(self):
-        """factory 戻り値 tuple が 5 要素 (Phase 0.5-B-β-2 commit 3 で +1)。"""
-        bg_runner, on_started, on_release, on_approved, on_close = self._factory()
+    def test_returns_six_callables(self):
+        """factory 戻り値 tuple が 6 要素 (Phase 0.5-D-d-2 で +1、Phase 0.5-B-β-2
+        commit 3 の 5 要素から拡張)。"""
+        bg_runner, on_started, on_release, on_approved, on_close, on_progressing = self._factory()
         assert callable(bg_runner)
         assert callable(on_started)
         assert callable(on_release)
         assert callable(on_approved)
         assert callable(on_close)
+        assert callable(on_progressing)
+
+    # ─── Phase 0.5-D-d-2: on_approval_progressing テスト ────────────
+
+    def test_on_approval_progressing_calls_bridge_filler(self, monkeypatch):
+        """on_approval_progressing が target キャラの bridge filler を即時再生する
+        (Phase 0.5-D-d-2)。
+
+        ルカが「ミミ様、どうぞ」承認時に BG LLM 未完了の場合、dispatcher が本 callback
+        を発火 → run_loop が target キャラの bridge filler (4-8 秒程度の繋ぎセリフ) を
+        専用 mini playback worker で即時再生する経路。30 秒沈黙の配信事故レベル対処。
+        """
+        from pathlib import Path
+        spawn_calls: list[tuple] = []
+        select_calls: list[tuple] = []
+
+        def fake_select_filler(slug, category, *, last_index=-1):
+            select_calls.append((slug, category))
+            return Path("/tmp/bridge.wav"), 0
+
+        def fake_spawn(slug, phrase_path, padding_sec=0.0, **kw):
+            spawn_calls.append((slug, phrase_path, padding_sec))
+            return None
+
+        monkeypatch.setattr(
+            "lab_lounge.filler.select_filler_path", fake_select_filler,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
+        )
+
+        _, _, _, _, _, on_progressing = self._factory()
+        on_progressing("chisame")
+
+        # bridge category で select_filler_path が呼ばれる
+        assert select_calls == [("chisame", "bridge")]
+        # _spawn_handraise_phrase_playback が padding=0 で呼ばれる
+        assert spawn_calls == [("chisame", Path("/tmp/bridge.wav"), 0.0)]
+
+    def test_on_approval_progressing_no_bridge_filler_no_op(self, monkeypatch):
+        """bridge filler が存在しない (= select_filler_path が (None, -1) 返す)
+        場合、on_approval_progressing は no-op + 例外なし (Phase 0.5-D-d-2)。
+
+        WHY: filler ディレクトリが空 / カテゴリ未定義のキャラでも例外発生せず、
+        他経路 (= bg_completed.wait + 通常 fallback) は通常通り動く設計。
+        """
+        spawn_calls: list = []
+
+        def fake_select_filler(slug, category, *, last_index=-1):
+            return None, -1
+
+        def fake_spawn(slug, phrase_path, padding_sec=0.0, **kw):
+            spawn_calls.append(slug)
+            return None
+
+        monkeypatch.setattr(
+            "lab_lounge.filler.select_filler_path", fake_select_filler,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
+        )
+
+        _, _, _, _, _, on_progressing = self._factory()
+        on_progressing("mimi")  # 例外発生せず
+
+        # bridge filler なし → spawn 呼ばれない
+        assert spawn_calls == []
 
     def test_on_handraise_started_idle_calls_spawn(self, monkeypatch):
         """se_pending=False で _spawn_handraise_phrase_playback を呼ぶ (padding=0)。"""
@@ -1489,7 +1559,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
         )
-        _, on_started, _, _, _ = self._factory()
+        _, on_started, _, _, _, _ = self._factory()
         on_started("mimi", Path("/tmp/x.wav"), False)
         assert spawn_calls == [("mimi", Path("/tmp/x.wav"), 0.0)]
 
@@ -1501,7 +1571,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop._spawn_handraise_phrase_playback",
             lambda *a, **kw: spawn_calls.append(a),
         )
-        _, on_started, _, _, _ = self._factory()
+        _, on_started, _, _, _, _ = self._factory()
         on_started("mimi", Path("/tmp/x.wav"), True)
         assert spawn_calls == []
 
@@ -1518,7 +1588,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_phrase_playback", fake_spawn,
         )
-        _, _, on_release, _, _ = self._factory()
+        _, _, on_release, _, _, _ = self._factory()
         on_release("sakura", Path("/tmp/x.wav"))
         assert spawn_calls == [("sakura", Path("/tmp/x.wav"), 0.7)]
 
@@ -1567,7 +1637,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
 
         # bg_result.result.events に llm.final がある (= 案 W'-1 の実態に合わせて
         # Pydantic JSON 文字列形式)
@@ -1667,7 +1737,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
 
         # 実走で観察された JSON 文字列を再現 (= sakura の応答)
         raw_json = (
@@ -1745,7 +1815,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
 
         # JSON ではない生テキスト (= ダミー LLM モード等)
         plain_text = "ダミー応答: 最近のAI倫理について深く考えています。"
@@ -1781,7 +1851,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop._approved_synthesize_fallback",
             lambda slug, snap, trace, **kw: called.append((slug, snap, trace)),
         )
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
         on_approved("mimi", None, "snap", "trace-x")
         # daemon thread 内 fallback なのでポーリング待機
         for _ in range(40):
@@ -1800,7 +1870,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             lambda slug, snap, trace, **kw: called.append(slug),
         )
         bg = HandraiseBgResult(chunks=[], result=None, trace_id="x")
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -1828,7 +1898,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": ""}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -1866,7 +1936,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": "test"}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -1905,7 +1975,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             {"type": "llm.final", "payload": {"text": "test"}},
         ]
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="x")
-        _, _, _, on_approved, _ = self._factory()
+        _, _, _, on_approved, _, _ = self._factory()
         on_approved("mimi", bg, "snap", "trace-x")
         for _ in range(40):
             if called:
@@ -1939,7 +2009,7 @@ class TestCreateHandraiseRunnerAndCallbacks:
             "lab_lounge.run_loop.run_pipeline", fake_run_pipeline,
         )
 
-        bg_runner, _, _, _, _ = self._factory()
+        bg_runner, _, _, _, _, _ = self._factory()
         cancel_event = threading.Event()
         thread = bg_runner(
             target_slug="mimi",
@@ -2340,7 +2410,7 @@ class TestApprovedFlowLoggingProgression:
             "lab_lounge.run_loop.publish", lambda ev: None,
         )
 
-        _, _, _, on_approved, _ = _create_handraise_runner_and_callbacks(
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
             session_stream_id="s1", session_id_root="ses1", stream_context=None,
         )
 
@@ -2467,7 +2537,7 @@ class TestStatusManagerWiring:
     def test_create_factory_accepts_status_manager(self):
         """_create_handraise_runner_and_callbacks が status_manager 引数を受け取れる。"""
         manager = CharacterStatusManager()
-        bg_runner, on_started, on_phrase_pending, on_approved, on_close = (
+        bg_runner, on_started, on_phrase_pending, on_approved, on_close, on_progressing = (
             _create_handraise_runner_and_callbacks(
                 session_stream_id="s1",
                 session_id_root="ss1",
@@ -2483,7 +2553,7 @@ class TestStatusManagerWiring:
 
     def test_create_factory_status_manager_optional(self):
         """status_manager 引数なしでも factory が動く (= 既存テスト互換)。"""
-        bg_runner, on_started, on_phrase_pending, on_approved, on_close = (
+        bg_runner, on_started, on_phrase_pending, on_approved, on_close, on_progressing = (
             _create_handraise_runner_and_callbacks(
                 session_stream_id="s1",
                 session_id_root="ss1",

@@ -284,6 +284,7 @@ class Dispatcher:
             [str, "HandraiseBgResult | None", Any, str], None
         ] | None = None,
         on_handraise_close: Callable[[str, str], None] | None = None,
+        on_approval_progressing: Callable[[str], None] | None = None,
         status_manager: CharacterStatusManager | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
         max_age_sec: float = DRAIN_MAX_AGE_SEC,
@@ -327,6 +328,13 @@ class Dispatcher:
                 の bg_tts キャンセル + playback queue drain を実行し、案 A の音声漏れ
                 (= 挙手中に流れた対話 TTS が却下後も再生キューに残る問題) を最小化する。
                 None 時は通知スキップ (= 後方互換、Phase 0.5-A 以前と同じ挙動)。
+            on_approval_progressing: 承認 (``on_approval_granted``) 時に BG LLM が
+                未完了 (= ``state.bg_completed.is_set()`` が False) の場合に呼ばれる
+                callback (Phase 0.5-D-d-2)。引数 ``(target_slug,)`` で、run_loop が
+                「bridge filler を即時再生」して 30 秒 wait 中の沈黙を埋めるフック。
+                ``state.se_pending=True`` (= RESPONDING 中) のキャラには発火されない
+                (= 通常応答 TTS との 3 重音声重なり防止、★R4 対処)。None 時は通知
+                スキップ (= 後方互換、Phase 0.5-D-d 以前と同じ挙動)。
             status_manager: 全キャラのステータス (Ready/Thinking/ToolCalling/Raisehand/
                 Talking) を一元管理する CharacterStatusManager (Phase 0.5-B-α)。
                 本クラスは handraise 経路 (start / approval_granted / approval_denied /
@@ -362,11 +370,18 @@ class Dispatcher:
         # Phase 0.5-B-β-2: 却下/lapse 時の close 通知 callback。run_loop が
         # ask_character bg_tts キャンセル + playback queue drain を実行する。
         self._on_handraise_close = on_handraise_close
+        # Phase 0.5-D-d-2: 承認時 BG LLM 未完了 → bridge filler 即時再生 callback
+        # (run_loop が注入)。state.se_pending=True のキャラには発火しない。
+        self._on_approval_progressing = on_approval_progressing
         # Phase 0.5-B-α: 全キャラ状態を一元管理する Manager (handraise 経路で
         # Raisehand / Ready を反映)。None 時は status 反映スキップ (後方互換)。
         self._status_manager = status_manager
         self._max_events = max_events
         self._max_age_sec = max_age_sec
+        # Phase 0.5-D-d-2: bg_completed wait の timeout 値 (秒)。テスト時には
+        # monkeypatch で 0.1s 等に短縮して時間効率を保つ。本番は 30s で実 BG LLM
+        # 典型レイテンシ ~5-15 秒の 2 倍 (= API スロットル対応)。
+        self._approval_bg_completed_timeout: float = 30.0
 
         # Phase 0.5-A: 挙手機能の設定 (環境変数から 1 回だけ読み込む)
         # テストでは monkeypatch.setenv した後に Dispatcher() を生成すれば反映される
@@ -1035,16 +1050,81 @@ class Dispatcher:
         を抽出して、Lock 解除後に ``on_handraise_approved`` callback で run_loop に
         引き渡す。run_loop は bg_result.chunks を専用 mini playback worker で再生する。
         bg_result が None の場合は run_loop が同期 fallback (再生成) に流す。
+
+        【Phase 0.5-D-d-2: daemon thread 化】
+        承認時に BG LLM 未完了 (= bg_completed が未 set) の場合、daemon thread 内で
+        最大 30 秒 wait してから本処理 (= ``_approve_after_bg_complete``) を実行する。
+        これにより:
+        - approval 早すぎで BG LLM 進行中なら、完了を待ってから state pop + callback
+          (= bg_result が ready で本来の streaming spawn 経路を取れる)
+        - 完了済みなら wait は即 return (= 既存テストへの影響なし)
+        - timeout 30 秒経過で諦めて本処理 (= bg_result=None で fallback パス、真の救済)
+
+        さらに progressing 経路では ``on_approval_progressing`` callback を発火して
+        run_loop が bridge filler を即時再生する (= 30 秒沈黙の配信事故レベル対処)。
+        ただし ``state.se_pending=True`` (= RESPONDING 中) のキャラは発火しない
+        (= 通常応答 TTS との 3 重音声重なり UX 崩壊を防ぐ、★R4 対処)。
+
+        【WHY: daemon thread にする理由】
+        wake_event 処理スレッドが 30 秒ブロックされるのを避ける (= 次の wake_event
+        を処理できなくなるのを防ぐ)。bg_completed 即 set 済 (= 既存挙動) の場合は
+        wait() が即 return するため、daemon thread 起動コスト数 ms のみで結果同じ。
+        既存テストは polling pattern で対応可能 (= max 0.5s の polling で抜ける)。
         """
         if not self._use_handraise:
             return
+        with self._lock:
+            state = self._handraise_states.get(target_slug)
+            if state is None:
+                return  # 冪等 (既に granted/denied/lapse 済)
+            bg_completed_event = state.bg_completed
+            progressing = not bg_completed_event.is_set()
+            se_pending = state.se_pending  # ★R4: RESPONDING 中フラグ
+
+        # progressing 経路: bridge filler 即時再生 callback を発火
+        # ★R4 対処: RESPONDING 中 (= se_pending=True) のキャラは通常応答 TTS が再生中
+        # なので、bridge filler を投入すると 3 重音声重なり (通常応答 + handraise wav +
+        # bridge filler) の UX 崩壊。se_pending=False (= IDLE 中) のみ即時再生する。
+        if progressing and not se_pending and self._on_approval_progressing is not None:
+            try:
+                self._on_approval_progressing(target_slug)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "on_approval_progressing callback failed [character=%s]: %s",
+                    target_slug, exc,
+                )
+
+        # bg_completed 即 set 済 (= 既存挙動) なら wait() 即 return → 既存テスト無影響
+        # bg_completed 未 set (= BG LLM 進行中) なら wait(timeout=30s) で最大 30 秒待機
+        timeout_sec = self._approval_bg_completed_timeout
+
+        def _wait_and_approve() -> None:
+            bg_completed_event.wait(timeout=timeout_sec)
+            self._approve_after_bg_complete(target_slug)
+
+        threading.Thread(
+            target=_wait_and_approve,
+            name=f"approval-wait-{target_slug}",
+            daemon=True,
+        ).start()
+
+    def _approve_after_bg_complete(self, target_slug: str) -> None:
+        """bg_completed.wait 完了後の本処理 (Phase 0.5-D-d-2)。
+
+        既存 ``on_approval_granted`` のロジック (= state pop + cancel_event.set +
+        cooldown reset + READY 反映 + handraise.update publish + on_handraise_approved
+        callback 発火) をここに移植。daemon thread 内から呼ばれる。
+
+        ``state is None`` の場合は冪等 no-op (= wait 中に granted/denied/lapse が別
+        経路で発生した場合の race ガード)。
+        """
         bg_result = None
         transcript_snapshot = None
         trace_id = ""
         with self._lock:
             state = self._handraise_states.get(target_slug)
             if state is None:
-                return  # 冪等 (既に granted/denied/lapse 済)
+                return  # 冪等 (wait 中に別経路で削除された)
             state.cancel_event.set()  # BG LLM ベストエフォート cleanup
             if state.lapse_timer is not None:
                 state.lapse_timer.cancel()
@@ -1061,7 +1141,7 @@ class Dispatcher:
             "Dispatcher.on_approval_granted: slug=%s bg_result=%s",
             target_slug, "ready" if bg_result is not None else "none",
         )
-        # Phase 0.5-B-α: 承認時点で Raisehand → Ready に戻す。
+        # Phase 0.5-B-α: 承認時点で Raisehand_Ready → Ready に戻す。
         # WHY: 承認 → TTS chunks 生成 → 再生開始までに 2-3 秒の gap がある。その間
         # Ready (= ニュートラル) を維持する方が HUD の精度が上がる。Talking への
         # 上書きは run_loop の _spawn_handraise_response_playback で行われる。
