@@ -872,6 +872,174 @@ class TestBgChunkBuffers:
         assert len(_bg_chunk_buffers) == 0
 
 
+# ─── Phase 0.5-D-d-7: streaming queue ref + drain_and_register_streaming_queue ────
+
+
+class TestStreamingQueueIntegration:
+    """Phase 0.5-D-d-7: 承認後 streaming queue 即時投入機能のテスト。
+
+    【背景: 中間実走 9 回目 take 9-B で発覚した再生開始 27 秒遅延問題】
+    旧設計 (D-d-6 まで): 承認後 wait_deferred_bg_tts_complete で sakura TTS の全
+    chunks 合成完了 (= 27 秒) まで待ってから streaming spawn を起動。mimi 導入
+    セリフが既に合成済でも再生開始が 27 秒遅延 (logs/runs/run_loop_20260509_234753.log)。
+
+    【新設計】
+    - 承認直後に streaming spawn 起動 (= 初回 drain で取得した chunks を initial 投入)
+    - drain_and_register_streaming_queue で「以降の _append_bg_chunk は queue.put」
+      経路に切替 (= 合成完了次第 chunks が再生される)
+    - 新 API:
+      - set_streaming_queue_ref(session, queue) → queue ref 登録
+      - clear_streaming_queue_ref(session) → queue ref クリア
+      - drain_and_register_streaming_queue(session, queue) → atomic drain + put + register
+    """
+
+    def test_append_bg_chunk_no_queue_put_when_not_registered(self):
+        """queue ref 登録なし時、_append_bg_chunk は buffer 蓄積のみ (= 後方互換)。
+
+        D-d-7 修正で _append_bg_chunk に queue.put 経路を追加したが、queue ref が
+        未登録 (= 承認前の通常状態) では既存挙動を完全維持することを保証する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_chunk_buffers,
+        )
+        fake_q_calls: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                fake_q_calls.append(item)
+
+        # queue ref 未登録の状態 (= 承認前の通常パス)
+        _append_bg_chunk("sess-noref", {"url": "u1", "text": "t1"})
+        _append_bg_chunk("sess-noref", {"url": "u2", "text": "t2"})
+
+        # buffer 蓄積されている
+        assert len(_bg_chunk_buffers["sess-noref"]) == 2
+        # queue.put は呼ばれない (= 登録なし、後方互換)
+        assert fake_q_calls == []
+
+    def test_set_streaming_queue_ref_then_append_invokes_put(self):
+        """set_streaming_queue_ref 後の _append_bg_chunk は buffer + queue.put 両方実行。
+
+        承認後の streaming queue 直投入経路 (= D-d-7 の核機能、合成完了次第再生)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_chunk_buffers,
+            set_streaming_queue_ref,
+        )
+        fake_q_calls: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                fake_q_calls.append(item)
+
+        q = _FakeQueue()
+        set_streaming_queue_ref("sess-reg", q)
+
+        chunk1 = {"url": "u1", "text": "t1"}
+        chunk2 = {"url": "u2", "text": "t2"}
+        _append_bg_chunk("sess-reg", chunk1)
+        _append_bg_chunk("sess-reg", chunk2)
+
+        # buffer 蓄積 (= 既存挙動維持)
+        assert _bg_chunk_buffers["sess-reg"] == [chunk1, chunk2]
+        # queue.put も呼ばれる (= D-d-7 新動作)
+        assert fake_q_calls == [chunk1, chunk2]
+
+    def test_drain_and_register_atomic_drain_and_put(self):
+        """drain_and_register_streaming_queue は drain + put + register を atomic に行う。
+
+        Lock 内で全 step を実行することで、bg_tts daemon thread の _append_bg_chunk
+        との順序競合を防ぐ (= 漏れ + 重複なし)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_chunk_buffers,
+            drain_and_register_streaming_queue,
+        )
+        fake_q_calls: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                fake_q_calls.append(item)
+
+        # 事前 buffer 蓄積 (= queue ref 登録前、bg_tts daemon thread 経由を想定)
+        chunk_a = {"url": "ua", "text": "a"}
+        chunk_b = {"url": "ub", "text": "b"}
+        _append_bg_chunk("sess-atomic", chunk_a)
+        _append_bg_chunk("sess-atomic", chunk_b)
+        assert _bg_chunk_buffers["sess-atomic"] == [chunk_a, chunk_b]
+
+        # atomic API で drain + put + register
+        q = _FakeQueue()
+        drained = drain_and_register_streaming_queue("sess-atomic", q)
+
+        # drained chunks が返る (= 情報用)
+        assert drained == [chunk_a, chunk_b]
+        # buffer は空になっている (= drain 完了)
+        assert "sess-atomic" not in _bg_chunk_buffers
+        # queue.put 済 (= API 内で実行)
+        assert fake_q_calls == [chunk_a, chunk_b]
+
+        # register 後の _append_bg_chunk は queue.put される (= 経路切替)
+        chunk_c = {"url": "uc", "text": "c"}
+        _append_bg_chunk("sess-atomic", chunk_c)
+        assert fake_q_calls == [chunk_a, chunk_b, chunk_c]
+        # buffer も蓄積されている (= 後方互換)
+        assert _bg_chunk_buffers["sess-atomic"] == [chunk_c]
+
+    def test_clear_streaming_queue_ref_stops_put(self):
+        """clear_streaming_queue_ref 後の _append_bg_chunk は queue.put しない (= 解除)。
+
+        cancel_bg_tts 経路 / エラー時の cleanup でクリアできることを保証。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk,
+            set_streaming_queue_ref,
+            clear_streaming_queue_ref,
+        )
+        fake_q_calls: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                fake_q_calls.append(item)
+
+        q = _FakeQueue()
+        set_streaming_queue_ref("sess-clr", q)
+        _append_bg_chunk("sess-clr", {"url": "u1"})
+        assert len(fake_q_calls) == 1
+
+        # clear 後は queue.put しない
+        clear_streaming_queue_ref("sess-clr")
+        _append_bg_chunk("sess-clr", {"url": "u2"})
+        assert len(fake_q_calls) == 1  # 増えない
+
+    def test_reset_session_state_clears_streaming_queue_ref(self):
+        """_reset_session_state (= ターン開始時) で streaming queue ref もクリーンされる。
+
+        前ターンの ref が次ターンに漏れて意図しない queue.put を起こさないことを保証。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _reset_session_state,
+            set_streaming_queue_ref, _streaming_queue_refs,
+        )
+        fake_q_calls: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                fake_q_calls.append(item)
+
+        q = _FakeQueue()
+        set_streaming_queue_ref("sess-rst", q)
+        assert "sess-rst" in _streaming_queue_refs
+
+        # ターン開始時の reset
+        _reset_session_state("sess-rst")
+        assert "sess-rst" not in _streaming_queue_refs
+
+        # reset 後の _append_bg_chunk は queue.put しない
+        _append_bg_chunk("sess-rst", {"url": "u1"})
+        assert fake_q_calls == []
+
+
 class TestDeferChunksMode:
     """Phase 0.5-D-1b: defer_chunks フラグによる _wrapped_on_chunk_ready 分岐テスト。
 
