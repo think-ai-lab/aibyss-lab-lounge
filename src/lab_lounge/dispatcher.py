@@ -931,11 +931,32 @@ class Dispatcher:
             target_slug, phrase_text, state.trace_id, state.se_pending,
         )
         # Phase 0.5-B-α: 挙手状態を CharacterStatusManager に反映 (HUD 用)。
-        # publish 順序: status.update (Ready→Raisehand) → bubble.update(handraise) →
-        # handraise.update。HUD 側は status.update を先に観察してから bubble の
-        # 詳細を処理する流れと整合。
+        # publish 順序: status.update → bubble.update(handraise) → handraise.update。
+        # HUD 側は status.update を先に観察してから bubble の詳細を処理する流れと整合。
+        #
+        # Phase 0.5-D-d-1: RAISEHAND → RAISEHAND_PROGRESSING (= bg_runner 起動と同
+        # タイミング、HUD で「先行思考中」ローディング表示)。
+        #
+        # bg_runner=None または bg_runner 起動失敗の経路では bg_completed が既に
+        # set() 済 (上の Lock 内 / except 経路) なので、その場合は直後に
+        # RAISEHAND_READY も反映して HUD を「準備完了」表示に進める (= 構造的に
+        # 「PROGRESSING → READY」の自然遷移を維持、テスト経路 + 起動失敗時のフォール
+        # バック経路含む)。実 BG LLM が動く経路では _bg_set_result の完了時に
+        # RAISEHAND_READY が反映される (= こちらは独立経路、無関係)。
         if self._status_manager is not None:
-            self._status_manager.set_status(target_slug, CharacterStatus.RAISEHAND)
+            self._status_manager.set_status(
+                target_slug, CharacterStatus.RAISEHAND_PROGRESSING,
+            )
+            # bg_completed が既に set 済 (= bg_runner=None / 起動失敗) なら READY 反映
+            with self._lock:
+                state_now = self._handraise_states.get(target_slug)
+                bg_already_completed = (
+                    state_now is not None and state_now.bg_completed.is_set()
+                )
+            if bg_already_completed:
+                self._status_manager.set_status(
+                    target_slug, CharacterStatus.RAISEHAND_READY,
+                )
         # publish + 物理通知も Lock 外 (callback の長時間処理が dispatcher を止めない)
         self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="handraise")
         self._publish_handraise_update()
@@ -973,6 +994,19 @@ class Dispatcher:
                 return
             state.bg_result = result
             state.bg_completed.set()
+        # Phase 0.5-D-d-1: BG LLM 完了 → RAISEHAND_READY 反映。
+        # WHY: bg_completed.set() の直後 (= 承認 callback がアクセス可能になった瞬間)
+        # に反映することで、HUD は「考え中 → 準備完了」の遷移を即時観察できる。
+        # ルカは HUD のグリーンチェックを目視で確認してから approval を発する判断材料
+        # にできる (= 「approval 早すぎ」を構造的に避けやすくなる)。
+        # state pop 後の race (= granted/denied/lapse 直後の set 呼出) は既存 dict
+        # ガード経路で _publish_handraise_update が冪等 no-op になるが、status_manager
+        # は削除済キャラに RAISEHAND_READY を反映する。これは直後の granted/denied/
+        # lapse で READY に上書きされるので害なし (= 短時間の不整合のみ、許容範囲)。
+        if self._status_manager is not None:
+            self._status_manager.set_status(
+                target_slug, CharacterStatus.RAISEHAND_READY,
+            )
         self._publish_handraise_update()
 
     def on_interjection_candidate(

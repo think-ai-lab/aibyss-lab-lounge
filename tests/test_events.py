@@ -731,8 +731,13 @@ class TestCharacterStatusUpdate:
         assert "stream_idx" not in ev
 
     def test_status_values_serialize(self):
-        """5 値 (ready/thinking/tool_calling/raisehand/talking) すべて schema 通る。"""
-        for status_value in ["ready", "thinking", "tool_calling", "raisehand", "talking"]:
+        """7 値すべて schema 通る (Phase 0.5-D-d-1 で raisehand_progressing /
+        raisehand_ready を追加、5 → 7 値)。"""
+        for status_value in [
+            "ready", "thinking", "tool_calling",
+            "raisehand", "raisehand_progressing", "raisehand_ready",
+            "talking",
+        ]:
             ev = build_character_status_update(
                 character="mimi", status=status_value, **COMMON,
             )

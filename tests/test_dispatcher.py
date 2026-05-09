@@ -1838,12 +1838,23 @@ class TestDispatcherStatusManager:
         d = Dispatcher()
         assert d._status_manager is None
 
-    def test_start_handraise_sets_raisehand(self, monkeypatch):
-        """_start_handraise (on_interjection_candidate 経由) で RAISEHAND が反映される。"""
+    def test_start_handraise_sets_raisehand_progressing(self, monkeypatch):
+        """_start_handraise で RAISEHAND_PROGRESSING が反映される (Phase 0.5-D-d-1)。
+
+        bg_runner=None の場合、bg_completed が即 set 済になり、_start_handraise の
+        末尾で RAISEHAND_PROGRESSING → RAISEHAND_READY への即時遷移が走る (= 構造的に
+        テスト経路 / 起動失敗時のフォールバック経路を維持)。本テストは bg_runner=None で
+        最終状態が RAISEHAND_READY になることを確認する (= 旧テストの RAISEHAND 期待値
+        の置換、5 → 7 値拡張)。
+
+        実 BG LLM 経路 (= bg_runner 注入で bg_completed が _bg_set_result まで未 set)
+        の挙動は test_bg_set_result_transitions_to_raisehand_ready で別途検証する。
+        """
         manager = CharacterStatusManager()
         d = self._make_dispatcher(manager, monkeypatch)
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
-        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+        # bg_runner=None なので bg_completed 即 set 済 → 最終状態は RAISEHAND_READY
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
 
     def test_approval_granted_resets_to_ready(self, monkeypatch):
         """on_approval_granted で Manager に READY が反映される (Raisehand → Ready)。"""
@@ -1869,22 +1880,100 @@ class TestDispatcherStatusManager:
         d.on_lapse_timeout("mimi")
         assert manager.get_status("mimi") == CharacterStatus.READY
 
+    # ─── Phase 0.5-D-d-1: 新ステータス遷移テスト ────────────────────
+
+    def test_bg_set_result_transitions_to_raisehand_ready(self, monkeypatch):
+        """_bg_set_result で BG LLM 完了通知 → RAISEHAND_PROGRESSING →
+        RAISEHAND_READY 遷移する (Phase 0.5-D-d-1)。
+
+        実 BG LLM 経路 (= bg_runner 注入で bg_completed が _bg_set_result まで未 set)
+        で、BG LLM 完了時の状態遷移を検証。
+        """
+        from lab_lounge.dispatcher import HandraiseBgResult
+        manager = CharacterStatusManager()
+        # bg_runner 注入で bg_completed が _bg_set_result まで未 set の状態を作る
+        fake_thread = MagicMock(spec=threading.Thread)
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=lambda **kw: fake_thread,
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+
+        # Phase 1: 挙手 → RAISEHAND_PROGRESSING (bg_completed 未 set)
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_PROGRESSING
+
+        # Phase 2: BG LLM 完了通知 → RAISEHAND_READY
+        result = HandraiseBgResult(chunks=[], trace_id="t1")
+        d._bg_set_result("mimi", result)
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
+
+    def test_bg_runner_exception_transitions_to_raisehand_ready(self, monkeypatch):
+        """bg_runner 起動失敗時、bg_completed 即 set → RAISEHAND_READY 即遷移
+        (Phase 0.5-D-d-1)。
+
+        bg_runner で例外が発生した場合、_start_handraise の except 経路で
+        bg_completed.set() され、その直後の status 反映で RAISEHAND_PROGRESSING →
+        RAISEHAND_READY の遷移が走る (= HUD では「準備完了」表示で承認待ち)。
+        """
+        manager = CharacterStatusManager()
+
+        def failing_runner(**kw):
+            raise RuntimeError("BG runner intentional failure")
+
+        d = Dispatcher(
+            status_manager=manager,
+            bg_runner=failing_runner,
+        )
+        monkeypatch.setattr(
+            d, "_create_lapse_timer",
+            lambda slug, sec: _FakeTimer(sec, lambda: None),
+        )
+
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+        # bg_runner 起動失敗 → bg_completed 即 set → RAISEHAND_READY 反映
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
+
     def test_callback_fires_on_raisehand_to_ready(self, monkeypatch):
-        """Manager の on_status_changed callback が遷移で発火する (metadata=None)。"""
+        """Manager の on_status_changed callback が遷移で発火する (metadata=None)。
+
+        Phase 0.5-D-d-1: bg_runner=None の場合、bg_completed 即 set 済で
+        RAISEHAND_PROGRESSING → RAISEHAND_READY への即時遷移が走るため、callback は
+        3 回発火する (ready → raisehand_progressing → raisehand_ready → ready)。
+        """
         callback = MagicMock()
         manager = CharacterStatusManager(on_status_changed=callback)
         d = self._make_dispatcher(manager, monkeypatch)
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
         d.on_approval_granted("mimi")
-        # 2 回 callback 発火: ready→raisehand, raisehand→ready
-        assert callback.call_count == 2
+        # 3 回 callback 発火 (Phase 0.5-D-d-1):
+        #   ready → raisehand_progressing
+        #   raisehand_progressing → raisehand_ready (bg_completed 即 set 済)
+        #   raisehand_ready → ready (承認時)
+        assert callback.call_count == 3
         first_call = callback.call_args_list[0]
         assert first_call.args == (
-            "mimi", CharacterStatus.RAISEHAND, CharacterStatus.READY, None,
+            "mimi",
+            CharacterStatus.RAISEHAND_PROGRESSING,
+            CharacterStatus.READY,
+            None,
         )
         second_call = callback.call_args_list[1]
         assert second_call.args == (
-            "mimi", CharacterStatus.READY, CharacterStatus.RAISEHAND, None,
+            "mimi",
+            CharacterStatus.RAISEHAND_READY,
+            CharacterStatus.RAISEHAND_PROGRESSING,
+            None,
+        )
+        third_call = callback.call_args_list[2]
+        assert third_call.args == (
+            "mimi",
+            CharacterStatus.READY,
+            CharacterStatus.RAISEHAND_READY,
+            None,
         )
 
     # ─── Phase 0.5-B-β-3 commit 3: 同一キャラ挙手の防止 ────────────────
@@ -1928,6 +2017,7 @@ class TestDispatcherStatusManager:
 
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
 
-        # 期待: RAISEHAND に遷移 (= 既存挙動、β-3-3 ガード未抵触)
-        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+        # 期待: RAISEHAND_PROGRESSING → RAISEHAND_READY に遷移 (Phase 0.5-D-d-1、
+        # bg_runner=None なので bg_completed 即 set 済 → 即遷移、β-3-3 ガード未抵触)
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
         assert "mimi" in d._handraise_states

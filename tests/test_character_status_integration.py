@@ -57,16 +57,24 @@ class TestHandraiseToTalkingFlow:
     """
 
     def test_handraise_approval_to_talking_with_metadata(self, monkeypatch):
-        """Raisehand → Ready (一瞬) → Talking (metadata 付き) → Ready の遷移を検証。"""
+        """Raisehand_Progressing → Raisehand_Ready → Ready → Talking (metadata 付き)
+        → Ready の遷移を検証 (Phase 0.5-D-d-1 で 5 回 publish に拡張)。
+
+        bg_runner=None の場合、bg_completed 即 set 済 → _start_handraise の末尾で
+        RAISEHAND_PROGRESSING → RAISEHAND_READY の即時遷移が起きるため、callback は
+        2 回追加発火する (= 5 回 publish: progressing 反映 + ready 反映 + 承認後 ready
+        + talking + worker finally の ready)。
+        """
         callback = MagicMock()
         manager = CharacterStatusManager(on_status_changed=callback)
 
-        # Phase 1: Dispatcher で挙手 → Raisehand
+        # Phase 1: Dispatcher で挙手 → RAISEHAND_PROGRESSING → RAISEHAND_READY
+        # (bg_runner=None で bg_completed 即 set 済、即時遷移)
         d = _make_dispatcher_with_status(monkeypatch, manager)
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
-        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
 
-        # Phase 2: 承認 → Raisehand → Ready
+        # Phase 2: 承認 → Raisehand_Ready → Ready
         d.on_approval_granted("mimi")
         assert manager.get_status("mimi") == CharacterStatus.READY
 
@@ -89,24 +97,27 @@ class TestHandraiseToTalkingFlow:
         # Phase 4: worker finally で Ready に戻る
         assert manager.get_status("mimi") == CharacterStatus.READY
 
-        # callback 履歴で全遷移を検証
-        # READY → RAISEHAND → READY → TALKING → READY の 4 回 publish
+        # callback 履歴で全遷移を検証 (Phase 0.5-D-d-1 で 5 回 publish に拡張)
+        # READY → RAISEHAND_PROGRESSING → RAISEHAND_READY → READY → TALKING → READY
         calls = callback.call_args_list
-        assert len(calls) == 4
+        assert len(calls) == 5
 
-        # 1: ready → raisehand
-        assert calls[0].args[1] == CharacterStatus.RAISEHAND
+        # 1: ready → raisehand_progressing
+        assert calls[0].args[1] == CharacterStatus.RAISEHAND_PROGRESSING
         assert calls[0].args[2] == CharacterStatus.READY
-        # 2: raisehand → ready (承認時)
-        assert calls[1].args[1] == CharacterStatus.READY
-        assert calls[1].args[2] == CharacterStatus.RAISEHAND
-        # 3: ready → talking (with metadata)
-        assert calls[2].args[1] == CharacterStatus.TALKING
-        assert calls[2].args[2] == CharacterStatus.READY
-        assert calls[2].args[3] == talking_metadata
-        # 4: talking → ready (worker finally)
-        assert calls[3].args[1] == CharacterStatus.READY
-        assert calls[3].args[2] == CharacterStatus.TALKING
+        # 2: raisehand_progressing → raisehand_ready (bg_completed 即 set 済)
+        assert calls[1].args[1] == CharacterStatus.RAISEHAND_READY
+        assert calls[1].args[2] == CharacterStatus.RAISEHAND_PROGRESSING
+        # 3: raisehand_ready → ready (承認時)
+        assert calls[2].args[1] == CharacterStatus.READY
+        assert calls[2].args[2] == CharacterStatus.RAISEHAND_READY
+        # 4: ready → talking (with metadata)
+        assert calls[3].args[1] == CharacterStatus.TALKING
+        assert calls[3].args[2] == CharacterStatus.READY
+        assert calls[3].args[3] == talking_metadata
+        # 5: talking → ready (worker finally)
+        assert calls[4].args[1] == CharacterStatus.READY
+        assert calls[4].args[2] == CharacterStatus.TALKING
 
 
 # ─── シナリオ 2: 並行 handraise (= 2 キャラ独立管理) ─────────────
@@ -133,15 +144,16 @@ class TestConcurrentCharacterStates:
         # Step 2: 並行で mimi が挙手
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
 
-        # 両キャラの状態が独立に保持されていること
+        # 両キャラの状態が独立に保持されていること (Phase 0.5-D-d-1: bg_runner=None
+        # なので mimi は RAISEHAND_READY、bg_completed 即 set 済の経路)
         assert manager.get_status("chisame") == CharacterStatus.TALKING
-        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
 
         # metadata も独立保持
         chisame_meta = manager.get_metadata("chisame")
         assert chisame_meta is not None
         assert chisame_meta["pose"] == "neutral"
-        assert manager.get_metadata("mimi") is None  # Raisehand は metadata なし
+        assert manager.get_metadata("mimi") is None  # Raisehand 系は metadata なし
 
     def test_get_snapshot_dashboard_view(self, monkeypatch):
         """HUD dashboard 用: 全キャラの状態を 1 回の get_snapshot で取得できる。"""
@@ -159,11 +171,12 @@ class TestConcurrentCharacterStates:
         # snapshot で全キャラ取得
         snap = manager.get_snapshot()
 
-        # 3 キャラすべて含まれる
+        # 3 キャラすべて含まれる (Phase 0.5-D-d-1: bg_runner=None なので mimi は
+        # raisehand_ready、bg_completed 即 set 済の経路)
         assert set(snap.keys()) == {"chisame", "mimi", "sakura"}
         assert snap["chisame"]["status"] == "talking"
         assert snap["chisame"]["metadata"]["pose"] == "smile"
-        assert snap["mimi"]["status"] == "raisehand"
+        assert snap["mimi"]["status"] == "raisehand_ready"
         assert snap["mimi"]["metadata"] is None
         assert snap["sakura"]["status"] == "thinking"
         assert snap["sakura"]["metadata"] is None
@@ -247,9 +260,12 @@ class TestPublishOrder:
 
         d.on_interjection_candidate("mimi", transcript_snapshot=None)
 
-        # 順序: status.update (raisehand) → bubble.update(handraise) → handraise.update
+        # 順序 (Phase 0.5-D-d-1): status.update (raisehand_progressing) →
+        # status.update (raisehand_ready, bg_runner=None で即遷移) →
+        # bubble.update(handraise) → handraise.update
         assert publish_log == [
-            "status.update:mimi:raisehand",
+            "status.update:mimi:raisehand_progressing",
+            "status.update:mimi:raisehand_ready",
             "bubble.update:handraise",
             "handraise.update",
         ]

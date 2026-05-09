@@ -3,8 +3,11 @@ character_status.py — キャラクターステータス管理 (Phase 0.5-B-α)
 
 責務:
   - 全キャラクター (mimi / chisame / sakura / octamaid / ruka 等) の内部状態を
-    一元管理する。状態は CharacterStatus enum の 5 値:
-      Ready / Thinking / ToolCalling / Raisehand / Talking
+    一元管理する。状態は CharacterStatus enum の 7 値:
+      Ready / Thinking / ToolCalling / Raisehand / Raisehand_Progressing /
+      Raisehand_Ready / Talking
+    (Raisehand_Progressing / Raisehand_Ready は Phase 0.5-D-d で追加。
+     BG LLM 進捗の HUD 視覚化 + 承認時の待ち合わせ用に挙手中状態を細分化)
   - 状態 + metadata を atomic に取得できる get_snapshot() を提供
     (HUD dashboard が「全キャラの現在状態」を一覧表示するための土台)
   - 状態変化時に subscriber callback を発火 (= bus への character.status.update
@@ -49,22 +52,35 @@ class CharacterStatus(str, Enum):
     比較も `status == "thinking"` のように文字列直接比較が動く。
 
     各値の意味:
-      READY:        応答可能、スタンバイ状態 (default)
-      THINKING:     LLM 推論中 (graph._generation_node の入口で反映、Phase 0.5-B-α
-                    commit 5 で配線)
-      TOOL_CALLING: ask_character / web_search / retrieve_memory 等のツール実行中
-                    (BubbleToolCallbackHandler.on_tool_start で反映、commit 5)
-      RAISEHAND:    挙手中 (Dispatcher._start_handraise で反映、
-                    on_approval_granted/denied/lapse で Ready に戻る、commit 3)
-      TALKING:      TTS chunk 物理再生中 (run_loop の _on_tts_chunk 第 1 chunk +
-                    _spawn_handraise_response_playback で反映、
-                    _bg_cleanup_pipeline / worker finally で Ready に戻る、commit 4)
+      READY:                 応答可能、スタンバイ状態 (default)
+      THINKING:              LLM 推論中 (graph._generation_node の入口で反映、
+                             Phase 0.5-B-α commit 5 で配線)
+      TOOL_CALLING:          ask_character / web_search / retrieve_memory 等のツール
+                             実行中 (BubbleToolCallbackHandler.on_tool_start で反映、
+                             commit 5)
+      RAISEHAND:             挙手中 (Phase 0.5-A 系の互換維持用、enum 値として残すが
+                             Phase 0.5-D-d 以降の新規コードでは RAISEHAND_PROGRESSING
+                             / RAISEHAND_READY を使う)
+      RAISEHAND_PROGRESSING: 挙手中 + BG LLM 推論中 (Phase 0.5-D-d、
+                             Dispatcher._start_handraise で反映)。HUD では「先行思考中」
+                             ローディング表示の根拠 → ルカは approval 早すぎを目で避け
+                             られる。
+      RAISEHAND_READY:       挙手中 + BG LLM 完了済 (Phase 0.5-D-d、
+                             Dispatcher._bg_set_result の bg_completed.set() 直後に反映)。
+                             HUD では「承認待ち (準備完了 ✓)」表示で、ルカが approval
+                             ボタンを押す視覚的タイミング材料。
+      TALKING:               TTS chunk 物理再生中 (run_loop の _on_tts_chunk 第 1
+                             chunk + _spawn_handraise_response_playback で反映、
+                             _bg_cleanup_pipeline / worker finally で Ready に戻る、
+                             commit 4)
     """
 
     READY = "ready"
     THINKING = "thinking"
     TOOL_CALLING = "tool_calling"
     RAISEHAND = "raisehand"
+    RAISEHAND_PROGRESSING = "raisehand_progressing"
+    RAISEHAND_READY = "raisehand_ready"
     TALKING = "talking"
 
 
