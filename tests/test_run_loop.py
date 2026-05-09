@@ -767,6 +767,81 @@ class TestApprovedSynthesizeFallbackCancelBgTts:
         )
 
 
+class TestApprovedAnsweringBubbleInlineMetadata:
+    """Phase 0.5-D-3 follow-up: 承認時 answering bubble の inline metadata 化テスト。
+
+    旧設計では approval 直後に bubble.update("answering") を事前 publish していたが、
+    物理再生開始の 21 秒前に bubble 表示されるフライング UX 不具合 (= 中間実走 3 回目で
+    観察) があった。本テストは:
+    - tts_only chunks の first chunk に `_pre_play_bubble` inline metadata が
+      埋め込まれることを検証 (= 物理再生時 worker が発火する設計に移行済)
+    """
+
+    def test_first_tts_only_chunk_has_pre_play_bubble_answering(self, monkeypatch):
+        """on_handraise_approved の tts_only chunks first に answering bubble inline 埋込。
+
+        WHY: 物理再生開始時に「caller (= mimi) が話し始めた」bubble が発火されることを
+        担保。approval 直後の事前 publish (= 旧設計) を廃止する代替経路として機能する。
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        # _spawn_handraise_response_playback を spy 化、chunks を捕捉
+        captured_chunks: list = []
+
+        def spy_spawn(slug, chunks, *args, **kwargs):
+            captured_chunks.extend(chunks)
+            return MagicMock()
+
+        # run_pipeline_tts_only mock: on_chunk を 2 回呼ぶ
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "first text", False, "mimi", None)
+                on_tts_chunk_ready("u2", "second text", True, "mimi", None)
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            spy_spawn,
+        )
+
+        _, _, _, on_approved, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": "ありがとう、ルカ。"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        # daemon thread の完了を待つ
+        for _ in range(40):
+            if captured_chunks:
+                break
+            time.sleep(0.05)
+
+        assert len(captured_chunks) == 2, (
+            f"tts_only chunks 2 件が spawn に渡される (実際: {captured_chunks})"
+        )
+        # first chunk に _pre_play_bubble (= answering) が埋め込まれている
+        first = captured_chunks[0]
+        bubble = first.get("_pre_play_bubble")
+        assert bubble is not None, (
+            f"first chunk に _pre_play_bubble が必要 (実際: {first})"
+        )
+        assert bubble["slug"] == "mimi"
+        assert bubble["step"] == "answering"
+        assert bubble["text"] == "ありがとう、ルカ。"  # = answering_text
+        # 後続 chunk には inline metadata なし (= 1 度だけ発火、冪等保護)
+        assert captured_chunks[1].get("_pre_play_bubble") is None
+
+
 class TestHandraiseCloseFlow:
     """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
 

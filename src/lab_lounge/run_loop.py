@@ -766,23 +766,23 @@ def _create_handraise_runner_and_callbacks(
             ).start()
             return
 
-        # bubble.update("answering") を発行 (TTS 開始直前タイミング)
-        # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech" (UI 一貫性優先)。
-        try:
-            event = build_bubble_update(
-                character=slug,
-                step="answering",
-                text=answering_text,
-                stream_id=session_stream_id,
-                session_id=session_id_root,
-                trace_id=bg_trace_id,
-                category="speech",
-            )
-            publish(event)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "bubble.update(answering) from approval publish 失敗: %s", exc,
-            )
+        # Phase 0.5-D-3 follow-up: 事前 bubble.update("answering") publish 廃止。
+        #
+        # 【WHY: 物理再生時に発火する設計に移行】
+        # 旧設計では approval 直後 (= TTS 合成 + chunks 投入の 21 秒前) に answering
+        # bubble を publish していた。中間実走 3 回目 (logs/runs/run_loop_20260509_184653.log)
+        # で「approval 直後に〆セリフ text が bubble 表示」(= 物理再生は導入セリフから
+        # 始まるのに) フライング UX 不具合として観察された。
+        #
+        # 【新設計】
+        # tts_only chunks (= caller の〆セリフ) の first chunk に `_pre_play_bubble`
+        # inline metadata を埋め込み、物理再生開始時 (= playback worker が pop した
+        # 直後) に発火する。これにより「視聴者が caller の〆セリフ text を見る瞬間」
+        # と「実際に caller が〆セリフを話し始める瞬間」が同期する (= D-3-c で
+        # bridge filler に対して同様に行った設計を caller の〆 chunks にも適用)。
+        #
+        # bg_chunks (= 導入セリフ + bridge + 本応答) は ask_character 内の inline
+        # metadata 経路で発火される (= D-3-b/D-3-c)。
 
         # TTS-only graph で TTS 実行 + chunks 蓄積 → playback worker (daemon thread)
         def _tts_and_play() -> None:
@@ -811,9 +811,19 @@ def _create_handraise_runner_and_callbacks(
                 )
 
             chunks: list[dict] = []
+            # Phase 0.5-D-3 follow-up: tts_only chunks の first に answering bubble の
+            # inline metadata を埋め込むため first 判定 closure 変数を保持する。
+            _first_tts_only_chunk_seen = [False]
 
             def on_chunk(url, chunk_text, is_last, character, pose=None):
-                """on_tts_chunk_ready 用、chunks 蓄積。"""
+                """on_tts_chunk_ready 用、chunks 蓄積 + first chunk に answering bubble inline 埋込。
+
+                旧設計では approval 直後に bubble.update("answering") を事前 publish して
+                いたが、物理再生開始の 21 秒前に bubble 表示されるフライング UX 不具合
+                があった (= 中間実走 3 回目で観察)。本関数で first tts_only chunk に
+                `_pre_play_bubble` inline metadata を埋め込み、物理再生開始時に
+                playback worker が発火する経路に移行する。
+                """
                 chunk: dict = {
                     "url": url,
                     "text": chunk_text,
@@ -822,6 +832,18 @@ def _create_handraise_runner_and_callbacks(
                 }
                 if pose is not None:
                     chunk["pose"] = pose
+
+                # Phase 0.5-D-3 follow-up: first tts_only chunk のみに caller (= slug)
+                # の answering bubble を inline metadata で埋込
+                # (= 旧設計の事前 publish の代替経路)。
+                if not _first_tts_only_chunk_seen[0]:
+                    _first_tts_only_chunk_seen[0] = True
+                    chunk["_pre_play_bubble"] = {
+                        "slug": slug,
+                        "step": "answering",
+                        "text": answering_text,
+                    }
+
                 chunks.append(chunk)
 
             logger.info(
