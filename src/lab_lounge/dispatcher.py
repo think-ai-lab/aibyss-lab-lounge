@@ -1002,13 +1002,32 @@ class Dispatcher:
         本メソッドは Lock を取得するが、callback 内処理は state 更新 + publish のみで
         短時間に完了する。
         """
+        # Phase 0.5-D-d-6 (= 中間実走 8 回目 take 1-2 hang 調査用ログ追加):
+        # _bg_set_result 呼出時の thread / state を記録する。take 1-2 では本ログが
+        # 「出ない」はず (= mimi Agent が hang して on_complete callback が呼ばれない)
+        # → 本ログの有無で hang の原因が「BG LLM 内 (= run_pipeline_llm_only)」か
+        # 「dispatcher 経路」かを切り分けられる。
+        logger.info(
+            "_bg_set_result 呼出 [target=%s]: thread_id=%d active_threads=%d",
+            target_slug, threading.get_ident(), threading.active_count(),
+        )
         with self._lock:
             state = self._handraise_states.get(target_slug)
             if state is None:
                 # 既に granted/denied/lapse で削除されている → 冪等で no-op
+                logger.info(
+                    "_bg_set_result no-op (state already removed) [target=%s]",
+                    target_slug,
+                )
                 return
             state.bg_result = result
             state.bg_completed.set()
+        # Phase 0.5-D-d-6: bg_completed.set() 直後ログ。dispatcher daemon thread の
+        # bg_completed.wait が解放される瞬間。
+        logger.info(
+            "_bg_set_result bg_completed.set 完了 [target=%s]",
+            target_slug,
+        )
         # Phase 0.5-D-d-1: BG LLM 完了 → RAISEHAND_READY 反映。
         # WHY: bg_completed.set() の直後 (= 承認 callback がアクセス可能になった瞬間)
         # に反映することで、HUD は「考え中 → 準備完了」の遷移を即時観察できる。

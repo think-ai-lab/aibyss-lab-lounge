@@ -701,6 +701,28 @@ def _create_handraise_runner_and_callbacks(
         bg_trace_id = _new_uuid()
 
         def _body() -> None:
+            # Phase 0.5-D-d-6 (= 中間実走 8 回目 take 1-2 hang 調査用ログ追加):
+            # bg_runner._body のライフサイクルを詳細追跡する。中間実走 9 回目以降
+            # で hang 再現時に「どこで止まっているか」を切り分け可能にする。
+            #
+            # 観察ポイント:
+            # - bg_runner._body 開始 (= thread spawn 直後)
+            # - run_pipeline_llm_only 完了 (= mimi Agent.invoke 完了タイミング)
+            # - on_complete callback 呼出 (= dispatcher._bg_set_result トリガー)
+            #
+            # Take 1-2 では「run_pipeline_llm_only 完了」ログが出ないはず (= mimi
+            # Agent が hang)。出ていれば原因は別経路 (= dispatcher / 後続経路)。
+            _bg_body_start = time.monotonic()
+            _tts_cb_repr = (
+                "set" if (on_tts_chunk_ready_ref and on_tts_chunk_ready_ref[0])
+                else "None"
+            )
+            logger.info(
+                "bg_runner._body 開始 [target=%s]: trace_id=%s thread_id=%d "
+                "tts_cb=%s active_threads=%d",
+                target_slug, bg_trace_id, threading.get_ident(),
+                _tts_cb_repr, threading.active_count(),
+            )
             try:
                 # Phase 0.5-B-β-1 commit 3: ask_character の対話 TTS を BG LLM
                 # 経路でも playback queue に届けるため、最新ターンの _on_tts_chunk
@@ -736,10 +758,28 @@ def _create_handraise_runner_and_callbacks(
                     on_tts_chunk_ready=_tts_cb,
                     on_pose_ready=_pose_cb,
                 )
+                # Phase 0.5-D-d-6: hang 調査用ログ。本ログが出ない場合 mimi Agent
+                # (= run_pipeline_llm_only 内の Agent.invoke) で hang していることを
+                # 示す重要なシグナル。
+                _llm_only_latency_ms = int(
+                    (time.monotonic() - _bg_body_start) * 1000
+                )
+                logger.info(
+                    "bg_runner._body run_pipeline_llm_only 完了 [target=%s]: "
+                    "trace_id=%s latency_ms=%d active_threads=%d",
+                    target_slug, bg_trace_id, _llm_only_latency_ms,
+                    threading.active_count(),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "BG LLM 失敗 [character=%s]: trace_id=%s err=%s",
                     target_slug, bg_trace_id, exc,
+                )
+                # Phase 0.5-D-d-6: 失敗パスでも on_complete callback 呼出を明記
+                logger.info(
+                    "bg_runner._body on_complete callback 呼出 [target=%s]: "
+                    "result=None (失敗) trace_id=%s",
+                    target_slug, bg_trace_id,
                 )
                 on_complete(HandraiseBgResult(
                     chunks=[], result=None, trace_id=bg_trace_id,
@@ -754,6 +794,13 @@ def _create_handraise_runner_and_callbacks(
                     target_slug, bg_trace_id,
                 )
 
+            # Phase 0.5-D-d-6: 正常完了時の on_complete callback 呼出を明記。
+            # dispatcher._bg_set_result が呼ばれて bg_completed.set される起点。
+            logger.info(
+                "bg_runner._body on_complete callback 呼出 [target=%s]: "
+                "result=ok trace_id=%s",
+                target_slug, bg_trace_id,
+            )
             on_complete(HandraiseBgResult(
                 # WHY: chunks は LLM-only モードでは常に空 (= TTS が走らないため)。
                 # 承認時に on_handraise_approved が run_pipeline_tts_only を呼び、
