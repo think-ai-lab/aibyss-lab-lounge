@@ -673,21 +673,35 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             try:
                 from ..tts import synthesize as tts_synthesize
 
-                intro_done = threading.Event()
-                _chunk_done_event_var.set(intro_done)
+                # Phase 0.5-D-3-b: intro_done event を削除した。
+                # 旧: intro_done = threading.Event() + _chunk_done_event_var.set(intro_done)
+                # で物理再生完了同期を取っていたが、Phase 0.5-D-3-a で intro_done.wait
+                # 廃止 → event 自体が不要になった。run_loop.py:1842-1846 の
+                # task["done_event"] attach 経路は ImportError ガードで安全に残す
+                # (= 他用途で将来使う可能性、無害)。
 
-                # Phase 0.5-D-2-α: 導入セリフ TTS の合成完了 chunks を _playback_queue
-                # に投入する直前で cancel_flag check するラッパー。
+                # Phase 0.5-D-2-α: 導入セリフ TTS の合成完了 chunks を投入する直前で
+                # cancel_flag check するラッパー。
+                # Phase 0.5-D-3-b: defer モード判定を追加。BG LLM 経路では _bg_chunk_buffers
+                # に蓄積してターン跨ぎ漏れを構造的に阻止する。
                 #
-                # 【WHY: 起動前 check だけでは不十分】
-                # tts_synthesize 起動前 (= 上の cancel_flag check、line 595) では
-                # cancel_flag 未 set だったとしても、subprocess.run(voicepeak.exe...)
-                # で 13 秒以上かけて合成中に lapse/却下が発火することがある (= 実走
-                # テスト 2026-05-09 logs/runs/run_loop_20260509_150431.log で観察、
-                # mimi 挙手 → 1 秒後に lapse → 12 秒後に導入セリフ wav が
-                # _playback_queue に投入され物理再生されてしまう不具合)。chunks
-                # 投入直前 (= 合成完了後) でもう一度 check することで、cancel された
-                # 後の漏れを完全に阻止する。
+                # 【WHY: cancel ガードは起動前 check だけでは不十分】
+                # tts_synthesize 起動前 (= 上の cancel_flag check) では未 set だった
+                # cancel_flag が、subprocess.run(voicepeak.exe...) で合成中に
+                # lapse/却下で set されることがある (= 実走テスト 2026-05-09
+                # logs/runs/run_loop_20260509_150431.log で観察)。chunks 投入直前
+                # (= 合成完了後) でもう一度 check することで漏れを完全に阻止する。
+                #
+                # 【WHY: defer モードで導入セリフも buffer 経由】
+                # 通常応答経路 (= defer=False) では caller LLM の戻り値ベース推論を
+                # 進めるため即時再生が必要なので既存挙動を完全維持する。BG LLM 経路
+                # (= defer=True) では承認時まで再生を遅延させていいため buffer 蓄積に
+                # 切替、これにより通常応答 _playback_queue への投入を完全に止めて
+                # ターン跨ぎ漏れを構造的に阻止する。chunk dict には inline metadata
+                # (= _pre_play_status / _pre_play_bubble) を付けない:
+                # - caller の TALKING は _spawn_handraise_response_playback の起動直前
+                #   (= run_loop.py:289-296) で反映済 (= talking_metadata 経由)
+                # - bubble は通常 worker の publish_bubble_fn(speaking) で発火する
                 def _wrapped_intro_chunk_ready(
                     url: str, chunk_text: str, is_last: bool, character: str,
                 ) -> None:
@@ -698,6 +712,15 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                             session_id, character,
                         )
                         return
+                    if _defer_chunks_var.get():
+                        # BG LLM 経路: buffer 蓄積 (= 承認時に専用 mini worker で再生)
+                        chunk = {
+                            "url": url, "text": chunk_text,
+                            "is_last": is_last, "character": character,
+                        }
+                        _append_bg_chunk(session_id, chunk)
+                        return
+                    # 通常応答経路: 既存挙動完全維持
                     on_tts_chunk(url, chunk_text, is_last, character)
 
                 logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
