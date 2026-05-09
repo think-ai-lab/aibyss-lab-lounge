@@ -157,6 +157,27 @@ _bg_chunk_buffers: dict[str, list[dict]] = {}
 # 受けないように分離する。
 _deferred_bg_tts_events: dict[str, list[threading.Event]] = {}
 
+# Phase 0.5-D-d-7 (= 中間実走 9 回目 take 9-B 修正): streaming spawn 即時化のため、
+# session_id ベースで「approval 後の streaming queue 参照」を保持する dict。
+#
+# 【WHY: streaming queue 参照を session 単位で持つ理由】
+# 旧設計 (D-d-6 まで): bg_tts daemon thread が _wrapped_on_chunk_ready で
+# `_append_bg_chunk` を呼んで buffer 蓄積。承認時に `_drain_bg_chunks` で全 chunks
+# を取得 → streaming spawn。ただし `wait_deferred_bg_tts_complete` で sakura TTS の
+# 全 chunks 合成完了 (= 27 秒) まで待つため、mimi 導入セリフが既に合成済でも
+# 再生開始が 27 秒遅延 (= take 9-B で観察、logs/runs/run_loop_20260509_234753.log)。
+#
+# 【新設計 (D-d-7)】
+# 承認後、streaming spawn 起動直前に `set_streaming_queue_ref` で session_id に
+# streaming queue を登録。以降、`_append_bg_chunk` が呼ばれる際に buffer 蓄積に
+# 加えて streaming queue にも投入することで、合成完了次第 chunks が再生される。
+# 順序は VOICEPEAK FIFO で保証される (= 直列合成 → 直列投入)。
+#
+# 【buffer も継続的に蓄積する理由】
+# 既存 `_drain_bg_chunks` テスト + 別経路 (= cancel_bg_tts での drain) との互換性
+# 維持。streaming queue.put は追加動作のみ、buffer 蓄積は無変更。
+_streaming_queue_refs: dict[str, Any] = {}
+
 
 def _reset_session_state(session_id: str) -> None:
     """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
@@ -173,6 +194,9 @@ def _reset_session_state(session_id: str) -> None:
         # Phase 0.5-D-2: deferred bg_tts events も同 session 分クリーン
         # (= 前ターンの未消化 event が残らないように)
         _deferred_bg_tts_events.pop(session_id, None)
+        # Phase 0.5-D-d-7: streaming queue ref も同 session 分クリーン
+        # (= 前ターンの ref が次ターンに漏れて意図しない queue.put を起こさないように)
+        _streaming_queue_refs.pop(session_id, None)
 
 
 def _next_ask_state(session_id: str) -> tuple[int, str]:
@@ -215,6 +239,16 @@ def _append_bg_chunk(session_id: str, chunk: dict) -> None:
     defer モード時に呼ばれる。chunk dict は `_run_playback_worker` が読む形式
     (`{"url", "text", "is_last", "character", "pose"?}`) を想定。
 
+    【Phase 0.5-D-d-7: streaming queue 直接投入】
+    `set_streaming_queue_ref` で session_id に streaming queue が登録されている場合
+    (= 承認後、streaming spawn 起動済み)、buffer 蓄積に加えて streaming queue にも
+    投入する。これにより合成完了次第 chunks が再生される (= take 9-B の 27 秒遅延
+    解消)。streaming queue が未登録 (= 承認前) なら buffer 蓄積のみ (= 既存挙動)。
+
+    順序保証: VOICEPEAK FIFO worker が直列合成 → _wrapped_on_chunk_ready callback も
+    直列実行 → buffer / queue への append も直列。これにより合成順 = 投入順 = 再生順
+    が自動保証される。
+
     Args:
         session_id: BG LLM の session_id (空文字なら no-op、後方互換)
         chunk:      playback worker 用 chunk dict
@@ -223,6 +257,18 @@ def _append_bg_chunk(session_id: str, chunk: dict) -> None:
         return
     with _ask_state_lock:
         _bg_chunk_buffers.setdefault(session_id, []).append(chunk)
+        streaming_queue = _streaming_queue_refs.get(session_id)
+    # Phase 0.5-D-d-7: streaming queue.put は Lock 外で呼ぶ (= queue 内部で thread-safe、
+    # _ask_state_lock 競合回避)。queue 投入失敗時は warning ログのみで buffer 蓄積は
+    # 既に完了しているため後続処理 (= cancel_bg_tts での drain) は影響を受けない。
+    if streaming_queue is not None:
+        try:
+            streaming_queue.put(chunk)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_append_bg_chunk streaming queue.put 失敗 [session=%s]: %s",
+                session_id, exc,
+            )
 
 
 def _drain_bg_chunks(session_id: str) -> list[dict]:
@@ -246,6 +292,101 @@ def _drain_bg_chunks(session_id: str) -> list[dict]:
         return []
     with _ask_state_lock:
         return _bg_chunk_buffers.pop(session_id, [])
+
+
+def set_streaming_queue_ref(session_id: str, queue_obj: Any) -> None:
+    """指定 session の streaming queue 参照を登録する (Phase 0.5-D-d-7)。
+
+    承認後 (= run_loop._tts_and_play 内、streaming spawn 起動直後) に呼ばれる。
+    以降 `_append_bg_chunk` が呼ばれる際、buffer 蓄積に加えて queue_obj.put(chunk)
+    も実行される (= take 9-B の 27 秒再生開始遅延を解消)。
+
+    Args:
+        session_id: BG LLM の session_id (空文字なら no-op)
+        queue_obj:  streaming queue (= `_spawn_handraise_response_playback_streaming`
+                    の戻り値 _streaming_queue、queue.Queue 互換 .put(item) を持つ)
+    """
+    if not session_id:
+        return
+    with _ask_state_lock:
+        _streaming_queue_refs[session_id] = queue_obj
+
+
+def clear_streaming_queue_ref(session_id: str) -> None:
+    """指定 session の streaming queue 参照をクリアする (Phase 0.5-D-d-7)。
+
+    通常は `_reset_session_state` で次ターン開始時にクリアされるが、明示的に
+    クリーンする場合 (= 例: cancel_bg_tts 経路、エラー時の cleanup) に呼ぶ。
+
+    Args:
+        session_id: BG LLM の session_id (空文字なら no-op)
+    """
+    if not session_id:
+        return
+    with _ask_state_lock:
+        _streaming_queue_refs.pop(session_id, None)
+
+
+def drain_and_register_streaming_queue(
+    session_id: str, queue_obj: Any,
+) -> int:
+    """承認後に streaming queue を有効化する atomic API (Phase 0.5-D-d-7)。
+
+    1. Lock 内で `_bg_chunk_buffers` から **既に蓄積済**の chunks を全て取得
+    2. Lock 内で取得した chunks を `queue_obj.put()` で順次 streaming queue に投入
+    3. Lock 内で `_streaming_queue_refs` に `queue_obj` を登録 (= 以降 `_append_bg_chunk`
+       が呼ばれる際に buffer 蓄積 + queue.put 両方を実行する経路を有効化)
+
+    全 step を Lock 内で atomic に実行することで、bg_tts daemon thread の
+    `_append_bg_chunk` との順序競合を防ぐ (= drained chunks → 新規合成 chunks の
+    順序保証、漏れ + 重複なし)。
+
+    【WHY: 旧 wait_deferred_bg_tts_complete 設計の問題】
+    旧設計 (D-d-6 まで) は承認後に sakura TTS 全 chunks 合成完了 (= 27 秒) まで
+    待ってから streaming spawn を起動していた。mimi 導入セリフが既に合成済でも
+    再生開始が 27 秒遅延する問題 (= take 9-B、run_loop_20260509_234753.log)。
+
+    【新設計 (D-d-7)】
+    承認直後に即 streaming spawn 起動 → 本 API で「現時点 buffer」を投入 + 「以降の
+    chunks」を queue 直投入経路に切替。これにより合成完了次第 chunks が再生開始
+    (= mimi 導入セリフは ~8 秒で再生開始 vs 旧 35 秒)。
+
+    Args:
+        session_id: BG LLM の session_id (空文字なら no-op)
+        queue_obj:  streaming queue (= `_spawn_handraise_response_playback_streaming`
+                    の戻り値 _streaming_queue、queue.Queue 互換 .put(item) を持つ)
+
+    【呼出パターン (run_loop._tts_and_play)】
+    旧 _drain_bg_chunks で初回 chunks 取得 (= talking_metadata 構築用) →
+    streaming spawn 起動 (= initial_chunks=drained) → 本 API で **再度 drain**
+    (= 初回 drain と register の間に到着した race chunks の回収) + register。
+    本 API での drained chunks は通常 0 件 (= race 時のみ存在)。
+
+    Args:
+        session_id: BG LLM の session_id (空文字なら no-op、空 list 返却)
+        queue_obj:  streaming queue (= queue.Queue 互換 .put(item) を持つ)
+
+    Returns:
+        Lock 内で drained された chunks の list (= queue.put 済、呼出側で再投入
+        不要)。通常空 list (= race 時のみ存在)。ログ用。
+    """
+    if not session_id:
+        return []
+    with _ask_state_lock:
+        chunks = _bg_chunk_buffers.pop(session_id, [])
+        for chunk in chunks:
+            try:
+                queue_obj.put(chunk)
+            except Exception as exc:  # noqa: BLE001
+                # queue.put 失敗時は warning ログのみ。他の chunks 投入は続行。
+                # queue.Queue() の default は無制限のため、通常 block しない (= Lock
+                # 保持時間も短時間)。
+                logger.warning(
+                    "drain_and_register queue.put 失敗 [session=%s]: %s",
+                    session_id, exc,
+                )
+        _streaming_queue_refs[session_id] = queue_obj
+    return chunks
 
 
 def _peek_bg_chunks_count(session_id: str) -> int:

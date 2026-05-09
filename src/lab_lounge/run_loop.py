@@ -969,16 +969,29 @@ def _create_handraise_runner_and_callbacks(
             #
             # 視聴者体感: 「approval → 即「ルカ、その問いは…」(= 導入セリフ) → 各キャラ
             # 応答 → 自然に〆セリフ」のシームレスな対話が、合成時間に関わらず実現する。
+            # Phase 0.5-D-d-7 (= 中間実走 9 回目 take 9-B 修正、再生開始遅延解消):
+            # 旧 wait_deferred_bg_tts_complete + _drain_bg_chunks の経路は、sakura TTS
+            # 全 chunks 合成完了 (= 27 秒) まで待ってから streaming spawn 起動するため、
+            # mimi 導入セリフが既に合成済でも再生開始が 27 秒遅延する問題があった
+            # (= run_loop_20260509_234753.log で観察)。
+            #
+            # 新設計 (3 step):
+            # 1. 初回 _drain_bg_chunks (= talking_metadata 構築用 + initial_chunks 取得)
+            # 2. _spawn_handraise_response_playback_streaming で起動 (= queue 取得)
+            # 3. drain_and_register_streaming_queue (= race 漏れ回収 + queue ref register)
+            #
+            # これにより、合成完了次第 chunks が streaming queue に投入される (= mimi
+            # 導入セリフは ~8 秒で再生開始 vs 旧 35 秒、約 27 秒短縮)。
             from .mcp_servers.ask_character import (
                 _drain_bg_chunks,
-                wait_deferred_bg_tts_complete,
+                drain_and_register_streaming_queue,
             )
 
-            wait_deferred_bg_tts_complete(session_id_root)
+            # Step 1: 初回 drain (= talking_metadata 構築用、現時点で合成済の chunks)
             bg_chunks = _drain_bg_chunks(session_id_root)
             if bg_chunks:
                 logger.info(
-                    "挙手承認 BG buffer drain [character=%s]: chunks=%d",
+                    "挙手承認 BG buffer 初回 drain [character=%s]: chunks=%d (= 即時投入用)",
                     slug, len(bg_chunks),
                 )
 
@@ -1032,6 +1045,22 @@ def _create_handraise_runner_and_callbacks(
                     talking_metadata=talking_metadata if talking_metadata else None,
                 )
             )
+
+            # Phase 0.5-D-d-7 Step 3: race 漏れ回収 + queue ref register
+            # streaming spawn 起動 (Step 2) と本 step の間に bg_tts daemon thread が
+            # `_append_bg_chunk` を呼んでいた場合、その chunks を回収して queue に
+            # 投入する (= 通常 0 件、race 時のみ存在)。同時に queue ref を register
+            # することで、以降の `_append_bg_chunk` は buffer 蓄積 + queue.put 両方を
+            # 実行する経路に切り替わる (= 合成完了次第 chunks が再生される、これで
+            # take 9-B の 27 秒再生開始遅延を構造的に解消)。
+            late_chunks = drain_and_register_streaming_queue(
+                session_id_root, _streaming_queue,
+            )
+            if late_chunks:
+                logger.info(
+                    "挙手承認 BG buffer 再 drain [character=%s]: chunks=%d (= race 漏れ回収)",
+                    slug, len(late_chunks),
+                )
 
             # tts_only chunks の動的追加用 closure 変数
             _first_tts_only_chunk_seen = [False]
