@@ -520,6 +520,30 @@ def _approved_synthesize_fallback(
         slug, fallback_trace_id, len(text),
     )
 
+    # Phase 0.5-D-e-3 (= 中間実走 11 回目 take 3 修正、fallback hang 防止):
+    # fallback の run_pipeline 自体に timeout を設定する。
+    #
+    # 【WHY: fallback も hang する可能性】
+    # take 3 で観察された通り、bg_runner と fallback が同 connection pool で
+    # 競合すると **両方が hang** する (= 5 分以上無音、Ctrl+C 強制終了)。D-e-2 で
+    # client pool 分離を入れたが、外部要因 (= OpenAI API 一時遅延) で fallback
+    # 自体が hang する可能性は依然残る。timeout で打ち切って「真の救済失敗」を
+    # 検出する経路を作る。
+    #
+    # 【timeout 値】
+    # 30s が default。fallback は disable_tools=["ask_character"] で軽量化されており
+    # 通常 5-15 秒で完了する。30s は典型値の 2 倍 (= D-d-2 の哲学を踏襲)。
+    # L2_FALLBACK_TIMEOUT_SEC で運用時 override 可能。不正値は 30.0 にフォールバック。
+    _fb_timeout_raw = os.environ.get("L2_FALLBACK_TIMEOUT_SEC", "30.0")
+    try:
+        fallback_timeout_sec = float(_fb_timeout_raw)
+    except ValueError:
+        logger.warning(
+            "L2_FALLBACK_TIMEOUT_SEC=%r は数値ではないため 30.0 にフォールバック",
+            _fb_timeout_raw,
+        )
+        fallback_timeout_sec = 30.0
+
     try:
         run_pipeline(
             text,
@@ -546,7 +570,17 @@ def _approved_synthesize_fallback(
             # 経路を断ち切る。bg_result=ready 経路 (= 通常パス) では disable_tools=None
             # のままなので ask_character の協働応答は通常通り使える。
             disable_tools=["ask_character"],
+            # Phase 0.5-D-e-3: fallback Agent.invoke timeout
+            timeout_sec=fallback_timeout_sec,
         )
+    except TimeoutError as exc:
+        # 真の救済失敗 → ログ出力 + 早期 return (= 視聴者には無音、別経路で要対処)
+        logger.error(
+            "挙手承認 fallback timeout [character=%s]: %ss 経過 (= bg_runner-fallback "
+            "二重 hang の可能性) trace_id=%s err=%s",
+            slug, fallback_timeout_sec, fallback_trace_id, exc,
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "挙手承認 fallback (run_pipeline 同期再生成) 失敗 [character=%s]: err=%s",
