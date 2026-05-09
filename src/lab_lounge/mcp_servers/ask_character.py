@@ -24,6 +24,7 @@ import contextvars
 import logging
 import os
 import threading
+import time
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -1124,6 +1125,19 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             on_tts_chunk(url, chunk_text, is_last, character)
 
         def _bg_tts_synthesize() -> None:
+            # Phase 0.5-D-d-6 (= 中間実走 8 回目 take 1-2 hang 調査用ログ追加):
+            # _bg_tts_synthesize daemon thread のライフサイクルを詳細追跡する。
+            #
+            # take 1-2 で sakura TTS が 50 秒走る間に mimi Agent が hang。本ログで
+            # thread 起動 / 完了タイミングを正確に把握 → 「mimi Agent hang と sakura
+            # TTS 合成」の時系列の関連性を切り分ける。
+            _bg_tts_start = time.monotonic()
+            logger.info(
+                "_bg_tts_synthesize 開始 [target=%s]: session=%s thread_id=%d "
+                "active_threads=%d",
+                character_slug, session_id or "(none)",
+                threading.get_ident(), threading.active_count(),
+            )
             synthesize_failed = False
             cancelled = False
             try:
@@ -1174,6 +1188,16 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                             "ask_character target READY 反映失敗 (%s): %s",
                             target_char.slug, exc,
                         )
+                # Phase 0.5-D-d-6: thread 完了タイミングログ。take 1-2 で sakura TTS
+                # 完了時刻 (= 本ログ) と mimi Agent 完了時刻のギャップを測るシグナル。
+                _bg_tts_latency_ms = int((time.monotonic() - _bg_tts_start) * 1000)
+                logger.info(
+                    "_bg_tts_synthesize 完了 [target=%s]: session=%s "
+                    "latency_ms=%d failed=%s cancelled=%s active_threads=%d",
+                    character_slug, session_id or "(none)",
+                    _bg_tts_latency_ms,
+                    synthesize_failed, cancelled, threading.active_count(),
+                )
                 bg_tts_done.set()
 
         _register_bg_tts_event(session_id, bg_tts_done)
@@ -1183,7 +1207,13 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             character_slug, session_id or "(none)",
         )
 
-    logger.info("ask_character 完了: target=%s response_len=%d", character_slug, len(response_text))
+    # Phase 0.5-D-d-6: ask_character return 直前の active_threads を記録。
+    # take 1-2 で「return 後 mimi Agent が走らない」現象の原因切り分け用 (= thread
+    # 数の急増 / Lock contention の兆候を検出するベースライン値)。
+    logger.info(
+        "ask_character 完了: target=%s response_len=%d active_threads=%d",
+        character_slug, len(response_text), threading.active_count(),
+    )
 
     # 直前 target を更新 (次回 ask_character 呼出し時の導入セリフ生成で参照される)
     _record_target(session_id, target_char.display_name)
