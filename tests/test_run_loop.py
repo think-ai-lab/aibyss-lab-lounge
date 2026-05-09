@@ -1126,6 +1126,164 @@ class TestApprovedAnsweringBubbleInlineMetadata:
         # 2 件目には _pre_play_status なし (= 1 度だけ発火)
         assert chunks_only[1].get("_pre_play_status") is None
 
+    def test_streaming_spawn_uses_caller_intro_text_in_talking_metadata(self, monkeypatch):
+        """Phase 0.5-D-d-5 (= 中間実走 8 回目 take 2-2 修正):
+        streaming spawn 起動時の talking_metadata.text は bg_chunks[0] の text
+        (= caller 導入セリフ) を使う。
+
+        【WHY: 旧設計の不具合】
+        旧設計では talking_metadata.text = answering_text (= 〆セリフ) で streaming
+        spawn 起動時に publish していたが、bg_chunks の最初は caller 導入セリフから
+        再生開始するため、HUD で 〆セリフ text が表示されながら音声は導入セリフが
+        流れる UX 不整合 (= run_loop_20260509_230651.log で観察)。
+
+        【新設計】
+        - streaming spawn 起動時: talking_metadata.text = bg_chunks[0].text (= 導入)
+        - tts_only first chunk 物理再生時: _pre_play_status で answering_text に切替
+        (= D-d-3 で実装済の inline metadata)
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        spawn_calls: list[dict] = []
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            spawn_calls.append({
+                "slug": slug,
+                "initial_chunks": list(initial_chunks),
+                "trace_id": trace_id,
+                "kwargs": kwargs,
+            })
+            return MagicMock(), _FakeQueue()
+
+        # tts_only chunks 投入は最小 (= talking_metadata 検証に集中)
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "first text", True, "mimi", None)
+            return llm_result
+
+        # _drain_bg_chunks mock で caller 導入セリフ chunk を返す
+        intro_text = "ルカ、すてきな問いですわね。さくら、感情の面ではどう考えますか?"
+
+        def fake_drain(session_id):
+            return [
+                {
+                    "character": "mimi",
+                    "text": intro_text,
+                    "url": "file:///tmp/intro.wav",
+                    "is_last": False,
+                    "pose": "smile",
+                },
+            ]
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.mcp_servers.ask_character._drain_bg_chunks", fake_drain,
+        )
+
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": "そうですわね、〆セリフテスト。"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        for _ in range(40):
+            if spawn_calls:
+                break
+            time.sleep(0.05)
+
+        # streaming spawn が 1 回呼ばれた
+        assert len(spawn_calls) == 1
+        kwargs = spawn_calls[0]["kwargs"]
+
+        # talking_metadata.text は bg_chunks[0].text (= 導入セリフ) と一致するべき
+        # 旧設計では answering_text (= 〆セリフ) が入っていた = HUD 不整合
+        talking_metadata = kwargs.get("talking_metadata")
+        assert talking_metadata is not None
+        assert talking_metadata["text"] == intro_text, (
+            f"talking_metadata.text が caller 導入セリフ text と一致するべき "
+            f"(実際: {talking_metadata['text']!r}、期待: {intro_text!r})"
+        )
+        # pose も bg_chunks[0].pose (= 導入セリフ pose) と一致
+        assert talking_metadata.get("pose") == "smile"
+
+    def test_streaming_spawn_falls_back_to_answering_text_when_bg_chunks_empty(
+        self, monkeypatch,
+    ):
+        """Phase 0.5-D-d-5: bg_chunks 空時は answering_text にフォールバック。
+
+        D-d-4 修正以前の状態 (= bg_chunks=0、中間実走 7 回目で観察) または
+        実装漏れ等で bg_chunks 空の場合は、talking_metadata.text は answering_text
+        (= 〆セリフ) を使う (= 旧挙動と整合、後方互換)。
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        spawn_calls: list[dict] = []
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            spawn_calls.append({"kwargs": kwargs})
+            return MagicMock(), _FakeQueue()
+
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            return llm_result
+
+        # bg_chunks 空 (= 既存テストと同じシナリオ)
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
+        )
+
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        answering_text = "そうですわね、〆セリフフォールバック。"
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": answering_text}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        for _ in range(40):
+            if spawn_calls:
+                break
+            time.sleep(0.05)
+
+        # bg_chunks 空なら answering_text (= 〆セリフ) にフォールバック
+        assert len(spawn_calls) == 1
+        kwargs = spawn_calls[0]["kwargs"]
+        talking_metadata = kwargs.get("talking_metadata")
+        assert talking_metadata is not None
+        assert talking_metadata["text"] == answering_text
+
     def test_pre_play_status_pose_none_with_text_includes_metadata(self, monkeypatch):
         """pose=None でも answering_text があれば _pre_play_status は埋込
         (= metadata.pose=None で発火、Phase 0.5-D-d-3)。

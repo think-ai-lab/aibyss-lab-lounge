@@ -939,14 +939,34 @@ def _create_handraise_runner_and_callbacks(
             # tts_only chunks の first pose は合成完了前に取得不可なので、bg_chunks
             # の最初 (= 通常 caller の導入セリフ first chunk) の pose を一旦使う。
             # bg_chunks 空時は pose=None で起動 (= text のみの metadata)。
+            #
+            # Phase 0.5-D-d-5 (= 中間実走 8 回目 take 2-2 修正):
+            # talking_metadata.text は bg_chunks[0] の text (= caller 導入セリフ) を
+            # 使う。〆セリフ text への切り替えは tts_only first chunk の inline metadata
+            # (= _pre_play_status、D-d-3 で実装済) で物理再生時に発火する。
+            #
+            # 【WHY: 旧設計の不具合】
+            # 旧設計では talking_metadata.text = answering_text (= 〆セリフ) で
+            # streaming spawn 起動時に publish していたが、bg_chunks の最初は caller
+            # 導入セリフから再生開始するため、HUD で 〆セリフ text が表示されながら
+            # 音声は導入セリフが流れる UX 不整合 (= 中間実走 8 回目 take 2-2、
+            # logs/runs/run_loop_20260509_230651.log で観察)。
+            #
+            # 【bg_chunks 空時のフォールバック】
+            # bg_chunks 空時 / first chunk が caller 以外の場合は caller_initial_text=""
+            # → answering_text (= 〆セリフ) にフォールバック (= 旧挙動と整合)。これは
+            # 実装漏れ等で bg_chunks=0 になった場合 (= 中間実走 7 回目で観察) の救済。
             caller_initial_pose: "str | None" = None
+            caller_initial_text = ""
             if bg_chunks:
                 # bg_chunks の最初は caller (= slug) の導入セリフ first chunk
                 first_bg = bg_chunks[0]
                 if first_bg.get("character") == slug:
                     caller_initial_pose = first_bg.get("pose")
+                    caller_initial_text = first_bg.get("text", "")
+            display_text = caller_initial_text or answering_text
             talking_metadata = _build_talking_metadata(
-                slug, answering_text, caller_initial_pose,
+                slug, display_text, caller_initial_pose,
             )
 
             # Phase 0.5-D-3 follow-up 2: streaming spawn (= bg_chunks 即時再生開始)
