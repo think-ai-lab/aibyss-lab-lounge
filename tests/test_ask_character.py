@@ -922,14 +922,18 @@ class TestDeferChunksMode:
             f"defer=True で target 本応答 chunks は callback に流れない "
             f"(実際: {len(target_callbacks)} 件、{target_callbacks})"
         )
-        # buffer に target 本応答 2 件蓄積される
+        # buffer 検証
         chunks = _drain_bg_chunks(session_id)
-        assert len(chunks) == 2, (
-            f"buffer に本応答 chunks 2 件蓄積される (実際: {len(chunks)} 件)"
+        # Phase 0.5-D-3-c で bridge filler chunk も buffer 経由になったので、
+        # 本応答 chunks (= text 非空) のみフィルタして検証する
+        response_chunks = [c for c in chunks if c["text"] != ""]
+        assert len(response_chunks) == 2, (
+            f"buffer に本応答 chunks 2 件蓄積される "
+            f"(実際 response: {len(response_chunks)} 件、全 buffer: {len(chunks)} 件)"
         )
-        for c in chunks:
+        for c in response_chunks:
             assert c["character"] == "chisame", (
-                f"buffer chunks の character は target=chisame "
+                f"本応答 chunks の character は target=chisame "
                 f"(実際: {c['character']})"
             )
 
@@ -1051,15 +1055,20 @@ class TestDeferChunksMode:
             f"defer=True で on_pose_ready callback は呼ばれない "
             f"(実際: {pose_callback_invocations})"
         )
-        # buffer の first_chunk に pose=special_doya が埋め込まれている
+        # buffer の本応答 first_chunk に pose=special_doya が埋め込まれている
         chunks = _drain_bg_chunks(session_id)
-        assert len(chunks) == 2
-        assert chunks[0].get("pose") == "special_doya", (
-            f"first_chunk の pose は special_doya (実際: {chunks[0].get('pose')})"
+        # Phase 0.5-D-3-c で bridge filler chunk も buffer 経由になったので、
+        # 本応答 chunks (= text 非空) のみフィルタして検証する
+        response_chunks = [c for c in chunks if c["text"] != ""]
+        assert len(response_chunks) == 2
+        assert response_chunks[0].get("pose") == "special_doya", (
+            f"first response chunk の pose は special_doya "
+            f"(実際: {response_chunks[0].get('pose')})"
         )
-        # 後続 chunk は pose 未指定 (= 維持の意味、実装で None or 欠如)
-        assert chunks[1].get("pose") in (None, ""), (
-            f"後続 chunk の pose は未指定 (実際: {chunks[1].get('pose')})"
+        # 後続 response chunk は pose 未指定 (= 維持の意味、実装で None or 欠如)
+        assert response_chunks[1].get("pose") in (None, ""), (
+            f"後続 response chunk の pose は未指定 "
+            f"(実際: {response_chunks[1].get('pose')})"
         )
 
     def test_defer_mode_first_chunk_carries_pre_play_status(self, monkeypatch):
@@ -1110,11 +1119,14 @@ class TestDeferChunksMode:
             wait_deferred_bg_tts_complete(session_id, timeout=5.0)
 
         chunks = _drain_bg_chunks(session_id)
-        assert len(chunks) == 2
+        # Phase 0.5-D-3-c で bridge filler chunk も buffer 経由になったので、
+        # 本応答 chunks (= text 非空) のみフィルタして検証する
+        response_chunks = [c for c in chunks if c["text"] != ""]
+        assert len(response_chunks) == 2
 
-        # first chunk に _pre_play_status が埋め込まれている
-        first_status = chunks[0].get("_pre_play_status")
-        assert first_status is not None, "first chunk に _pre_play_status が必要"
+        # first response chunk に _pre_play_status (= TALKING) が埋め込まれている
+        first_status = response_chunks[0].get("_pre_play_status")
+        assert first_status is not None, "first response chunk に _pre_play_status が必要"
         assert first_status["slug"] == "chisame"
         assert first_status["status"] == "TALKING"
         # metadata に pose と text が含まれる (= HUD 表示用)
@@ -1122,8 +1134,8 @@ class TestDeferChunksMode:
         assert meta.get("pose") == "special_smile"
         assert meta.get("text") == "こんにちは"  # _parse_voicepeak_json 通過後
 
-        # 後続 chunk には _pre_play_status は埋まらない (= 1 度だけ反映、冪等保護)
-        assert chunks[1].get("_pre_play_status") is None
+        # 後続 response chunk には _pre_play_status は埋まらない (= 1 度だけ反映、冪等保護)
+        assert response_chunks[1].get("_pre_play_status") is None
 
     def test_defer_mode_first_chunk_carries_pre_play_bubble(self, monkeypatch):
         """Phase 0.5-D-2: defer モードの first chunk に _pre_play_bubble が埋め込まれる。
@@ -1168,11 +1180,14 @@ class TestDeferChunksMode:
             wait_deferred_bg_tts_complete(session_id, timeout=5.0)
 
         chunks = _drain_bg_chunks(session_id)
-        assert len(chunks) == 1
+        # Phase 0.5-D-3-c で bridge filler chunk も buffer 経由になったので、
+        # 本応答 chunks (= text 非空) のみフィルタして検証する
+        response_chunks = [c for c in chunks if c["text"] != ""]
+        assert len(response_chunks) == 1
 
-        # first chunk に _pre_play_bubble が埋め込まれている
-        first_bubble = chunks[0].get("_pre_play_bubble")
-        assert first_bubble is not None, "first chunk に _pre_play_bubble が必要"
+        # first response chunk に _pre_play_bubble (= answering) が埋め込まれている
+        first_bubble = response_chunks[0].get("_pre_play_bubble")
+        assert first_bubble is not None, "first response chunk に _pre_play_bubble が必要"
         assert first_bubble["slug"] == "chisame"
         assert first_bubble["step"] == "answering"
         # text は _load_bubble_messages から取得 (= キャラ別 yaml の "answering")。
