@@ -1267,6 +1267,153 @@ class TestDeferredBgTtsEvents:
         # normal=1 + deferred=2 = 3 件返却
         assert n == 3
 
+    def test_cancel_bg_tts_drains_buffer_chunks_too(self):
+        """Phase 0.5-D-2-α: cancel_bg_tts は _bg_chunk_buffers も同時に pop する。
+
+        WHY: cancel と drain を統合することで「片方忘れる」不具合を構造的に防ぐ
+        (= 実走テスト 2026-05-09 で観察した「fallback パスで buffer drain されず
+        chunks が放置される」現象の根本対処、D-3 前倒し)。
+        """
+        import threading
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_cancel_flags, _bg_chunk_buffers,
+            _ask_state_lock, cancel_bg_tts, _peek_bg_chunks_count,
+        )
+        # cancel_flag を用意 + buffer に chunks を蓄積
+        with _ask_state_lock:
+            _bg_cancel_flags["sess-drain"] = threading.Event()
+        _append_bg_chunk("sess-drain", {"url": "a", "text": "t1"})
+        _append_bg_chunk("sess-drain", {"url": "b", "text": "t2"})
+        assert _peek_bg_chunks_count("sess-drain") == 2
+
+        cancel_bg_tts("sess-drain")
+
+        # buffer も同時に pop されている
+        assert _peek_bg_chunks_count("sess-drain") == 0
+        assert "sess-drain" not in _bg_chunk_buffers
+
+
+class TestCancelGuardLeakageFix:
+    """Phase 0.5-D-2-α: 導入セリフ TTS + bridge filler の cancel ガード漏れ修正テスト。
+
+    実走テスト 2026-05-09 で観察した、lapse/fallback 後でも 「on_tts_chunk 直接呼出
+    経路」(= _wrapped_on_chunk_ready を経由しない経路) の chunks が _playback_queue
+    に投入される漏れ現象の対処。これらの経路は案 C の defer 分岐ではガードされない
+    ため、明示的な cancel_flag check を追加した。
+    """
+
+    def test_intro_chunk_skip_when_cancel_flag_set(self, monkeypatch):
+        """導入セリフ TTS が cancel_flag set 後の chunk 投入を skip する。
+
+        WHY: 導入セリフ TTS は subprocess.run で 13 秒以上かけて合成されるため、
+        起動前 check (line 595) では未 set だった cancel_flag が合成完了時には
+        set されているケースがある (= 実走 logs/runs/run_loop_20260509_150431.log
+        で観察)。chunk 投入直前の wrapper で再度 check することで、合成完了 chunks
+        が _playback_queue に流れ込むのを阻止する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _bg_cancel_flags, _ask_state_lock, cancel_bg_tts, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-intro-cancel"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # 導入セリフ TTS の合成途中で cancel_flag set される動作を fake_synth で再現
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            # 「合成中」に cancel_flag set される (= 実走で 13 秒間に lapse 発火相当)
+            if speaker == "mimi":  # 導入セリフ TTS = caller=mimi
+                cancel_bg_tts(session_id)
+            if on_chunk:
+                # cancel 後に chunk を投入するが、wrapper で skip されるはず
+                on_chunk(f"file://{speaker}_intro.wav", "ふふ", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "ok", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="まあ、ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ chunk (= speaker=mimi) は cancel_flag set 後だったので skip された
+        intro_callbacks = [c for c in callback_invocations if c[3] == "mimi"]
+        assert intro_callbacks == [], (
+            f"cancel_flag set 後の導入セリフ chunk は skip される "
+            f"(実際: {intro_callbacks})"
+        )
+
+    def test_bridge_filler_skip_when_cancel_flag_set(self, monkeypatch):
+        """bridge filler 投入が cancel_flag set 後に skip される。
+
+        WHY: bridge filler は ask_character.py 内の `on_tts_chunk` 直接呼出経路で
+        _wrapped_on_chunk_ready を経由しない。よって案 C の defer 分岐ではガード
+        されない。明示的な cancel_flag check で fallback 後の漏れを阻止する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            cancel_bg_tts, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-bridge-cancel"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # bridge filler 投入直前に cancel_flag を set する fake_synth (= 導入セリフ
+        # 完了直後 = bridge filler 直前のタイミング相当)
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if speaker == "mimi":  # 導入セリフ TTS 完了 → cancel set
+                if on_chunk:
+                    on_chunk(f"file://{speaker}_intro.wav", "問いかけ", True, speaker)
+                cancel_bg_tts(session_id)
+            elif speaker == "chisame":  # 本応答 TTS は cancel 後なので skip される (defer モードでも非 defer でも)
+                if on_chunk:
+                    on_chunk(f"file://{speaker}_c1.wav", "応答", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="導入セリフ",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # bridge filler chunk (= chisame slug, text="" の filler 投入) は cancel 後で skip される
+        # (本応答 chunks も skip)
+        bridge_filler_callbacks = [c for c in callback_invocations
+                                   if c[3] == "chisame" and c[1] == ""]
+        assert bridge_filler_callbacks == [], (
+            f"cancel_flag set 後の bridge filler は skip される "
+            f"(実際: {bridge_filler_callbacks})"
+        )
+
 
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""

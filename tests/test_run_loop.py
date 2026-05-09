@@ -723,6 +723,50 @@ class TestRunPlaybackWorkerPrePlay:
         )
 
 
+class TestApprovedSynthesizeFallbackCancelBgTts:
+    """Phase 0.5-D-2-α: _approved_synthesize_fallback が cancel_bg_tts を呼ぶ。
+
+    bg_result=None の fallback パス起動時に旧 BG LLM の bg_tts thread + buffer を
+    クリーンする経路。これがないと「fallback 動作中に旧 BG LLM が完了し ask_character
+    chunks が _playback_queue / _bg_chunk_buffers に投入される」漏れが起きる
+    (= 実走 2026-05-09 logs/runs/run_loop_20260509_155109.log で観察)。
+    """
+
+    def test_fallback_calls_cancel_bg_tts_with_session_id_root(self, monkeypatch):
+        """_approved_synthesize_fallback 冒頭で cancel_bg_tts(session_id_root) が呼ばれる。"""
+        from unittest.mock import patch as _patch
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        # cancel_bg_tts を spy
+        cancel_calls: list[str] = []
+
+        def spy_cancel(session_id):
+            cancel_calls.append(session_id)
+            return 0
+
+        # 内部 run_pipeline / _spawn_handraise_response_playback を mock (= 重い処理 skip)
+        with _patch(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts",
+            side_effect=spy_cancel,
+        ), _patch(
+            "lab_lounge.run_loop.run_pipeline",
+            return_value=MagicMock(events=[], speaker="mimi"),
+        ), _patch(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            return_value=MagicMock(),
+        ):
+            _approved_synthesize_fallback(
+                "mimi", "ルカ発話", "trace-fallback-1",
+                session_stream_id="ss-fallback-1",
+                session_id_root="sess-root-fallback",
+            )
+
+        # session_id_root で cancel_bg_tts が呼ばれたことを確認
+        assert "sess-root-fallback" in cancel_calls, (
+            f"cancel_bg_tts(session_id_root) が呼ばれていない (実際: {cancel_calls})"
+        )
+
+
 class TestHandraiseCloseFlow:
     """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
 

@@ -361,6 +361,30 @@ def _approved_synthesize_fallback(
         session_id_root:   session_id
         stream_context:    配信文脈 markdown (起動時に load_stream_context() で取得)
     """
+    # Phase 0.5-D-2-α: fallback 起動時に旧 BG LLM の bg_tts thread をキャンセル + buffer drain。
+    #
+    # 【WHY】
+    # bg_result=None で fallback に入るのは「BG LLM が承認時に未完了」のケース。
+    # その後で BG LLM が完了すると ask_character ツール呼出 → 導入セリフ TTS +
+    # bridge filler + 本応答 TTS を生成する。これらが fallback 動作中の
+    # _playback_queue / _bg_chunk_buffers に投入されると「fallback の単独応答」と
+    # 「旧 BG LLM の対話演出」が混在し UX 崩壊する (= 実走テスト 2026-05-09
+    # logs/runs/run_loop_20260509_155109.log で観察した「ask_character 経由
+    # sakura 本応答 chunks が buffer 放置」現象の根本対処)。
+    #
+    # cancel_bg_tts は Phase 0.5-D-2-α で _bg_chunk_buffers.pop も統合した。本呼出 1 つで:
+    # - cancel_flag set → 後続の bg_tts thread / chunk 投入を構造的に阻止
+    # - 既蓄積 buffer を drain → 既に貯まった chunks を完全破棄
+    # の 3 経路がクリーンになる (= 漏れ防止 + UX 整合)。
+    from .mcp_servers.ask_character import cancel_bg_tts
+    cancel_count = cancel_bg_tts(session_id_root)
+    if cancel_count > 0:
+        logger.info(
+            "挙手承認 fallback [character=%s]: 旧 BG LLM cancel=%d "
+            "(= 後続 chunks 投入阻止 + buffer drain)",
+            slug, cancel_count,
+        )
+
     text = transcript_snapshot or ""
     if not isinstance(text, str):
         text = str(text)
