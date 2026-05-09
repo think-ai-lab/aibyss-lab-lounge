@@ -908,6 +908,125 @@ class TestApprovedSynthesizeFallbackCancelBgTts:
         )
 
 
+class TestApprovedSynthesizeFallbackTimeout:
+    """Phase 0.5-D-e-3: _approved_synthesize_fallback の run_pipeline timeout。
+
+    中間実走 11 回目 take 3 (5 分以上 hang + Ctrl+C) への構造的対処。fallback
+    自体が hang した場合に timeout で打ち切って「真の救済失敗」を検出する。
+    """
+
+    def test_fallback_passes_default_timeout_to_run_pipeline(self, monkeypatch):
+        """L2_FALLBACK_TIMEOUT_SEC 未設定時、run_pipeline に timeout_sec=30.0 が渡る。"""
+        from unittest.mock import patch as _patch
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        monkeypatch.delenv("L2_FALLBACK_TIMEOUT_SEC", raising=False)
+
+        captured: dict = {}
+
+        def capture_run_pipeline(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock(events=[], speaker="mimi")
+
+        with _patch(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts", return_value=0,
+        ), _patch(
+            "lab_lounge.run_loop.run_pipeline",
+            side_effect=capture_run_pipeline,
+        ), _patch(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            return_value=MagicMock(),
+        ):
+            _approved_synthesize_fallback(
+                "mimi", "ルカ発話", "trace-T1",
+                session_stream_id="ss-T1",
+                session_id_root="sess-T1",
+            )
+
+        assert captured.get("timeout_sec") == 30.0
+
+    def test_fallback_passes_env_override_timeout(self, monkeypatch):
+        """L2_FALLBACK_TIMEOUT_SEC 環境変数で timeout を override できる。"""
+        from unittest.mock import patch as _patch
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        monkeypatch.setenv("L2_FALLBACK_TIMEOUT_SEC", "15.0")
+
+        captured: dict = {}
+
+        def capture_run_pipeline(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock(events=[], speaker="mimi")
+
+        with _patch(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts", return_value=0,
+        ), _patch(
+            "lab_lounge.run_loop.run_pipeline",
+            side_effect=capture_run_pipeline,
+        ), _patch(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            return_value=MagicMock(),
+        ):
+            _approved_synthesize_fallback(
+                "mimi", "ルカ発話", "trace-T2",
+                session_stream_id="ss-T2",
+                session_id_root="sess-T2",
+            )
+
+        assert captured.get("timeout_sec") == 15.0
+
+    def test_fallback_logs_and_returns_on_timeout(self, monkeypatch, caplog):
+        """run_pipeline が TimeoutError を raise したら error ログ + 早期 return。
+
+        - _spawn_handraise_response_playback は呼ばれない (= 再生パス進行なし)
+        - logger.error に "fallback timeout" を含む文言
+        """
+        import logging
+        from unittest.mock import patch as _patch
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+
+        spawn_calls: list = []
+
+        def spy_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+            return MagicMock()
+
+        def hang_run_pipeline(text, **kwargs):
+            raise TimeoutError("simulated bg-fallback double hang")
+
+        caplog.set_level(logging.ERROR, logger="lab_lounge.run_loop")
+
+        with _patch(
+            "lab_lounge.mcp_servers.ask_character.cancel_bg_tts", return_value=0,
+        ), _patch(
+            "lab_lounge.run_loop.run_pipeline", side_effect=hang_run_pipeline,
+        ), _patch(
+            "lab_lounge.run_loop._spawn_handraise_response_playback",
+            side_effect=spy_spawn,
+        ):
+            # raise されず None を返す (= 早期 return)
+            ret = _approved_synthesize_fallback(
+                "mimi", "ルカ発話", "trace-Thang",
+                session_stream_id="ss-Thang",
+                session_id_root="sess-Thang",
+            )
+
+        assert ret is None
+        assert spawn_calls == [], (
+            "timeout 後に _spawn_handraise_response_playback が呼ばれた "
+            "(= 真の救済失敗の早期 return ができていない)"
+        )
+        # error log に「fallback timeout」関連文言
+        assert any(
+            "fallback timeout" in r.message
+            for r in caplog.records
+            if r.levelno >= logging.ERROR
+        ), (
+            f"fallback timeout の error ログが出ていない: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+
 class TestApprovedAnsweringBubbleInlineMetadata:
     """Phase 0.5-D-3 follow-up: 承認時 answering bubble の inline metadata 化テスト。
 

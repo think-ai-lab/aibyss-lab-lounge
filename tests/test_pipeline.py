@@ -1079,3 +1079,81 @@ class TestRunPipelineStatusManager:
         )
 
         assert captured.get("status_manager") is sentinel_manager
+
+
+# ─── Phase 0.5-D-e-3: run_pipeline timeout_sec ─────────────────────
+
+
+class TestRunPipelineTimeout:
+    """Phase 0.5-D-e-3: run_pipeline timeout_sec 引数 (= fallback hang 防止)。
+
+    中間実走 11 回目 take 3 で観察された 5 分以上 hang への構造的対処。fallback
+    パスでの run_pipeline 呼出が hang した場合に TimeoutError で打ち切れる
+    経路を作る。
+    """
+
+    def test_no_timeout_runs_synchronously(self, monkeypatch):
+        """timeout_sec=None では従来通り同期実行 (= 後方互換)。"""
+        captured = {}
+
+        def fake_graph(text, **kwargs):
+            captured["called"] = True
+            captured.update(kwargs)
+            return MagicMock(events=[])
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        run_pipeline("hello", timeout_sec=None, **COMMON)
+        assert captured["called"] is True
+
+    def test_timeout_completes_under_limit(self, monkeypatch):
+        """timeout_sec 内に完了すれば TimeoutError は出ない。"""
+        sentinel_result = MagicMock(events=[])
+
+        def fake_graph(text, **kwargs):
+            return sentinel_result
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        # timeout 5s だが処理は即座に完了 → TimeoutError なし
+        result = run_pipeline("hello", timeout_sec=5.0, **COMMON)
+        assert result is sentinel_result
+
+    def test_timeout_raises_timeout_error(self, monkeypatch):
+        """timeout_sec を超えたら TimeoutError を raise する。"""
+        import time
+
+        def slow_graph(text, **kwargs):
+            time.sleep(2.0)  # 2 秒スリープ
+            return MagicMock(events=[])
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", slow_graph)
+
+        # timeout 0.1s で 2s スリープ → TimeoutError
+        with pytest.raises(TimeoutError, match="run_pipeline timeout"):
+            run_pipeline("hello", timeout_sec=0.1, **COMMON)
+
+    def test_timeout_propagates_contextvars(self, monkeypatch):
+        """timeout_sec 経路でも contextvars (session_id / mode) が thread に伝播。
+
+        ThreadPoolExecutor は default で context をコピーしないため、明示的な
+        contextvars.copy_context().run(...) で wrap する設計を検証する。
+        伝播がないと thread 内で _get_llm_for_agent が default mode="normal"
+        を使い、意図しない pool key になる可能性がある。
+        """
+        from lab_lounge import graph as graph_mod
+
+        observed = {}
+
+        def capture_graph(text, **kwargs):
+            # _run_pipeline_graph 内では contextvars が set 済の状態
+            observed["session_id"] = graph_mod._llm_client_session_id_var.get()
+            observed["mode"] = graph_mod._llm_client_mode_var.get()
+            return MagicMock(events=[])
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", capture_graph)
+
+        run_pipeline("hello", timeout_sec=5.0, **COMMON)
+        # run_pipeline は mode="normal" を contextvars に set する設計
+        assert observed["session_id"] == COMMON["session_id"]
+        assert observed["mode"] == "normal"
