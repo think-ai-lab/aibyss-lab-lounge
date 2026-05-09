@@ -707,6 +707,116 @@ class TestCancelBgTts:
         mock_synth.assert_not_called()
 
 
+class TestBgChunkBuffers:
+    """Phase 0.5-D-1a: BG LLM 経路用の chunk buffer 機構の単体テスト。
+
+    本 phase (D-1a) では _bg_chunk_buffers dict と操作 API (_append/_drain/_peek)
+    を追加するのみ (= 未配線、_wrapped_on_chunk_ready からは呼ばれない)。
+    D-1b で `set_ask_character_context(defer_chunks=True)` 時の defer モード分岐
+    から本 API を呼ぶよう配線する。
+
+    本クラスでは API 単体の挙動 (= 蓄積/atomic 取得 + クリア/カウント/初期化) を
+    検証する。
+    """
+
+    def test_append_bg_chunk_stores_in_session_dict(self):
+        """_append_bg_chunk で session_id ごとに chunks が累積する。"""
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _peek_bg_chunks_count,
+        )
+        chunk = {"url": "file:///a.wav", "text": "hello",
+                 "is_last": False, "character": "mimi", "pose": None}
+        _append_bg_chunk("session-A", chunk)
+        assert _peek_bg_chunks_count("session-A") == 1
+        _append_bg_chunk("session-A", chunk)
+        assert _peek_bg_chunks_count("session-A") == 2
+
+    def test_drain_bg_chunks_returns_and_clears(self):
+        """_drain_bg_chunks は chunks list を順序保証で返し、同時に dict から削除する。
+
+        WHY atomic: 並行 daemon thread からの append と承認 callback からの drain
+        の race を防ぐため、_ask_state_lock 配下で取得 + クリアを 1 操作にする
+        (= 取得後の追加チャンクは新 buffer に蓄積される、見逃しなし)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _drain_bg_chunks, _peek_bg_chunks_count,
+        )
+        c1 = {"url": "1", "text": "a"}
+        c2 = {"url": "2", "text": "b"}
+        _append_bg_chunk("session-B", c1)
+        _append_bg_chunk("session-B", c2)
+        result = _drain_bg_chunks("session-B")
+        # 順序保証 (= append 順)
+        assert result == [c1, c2]
+        # drain 後は完全クリア (= 2 度目 drain は空)
+        assert _peek_bg_chunks_count("session-B") == 0
+        assert _drain_bg_chunks("session-B") == []
+
+    def test_drain_bg_chunks_unknown_session_returns_empty_list(self):
+        """未知 session_id の drain は [] を返す (= 未蓄積/未配線時の後方互換)。"""
+        from lab_lounge.mcp_servers.ask_character import _drain_bg_chunks
+        assert _drain_bg_chunks("session-unknown") == []
+
+    def test_empty_session_id_no_op(self):
+        """空文字 session_id では append/drain/peek 全部 no-op (= 既存 dict 群と同じパターン)。
+
+        WHY: テストやエッジケースで session_id 未指定で呼ばれることがあるため、
+        既存の _ask_counts/_previous_targets 等と同じく空文字は副作用なし扱い。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_chunk_buffers, _drain_bg_chunks, _peek_bg_chunks_count,
+        )
+        _append_bg_chunk("", {"url": "x"})
+        # 空文字 session_id では dict 自体に何も登録されない
+        assert "" not in _bg_chunk_buffers
+        assert _peek_bg_chunks_count("") == 0
+        assert _drain_bg_chunks("") == []
+
+    def test_buffer_resets_on_set_ask_character_context(self):
+        """set_ask_character_context (= ターン開始時) で前ターンの buffer がリセットされる。
+
+        WHY: 前ターン残留 buffer が次ターンに混入することを構造的に防ぐ
+        (= _reset_session_state 内の _bg_chunk_buffers.pop で担保)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _peek_bg_chunks_count,
+        )
+        _append_bg_chunk("sess-C", {"url": "leaked"})
+        assert _peek_bg_chunks_count("sess-C") == 1
+        # set_ask_character_context で同一 session_id 指定 → _reset_session_state 経由でクリア
+        set_ask_character_context(common={"session_id": "sess-C"})
+        assert _peek_bg_chunks_count("sess-C") == 0
+
+    def test_buffer_isolated_per_session_id(self):
+        """異なる session_id 間で buffer が完全分離される (= dict ベース、明示テスト)。"""
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _drain_bg_chunks, _peek_bg_chunks_count,
+        )
+        _append_bg_chunk("sess-X", {"url": "x1"})
+        _append_bg_chunk("sess-Y", {"url": "y1"})
+        _append_bg_chunk("sess-Y", {"url": "y2"})
+        assert _peek_bg_chunks_count("sess-X") == 1
+        assert _peek_bg_chunks_count("sess-Y") == 2
+        # X drain しても Y には影響なし
+        assert _drain_bg_chunks("sess-X") == [{"url": "x1"}]
+        assert _peek_bg_chunks_count("sess-Y") == 2
+
+    def test_reset_ask_character_context_clears_all_session_buffers(self):
+        """reset_ask_character_context は全 session の buffer を一括クリーンする。
+
+        WHY: テスト間の漏れ防止 (= autouse fixture の _reset_context で全 session
+        buffer が空になっていることを担保、case 同士の干渉を防ぐ)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _append_bg_chunk, _bg_chunk_buffers, reset_ask_character_context,
+        )
+        _append_bg_chunk("sess-1", {"url": "1"})
+        _append_bg_chunk("sess-2", {"url": "2"})
+        assert len(_bg_chunk_buffers) == 2
+        reset_ask_character_context()
+        assert len(_bg_chunk_buffers) == 0
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
