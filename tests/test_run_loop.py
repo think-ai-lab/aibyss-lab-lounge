@@ -1002,6 +1002,191 @@ class TestApprovedAnsweringBubbleInlineMetadata:
         # 後続 chunk には inline metadata なし (= 1 度だけ発火、冪等保護)
         assert chunks_only[1].get("_pre_play_bubble") is None
 
+    # ─── Phase 0.5-D-d-3 (= A4): caller pose の inline metadata 検証 ────
+
+    def test_first_tts_only_chunk_has_pre_play_status_talking(self, monkeypatch):
+        """first tts_only chunk に _pre_play_status (TALKING + caller pose + text) が
+        埋め込まれる (Phase 0.5-D-d-3 = A4 対処)。
+
+        bg_chunks 経路 (= ask_character target chunks の pattern、ask_character.py:
+        1004-1010) を caller chunks にも適用。物理再生時に worker が dispatch することで
+        「caller が〆セリフを話し始める瞬間」と HUD の TALKING / pose 表示が同期する。
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        spawn_calls: list[tuple] = []
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            spawn_calls.append((slug, list(initial_chunks), trace_id))
+            return MagicMock(), _FakeQueue()
+
+        # run_pipeline_tts_only mock: on_chunk を pose="smile" で 1 回呼ぶ
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "first text", True, "mimi", "smile")
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
+        )
+
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": "ありがとう、ルカ。"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        for _ in range(40):
+            if spawn_calls and len(queue_items) >= 2:
+                break
+            time.sleep(0.05)
+
+        # first chunk に _pre_play_status (= TALKING + caller pose + text) が埋込
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) >= 1
+        first = chunks_only[0]
+        status = first.get("_pre_play_status")
+        assert status is not None, (
+            f"first chunk に _pre_play_status が必要 (実際: {first})"
+        )
+        assert status["slug"] == "mimi"
+        assert status["status"] == "TALKING"
+        assert status["metadata"]["pose"] == "smile"
+        assert status["metadata"]["text"] == "ありがとう、ルカ。"
+
+    def test_subsequent_chunks_no_pre_play_status(self, monkeypatch):
+        """2 件目以降の tts_only chunk には _pre_play_status なし (Phase 0.5-D-d-3)。
+
+        _first_tts_only_chunk_seen ガードで 1 度だけ発火 (= HUD の subscriber に対して
+        無駄な再 publish を避ける)。bg_chunks 経路と同じ冪等保護。
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            return MagicMock(), _FakeQueue()
+
+        # run_pipeline_tts_only mock: on_chunk を 2 回呼ぶ (= first + 後続)
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "first", False, "mimi", "smile")
+                on_tts_chunk_ready("u2", "second", True, "mimi", "neutral")
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
+        )
+
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": "ルカへ。"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        for _ in range(40):
+            if len(queue_items) >= 3:  # 2 chunks + sentinel
+                break
+            time.sleep(0.05)
+
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) == 2
+
+        # 2 件目には _pre_play_status なし (= 1 度だけ発火)
+        assert chunks_only[1].get("_pre_play_status") is None
+
+    def test_pre_play_status_pose_none_with_text_includes_metadata(self, monkeypatch):
+        """pose=None でも answering_text があれば _pre_play_status は埋込
+        (= metadata.pose=None で発火、Phase 0.5-D-d-3)。
+
+        【WHY: pose=None でも発火する設計】
+        TTS-only graph で pose 推論が遅延するケース (= chunk 1 では pose=None で届く
+        ことがある) でも、TALKING ステータス + text の HUD 反映は維持したい。pose は
+        None として渡し、HUD 側で「pose 不明時は前 pose を維持」のフォールバック
+        ロジックで対応する設計。冪等性は metadata 差分時に publish (= 後続 pose
+        確定で再 publish 可能、ただし first chunk only ガードで本経路では 1 回のみ)。
+        """
+        import time
+        from lab_lounge.dispatcher import HandraiseBgResult
+        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
+
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            return MagicMock(), _FakeQueue()
+
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "x", True, "mimi", None)  # pose=None
+            return llm_result
+
+        monkeypatch.setattr(
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
+        )
+        monkeypatch.setattr(
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
+        )
+
+        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1", stream_context=None,
+        )
+
+        fake_result = MagicMock()
+        fake_result.events = [
+            {"type": "llm.final", "payload": {"text": "ありがとう。"}},
+        ]
+        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
+
+        on_approved("mimi", bg, "snap", "trace-orig")
+        for _ in range(40):
+            if len(queue_items) >= 2:  # 1 chunk + sentinel
+                break
+            time.sleep(0.05)
+
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) >= 1
+        status = chunks_only[0].get("_pre_play_status")
+        # answering_text が空でなければ pose=None でも埋込
+        assert status is not None
+        assert status["metadata"]["pose"] is None
+        assert status["metadata"]["text"] == "ありがとう。"
+
 
 class TestHandraiseCloseFlow:
     """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
