@@ -311,15 +311,23 @@ class TestStatusReflection:
         metadata = talking_calls[0].kwargs.get("metadata")
         assert metadata is not None
         assert metadata.get("pose") == "special_doya"
-        assert metadata.get("text") == response_text
+        # Phase 0.5-B-β-3 commit 1: text は say_text (= JSON parse 後の response
+        # 部分のみ) を期待する。JSON 全文ではない (= シナリオ 2 で観察した
+        # 「HUD に JSON が表示される」不具合の修正)。
+        assert metadata.get("text") == "データを分析しました"
 
-    def test_target_ready_reflected_at_bg_tts_done(self, monkeypatch):
-        """bg_tts 合成完了後 (finally) に target が READY で反映される。
+    def test_target_talking_metadata_text_falls_back_to_raw_on_parse_failure(
+        self, monkeypatch,
+    ):
+        """response_text が JSON でない場合、metadata.text は raw 文字列にフォールバック。
 
-        WHY: target の発話終了 = HUD カードを ready (灰) に戻す瞬間。例外時も
-        finally で確実に Ready にすることで、HUD カードが talking のまま stuck
-        するのを防ぐ (= UI 整合性、視覚的に「終了した」が分かる)。
+        WHY: _parse_voicepeak_json が失敗したケース (= 協働先 LLM が JSON 形式を
+        返さなかった、あるいは structured_output 未指定で plain text 返却)。
+        metadata.text を None にしてしまうと HUD に何も表示されないため、raw を
+        fallback として使う (= 視認可能性を最優先、UI stuck 防止)。
         """
+        import time
+
         from lab_lounge.character_status import CharacterStatus
         from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
 
@@ -327,7 +335,7 @@ class TestStatusReflection:
 
         mock_status = MagicMock()
         mock_tts_chunk = MagicMock()
-        session_id = "ss1"
+        session_id = "ss-fallback"
         set_ask_character_context(
             on_tts_chunk=mock_tts_chunk,
             tts_output_dir="/tmp/audio",
@@ -336,22 +344,117 @@ class TestStatusReflection:
             status_manager=mock_status,
         )
 
-        # tts.synthesize は単純 return (= 合成成功シナリオ)
+        # JSON parse 不可な raw 文字列
+        raw_response = "ただのテキスト応答 (JSON ではない)"
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "chisame":
+                on_chunk("file://chunk1.wav", "ただの…", True, "chisame")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=raw_response,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        talking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.TALKING)
+        ]
+        assert len(talking_calls) == 1
+        metadata = talking_calls[0].kwargs.get("metadata")
+        assert metadata is not None
+        # JSON parse 失敗時は raw response_text にフォールバック
+        assert metadata.get("text") == raw_response
+
+    def test_target_ready_NOT_reflected_when_synth_normal(self, monkeypatch):
+        """正常合成時は bg_tts_synthesize finally で READY 反映しない (Phase 0.5-B-β-3 commit 2)。
+
+        WHY: bg_tts 合成完了 != 物理再生完了。シナリオ 2 で観察した「HUD で発話
+        途中に灰色化する」不具合の修正。正常系の READY 反映は playback worker
+        (= is_last chunk 物理再生完了時) に移動。bg_tts_synthesize の finally では
+        READY 反映しない (= playback worker 経由で適切なタイミングに反映される)。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1-normal"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize は単純 return (= 合成成功シナリオ、例外なし)
         with patch(
             "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
             return_value='{"response": "テスト応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
         ), patch("lab_lounge.tts.synthesize"):
             _ask_character_impl("chisame", "質問")
-            # bg_tts daemon thread の完了を確実に待つ (finally で READY 反映後)
             wait_bg_tts_complete(session_id, timeout=5.0)
 
-        # 期待: target=chisame で READY 反映が 1 回 (= bg_tts 合成完了 finally)
+        # 期待: 正常系では target=chisame で READY 反映が呼ばれない (= 0 回)。
+        # playback worker 経由で is_last 再生完了時に反映される設計のため。
+        ready_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.READY)
+        ]
+        assert len(ready_calls) == 0, (
+            f"正常系では bg_tts_synthesize finally で READY 反映されないこと "
+            f"(playback worker 経由に移動): ready_calls={ready_calls}"
+        )
+
+    def test_target_ready_fallback_when_synth_exception(self, monkeypatch):
+        """合成例外時は bg_tts_synthesize finally で fallback READY 反映 (Phase 0.5-B-β-3 commit 2)。
+
+        WHY: tts.synthesize が例外を投げた場合、chunks が playback queue に入らない
+        ため、playback worker 経由の READY 反映が走らない。HUD カードが talking
+        のまま stuck するのを防ぐため、本 finally で fallback として READY 反映する。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1-exc"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize が例外を投げる (= 合成失敗、VOICEPEAK クラッシュ等)
+        def fake_synth_raises(*args, **kwargs):
+            raise RuntimeError("VOICEPEAK 合成失敗")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth_raises):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: 例外系では fallback で target=chisame の READY 反映が 1 回呼ばれる
         ready_calls = [
             call for call in mock_status.set_status.call_args_list
             if call.args[:2] == ("chisame", CharacterStatus.READY)
         ]
         assert len(ready_calls) >= 1, (
-            "bg_tts 合成完了後に target が READY で set_status されること"
+            "tts.synthesize 例外時は finally で fallback として target が "
+            "READY で set_status されること (UI stuck 防止)"
         )
 
     def test_status_manager_none_skips_reflection(self, monkeypatch):

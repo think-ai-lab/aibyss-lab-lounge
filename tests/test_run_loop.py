@@ -436,6 +436,113 @@ class TestPlaybackWorkerDrain:
         assert not thread.is_alive()
 
 
+# ─── Phase 0.5-B-β-3 commit 2: is_last chunk 再生完了時の READY 反映 ─────────
+
+
+class TestRunPlaybackWorkerStatusReady:
+    """_run_playback_worker の status_manager 経由 READY 反映 (Phase 0.5-B-β-3 commit 2)。
+
+    is_last=True chunk の **物理再生完了時** に status_manager.set_status(character, READY)
+    を呼ぶ機能。bg_tts 合成完了 != 物理再生完了の不整合を解消する (= シナリオ 2 で
+    観察した「HUD で発話途中に灰色化する」不具合の修正、ask_character target キャラ用)。
+    通常応答 caller の最終応答経路では _bg_cleanup_pipeline と二重発火するが
+    冪等性で害なし。
+    """
+
+    def _start_worker(self, q, *, status_manager=None, publish_fn=None,
+                      play_fn=None, cleanup_fn=None, done_delay=0.01):
+        publish_fn = publish_fn or MagicMock()
+        play_fn = play_fn or MagicMock()
+        cleanup_fn = cleanup_fn or MagicMock()
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "done_delay_seconds": done_delay,
+                "status_manager": status_manager,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def test_is_last_true_invokes_set_status_ready(self):
+        """is_last=True chunk 再生完了時に status_manager.set_status(character, READY) 呼出。
+
+        WHY: シナリオ 2 観察「HUD で発話途中に灰色化」の修正の核心経路。物理再生
+        完了 (= cleanup_audio_fn 後) のタイミングで READY 反映することで、視聴者
+        体験と HUD 表示が同期する。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        q: queue.Queue = queue.Queue()
+        mock_status = MagicMock()
+
+        thread = self._start_worker(q, status_manager=mock_status)
+        q.put({
+            "url": "file:///a.wav", "text": "x", "is_last": True, "character": "chisame",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # is_last 再生完了で chisame -> READY が 1 回呼ばれる
+        ready_calls = [
+            c for c in mock_status.set_status.call_args_list
+            if c.args[:2] == ("chisame", CharacterStatus.READY)
+        ]
+        assert len(ready_calls) == 1, (
+            f"is_last=True chunk 再生完了時に READY 反映されること: {ready_calls}"
+        )
+
+    def test_status_manager_none_no_op(self):
+        """status_manager=None なら set_status は呼ばれない (= 後方互換)。
+
+        WHY: Phase 0.5-A 以前の呼出元 (= status_manager 未注入) で動作することを
+        保証。引数追加で既存呼出が壊れないこと (= 後方互換) の確認。
+        """
+        q: queue.Queue = queue.Queue()
+        thread = self._start_worker(q, status_manager=None)
+        q.put({
+            "url": "file:///a.wav", "text": "x", "is_last": True, "character": "mimi",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+        # status_manager=None なので set_status は一切呼ばれない (= 例外も出ない)
+        assert not thread.is_alive()
+
+    def test_non_is_last_does_not_invoke_set_status(self):
+        """is_last=False chunk では status_manager.set_status は呼ばれない。
+
+        WHY: 中間 chunks は通常再生のみ (= TALKING 状態の維持)。READY 反映は最後の
+        chunk (= is_last=True) のときだけ。途中で READY にすると HUD が灰色化する。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        q: queue.Queue = queue.Queue()
+        mock_status = MagicMock()
+
+        thread = self._start_worker(q, status_manager=mock_status)
+        # is_last=False の中間 chunks を 2 件 + None
+        q.put({
+            "url": "file:///a.wav", "text": "x", "is_last": False, "character": "mimi",
+        })
+        q.put({
+            "url": "file:///b.wav", "text": "y", "is_last": False, "character": "mimi",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # is_last=False では READY 反映なし
+        ready_calls = [
+            c for c in mock_status.set_status.call_args_list
+            if c.args[:2] == ("mimi", CharacterStatus.READY)
+        ]
+        assert ready_calls == [], (
+            f"is_last=False chunks では READY 反映されないこと: {ready_calls}"
+        )
+
+
 class TestHandraiseCloseFlow:
     """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
 

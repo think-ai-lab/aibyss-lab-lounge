@@ -1886,3 +1886,48 @@ class TestDispatcherStatusManager:
         assert second_call.args == (
             "mimi", CharacterStatus.READY, CharacterStatus.RAISEHAND, None,
         )
+
+    # ─── Phase 0.5-B-β-3 commit 3: 同一キャラ挙手の防止 ────────────────
+
+    def test_start_handraise_skipped_when_already_talking(self, monkeypatch):
+        """既に TALKING 状態のキャラは _start_handraise が no-op (Phase 0.5-B-β-3 commit 3)。
+
+        WHY: シナリオ 3 で観察した「自分が応答中なのに raisehand 遷移」のカオス
+        フローを防ぐ。応答中のキャラ (= talking) は raisehand 対象から除外し、
+        現在の発話を続行させる (= 既に話す権利を持っているので追加挙手は不自然)。
+        """
+        _patch_filler(monkeypatch, slug="mimi")
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+
+        # 事前に mimi を TALKING に設定 (= 既に応答中の状況を再現)
+        manager.set_status("mimi", CharacterStatus.TALKING)
+
+        # interjection_candidate 経由で _start_handraise を呼ぶ
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+
+        # 期待: status は TALKING のまま (= raisehand に遷移しない)
+        assert manager.get_status("mimi") == CharacterStatus.TALKING
+        # 期待: handraise_states に追加されない (= 挙手扱いされない)
+        assert "mimi" not in d._handraise_states
+
+    def test_start_handraise_proceeds_when_status_ready(self, monkeypatch):
+        """status=READY のキャラは _start_handraise が通常進行 (Phase 0.5-B-β-3 commit 3)。
+
+        WHY: 後方互換確認。READY (= 応答していない) のキャラは挙手対象として
+        通常通り扱われ、RAISEHAND に遷移する。β-3-3 のガード追加で既存挙動が
+        壊れないことを保証する (= 既存テスト test_start_handraise_sets_raisehand
+        と同じシナリオを明示的に talking ガードと組み合わせて検証)。
+        """
+        _patch_filler(monkeypatch, slug="mimi")
+        manager = CharacterStatusManager()
+        d = self._make_dispatcher(manager, monkeypatch)
+
+        # mimi は READY デフォルト
+        assert manager.get_status("mimi") == CharacterStatus.READY
+
+        d.on_interjection_candidate("mimi", transcript_snapshot=None)
+
+        # 期待: RAISEHAND に遷移 (= 既存挙動、β-3-3 ガード未抵触)
+        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND
+        assert "mimi" in d._handraise_states
