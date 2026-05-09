@@ -1026,6 +1026,59 @@ class TestApprovedSynthesizeFallbackTimeout:
             f"{[r.message for r in caplog.records]}"
         )
 
+    def test_fallback_timeout_logs_pool_snapshot(self, monkeypatch, caplog):
+        """timeout 検出時の error ログに pool_keys + active_threads が含まれる。
+
+        Phase 0.5-D-e-4-3 (= 中間実走 12 検分): bg_runner-fallback 二重 hang
+        再発時に「D-e-2 pool 分離が機能したか」「thread leak がないか」を
+        判別する基盤となるスナップショット情報。
+        """
+        import logging
+        from unittest.mock import patch as _patch
+        from lab_lounge.run_loop import _approved_synthesize_fallback
+        from lab_lounge import graph as graph_mod
+
+        # graph._llm_client_pool に dummy entry を入れて pool_keys が出力されるか確認
+        graph_mod._clear_llm_client_pool()
+        with graph_mod._llm_client_pool_lock:
+            graph_mod._llm_client_pool[("sess-X", "bg")] = MagicMock()
+            graph_mod._llm_client_pool[("sess-X", "normal")] = MagicMock()
+
+        def hang_run_pipeline(text, **kwargs):
+            raise TimeoutError("simulated double hang")
+
+        caplog.set_level(logging.ERROR, logger="lab_lounge.run_loop")
+
+        try:
+            with _patch(
+                "lab_lounge.mcp_servers.ask_character.cancel_bg_tts", return_value=0,
+            ), _patch(
+                "lab_lounge.run_loop.run_pipeline", side_effect=hang_run_pipeline,
+            ), _patch(
+                "lab_lounge.run_loop._spawn_handraise_response_playback",
+                return_value=MagicMock(),
+            ):
+                _approved_synthesize_fallback(
+                    "mimi", "ルカ発話", "trace-snap",
+                    session_stream_id="ss-snap",
+                    session_id_root="sess-snap",
+                )
+
+            # error ログに pool_keys + active_threads が含まれる
+            timeout_records = [
+                r for r in caplog.records
+                if "fallback timeout" in r.message and r.levelno >= logging.ERROR
+            ]
+            assert timeout_records, "fallback timeout error ログ不在"
+            msg = timeout_records[0].message
+            # pool_keys には事前に入れた ("sess-X", "bg") + ("sess-X", "normal") が含まれる
+            assert "pool_keys=" in msg, f"pool_keys が出ていない: {msg}"
+            assert "sess-X" in msg, f"pool_keys 内容が反映されていない: {msg}"
+            assert "active_threads=" in msg, f"active_threads が出ていない: {msg}"
+        finally:
+            # 後片付け: pool を綺麗にしてテスト間の漏れ防止
+            graph_mod._clear_llm_client_pool()
+
 
 class TestApprovedAnsweringBubbleInlineMetadata:
     """Phase 0.5-D-3 follow-up: 承認時 answering bubble の inline metadata 化テスト。

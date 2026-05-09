@@ -575,10 +575,24 @@ def _approved_synthesize_fallback(
         )
     except TimeoutError as exc:
         # 真の救済失敗 → ログ出力 + 早期 return (= 視聴者には無音、別経路で要対処)
+        # Phase 0.5-D-e-4-3 (= 中間実走 12 検分):
+        # timeout 検出時のスナップショットを error ログに追加。
+        # 「pool 分離が機能したか」「thread leak がないか」を再発時に判別可能に。
+        # 含める情報は最小限 (= pool_keys + active_threads)、過剰情報は post-mortem 経路へ。
+        try:
+            from .graph import _llm_client_pool, _llm_client_pool_lock
+            with _llm_client_pool_lock:
+                pool_keys = sorted(_llm_client_pool.keys())
+        except Exception:  # noqa: BLE001
+            # graph import 失敗等は本流に影響させない (= 防衛的)
+            pool_keys = []
+        active_threads = threading.active_count()
         logger.error(
-            "挙手承認 fallback timeout [character=%s]: %ss 経過 (= bg_runner-fallback "
-            "二重 hang の可能性) trace_id=%s err=%s",
-            slug, fallback_timeout_sec, fallback_trace_id, exc,
+            "挙手承認 fallback timeout [character=%s]: %ss 経過 "
+            "(= bg_runner-fallback 二重 hang の可能性) "
+            "trace_id=%s pool_keys=%s active_threads=%d err=%s",
+            slug, fallback_timeout_sec, fallback_trace_id,
+            pool_keys, active_threads, exc,
         )
         return
     except Exception as exc:  # noqa: BLE001
