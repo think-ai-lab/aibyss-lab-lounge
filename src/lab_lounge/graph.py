@@ -22,6 +22,8 @@ import functools
 import logging
 import operator
 import os
+import threading
+from contextvars import ContextVar
 from typing import Annotated, Any, TypedDict
 
 from .character_status import CharacterStatus, CharacterStatusManager
@@ -91,8 +93,54 @@ def _is_tools_enabled() -> bool:
     return os.environ.get("L2_ENABLE_TOOLS", "false").lower() in ("true", "1", "yes")
 
 
-def _get_llm_for_agent(provider: str, model: str):
-    """プロバイダーに応じた LangChain Chat モデルを返す。"""
+# ─── Phase 0.5-D-e-2: LLM client pool (= bg_runner / fallback の connection ──
+# pool 競合解消) ──────────────────────────────────────────────────
+#
+# 【WHY: ChatOpenAI を毎回新規生成すると connection pool が競合】
+# 中間実走 11 回目 take 3 で観察された 5 分以上 hang の核心要因:
+#   - bg_runner._body と _approved_synthesize_fallback が同一 session_id で並走
+#   - 各経路で ChatOpenAI() を新規生成 → httpx connection pool が
+#     OpenAI API 側の rate limiting / TCP keepalive と組み合わさって競合
+#   - 結果: 両方の Agent.invoke が遅延 → 二重 hang
+#
+# 【設計】
+#   - dict[(session_id, mode), Chat<Provider>] で session 内再利用
+#   - mode = "bg" (= bg_runner / 挙手 BG LLM 経路 / collab agent も継承)
+#           / "normal" (= 通常応答 / fallback)
+#   - 同 session + 同 mode の client を再利用 (= connection 確立コスト削減)
+#   - 違う mode 同士は別 client (= connection pool 独立、競合構造解消)
+#   - cleanup: reset_ask_character_context 呼出時に session 単位で削除
+#
+# 【WHY: contextvars 経由で透過渡し】
+# _get_llm_for_agent の signature を変えずに pool key を伝播するため、
+# pipeline.py で contextvars に session_id + mode をセットする方式を採用。
+# これにより既存テスト (= _get_llm_for_agent を mock している test_graph_agent.py)
+# への影響をゼロにできる。collab agent (= ask_character 経由の chisame/sakura
+# Agent) も bg_runner._body と同 thread で実行されるため、contextvars が
+# 自然に伝播し、同 mode="bg" の pool client を共有する (= 期待動作)。
+_llm_client_pool: dict[tuple[str, str], Any] = {}
+_llm_client_pool_lock = threading.Lock()
+
+# Phase 0.5-D-e-2: LLM client の pool key 用 contextvars。
+# 配信ターン単位 (= session_id) に経路 mode (= "bg" / "normal") を組み合わせた
+# tuple をキーに client を pool 化する。
+# pipeline.run_pipeline / run_pipeline_llm_only がそれぞれ "normal" / "bg" を
+# set し、graph 経由の Agent 実行と ask_character collab agent でも同 var が
+# 透過参照される。
+_llm_client_session_id_var: ContextVar[str] = ContextVar(
+    "_llm_client_session_id_var", default="",
+)
+_llm_client_mode_var: ContextVar[str] = ContextVar(
+    "_llm_client_mode_var", default="normal",
+)
+
+
+def _create_llm_client_raw(provider: str, model: str):
+    """プロバイダーに応じた LangChain Chat モデルを実生成する (pool 化対象の生成器)。
+
+    元の ``_get_llm_for_agent`` 本体ロジックを切り出したもの。pool ヒット時には
+    呼ばれず、初回生成時のみ呼ばれる。
+    """
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(model=model)
@@ -102,6 +150,115 @@ def _get_llm_for_agent(provider: str, model: str):
     else:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(model=model)
+
+
+def _get_or_create_llm_client(
+    provider: str,
+    model: str,
+    *,
+    session_id: str,
+    mode: str = "normal",
+):
+    """session_id + mode 単位で LLM client を pool 管理する (Phase 0.5-D-e-2)。
+
+    Args:
+        provider:   LLM プロバイダ ("openai" / "google" / "anthropic")
+        model:      LLM model 名 (= "gpt-5.5" / "gemini-3.1-pro-preview" 等)
+        session_id: BG LLM の session_id (= 配信ターン単位、空文字なら pool 化なし)
+        mode:       "bg" (= bg_runner / collab agent) / "normal" (= 通常応答 / fallback)
+
+    Returns:
+        Chat<Provider>: pool 化された client (= 同 session + 同 mode で再利用)
+    """
+    if not session_id:
+        # session_id 空時は pool 化なし (= 後方互換、テスト時の挙動維持)。
+        # graph._get_llm_for_agent の旧呼出経路 (= contextvars 未設定時) と互換。
+        return _create_llm_client_raw(provider, model)
+    key = (session_id, mode)
+    with _llm_client_pool_lock:
+        if key not in _llm_client_pool:
+            _llm_client_pool[key] = _create_llm_client_raw(provider, model)
+            logger.debug(
+                "LLM client pool: created [session=%s mode=%s provider=%s model=%s]",
+                session_id, mode, provider, model,
+            )
+        return _llm_client_pool[key]
+
+
+def _cleanup_llm_client_pool(session_id: str) -> None:
+    """指定 session_id の client を全 mode 削除する (Phase 0.5-D-e-2、cleanup)。
+
+    呼出元: ask_character.cancel_bg_tts (= 却下/lapse 時)、テスト等の明示 cleanup。
+    既存 client は GC 対象になり、httpx connection も async close される。
+    """
+    if not session_id:
+        return
+    with _llm_client_pool_lock:
+        keys_to_remove = [
+            k for k in _llm_client_pool if k[0] == session_id
+        ]
+        for k in keys_to_remove:
+            _llm_client_pool.pop(k, None)
+        if keys_to_remove:
+            logger.debug(
+                "LLM client pool: cleaned up [session=%s removed_count=%d]",
+                session_id, len(keys_to_remove),
+            )
+
+
+def _cleanup_llm_client_pool_except(active_session_id: str) -> None:
+    """指定 session_id 以外の client を全削除する (Phase 0.5-D-e-2)。
+
+    呼出元: ask_character.set_ask_character_context (= 各ターン開始時)。
+    新ターン開始のタイミングで「前ターンまでの client を解放」する経路を作ることで、
+    承認/却下/lapse のいずれの完了パターンでもメモリリークしない設計とする。
+
+    active_session_id 自身は保持される (= 同 session 内の連続呼出で再利用可能)。
+    空文字なら pool 全削除 (= テスト挙動互換)。
+    """
+    with _llm_client_pool_lock:
+        if not active_session_id:
+            removed = len(_llm_client_pool)
+            _llm_client_pool.clear()
+            if removed:
+                logger.debug(
+                    "LLM client pool: cleared all [removed_count=%d]", removed,
+                )
+            return
+        keys_to_remove = [
+            k for k in _llm_client_pool if k[0] != active_session_id
+        ]
+        for k in keys_to_remove:
+            _llm_client_pool.pop(k, None)
+        if keys_to_remove:
+            logger.debug(
+                "LLM client pool: cleaned up except [active=%s removed_count=%d]",
+                active_session_id, len(keys_to_remove),
+            )
+
+
+def _clear_llm_client_pool() -> None:
+    """LLM client pool を全クリーンする (Phase 0.5-D-e-2、テスト用)。
+
+    呼出元: ask_character.reset_ask_character_context (= テスト fixture でのリセット)。
+    """
+    with _llm_client_pool_lock:
+        _llm_client_pool.clear()
+
+
+def _get_llm_for_agent(provider: str, model: str):
+    """プロバイダーに応じた LangChain Chat モデルを返す (Phase 0.5-D-e-2 で pool 化)。
+
+    contextvars (= ``_llm_client_session_id_var`` / ``_llm_client_mode_var``) から
+    pool key を読み取り、同 session + 同 mode で再利用する。pipeline.py 側で
+    set されるが、未設定時 (= 後方互換、テスト直接呼出) は session_id="" で
+    新規生成にフォールバック。
+    """
+    session_id = _llm_client_session_id_var.get()
+    mode = _llm_client_mode_var.get()
+    return _get_or_create_llm_client(
+        provider, model, session_id=session_id, mode=mode,
+    )
 
 
 def _is_rag_enabled() -> bool:

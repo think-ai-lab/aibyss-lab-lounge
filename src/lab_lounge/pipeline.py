@@ -209,20 +209,33 @@ def run_pipeline(
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
     """
-    return _run_pipeline_graph(
-        text,
-        stream_id=stream_id,
-        session_id=session_id,
-        trace_id=trace_id,
-        utterance_meta=utterance_meta,
-        speaker_hint=speaker_hint,
-        on_tts_chunk_ready=on_tts_chunk_ready,
-        on_pose_ready=on_pose_ready,
-        stream_context=stream_context,
-        suppress_bubble_answering=suppress_bubble_answering,
-        disable_tools=disable_tools,
-        status_manager=status_manager,
-    )
+    # Phase 0.5-D-e-2: LLM client pool key を contextvars にセット。
+    # run_pipeline は通常応答 / fallback パスの入口なので mode="normal"。
+    # bg_runner との connection pool 競合を構造的に解消するため (= take 3
+    # の二重 hang 対策)、graph._get_llm_for_agent はこの contextvars を
+    # 読んで pool key を決定する。try/finally で必ず reset (= 同 thread
+    # 内の前後ターンへの漏洩防止)。
+    from .graph import _llm_client_session_id_var, _llm_client_mode_var
+    sid_token = _llm_client_session_id_var.set(session_id)
+    mode_token = _llm_client_mode_var.set("normal")
+    try:
+        return _run_pipeline_graph(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
+            stream_context=stream_context,
+            suppress_bubble_answering=suppress_bubble_answering,
+            disable_tools=disable_tools,
+            status_manager=status_manager,
+        )
+    finally:
+        _llm_client_session_id_var.reset(sid_token)
+        _llm_client_mode_var.reset(mode_token)
 
 
 def _run_pipeline_graph(
@@ -370,18 +383,33 @@ def run_pipeline_llm_only(
                         tts.done は含まれない。承認時に ``run_pipeline_tts_only``
                         にこの result を渡して TTS を実行する。
     """
-    return _run_pipeline_graph_llm_only(
-        text,
-        stream_id=stream_id,
-        session_id=session_id,
-        trace_id=trace_id,
-        utterance_meta=utterance_meta,
-        speaker_hint=speaker_hint,
-        stream_context=stream_context,
-        status_manager=status_manager,
-        on_tts_chunk_ready=on_tts_chunk_ready,
-        on_pose_ready=on_pose_ready,
-    )
+    # Phase 0.5-D-e-2: LLM client pool key を contextvars にセット。
+    # run_pipeline_llm_only は bg_runner._body から呼ばれる挙手 BG LLM
+    # 経路の入口なので mode="bg"。fallback パス (= mode="normal") とは
+    # 別の client を使うことで OpenAI httpx connection pool の競合を構造的
+    # に解消する (= 中間実走 11 回目 take 3 の 5 分以上 hang 対処)。
+    # ask_character collab agent (= mimi → chisame の協働) も同 thread で
+    # 実行されるため、contextvars が自然に伝播し同 mode="bg" の client を
+    # 共有する (= connection 確立コスト削減)。
+    from .graph import _llm_client_session_id_var, _llm_client_mode_var
+    sid_token = _llm_client_session_id_var.set(session_id)
+    mode_token = _llm_client_mode_var.set("bg")
+    try:
+        return _run_pipeline_graph_llm_only(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            stream_context=stream_context,
+            status_manager=status_manager,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
+        )
+    finally:
+        _llm_client_session_id_var.reset(sid_token)
+        _llm_client_mode_var.reset(mode_token)
 
 
 def _run_pipeline_graph_llm_only(
