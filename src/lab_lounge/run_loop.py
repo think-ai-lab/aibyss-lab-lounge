@@ -1120,6 +1120,30 @@ def _create_handraise_runner_and_callbacks(
                 _streaming_queue.put(chunk)
                 _tts_only_count[0] += 1
 
+            # Phase 0.5-D-d-8 (= 中間実走 10 回目 take 2/3 修正、VOICEPEAK FIFO 順序
+            # 乱れ解消): mimi 〆セリフ TTS の VOICEPEAK 投入前に sakura TTS 全 chunks
+            # 合成完了を待つ。
+            #
+            # 【WHY: VOICEPEAK FIFO 順序乱れ問題】
+            # D-d-7 で wait_deferred_bg_tts_complete を削除した結果、mimi 〆セリフ TTS
+            # が sakura TTS の途中で並行投入され、VOICEPEAK FIFO worker の合成順 (=
+            # 投入順) で交錯が発生:
+            #   旧 (D-d-7): 投入順 = mimi 導入 → sakura 1 → sakura 2 → mimi 〆 1 →
+            #               sakura 3 → mimi 〆 2 (= take 2/3 で「ミミ → さくら → ミミ
+            #               → さくら → ミミ」の交錯を観察、logs/runs/run_loop_20260510_001209.log)
+            #
+            # VOICEPEAK は process global で 1 個直列のため、複数キャラの並行投入が
+            # 順序乱れを引き起こす根本制約。
+            #
+            # 【新設計 (D-d-8) のバランス】
+            # - mimi 導入セリフ + sakura chunks: 即時再生開始 (= D-d-7 の利点維持、
+            #   bg_chunks の蓄積分は streaming queue 直投入で再生)
+            # - mimi 〆セリフ chunks: sakura TTS 完了後に VOICEPEAK 投入 (= 順序保証、
+            #   ミミ → さくら → ミミ の自然な対話順)
+            # - mimi 〆セリフ再生開始は旧設計と同じタイミング (= sakura 完了後)
+            from .mcp_servers.ask_character import wait_deferred_bg_tts_complete
+            wait_deferred_bg_tts_complete(session_id_root)
+
             logger.info(
                 "挙手承認 TTS 同期実行 開始 [character=%s]: trace_id=%s text_len=%d",
                 slug, bg_trace_id, len(answering_text),
