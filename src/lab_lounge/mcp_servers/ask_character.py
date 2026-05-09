@@ -602,13 +602,18 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         # _wrapped_on_chunk_ready / _bg_tts_synthesize から参照する。
         status_manager_capture = _status_manager_var.get()
 
-        # response_text から pose を事前に抽出 (_wrapped_on_chunk_ready で使用)。
-        # 本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
+        # response_text から pose と say_text を事前に抽出 (_wrapped_on_chunk_ready
+        # で使用)。本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
         # _pending_poses に予約するタイミングと _on_tts_chunk で pop されるタイミング
         # の順序が保証される (= bridge filler 投入時には予約がなく neutral、本応答
         # chunk 1 投入時に target_pose が予約されている状態を作る)。
+        # Phase 0.5-B-β-3 commit 1: say_text も同時に取得し、TALKING metadata.text
+        # に渡すことで HUD ダッシュボードに「response 部分のみ」を表示する
+        # (= JSON 全文 ({"emotion":..., "response":..., ...}) が HUD に出てしまう
+        # 不具合の修正、シナリオ 2 で観察)。通常応答経路の graph._tts_node も
+        # 同じ前処理を行っており、metadata 形を統一する。
         from ..tts import _parse_voicepeak_json
-        _, _, _, target_pose = _parse_voicepeak_json(response_text)
+        target_say_text, _, _, target_pose = _parse_voicepeak_json(response_text)
 
         def _wrapped_on_chunk_ready(url: str, chunk_text: str, is_last: bool, character: str) -> None:
             # Phase 0.5-B-β-2: cancel flag set されていれば chunk 投入 skip。
@@ -659,9 +664,12 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                 if status_manager_capture is not None:
                     try:
                         from ..character_status import CharacterStatus
+                        # Phase 0.5-B-β-3 commit 1: text は say_text (= JSON parse 後の
+                        # response 部分) を優先する。parse 失敗時は元の response_text に
+                        # fallback (= 旧挙動、JSON 全文だが視認可能性は維持)。
                         talking_metadata: dict[str, Any] = {
                             "pose": target_pose if target_pose else None,
-                            "text": response_text,
+                            "text": target_say_text or response_text,
                         }
                         status_manager_capture.set_status(
                             target_char.slug,
@@ -676,13 +684,14 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             on_tts_chunk(url, chunk_text, is_last, character)
 
         def _bg_tts_synthesize() -> None:
+            synthesize_failed = False
+            cancelled = False
             try:
                 # Phase 0.5-B-β-2: cancel flag set されていれば tts_synthesize 起動
                 # を skip。VOICEPEAK の subprocess.run は止められないが、起動前なら
                 # 完全に阻止できる (= 一番早い cancel タイミング、CPU/GPU 浪費なし)。
-                # finally で bg_tts_done.set() + status_manager READY 反映が走るため、
-                # 状態整合性は維持される。
                 if cancel_flag is not None and cancel_flag.is_set():
+                    cancelled = True
                     logger.info(
                         "ask_character 協働応答 TTS skip (cancel flag set): "
                         "target=%s session=%s",
@@ -699,16 +708,22 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     on_chunk_ready=_wrapped_on_chunk_ready,
                 )
             except Exception as exc:
+                synthesize_failed = True
                 logger.warning(
                     "ask_character 協働応答 TTS 合成失敗 (%s): %s",
                     character_slug, exc,
                 )
             finally:
-                # Phase 0.5-B-β-1 commit 4: target の HUD ステータスを READY に
-                # 戻す。bg_tts 合成完了 = target の発話が終わった瞬間。例外時も
-                # finally で確実に Ready にする (= HUD カードが talking のまま
-                # stuck するのを防ぐ、UI 上の整合性を保つ)。
-                if status_manager_capture is not None:
+                # Phase 0.5-B-β-3 commit 2: 正常系の READY 反映は playback worker
+                # (= is_last chunk 物理再生完了時、run_loop._run_playback_worker)
+                # に移動した。bg_tts 合成完了 != 物理再生完了の不整合を解消する
+                # ため (= シナリオ 2 で観察、HUD で発話途中に灰色化する不具合)。
+                #
+                # ただし例外時 (= 合成失敗) と cancel 時は chunks が playback queue
+                # に入らないため、playback worker 経由の READY 反映が走らない。
+                # その場合は本 finally で READY を反映して UI stuck を防ぐ
+                # (= fallback 経路、HUD カードが talking のまま残らないようにする)。
+                if (synthesize_failed or cancelled) and status_manager_capture is not None:
                     try:
                         from ..character_status import CharacterStatus
                         status_manager_capture.set_status(

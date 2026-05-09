@@ -297,6 +297,10 @@ def _spawn_handraise_response_playback(
         """worker 本体 + finally で Ready 反映する wrapper (Phase 0.5-B-α)。
 
         chunks 再生完了 / worker 内例外のいずれでも finally 経路で Ready に戻す。
+        Phase 0.5-B-β-3 commit 2 で _run_playback_worker が is_last 再生完了時に
+        Ready 反映する経路を追加したが、worker 内例外 (= 再生失敗) で is_last 経路
+        を通らないケースに備えて finally の Ready 反映は維持する (= 二重発火だが
+        冪等性で害なし)。
         """
         try:
             _run_playback_worker(
@@ -305,6 +309,7 @@ def _spawn_handraise_response_playback(
                 play_audio_fn=play_audio_file,
                 cleanup_audio_fn=_cleanup_audio,
                 set_pose_fn=_set_pose_safe,
+                status_manager=status_manager,
             )
         finally:
             if status_manager is not None:
@@ -1030,6 +1035,7 @@ def _run_playback_worker(
     set_pose_fn=None,
     done_delay_seconds: float = 5.0,
     on_last_chunk_played=None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> None:
     """
     再生ワーカー: キューから task dict を受け取り、音声再生と bubble publish を調停する。
@@ -1065,6 +1071,15 @@ def _run_playback_worker(
                               dispatcher.flush_pending_handraise_releases を渡すことで
                               RESPONDING 中保留された挙手 wav を 5 秒早く release する。
                               None (default) なら従来挙動 (= done_delay → done bubble の直列)。
+        status_manager:       Phase 0.5-B-β-3 commit 2 で追加。is_last=True chunk の
+                              **物理再生完了時** に ``set_status(character, READY)`` を
+                              呼ぶ。HUD UX で「発話完了 = READY」を視覚化するため
+                              (= シナリオ 2 で観察した「発話途中で灰色化する」不具合の
+                              修正、ask_character target キャラ用に追加)。冪等性
+                              により、通常応答 caller の最終応答経路では既存の
+                              ``_bg_cleanup_pipeline`` 経由 READY 反映と二重発火するが
+                              CharacterStatusManager.set_status の同 status no-op で
+                              害なし。None (default) なら反映スキップ (= 後方互換)。
     """
     speaking_published = False
     last_character: str | None = None
@@ -1167,6 +1182,22 @@ def _run_playback_worker(
             last_character = character
         play_audio_fn(task["url"])
         cleanup_audio_fn(task["url"])
+        # Phase 0.5-B-β-3 commit 2: is_last=True chunk の **物理再生完了時** に
+        # status_manager で READY 反映。bg_tts 合成完了 != 再生完了の不整合を
+        # 解消する (= シナリオ 2 で観察、HUD で発話途中に灰色化する不具合)。
+        # status_manager.set_status の冪等性 (同 status no-op) により、通常応答
+        # caller の最終応答経路で _bg_cleanup_pipeline と二重発火しても害なし。
+        # ask_character target キャラ用に追加した経路がメインの想定。
+        if task.get("is_last") and status_manager is not None:
+            try:
+                status_manager.set_status(
+                    character, CharacterStatus.READY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "playback worker is_last READY 反映失敗 [character=%s]: %s",
+                    character, exc,
+                )
         # Phase 3: 再生完了通知 (ask_character の導入セリフ同期用)
         done_event = task.get("done_event")
         if done_event is not None:
@@ -1630,6 +1661,11 @@ def run_loop(
                         "cleanup_audio_fn": _cleanup_audio,
                         "set_pose_fn": _set_pose_safe,
                         "on_last_chunk_played": _on_last_chunk_played_cb,
+                        # Phase 0.5-B-β-3 commit 2: ask_character target キャラの
+                        # READY 反映を playback worker 経由に移すため status_manager を渡す。
+                        # caller の最終応答経路では _bg_cleanup_pipeline が READY 反映する
+                        # 経路と二重になるが、status_manager の冪等性で害なし。
+                        "status_manager": status_manager,
                     },
                     daemon=True,
                 )

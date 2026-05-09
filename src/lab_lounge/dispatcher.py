@@ -845,9 +845,28 @@ class Dispatcher:
         bubble.update(handraise) は ttl_ms=None で発行 (承認/却下/lapse まで保持)。
         ``on_handraise_started`` callback は Lock 解除後に発火し、run_loop が
         ``se_pending`` を見て handraise wav を即再生 / 保留する。
+
+        Phase 0.5-B-β-3 commit 3: 既に talking 状態のキャラは挙手対象から除外する
+        (= 同一キャラが応答中に raisehand に遷移するカオス防止、シナリオ 3 で観察)。
         """
         # 関数内 import で循環回避 + filler.py の副作用を起動時に避ける
         from .filler import select_filler_phrase
+
+        # Phase 0.5-B-β-3 commit 3: 既に talking 状態のキャラは挙手対象から除外。
+        # シナリオ 3 で観察した「自分が発話中なのに raisehand に遷移」のカオス的
+        # フローを防ぐ。例えば chisame が量子コンピューターを応答中にルカが
+        # 「論理と感情の両方の意見が聞きたい」と発話 → chisame 自身が候補に →
+        # talking->raisehand へ遷移、という現象。応答中のキャラは「既に話す権利
+        # を持っている」ため、追加で挙手するのは設計上不自然。
+        # status_manager 未注入時 (= 後方互換、テスト等) はチェックスキップ。
+        if self._status_manager is not None:
+            current = self._status_manager.get_status(target_slug)
+            if current == CharacterStatus.TALKING:
+                logger.info(
+                    "Dispatcher._start_handraise skip: slug=%s already talking",
+                    target_slug,
+                )
+                return
 
         with self._lock:
             if target_slug in self._handraise_states:
