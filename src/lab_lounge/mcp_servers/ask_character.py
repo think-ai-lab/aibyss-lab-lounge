@@ -344,10 +344,24 @@ def cancel_bg_tts(session_id: str) -> int:
         n_normal = len(_bg_tts_events.get(session_id, []))
         n_deferred = len(_deferred_bg_tts_events.get(session_id, []))
         n = n_normal + n_deferred
+        # Phase 0.5-D-2-α (= D-3 前倒し): defer モードで buffer に蓄積された chunks
+        # も同時に drain (= 完全クリーン)。
+        #
+        # 【WHY: cancel と drain を統合する】
+        # 却下/lapse/fallback 起動時に「(a) 後続 chunks 投入を阻止 (= cancel_flag set)」
+        # と「(b) 既蓄積 chunks の破棄 (= buffer drain)」は同じ意味論的タイミングで
+        # 発火するべき。これを 2 つの API に分けると呼出側で「片方忘れる」不具合が
+        # 起こりやすい (= 実走テスト 2026-05-09 で発見した「fallback パスでは
+        # buffer drain されず chunks が蓄積されたまま放置」現象)。1 関数で両方を
+        # 統合することで構造的に漏れを防ぐ。
+        #
+        # 影響範囲: TestHandraiseCloseFlow / TestLlmOnlyAskCharacterDenialDrain は
+        # cancel_bg_tts の呼出を spy しているだけなので無変更で pass する想定。
+        drained_buffer_chunks = _bg_chunk_buffers.pop(session_id, [])
     logger.info(
         "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d "
-        "(normal=%d, deferred=%d)",
-        session_id, n, n_normal, n_deferred,
+        "(normal=%d, deferred=%d) drained_buffer_chunks=%d",
+        session_id, n, n_normal, n_deferred, len(drained_buffer_chunks),
     )
     return n
 
@@ -662,6 +676,30 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                 intro_done = threading.Event()
                 _chunk_done_event_var.set(intro_done)
 
+                # Phase 0.5-D-2-α: 導入セリフ TTS の合成完了 chunks を _playback_queue
+                # に投入する直前で cancel_flag check するラッパー。
+                #
+                # 【WHY: 起動前 check だけでは不十分】
+                # tts_synthesize 起動前 (= 上の cancel_flag check、line 595) では
+                # cancel_flag 未 set だったとしても、subprocess.run(voicepeak.exe...)
+                # で 13 秒以上かけて合成中に lapse/却下が発火することがある (= 実走
+                # テスト 2026-05-09 logs/runs/run_loop_20260509_150431.log で観察、
+                # mimi 挙手 → 1 秒後に lapse → 12 秒後に導入セリフ wav が
+                # _playback_queue に投入され物理再生されてしまう不具合)。chunks
+                # 投入直前 (= 合成完了後) でもう一度 check することで、cancel された
+                # 後の漏れを完全に阻止する。
+                def _wrapped_intro_chunk_ready(
+                    url: str, chunk_text: str, is_last: bool, character: str,
+                ) -> None:
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        logger.info(
+                            "ask_character 導入セリフ chunk skip (cancel flag set): "
+                            "session=%s character=%s",
+                            session_id, character,
+                        )
+                        return
+                    on_tts_chunk(url, chunk_text, is_last, character)
+
                 logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
                 tts_synthesize(
                     intro_response_text,
@@ -669,7 +707,7 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     voice=caller_char.tts_voice,
                     speaker=caller_char.slug,
                     output_dir=tts_output_dir,
-                    on_chunk_ready=on_tts_chunk,
+                    on_chunk_ready=_wrapped_intro_chunk_ready,
                 )
 
                 logger.info("ask_character 導入セリフ再生待ち...")
@@ -731,23 +769,38 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             from ..filler import select_filler_path
             bridge_path, _ = select_filler_path(target_char.slug, "bridge")
             if bridge_path:
-                # chunk_text を空文字にする理由:
-                #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
-                #   bubble.update step="speaking" の表示テキストにそのまま流す。
-                #   filler 用の内部識別ラベル (e.g., "(target bridge filler)") をここに
-                #   渡すと HUD にそのまま出てしまうため、空文字を渡し、playback worker
-                #   側で「空文字なら speaking publish をスキップ」して直前の thinking
-                #   テロップを維持させる。
-                on_tts_chunk(
-                    bridge_path.as_uri(),
-                    "",
-                    False,  # is_last=False — 本応答が続く
-                    target_char.slug,
-                )
-                logger.info(
-                    "ask_character target bridge filler 投入: [%s] %s",
-                    target_char.slug, bridge_path.name,
-                )
+                # Phase 0.5-D-2-α: bridge filler 投入前に cancel_flag check。
+                # 却下/lapse 後 or fallback 起動後に bridge filler が
+                # _playback_queue に投入されないようにガードする (= 実走テスト
+                # 2026-05-09 logs/runs/run_loop_20260509_155109.log で観察された
+                # 「fallback パス後に sakura bridge filler が漏れて再生」現象の対処)。
+                # bridge filler は _wrapped_on_chunk_ready を経由しない直接呼出のため、
+                # 案 C の defer 経路 (= chunk dict 経由 buffer) でもガードされない。
+                # ここで明示的に cancel_flag check で阻止する。
+                if cancel_flag is not None and cancel_flag.is_set():
+                    logger.info(
+                        "ask_character target bridge filler skip (cancel flag set): "
+                        "[%s] session=%s",
+                        target_char.slug, session_id,
+                    )
+                else:
+                    # chunk_text を空文字にする理由:
+                    #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
+                    #   bubble.update step="speaking" の表示テキストにそのまま流す。
+                    #   filler 用の内部識別ラベル (e.g., "(target bridge filler)") をここに
+                    #   渡すと HUD にそのまま出てしまうため、空文字を渡し、playback worker
+                    #   側で「空文字なら speaking publish をスキップ」して直前の thinking
+                    #   テロップを維持させる。
+                    on_tts_chunk(
+                        bridge_path.as_uri(),
+                        "",
+                        False,  # is_last=False — 本応答が続く
+                        target_char.slug,
+                    )
+                    logger.info(
+                        "ask_character target bridge filler 投入: [%s] %s",
+                        target_char.slug, bridge_path.name,
+                    )
             else:
                 logger.debug("target bridge filler なし: %s", target_char.slug)
         except Exception as exc:
