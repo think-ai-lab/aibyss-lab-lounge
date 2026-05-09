@@ -675,9 +675,14 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
             last_bridge_idx = idx
             logger.info("フィラー bridge 再生: [%s] %s", slug, bridge_path.name)
             play_audio_file(str(bridge_path))
-            # bridge 間に間を空ける（立て続けの再生を防止）
+            # bridge 間に間を空ける（立て続けの再生を防止）。
+            # 中間実走 3 回目 (logs/runs/run_loop_20260509_184653.log) で観察された
+            # 「ブリッジフレーズがしつこい」(= 3 秒固定で連続再生されて視聴者が
+            # 単調に感じる) 問題への対処として、4〜8 秒のランダムインターバルに
+            # 変更する。lower=4 で「再生直後の即時連発」を防ぎ、upper=8 で
+            # 「待ち時間が長すぎる空白」も防ぐ範囲。
             if not filler_ready.is_set():
-                filler_ready.wait(timeout=3.0)
+                filler_ready.wait(timeout=random.uniform(4.0, 8.0))
 
     if stop_event.is_set():
         logger.debug("フィラー終了（bridge 後）: %s", slug)
@@ -708,7 +713,10 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
             stop_event.wait(timeout=0.5)
             continue
         last_bridge_idx2 = idx
-        stop_event.wait(timeout=3.0)
+        # bridge 間のインターバル。中間実走 3 回目で観察された「ブリッジフレーズが
+        # しつこい」問題への対処として 3 秒固定 → 4〜8 秒ランダムに変更
+        # (= 上の Phase 2 と同じ範囲)。
+        stop_event.wait(timeout=random.uniform(4.0, 8.0))
         if stop_event.is_set():
             break
         logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
