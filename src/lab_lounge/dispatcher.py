@@ -378,10 +378,32 @@ class Dispatcher:
         self._status_manager = status_manager
         self._max_events = max_events
         self._max_age_sec = max_age_sec
-        # Phase 0.5-D-d-2: bg_completed wait の timeout 値 (秒)。テスト時には
-        # monkeypatch で 0.1s 等に短縮して時間効率を保つ。本番は 30s で実 BG LLM
-        # 典型レイテンシ ~5-15 秒の 2 倍 (= API スロットル対応)。
-        self._approval_bg_completed_timeout: float = 30.0
+        # Phase 0.5-D-e-1 (= 中間実走 11 回目修正、timeout 30s 不足対処):
+        # bg_completed.wait の timeout 値 (秒)。テスト時には monkeypatch で
+        # 0.1s 等に短縮して時間効率を保つ。
+        #
+        # 【WHY: 30s → 60s に延長】
+        # 中間実走 11 回目で観察された実測レイテンシ:
+        #   - chisame 単段 (Gemini gemini-3.1-pro-preview): 49 秒
+        #   - mimi 多段階 ask_character ×2 (gpt-5.5): 50-60 秒
+        # 30s では構造的に間に合わず、毎回 fallback パスへ落ち、buffer drain で
+        # mimi 導入セリフ + bridge filler + chisame chunk 1 が破棄される。
+        # 60s に延長することで多段階 / Gemini を救済 (= bg_result=ready 確率向上)。
+        #
+        # 【環境変数 L2_APPROVAL_BG_TIMEOUT_SEC で override 可能】
+        # 配信運用で動的調整できるよう環境変数化。別キャラ追加 / 別 LLM 採用時に
+        # コード変更なしで調整できる柔軟性を確保。値は Dispatcher() 生成時に
+        # 評価されるため、配信開始時には決定する。
+        # 不正値 (= 数値変換不能) は 60.0 にフォールバック (= 配信中断回避優先)。
+        _bg_timeout_raw = os.environ.get("L2_APPROVAL_BG_TIMEOUT_SEC", "60.0")
+        try:
+            self._approval_bg_completed_timeout: float = float(_bg_timeout_raw)
+        except ValueError:
+            logger.warning(
+                "L2_APPROVAL_BG_TIMEOUT_SEC=%r は数値ではないため 60.0 にフォールバックします",
+                _bg_timeout_raw,
+            )
+            self._approval_bg_completed_timeout = 60.0
 
         # Phase 0.5-A: 挙手機能の設定 (環境変数から 1 回だけ読み込む)
         # テストでは monkeypatch.setenv した後に Dispatcher() を生成すれば反映される
