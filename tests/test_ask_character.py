@@ -596,7 +596,62 @@ class TestLlmOnlyTtsPenetration:
             _ask_character_impl("chisame", "質問")
 
         # gating False → tts.synthesize 一切呼ばれない (= バグ前の状態)
+        # Phase 0.5-D-d-4 確認: defer_chunks 未指定 (= default False) なら旧挙動が維持される
+        # (= 通常応答経路の callback 必須要件を変えない)。defer=True ケースは下の
+        # test_defer_true_with_callback_none_runs_tts で検証。
         mock_synth.assert_not_called()
+
+    def test_defer_true_with_callback_none_runs_tts(self, monkeypatch):
+        """Phase 0.5-D-d-4: defer モード (= BG LLM 経路) では on_tts_chunk=None でも
+        TTS が走る (= 中間実走 7 回目で発覚した実装漏れの修正検証)。
+
+        【WHY: 中間実走 7 回目で発覚した実装漏れ】
+        IDLE 中挙手 (= ルカ発話で挙手判定 → bg_runner 起動) では run_loop の
+        `_current_on_tts_chunk[0] = None` (= ターン外で closure 未設定) になる。
+        この値が ask_character の contextvars に伝播 → 旧 gating 条件
+        `if on_tts_chunk and use_real_tts and ...:` で False → TTS 完全 skip →
+        buffer 蓄積 0 → 承認時 bg_chunks=0 → mimi 〆セリフのみ再生 (= 配信品質崩壊、
+        logs/runs/run_loop_20260509_223616.log + 223908.log の両 take で再現)。
+
+        【修正】
+        gating 条件を `(defer_chunks or on_tts_chunk) and use_real_tts and ...`
+        に変更。defer モードでは callback 不要 (= `_wrapped_intro_chunk_ready` /
+        `_wrapped_on_chunk_ready` の defer 分岐で _append_bg_chunk 経由で buffer
+        蓄積される設計、D-3-b/D-2 で実装済) のため、on_tts_chunk=None でも TTS
+        起動して buffer に正しく蓄積される。
+
+        中間実走 1〜6 回目では bg_result=none で fallback パスに行っていたため
+        発覚せず、案 C リファクタ完了 + Phase 0.5-D-d で承認パスが正常化したことで
+        初めて表面化した実装漏れ。
+        """
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        # defer モード + callback=None (= 中間実走 7 回目の再現条件)
+        set_ask_character_context(
+            on_tts_chunk=None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="導入セリフテスト",
+        ), patch("lab_lounge.tts.synthesize") as mock_synth:
+            _ask_character_impl("chisame", "質問")
+
+        # gating 修正後: defer=True なら on_tts_chunk=None でも TTS 起動
+        # 導入セリフ TTS は main thread で同期呼出 → 最低 1 回呼ばれる
+        # (本応答 TTS は _bg_tts_synthesize の別 thread で走るので main thread
+        # 完了直後では未実行の可能性あり、最低 1 回 = 導入セリフ分で検証)
+        assert mock_synth.call_count >= 1, (
+            f"defer モードで TTS が呼ばれること "
+            f"(実際: {mock_synth.call_count} 回、修正前は 0 回 = 配信事故レベル不具合)"
+        )
 
 
 # ─── Phase 0.5-B-β-2 commit 2: cancel_bg_tts API + bg_tts キャンセルガード ────
