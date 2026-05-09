@@ -737,6 +737,39 @@ class TestRunPipelineLlmOnly:
         assert len(captured_states) == 1
         assert captured_states[0]["on_pose_ready"] is my_pose_cb
 
+    def test_initial_state_sets_defer_chunks_true_for_bg_llm_path(
+        self, mock_publish, monkeypatch,
+    ):
+        """initial_state['defer_chunks_for_ask_character']=True が乗る (Phase 0.5-D-1b)。
+
+        WHY: BG LLM 経路 (= run_pipeline_llm_only、挙手先行生成) では ask_character
+        の対話 TTS chunks を _bg_chunk_buffers に蓄積する defer モードに切替えるため、
+        initial_state に True を乗せる。graph._generation_node が
+        set_ask_character_context(defer_chunks=state.get(...)) で透過渡しする経路。
+        通常応答経路 (= run_pipeline) は False で既存挙動 (= 即時 _playback_queue
+        投入) を維持。本テストは「LLM-only パスが defer モードを True で起動する」
+        wiring を spy で検証する。
+        """
+        from lab_lounge import graph as graph_mod
+        from lab_lounge.pipeline import run_pipeline_llm_only
+
+        captured_states: list[dict] = []
+        original_fn = graph_mod.run_pipeline_graph_llm_only
+
+        def spy(initial_state):
+            captured_states.append(dict(initial_state))
+            return original_fn(initial_state)
+
+        monkeypatch.setattr(graph_mod, "run_pipeline_graph_llm_only", spy)
+
+        run_pipeline_llm_only("hello", **COMMON)
+
+        assert len(captured_states) == 1
+        assert captured_states[0].get("defer_chunks_for_ask_character") is True, (
+            f"BG LLM 経路で defer_chunks_for_ask_character=True が initial_state に乗る "
+            f"(実際: {captured_states[0].get('defer_chunks_for_ask_character')})"
+        )
+
     def test_no_tts_done_event_with_callback_set(self, mock_publish):
         """run_pipeline_llm_only(on_tts_chunk_ready=cb) でも events に tts.done なし
         (Phase 0.5-B-β-1 commit 5、案 W'-1 不変性の保証)。

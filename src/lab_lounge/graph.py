@@ -760,6 +760,12 @@ class PipelineGraphState(TypedDict):
     stream_context: str | None
     on_tts_chunk_ready: Any
     on_pose_ready: Any
+    # Phase 0.5-D-1b: ask_character ツール内の対話 TTS chunks を _bg_chunk_buffers
+    # に蓄積する (= BG LLM 経路、True) か、即時 _playback_queue に投入する
+    # (= 通常応答経路、False) かのフラグ。run_pipeline_llm_only から initial_state
+    # 経由で True を、run_pipeline からは False を渡す。_generation_node の
+    # set_ask_character_context(defer_chunks=...) に透過渡しされる。
+    defer_chunks_for_ask_character: bool
     # Phase 0.5-A フェーズ 7: 挙手 BG LLM モードで True にすると、
     # _generation_node 内の bubble.update("answering") 発行を抑制する。
     # 通常応答は run_pipeline 経由で生成するときに graph.py 内で answering bubble
@@ -1161,6 +1167,13 @@ def _generation_node(state: PipelineGraphState) -> dict:
         # 反映 (= graph._generation_node / _tts_node) のみ実装されており、target は
         # 未配線で HUD カードが READY のままだった穴を埋める。
         from .mcp_servers.ask_character import set_ask_character_context
+        # Phase 0.5-D-1b: defer_chunks フラグを state 経由で透過渡し。
+        # BG LLM 経路 (= run_pipeline_llm_only → _run_pipeline_graph_llm_only で
+        # initial_state["defer_chunks_for_ask_character"]=True) では ask_character
+        # の対話 TTS chunks を _bg_chunk_buffers に蓄積するモードに切替。通常応答
+        # 経路 (= run_pipeline、未指定 → False default) では既存挙動 (= 即時
+        # _playback_queue 投入) を完全維持 (= ToolNode 戻り値ベースの caller LLM
+        # 推論を進めるための逆順防止)。
         set_ask_character_context(
             on_tts_chunk=state["on_tts_chunk_ready"],
             tts_output_dir=state["tts_output_dir"],
@@ -1168,6 +1181,7 @@ def _generation_node(state: PipelineGraphState) -> dict:
             caller_slug=state["character_slug"],
             on_pose_ready=state.get("on_pose_ready"),
             status_manager=_gen_status_manager,
+            defer_chunks=state.get("defer_chunks_for_ask_character", False),
         )
 
         _run_meta = build_run_metadata(

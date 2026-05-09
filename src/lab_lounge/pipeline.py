@@ -270,6 +270,13 @@ def _run_pipeline_graph(
         "stream_context": stream_context,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
+        # Phase 0.5-D-1b: 通常応答経路では既存挙動 (= ask_character の対話 TTS chunks
+        # を即時 _playback_queue に投入) を維持する。caller LLM が ToolNode 戻り値
+        # 「【target からの応答】... 上記は target が話した内容です」を読んで自分の
+        # リアクションを組み立てる前に target の TTS が再生されている必要がある
+        # (= 視聴者には「target が話した → caller がリアクション」の自然な流れに
+        # なる、defer=True にすると逆順バグ)。
+        "defer_chunks_for_ask_character": False,
         "suppress_bubble_answering": suppress_bubble_answering,
         "disable_tools": disable_tools,
         # Phase 0.5-B-α: status_manager は run_loop から透過渡し。
@@ -436,6 +443,14 @@ def _run_pipeline_graph_llm_only(
         #   on_chunk_ready 経由で playback queue に届く (= A1 修正の核心)
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
+        # Phase 0.5-D-1b: BG LLM 経路では ask_character の対話 TTS chunks を
+        # session 単位 _bg_chunk_buffers に蓄積する defer モードに切替。承認時
+        # (= run_loop.on_handraise_approved、D-2 で配線) に drain → 専用 mini
+        # playback worker で再生する。これによりターン跨ぎ問題 (= シナリオ 3
+        # take 2 で観察した数分間の無音、配信事故レベル) を構造的に解消する。
+        # graph._generation_node が state.get("defer_chunks_for_ask_character") を
+        # 読んで set_ask_character_context(defer_chunks=...) に渡す。
+        "defer_chunks_for_ask_character": True,
         # WHY: 承認時に run_loop が answering bubble を発行する設計のため、graph 側で
         # 二重発行しないよう内部固定で抑制する
         "suppress_bubble_answering": True,
@@ -555,6 +570,10 @@ def run_pipeline_tts_only(
         "stream_context": None,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
+        # Phase 0.5-D-1b: TTS-only モードでは _generation_node を通らないため
+        # ask_character が起動する経路がない (= defer_chunks の意味は実質的に
+        # ない) が、TypedDict の完全性のため False で埋める。
+        "defer_chunks_for_ask_character": False,
         # _tts_node 内では使われないが型整合
         "suppress_bubble_answering": True,
         # disable_tools は TTS-only モードでは使われないが型整合のため None
