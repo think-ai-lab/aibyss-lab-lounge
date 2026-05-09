@@ -480,6 +480,37 @@ class TestDispatcherEnvVarOverride:
         d = Dispatcher()
         assert d._lapse_utterance_count == 3
 
+    # ─── Phase 0.5-D-e-1: bg_completed timeout 環境変数化 ──────────────
+
+    def test_approval_bg_completed_timeout_default_60s(self, monkeypatch):
+        """L2_APPROVAL_BG_TIMEOUT_SEC 未設定で default 60.0 秒。
+
+        Phase 0.5-D-e-1: 中間実走 11 回目で 30s が構造的に不足することを発見。
+        chisame Gemini (49s) / mimi 多段階 (50-60s) を救済するため 60s に延長。
+        """
+        monkeypatch.delenv("L2_APPROVAL_BG_TIMEOUT_SEC", raising=False)
+        d = Dispatcher()
+        assert d._approval_bg_completed_timeout == 60.0
+
+    def test_approval_bg_completed_timeout_env_override(self, monkeypatch):
+        """L2_APPROVAL_BG_TIMEOUT_SEC で任意秒数に上書きできる。
+
+        配信運用で別 LLM provider 採用時にコード変更なしで調整できるよう、
+        環境変数 override を可能にしている (= D-e-1 設計)。
+        """
+        monkeypatch.setenv("L2_APPROVAL_BG_TIMEOUT_SEC", "90.0")
+        d = Dispatcher()
+        assert d._approval_bg_completed_timeout == 90.0
+
+    def test_approval_bg_completed_timeout_invalid_env_falls_back(self, monkeypatch):
+        """不正値 (= 数値変換不能) では 60.0 にフォールバック。
+
+        配信中断回避優先の設計。warning ログ + default 値で動作継続する。
+        """
+        monkeypatch.setenv("L2_APPROVAL_BG_TIMEOUT_SEC", "not-a-number")
+        d = Dispatcher()
+        assert d._approval_bg_completed_timeout == 60.0
+
 
 # ─── Phase 0.5-A 用テストヘルパー ──────────────────────────────────
 
