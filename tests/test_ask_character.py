@@ -1804,6 +1804,257 @@ class TestIntroDeferIntegration:
             )
 
 
+class TestBridgeFillerDeferIntegration:
+    """Phase 0.5-D-3-c: bridge filler chunk の defer 経路統合テスト。
+
+    通常応答経路 (= defer=False) では on_tts_chunk 直接呼出だが、defer モードでは
+    他の chunks と同じ buffer に統合することで、承認時の一括 drain で UX 整合する。
+    inline metadata (_pre_play_status / _pre_play_bubble) で物理再生時に target
+    THINKING / thinking bubble を発火する (= 「承認前 target THINKING」表示の解消)。
+    """
+
+    def test_defer_true_appends_bridge_filler_chunk_to_buffer(self, monkeypatch):
+        """defer モードで bridge filler chunk が _bg_chunk_buffers に蓄積される。"""
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "bridge_defer_buffer"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        # bridge filler chunk (= target=chisame、text="") は callback に流れない
+        bridge_filler_callbacks = [c for c in callback_invocations
+                                   if c[3] == "chisame" and c[1] == ""]
+        assert bridge_filler_callbacks == [], (
+            f"defer=True で bridge filler は callback に流れない "
+            f"(実際: {bridge_filler_callbacks})"
+        )
+
+        # buffer に bridge filler chunk が蓄積されている
+        chunks = _drain_bg_chunks(session_id)
+        bridge_chunks = [c for c in chunks
+                         if c["character"] == "chisame" and c["text"] == ""]
+        assert len(bridge_chunks) == 1, (
+            f"buffer に bridge filler chunk 1 件が蓄積される "
+            f"(実際 全 chunks: {chunks})"
+        )
+
+    def test_bridge_filler_chunk_has_pre_play_status_thinking(self, monkeypatch):
+        """bridge filler chunk の `_pre_play_status` は target THINKING を持つ。
+
+        WHY: 物理再生開始時に worker が `_pre_play_status` を読んで
+        set_status(target, THINKING) を発火 (= 通常モードの即時発火を defer モードで
+        移動した経路)。これにより「承認前に target THINKING 表示」の UX 不具合を
+        構造的に防ぐ。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "bridge_defer_pre_play_status"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+        bridge_chunks = [c for c in chunks
+                         if c["character"] == "chisame" and c["text"] == ""]
+        assert len(bridge_chunks) == 1
+        bridge_chunk = bridge_chunks[0]
+
+        # _pre_play_status が埋め込まれている
+        pre_play_status = bridge_chunk.get("_pre_play_status")
+        assert pre_play_status is not None, (
+            f"bridge filler chunk に _pre_play_status が必要 (実際: {bridge_chunk})"
+        )
+        assert pre_play_status["slug"] == "chisame"
+        assert pre_play_status["status"] == "THINKING"
+
+    def test_bridge_filler_chunk_has_pre_play_bubble_thinking(self, monkeypatch):
+        """bridge filler chunk の `_pre_play_bubble` は thinking step を持つ。
+
+        WHY: 物理再生開始時に worker が `_pre_play_bubble` を読んで
+        publish_bubble_fn(target, "thinking", text) を発火 (= 通常モードの
+        _publish_bubble("thinking") 相当)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "bridge_defer_pre_play_bubble"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+        bridge_chunks = [c for c in chunks
+                         if c["character"] == "chisame" and c["text"] == ""]
+        assert len(bridge_chunks) == 1
+        bridge_chunk = bridge_chunks[0]
+
+        # _pre_play_bubble が埋め込まれている
+        pre_play_bubble = bridge_chunk.get("_pre_play_bubble")
+        assert pre_play_bubble is not None, (
+            f"bridge filler chunk に _pre_play_bubble が必要 (実際: {bridge_chunk})"
+        )
+        assert pre_play_bubble["slug"] == "chisame"
+        assert pre_play_bubble["step"] == "thinking"
+        # text は str 型 (= 空文字 or yaml の thinking メッセージ)
+        assert "text" in pre_play_bubble
+        assert isinstance(pre_play_bubble["text"], str)
+
+
+class TestDeferModeFullChunkOrder:
+    """Phase 0.5-D-3 統合: defer モードで「導入 → bridge filler → 本応答」順保証テスト。"""
+
+    def test_buffer_order_intro_bridge_response(self, monkeypatch):
+        """defer モードで buffer 順序が「導入セリフ → bridge filler → 本応答」になる。
+
+        WHY: 視聴者には「caller 問いかけ → target 思案 → target 応答」の自然な対話演出
+        として再生される。この順序が崩れると「target 応答が先に始まって caller 問いかけ
+        が後」のような逆順になり UX 崩壊。VOICEPEAK FIFO + buffer 投入順 = 物理再生順
+        の不変条件を統合的に検証する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "full_chunk_order_test"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+
+        # 順序保証: caller=mimi (= 導入) → chisame text="" (= bridge filler) → chisame text 非空 (= 本応答)
+        mimi_indices = [i for i, c in enumerate(chunks) if c["character"] == "mimi"]
+        bridge_indices = [i for i, c in enumerate(chunks)
+                          if c["character"] == "chisame" and c["text"] == ""]
+        response_indices = [i for i, c in enumerate(chunks)
+                            if c["character"] == "chisame" and c["text"] != ""]
+
+        assert len(mimi_indices) >= 1, "caller (mimi) の導入セリフ chunks 必須"
+        assert len(bridge_indices) == 1, "bridge filler chunk は 1 件必須"
+        assert len(response_indices) >= 1, "target (chisame) の本応答 chunks 必須"
+
+        # 順序: max(mimi) < bridge < min(response)
+        assert max(mimi_indices) < bridge_indices[0], (
+            f"順序保証違反: mimi 導入 → bridge filler の順序が崩れた "
+            f"(chunks: {chunks})"
+        )
+        assert bridge_indices[0] < min(response_indices), (
+            f"順序保証違反: bridge filler → chisame 本応答の順序が崩れた "
+            f"(chunks: {chunks})"
+        )
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
