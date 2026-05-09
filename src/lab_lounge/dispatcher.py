@@ -412,6 +412,16 @@ class Dispatcher:
         self._lapse_sec: float = cfg["lapse_sec"]
         self._lapse_utterance_count: int = cfg["lapse_utterance_count"]
 
+        # Phase 0.5-D-e-4-2 (= 中間実走 12 検分):
+        # 起動時に解決された timeout 値 + 環境変数の生値を INFO 出力。
+        # 環境変数 typo / 不正値 fallback / 運用ミスでの 30s 戻り等を実走で
+        # 早期発見できるようにする (= 起動時 1 行だけ出して noise を抑える)。
+        logger.info(
+            "Dispatcher 設定: bg_completed_timeout=%.1fs (env L2_APPROVAL_BG_TIMEOUT_SEC=%s)",
+            self._approval_bg_completed_timeout,
+            os.environ.get("L2_APPROVAL_BG_TIMEOUT_SEC", "(未設定)"),
+        )
+
     # ─── 状態取得 (テスト・デバッグ用) ────────────────────────────────
 
     def get_state(self) -> DispatcherState:
