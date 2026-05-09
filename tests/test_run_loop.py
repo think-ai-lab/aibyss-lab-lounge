@@ -782,17 +782,27 @@ class TestApprovedAnsweringBubbleInlineMetadata:
 
         WHY: 物理再生開始時に「caller (= mimi) が話し始めた」bubble が発火されることを
         担保。approval 直後の事前 publish (= 旧設計) を廃止する代替経路として機能する。
+
+        Phase 0.5-D-3 follow-up 2 で _spawn_handraise_response_playback_streaming への
+        移行に伴い、tts_only chunks は streaming queue 経由で動的追加される設計になった。
+        本テストは queue.put された chunks を spy で捕捉して inline metadata を検証する。
         """
         import time
         from lab_lounge.dispatcher import HandraiseBgResult
         from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
 
-        # _spawn_handraise_response_playback を spy 化、chunks を捕捉
-        captured_chunks: list = []
+        # _spawn_handraise_response_playback_streaming を spy 化、queue.put された
+        # chunks を捕捉する FakeQueue を返す
+        spawn_calls: list[tuple] = []
+        queue_items: list = []
 
-        def spy_spawn(slug, chunks, *args, **kwargs):
-            captured_chunks.extend(chunks)
-            return MagicMock()
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        def spy_spawn_streaming(slug, initial_chunks, trace_id, **kwargs):
+            spawn_calls.append((slug, list(initial_chunks), trace_id))
+            return MagicMock(), _FakeQueue()
 
         # run_pipeline_tts_only mock: on_chunk を 2 回呼ぶ
         def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
@@ -805,8 +815,8 @@ class TestApprovedAnsweringBubbleInlineMetadata:
             "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
         monkeypatch.setattr(
-            "lab_lounge.run_loop._spawn_handraise_response_playback",
-            spy_spawn,
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            spy_spawn_streaming,
         )
 
         _, _, _, on_approved, _ = _create_handraise_runner_and_callbacks(
@@ -820,17 +830,27 @@ class TestApprovedAnsweringBubbleInlineMetadata:
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
 
         on_approved("mimi", bg, "snap", "trace-orig")
-        # daemon thread の完了を待つ
+        # daemon thread の完了を待つ (= queue 投入と sentinel 投入完了)
         for _ in range(40):
-            if captured_chunks:
+            if spawn_calls and len(queue_items) >= 3:  # 2 chunks + sentinel
                 break
             time.sleep(0.05)
 
-        assert len(captured_chunks) == 2, (
-            f"tts_only chunks 2 件が spawn に渡される (実際: {captured_chunks})"
+        # streaming spawn が 1 回呼ばれた (= initial_chunks=[] = bg_chunks 空)
+        assert len(spawn_calls) == 1
+        assert spawn_calls[0][0] == "mimi"
+        assert spawn_calls[0][1] == []  # bg_chunks 空 (= test では bg_buffer なし)
+
+        # queue.put 経由で tts_only chunks 2 件 + None sentinel が投入される
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) == 2, (
+            f"tts_only chunks 2 件が queue に投入される (実際: {chunks_only})"
         )
+        # 最後の None sentinel
+        assert queue_items[-1] is None, "worker 終了通知の None sentinel が投入される"
+
         # first chunk に _pre_play_bubble (= answering) が埋め込まれている
-        first = captured_chunks[0]
+        first = chunks_only[0]
         bubble = first.get("_pre_play_bubble")
         assert bubble is not None, (
             f"first chunk に _pre_play_bubble が必要 (実際: {first})"
@@ -839,7 +859,7 @@ class TestApprovedAnsweringBubbleInlineMetadata:
         assert bubble["step"] == "answering"
         assert bubble["text"] == "ありがとう、ルカ。"  # = answering_text
         # 後続 chunk には inline metadata なし (= 1 度だけ発火、冪等保護)
-        assert captured_chunks[1].get("_pre_play_bubble") is None
+        assert chunks_only[1].get("_pre_play_bubble") is None
 
 
 class TestHandraiseCloseFlow:
@@ -1370,18 +1390,25 @@ class TestCreateHandraiseRunnerAndCallbacks:
         """
         from lab_lounge.dispatcher import HandraiseBgResult
         published: list = []
-        spawn_calls: list[tuple] = []
+        spawn_calls: list[tuple] = []  # streaming spawn の (slug, initial_chunks, trace_id)
+        queue_items: list = []  # queue.put された全アイテム (= tts_only chunks + None)
         tts_only_calls: list[tuple] = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
 
         monkeypatch.setattr(
             "lab_lounge.run_loop.publish",
             lambda ev: published.append(ev),
         )
+        # Phase 0.5-D-3 follow-up 2: streaming spawn 経路を mock
+        def fake_spawn_streaming(slug, initial_chunks, trace_id, **kw):
+            spawn_calls.append((slug, list(initial_chunks), trace_id))
+            return MagicMock(), _FakeQueue()
         monkeypatch.setattr(
-            "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
-                (slug, list(chunks), trace_id)
-            ),
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            fake_spawn_streaming,
         )
 
         def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
@@ -1429,14 +1456,25 @@ class TestCreateHandraiseRunnerAndCallbacks:
                 break
             time.sleep(0.05)
 
-        # Phase 0.5-D-3 follow-up: 事前 publish 廃止 → first chunk inline metadata で発火
-        # に変更されたため、bubble.update("answering") は事前 publish されず、
-        # tts_only first chunk の `_pre_play_bubble` 経由で物理再生時に発火する設計。
-        # ここでは spawn_calls[0][1] = chunks の first chunk に inline metadata が
-        # 埋め込まれていることを検証する。
-        chunks = spawn_calls[0][1]
-        assert len(chunks) >= 1
-        first_chunk = chunks[0]
+        # Phase 0.5-D-3 follow-up 2: streaming spawn 経路 + queue 動的追加。
+        # bg_chunks (= initial_chunks) は test では空 (= bg_buffer なし)。
+        # tts_only chunks は queue.put 経由で投入される。
+        # 事前 publish 廃止 (= D-3 follow-up 1) により bubble は first chunk の
+        # inline metadata 経由で物理再生時に発火する設計。
+
+        # streaming spawn が 1 回呼ばれた
+        assert len(spawn_calls) == 1
+        assert spawn_calls[0][0] == "mimi"
+        assert spawn_calls[0][1] == []  # bg_chunks 空
+        assert spawn_calls[0][2] == "bg-abc"  # bg_trace_id 引継ぎ
+
+        # queue.put 経由で tts_only chunks 1 件 + None sentinel が投入される
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) == 1
+        assert queue_items[-1] is None, "worker 終了通知の None sentinel"
+
+        # first tts_only chunk に _pre_play_bubble (= answering) が埋め込まれている
+        first_chunk = chunks_only[0]
         pre_play_bubble = first_chunk.get("_pre_play_bubble")
         assert pre_play_bubble is not None, (
             f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
@@ -1447,10 +1485,6 @@ class TestCreateHandraiseRunnerAndCallbacks:
         assert pre_play_bubble["text"] == "わたくしの見解は…"
         # run_pipeline_tts_only が呼ばれた (= TTS-only graph 経由)
         assert len(tts_only_calls) == 1
-        # _spawn_handraise_response_playback が呼ばれた
-        assert len(spawn_calls) == 1
-        assert spawn_calls[0][0] == "mimi"
-        assert spawn_calls[0][2] == "bg-abc"  # bg_trace_id 引継ぎ
 
     def test_on_handraise_approved_bubble_text_is_response_only_not_raw_json(
         self, monkeypatch,
@@ -1466,11 +1500,19 @@ class TestCreateHandraiseRunnerAndCallbacks:
         """
         from lab_lounge.dispatcher import HandraiseBgResult
         spawn_calls: list[tuple] = []
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        # Phase 0.5-D-3 follow-up 2: streaming spawn 経路を mock
+        def fake_spawn_streaming(slug, initial_chunks, trace_id, **kw):
+            spawn_calls.append((slug, list(initial_chunks), trace_id))
+            return MagicMock(), _FakeQueue()
         monkeypatch.setattr(
-            "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
-                (slug, list(chunks), trace_id),
-            ),
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            fake_spawn_streaming,
         )
 
         # run_pipeline_tts_only mock: on_chunk で 1 件流す (= first chunk への
@@ -1501,18 +1543,17 @@ class TestCreateHandraiseRunnerAndCallbacks:
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-x")
         on_approved("sakura", bg, "snap", "trace-x")
 
-        # daemon thread が走るので spawn を待つ
+        # daemon thread が走るので spawn + queue 投入を待つ
         for _ in range(40):
-            if spawn_calls:
+            if spawn_calls and queue_items:
                 break
             time.sleep(0.05)
 
-        # Phase 0.5-D-3 follow-up: 事前 publish 廃止 → first chunk inline metadata 経由
-        # spawn_calls[0][1] = chunks list、first chunk の `_pre_play_bubble.text` を検証
+        # Phase 0.5-D-3 follow-up 2: streaming 経路、queue.put 経由で chunks 投入
         assert len(spawn_calls) == 1
-        chunks = spawn_calls[0][1]
-        assert len(chunks) >= 1
-        first_chunk = chunks[0]
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) >= 1
+        first_chunk = chunks_only[0]
         pre_play_bubble = first_chunk.get("_pre_play_bubble")
         assert pre_play_bubble is not None, (
             f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
@@ -1538,11 +1579,19 @@ class TestCreateHandraiseRunnerAndCallbacks:
         """
         from lab_lounge.dispatcher import HandraiseBgResult
         spawn_calls: list[tuple] = []
+        queue_items: list = []
+
+        class _FakeQueue:
+            def put(self, item):
+                queue_items.append(item)
+
+        # Phase 0.5-D-3 follow-up 2: streaming spawn 経路を mock
+        def fake_spawn_streaming(slug, initial_chunks, trace_id, **kw):
+            spawn_calls.append((slug, list(initial_chunks), trace_id))
+            return MagicMock(), _FakeQueue()
         monkeypatch.setattr(
-            "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
-                (slug, list(chunks), trace_id),
-            ),
+            "lab_lounge.run_loop._spawn_handraise_response_playback_streaming",
+            fake_spawn_streaming,
         )
 
         # run_pipeline_tts_only mock: on_chunk で 1 件流す
@@ -1568,15 +1617,15 @@ class TestCreateHandraiseRunnerAndCallbacks:
         on_approved("sakura", bg, "snap", "trace-x")
 
         for _ in range(40):
-            if spawn_calls:
+            if spawn_calls and queue_items:
                 break
             time.sleep(0.05)
 
-        # Phase 0.5-D-3 follow-up: first chunk inline metadata 経由
+        # Phase 0.5-D-3 follow-up 2: streaming 経路、queue.put 経由で chunks 投入
         assert len(spawn_calls) == 1
-        chunks = spawn_calls[0][1]
-        assert len(chunks) >= 1
-        first_chunk = chunks[0]
+        chunks_only = [c for c in queue_items if c is not None]
+        assert len(chunks_only) >= 1
+        first_chunk = chunks_only[0]
         pre_play_bubble = first_chunk.get("_pre_play_bubble")
         assert pre_play_bubble is not None, (
             f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
