@@ -817,6 +817,249 @@ class TestBgChunkBuffers:
         assert len(_bg_chunk_buffers) == 0
 
 
+class TestDeferChunksMode:
+    """Phase 0.5-D-1b: defer_chunks フラグによる _wrapped_on_chunk_ready 分岐テスト。
+
+    set_ask_character_context(defer_chunks=True) で起動された ask_character の本応答
+    chunks (= _wrapped_on_chunk_ready 経由) は _bg_chunk_buffers に蓄積され、
+    on_tts_chunk callback には流れない。通常応答経路 (defer_chunks=False、default)
+    では既存挙動 (= 即時 callback) を完全維持する。
+
+    【BG LLM 経路と通常応答経路の分岐根拠】
+    通常応答経路では ask_character の戻り値文字列を caller LLM が読んで「target が
+    既に話した前提でリアクション」を組み立てる。即時再生でないと caller のリアクション
+    が target の発話前に流れる逆順バグになる。BG LLM 経路では承認時まで再生を遅らせて
+    いいため、ターン跨ぎ問題回避のため buffer 経路にする。
+    """
+
+    def test_set_ask_character_context_default_is_false(self):
+        """set_ask_character_context の defer_chunks 引数の default は False (= 後方互換)。"""
+        from lab_lounge.mcp_servers.ask_character import _defer_chunks_var
+        set_ask_character_context()
+        assert _defer_chunks_var.get() is False
+
+    def test_set_ask_character_context_accepts_defer_chunks_true(self):
+        """set_ask_character_context(defer_chunks=True) で contextvars に True がセットされる。"""
+        from lab_lounge.mcp_servers.ask_character import _defer_chunks_var
+        set_ask_character_context(defer_chunks=True)
+        assert _defer_chunks_var.get() is True
+
+    def test_reset_ask_character_context_resets_defer_flag(self):
+        """reset_ask_character_context で defer_chunks も False にリセットされる。"""
+        from lab_lounge.mcp_servers.ask_character import (
+            _defer_chunks_var, reset_ask_character_context,
+        )
+        set_ask_character_context(defer_chunks=True)
+        assert _defer_chunks_var.get() is True
+        reset_ask_character_context()
+        assert _defer_chunks_var.get() is False
+
+    def test_defer_true_appends_response_chunks_to_buffer(self, monkeypatch):
+        """defer_chunks=True で target 本応答 chunks は buffer に蓄積、callback には流れない。
+
+        WHY: BG LLM 経路では target (= 質問先キャラ) の応答 TTS を承認時まで再生
+        遅延させる。bridge filler や caller (= 質問する側) の導入セリフ TTS は
+        on_tts_chunk 直接呼出 (= _wrapped_on_chunk_ready 経由でない、ask_character.py
+        内の独立経路) なので defer モードでも生 callback に流れる (= 設計通り、UX
+        として「考え中の繋ぎ」を即時再生する)。本テストでは「target 応答のみが
+        buffer に行く」ことを character フィルタで区別検証する。
+
+        【テスト隔離】
+        _generate_intro は内部で call_llm (= API key 必要) を呼ぶため、本テストの
+        範囲では mock して空文字を返させる (= 導入セリフ TTS skip パス、
+        ask_character.py:591 の `if on_tts_chunk and use_real_tts and caller_char
+        and intro_response_text:` が False に)。これにより fake_synth は target
+        本応答の 1 回だけ呼ばれ、テスト挙動が決定的になる。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "defer_test_buffer"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "テスト応答", "emotion": {"happy": 50}, '
+            '"speed": 100, "pose": "doya"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            """on_chunk_ready 経由で 2 件 chunk 投入 (= 本応答 = target=chisame)。"""
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}_c1.wav", "テスト", False, speaker)
+                on_chunk(f"file://{speaker}_c2.wav", "応答", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="",  # 導入セリフ skip → 本応答 TTS のみ実行
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # target = chisame の chunks (= 本応答) は callback に流れない (= defer モード)
+        target_callbacks = [c for c in callback_invocations if c[3] == "chisame"
+                            and c[1] != ""]  # text 非空 = bridge filler を除外
+        assert len(target_callbacks) == 0, (
+            f"defer=True で target 本応答 chunks は callback に流れない "
+            f"(実際: {len(target_callbacks)} 件、{target_callbacks})"
+        )
+        # buffer に target 本応答 2 件蓄積される
+        chunks = _drain_bg_chunks(session_id)
+        assert len(chunks) == 2, (
+            f"buffer に本応答 chunks 2 件蓄積される (実際: {len(chunks)} 件)"
+        )
+        for c in chunks:
+            assert c["character"] == "chisame", (
+                f"buffer chunks の character は target=chisame "
+                f"(実際: {c['character']})"
+            )
+
+    def test_defer_false_preserves_existing_callback_behavior(self, monkeypatch):
+        """defer_chunks=False (= 通常応答経路) で chunks は既存通り callback 経由で流れる。
+
+        WHY: 通常応答経路の不変保証。Phase 0.5-D-1b で BG LLM 経路だけ分岐させ、
+        通常応答経路は完全に既存挙動を維持していることを担保する (= TestStatusReflection
+        等 36 件への影響なし)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _peek_bg_chunks_count, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "non_defer_test"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=False,  # 既存挙動 (= 通常応答経路)
+        )
+
+        response_text = (
+            '{"response": "テスト", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}_c1.wav", "テスト応答", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="",  # 導入セリフ skip でテスト決定性確保
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 本応答 chunks (= target=chisame, text 非空) が callback で受け取られる (= 既存挙動)
+        response_callbacks = [c for c in callback_invocations if c[3] == "chisame"
+                              and c[1] != ""]
+        assert len(response_callbacks) >= 1, (
+            f"defer=False で本応答 chunks は callback 経由 "
+            f"(実際: {len(response_callbacks)} 件)"
+        )
+        # buffer は空 (= 通常応答経路では使われない)
+        assert _peek_bg_chunks_count(session_id) == 0, (
+            f"defer=False で buffer は使われない "
+            f"(実際: {_peek_bg_chunks_count(session_id)} 件)"
+        )
+
+    def test_defer_true_chunk_dict_carries_pose_directly(self, monkeypatch):
+        """defer モードで pose は chunk dict に直接埋め込まれる (= on_pose_ready callback でなく)。
+
+        WHY: 通常応答経路は on_pose_ready callback で run_loop の _pending_poses に
+        セット → 直後の _on_tts_chunk で pop → chunk dict にセット、という流れだが、
+        defer 経路では run_loop closure に依存しない (= ターン跨ぎ独立性のため)。
+        chunk dict の "pose" に直接埋め込み、専用 mini worker (= D-2 で配線) が
+        OBS 立ち絵切替する経路を担保する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        pose_callback_invocations: list[tuple] = []
+
+        def mock_pose_cb(slug, pose):
+            pose_callback_invocations.append((slug, pose))
+
+        session_id = "defer_test_pose"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,  # bridge filler 用、no-op
+            on_pose_ready=mock_pose_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        # 本応答に pose=special_doya を含める
+        response_text = (
+            '{"response": "ふふ、その通りですわ", "emotion": {"happy": 80}, '
+            '"speed": 100, "pose": "special_doya"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}_c1.wav", "ふふ", False, speaker)
+                on_chunk(f"file://{speaker}_c2.wav", "その通り", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="",  # 導入セリフ skip でテスト決定性確保
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # defer モードでは on_pose_ready callback は呼ばれない
+        # (= chunk dict に直接埋込が代替経路)
+        assert len(pose_callback_invocations) == 0, (
+            f"defer=True で on_pose_ready callback は呼ばれない "
+            f"(実際: {pose_callback_invocations})"
+        )
+        # buffer の first_chunk に pose=special_doya が埋め込まれている
+        chunks = _drain_bg_chunks(session_id)
+        assert len(chunks) == 2
+        assert chunks[0].get("pose") == "special_doya", (
+            f"first_chunk の pose は special_doya (実際: {chunks[0].get('pose')})"
+        )
+        # 後続 chunk は pose 未指定 (= 維持の意味、実装で None or 欠如)
+        assert chunks[1].get("pose") in (None, ""), (
+            f"後続 chunk の pose は未指定 (実際: {chunks[1].get('pose')})"
+        )
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 

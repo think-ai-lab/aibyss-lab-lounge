@@ -71,6 +71,21 @@ _on_pose_ready_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
 _status_manager_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ask_char_status_manager", default=None,
 )
+# Phase 0.5-D-1b: BG LLM 経路 (= run_pipeline_llm_only) では対話 TTS chunks を
+# 通常応答 _playback_queue に投入せず、_bg_chunk_buffers に蓄積する defer モード
+# フラグ。挙手承認時 (= run_loop.on_handraise_approved、D-2 で配線) に drain して
+# 専用 mini playback worker で再生することで「ターン跨ぎ問題」(= 配信事故レベル)
+# を構造的に解消する。
+#
+# 【WHY: 通常応答経路では defer=False で既存挙動維持が必須】
+# 通常応答経路 (= 挙手なしターン中の ToolNode 即時呼出) では、ask_character の
+# 戻り値文字列「【target からの応答】... 上記は target が話した内容です」を
+# caller LLM が読んで「target が既に話した前提でリアクション」を組み立てる。
+# 通常応答経路で defer=True にすると、caller のリアクション TTS が target の発話前
+# に再生される逆順バグになる。よって本フラグは BG LLM 経路でのみ True。
+_defer_chunks_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ask_char_defer_chunks", default=False,
+)
 
 # ─── ターン状態 (session_id をキーにした module-level dict) ──────────
 # contextvars ではなく dict + Lock で管理する理由:
@@ -315,6 +330,7 @@ def set_ask_character_context(
     caller_slug: str = "",
     on_pose_ready: Callable | None = None,
     status_manager: Any = None,
+    defer_chunks: bool = False,
 ) -> None:
     """Agent 実行前にコンテキストをセットする。graph.py の _generation_node から呼ばれる。
 
@@ -326,6 +342,14 @@ def set_ask_character_context(
         status_manager: Phase 0.5-B-β-1 commit 4 で追加。target キャラの HUD
                        ステータス反映に使う CharacterStatusManager。None なら
                        ステータス反映 no-op (= 後方互換、Phase 0.5-B-α 以前と同じ)。
+        defer_chunks:  Phase 0.5-D-1b で追加。True (= BG LLM 経路) では対話 TTS
+                       chunks を通常応答 _playback_queue に投入せず、
+                       _bg_chunk_buffers に蓄積する。承認時 (= D-2 で配線) に
+                       drain して再生する。False (= 通常応答経路、default) では
+                       既存挙動 (= on_tts_chunk callback で即時 _playback_queue 投入)。
+                       BG LLM 経路で True 必須の理由は _defer_chunks_var の docstring
+                       (= 通常応答経路では caller LLM の戻り値ベース推論を進める
+                       ため即時再生が必要、defer=True にすると逆順バグ)。
     """
     _on_tts_chunk_var.set(on_tts_chunk)
     _tts_output_dir_var.set(tts_output_dir)
@@ -333,6 +357,7 @@ def set_ask_character_context(
     _caller_slug_var.set(caller_slug)
     _on_pose_ready_var.set(on_pose_ready)
     _status_manager_var.set(status_manager)
+    _defer_chunks_var.set(defer_chunks)
     # ターン開始時に呼出し回数と直前 target をリセット (各ターン独立にカウント)。
     # graph.py の _generation_node がターン開始時に 1 回呼ぶ前提。
     session_id = (common or {}).get("session_id", "")
@@ -355,6 +380,7 @@ def reset_ask_character_context() -> None:
     _chunk_done_event_var.set(None)
     _on_pose_ready_var.set(None)
     _status_manager_var.set(None)
+    _defer_chunks_var.set(False)  # Phase 0.5-D-1b
     with _ask_state_lock:
         _ask_counts.clear()
         _previous_targets.clear()
@@ -699,6 +725,10 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         # 問題に対処するためメインスレッドで取得し、クロージャ経由で
         # _wrapped_on_chunk_ready / _bg_tts_synthesize から参照する。
         status_manager_capture = _status_manager_var.get()
+        # Phase 0.5-D-1b: defer モード判定もメインスレッドで closure capture。
+        # True なら BG LLM 経路として _bg_chunk_buffers に蓄積、False なら通常応答
+        # 経路として既存挙動 (= on_tts_chunk で _playback_queue 即時投入)。
+        defer_chunks_capture = _defer_chunks_var.get()
 
         # response_text から pose と say_text を事前に抽出 (_wrapped_on_chunk_ready
         # で使用)。本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
@@ -721,6 +751,39 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             # (= これらは「target が話す」前提の演出なので、cancel 後は不要)。
             if cancel_flag is not None and cancel_flag.is_set():
                 return
+
+            # Phase 0.5-D-1b: defer モード分岐 — BG LLM 経路では chunks を buffer に
+            # 蓄積し通常応答 _playback_queue には流さない。承認時 (= D-2 で配線) に
+            # drain → _spawn_handraise_response_playback で専用 mini worker 再生する
+            # ことで、ターン跨ぎ問題 (= 配信事故レベル、シナリオ 3 take 2 で観察) を
+            # 構造的に解消する。
+            #
+            # 【answering bubble / pose 予約 / TALKING 反映は本 phase では skip】
+            # buffer 蓄積タイミングで反映すると「承認前に target が TALKING 表示」
+            # される UX 不具合が起こる。D-2 で物理再生時 (= playback worker の chunk
+            # 再生直前) に発火する設計に移行する (= chunk dict に inline metadata
+            # として埋め込む経路)。本 phase ではタイミングずれの中間状態として全部
+            # skip し、再生時の発火に集約する準備を進める。
+            #
+            # 【pose は chunk dict に直接埋め込む】
+            # 通常応答経路は on_pose_ready callback 経由で run_loop の _pending_poses
+            # にセット → 直後の _on_tts_chunk で pop → chunk dict にセット、という
+            # 流れだが、defer 経路ではこの run_loop closure に依存しない (= ターン跨ぎ
+            # 独立性のため)。chunk dict の "pose" に直接埋め込み、専用 mini worker
+            # (= _spawn_handraise_response_playback の _run_playback_worker) が
+            # task["pose"] を読んで OBS 立ち絵切替する経路。
+            if defer_chunks_capture:
+                chunk: dict[str, Any] = {
+                    "url": url, "text": chunk_text,
+                    "is_last": is_last, "character": character,
+                }
+                if not first_chunk_seen[0] and target_pose:
+                    chunk["pose"] = target_pose
+                first_chunk_seen[0] = True
+                _append_bg_chunk(session_id, chunk)
+                return
+
+            # 通常応答経路 (= defer_chunks=False、既存挙動完全維持)
             # 本応答 TTS の最初のチャンクが投入される直前のフック
             if not first_chunk_seen[0]:
                 first_chunk_seen[0] = True
