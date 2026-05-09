@@ -1042,13 +1042,16 @@ def _create_handraise_runner_and_callbacks(
                 )
                 return
 
+            # ログメッセージは既存形式を維持 (= W'-3 ログ強化テストとの後方互換性)。
+            # streaming 設計でも「同期実行 完了 → playback worker 起動」のフローを
+            # ログ上は維持し、grep パターンでの追跡互換性を保つ。
             logger.info(
-                "挙手承認 TTS streaming 投入完了 [character=%s]: bg=%d + tts_only=%d = total=%d",
+                "挙手承認 TTS 同期実行 完了 [character=%s]: bg=%d + tts_only=%d = total=%d (streaming)",
                 slug, len(bg_chunks), _tts_only_count[0],
                 len(bg_chunks) + _tts_only_count[0],
             )
             logger.info(
-                "挙手承認 playback worker 起動 (streaming) [character=%s]",
+                "挙手承認 playback worker 起動 [character=%s] (streaming)",
                 slug,
             )
 
