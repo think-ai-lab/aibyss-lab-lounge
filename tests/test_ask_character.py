@@ -1415,6 +1415,137 @@ class TestCancelGuardLeakageFix:
         )
 
 
+class TestIntroPlaybackOrdering:
+    """Phase 0.5-D-3-a: intro_done.wait 廃止後の return タイミング + 順序保証テスト。
+
+    旧設計では `intro_done.wait(timeout=120)` で 120 秒 timeout を起こし latency の
+    主因 (= 80%) になっていた。本テストクラスは:
+    - ask_character が物理再生完了を待たず return することを検証
+    - on_tts_chunk への投入順 (= 導入 → bridge → 本応答) が維持されることを検証
+    """
+
+    def test_ask_character_returns_before_intro_physical_playback(self, monkeypatch):
+        """intro_done.wait 廃止により、ask_character は物理再生完了を待たず return する。
+
+        WHY: 旧設計では intro_done.wait(timeout=120) で 120 秒 timeout を起こし
+        latency の主因になっていた。物理再生は playback worker (別 thread) で行われ、
+        ask_character の完了とは独立しているべき。本テストは on_tts_chunk callback が
+        呼ばれても物理再生をシミュレートしない (= worker が走らない) 状態で、
+        ask_character が短時間で return することを検証する。
+        """
+        import time
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            # callback は呼ぶが、playback worker は走らない (= intro_done.set() は発火しない)
+            # 旧設計では intro_done.wait(timeout=120) でここで 120 秒 stuck していた
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_return_test"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        start_time = time.monotonic()
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        elapsed = time.monotonic() - start_time
+
+        # 旧設計だと intro_done.wait(timeout=120) で 120 秒 stuck していた
+        # D-3-a 廃止後は数秒以内で return する想定 (= playback worker 完了に依存しない)
+        assert elapsed < 10.0, (
+            f"ask_character は intro_done.wait 廃止により 10 秒以内に return する "
+            f"(実際: {elapsed:.2f}s、旧設計だと 120 秒 stuck)"
+        )
+
+    def test_chunks_invoked_in_caller_then_target_order(self, monkeypatch):
+        """順序保証: 「導入セリフ (caller) → bridge filler / 本応答 (target)」順で投入される。
+
+        WHY: intro_done.wait 廃止後も、ask_character 内の処理順序 (= 導入セリフ TTS 投入
+        → 並行 sakura LLM 待機 → bridge filler 投入 → 本応答 TTS bg_tts thread) が
+        維持されることを on_tts_chunk callback への呼出順で検証する。playback queue
+        の FIFO 特性 (= 投入順 = 物理再生順) と組み合わさることで、視聴者には
+        「導入 → 思案 → target 応答」の自然な順序で再生される。
+        """
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_order_test"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 順序保証: caller (= mimi、導入) の chunks が target (= chisame、bridge/本応答) より先
+        mimi_indices = [i for i, c in enumerate(callback_invocations) if c[3] == "mimi"]
+        chisame_indices = [i for i, c in enumerate(callback_invocations) if c[3] == "chisame"]
+
+        # 両方 chunks が投入されていることを確認 (= 導入 + bridge or 本応答)
+        assert len(mimi_indices) >= 1, (
+            f"caller (mimi) の導入セリフ chunks が投入されること (実際 callback: {callback_invocations})"
+        )
+        assert len(chisame_indices) >= 1, (
+            f"target (chisame) の bridge filler / 本応答 chunks が投入されること "
+            f"(実際 callback: {callback_invocations})"
+        )
+        # mimi の最後 index < chisame の最初 index (= 順序保証)
+        assert max(mimi_indices) < min(chisame_indices), (
+            f"順序保証違反: mimi (caller) の chunks が chisame (target) の chunks より後に投入された "
+            f"(callback 順: {callback_invocations})"
+        )
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 

@@ -710,9 +710,41 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     on_chunk_ready=_wrapped_intro_chunk_ready,
                 )
 
-                logger.info("ask_character 導入セリフ再生待ち...")
-                intro_done.wait(timeout=120)
-                logger.info("ask_character 導入セリフ再生完了")
+                # Phase 0.5-D-3-a: intro_done.wait(timeout=120) を廃止。
+                #
+                # 【WHY: 物理再生完了同期は不要】
+                # 旧設計では「導入セリフ wav の物理再生完了」を待っていたが、これが
+                # 実走テスト (logs/runs/run_loop_20260509_165916.log) で 80% latency
+                # の主因 (= 149 秒中 120 秒) と判明:
+                # - mimi 挙手中に導入セリフ wav が _playback_queue に投入される
+                # - しかし通常応答ターン用の playback worker が既に終了済 (or
+                #   ターン跨ぎで break) → 物理再生されない → intro_done.set() が
+                #   呼ばれない → timeout=120 秒で stuck
+                # - ルカ「ミミ様、どうぞ」発話時には bg_result=none で fallback パスに
+                #   行き、視聴者が 2 分半待たされる配信事故レベルの UX 不具合
+                #
+                # 【順序保証は別経路で実現】
+                # - VOICEPEAK FIFO worker (= tts.py:_voicepeak_worker_fn) が直列化 →
+                #   「導入セリフ → 本応答」の合成完了順は VOICEPEAK 内部で保証
+                # - playback queue は FIFO → 投入順 = 物理再生順
+                # - 連続 ask_character の順序保証は ask_character.py 冒頭の
+                #   wait_bg_tts_complete で維持 (= 既存対処継続)
+                #
+                # 【効果】
+                # ask_character 処理時間: 149 秒 → 約 25 秒 (= 並行 LLM/TTS の最大値)
+                # bg_result=ready 確率: 0% → ~80% (= 30 秒以内に承認されれば成立)
+                # 案 W'-1 設計意図 (= LLM 先行生成 → 承認時 TTS 再利用) が機能し始める。
+                #
+                # 【中間状態 (D-3-b 未実装時)】
+                # 導入セリフ chunks は依然として通常応答 _playback_queue に流れる
+                # (= _wrapped_intro_chunk_ready が defer 分岐していない) ため、
+                # ターン跨ぎ漏れの可能性は残る。D-3-b で defer 経路統合により構造的に
+                # 解消する。
+                #
+                # 【intro_done event は保持】
+                # `intro_done = threading.Event()` と `_chunk_done_event_var.set(intro_done)`
+                # は D-3-a 段階では保持 (= run_loop.py:1842-1846 の task["done_event"]
+                # 経路は維持、ImportError ガードで安全)。D-3-b で削除予定。
             except Exception as exc:
                 logger.warning("導入セリフ TTS 失敗: %s", exc)
 
