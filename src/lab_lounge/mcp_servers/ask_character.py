@@ -781,13 +781,23 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     # 5. 協働先の応答を TTS 合成 + 再生キュー投入
     if on_tts_chunk and use_real_tts:
-        from ..pipeline import _publish_bubble
+        from ..pipeline import _publish_bubble, _load_bubble_messages
+
+        # Phase 0.5-D-3-c: defer モード判定をローカルにキャプチャ。
+        # 5-a の即時 thinking 発火 (= 通常モード) と、bridge filler 投入の defer 分岐
+        # (= D-3-c) で同じ判定値を使う。
+        _is_defer_mode = _defer_chunks_var.get()
 
         # 5-a. target の "考え中" bubble を発行する (filler 再生中のテロップ用)。
         # graph.py の _generation_node が caller の thinking bubble を出すのと同じ仕組みで、
         # filler が target の声で再生されている間、V2 HUD には target の thinking テキスト
         # (例: chisame「分析しています」/ sakura「んー……考え中ですよぉ」) を表示する。
-        if common:
+        #
+        # Phase 0.5-D-3-c: defer モードでは skip (= 物理再生時に inline metadata で発火)。
+        # 「承認前に target THINKING / thinking bubble が表示される」UX 不具合を構造的に
+        # 解消する。物理再生発火は bridge filler chunk の `_pre_play_bubble` /
+        # `_pre_play_status` (= 下の 5-b で埋込) 経由で worker が発火する。
+        if common and not _is_defer_mode:
             try:
                 _publish_bubble("thinking", target_char.slug, common)
             except Exception as exc:
@@ -801,8 +811,10 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         # CharacterStatusManager 経由) を発火する。bridge filler が再生されている
         # 間 HUD カードが「考え中」(黄色) で表示される。bg_tts 合成失敗時は
         # _bg_tts_synthesize の finally で READY に戻る (= ステータス stuck 防止)。
+        # Phase 0.5-D-3-c: defer モードでは skip (= 同様、物理再生時に inline metadata
+        # 経由で発火、二重発火防止 + UX 不具合解消)。
         _status_manager_for_target = _status_manager_var.get()
-        if _status_manager_for_target is not None:
+        if _status_manager_for_target is not None and not _is_defer_mode:
             try:
                 from ..character_status import CharacterStatus
                 _status_manager_for_target.set_status(
@@ -838,7 +850,41 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                         "[%s] session=%s",
                         target_char.slug, session_id,
                     )
+                elif _is_defer_mode:
+                    # Phase 0.5-D-3-c: defer モードでは bridge filler chunk も buffer に
+                    # 蓄積する (= ターン跨ぎ漏れの構造的阻止)。inline metadata
+                    # (`_pre_play_status` + `_pre_play_bubble`) を埋め込んで、物理再生時
+                    # に target THINKING + thinking bubble を発火させる経路に統合する
+                    # (= 上の 5-a の即時発火を defer モードでは skip 済み、UX 不具合解消)。
+                    #
+                    # chunk_text="" は通常モードと同じく speaking publish skip 仕組み維持
+                    # (= _run_playback_worker で text 空なら speaking publish skip → 直前の
+                    # thinking テロップを維持)。`_pre_play_bubble` の text には キャラ別
+                    # yaml の "thinking" メッセージ (= 通常モードの _publish_bubble 相当)
+                    # を入れる。
+                    bubble_msgs = _load_bubble_messages().get(target_char.slug, {})
+                    chunk = {
+                        "url": bridge_path.as_uri(),
+                        "text": "",
+                        "is_last": False,
+                        "character": target_char.slug,
+                        "_pre_play_status": {
+                            "slug": target_char.slug,
+                            "status": "THINKING",
+                        },
+                        "_pre_play_bubble": {
+                            "slug": target_char.slug,
+                            "step": "thinking",
+                            "text": bubble_msgs.get("thinking", ""),
+                        },
+                    }
+                    _append_bg_chunk(session_id, chunk)
+                    logger.info(
+                        "ask_character target bridge filler buffer 蓄積 (defer): [%s] %s",
+                        target_char.slug, bridge_path.name,
+                    )
                 else:
+                    # 通常応答経路: 既存挙動完全維持
                     # chunk_text を空文字にする理由:
                     #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
                     #   bubble.update step="speaking" の表示テキストにそのまま流す。
