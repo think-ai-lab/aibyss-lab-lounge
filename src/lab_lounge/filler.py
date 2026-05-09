@@ -703,23 +703,79 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
         logger.debug("フィラー終了（continue 後）: %s", slug)
         return
 
-    # Phase 4: 本命到着まで bridge で待機（最大 60 秒）
+    # Phase 4: 本命到着まで bridge filler + LLM continue で待機（最大 60 秒）
+    #
+    # Phase 0.5-D-3 follow-up 2: 「ブリッジフレーズがしつこい」問題への (A)+(D) 対処
+    # 中間実走 3 / 4 回目で観察された「同じ bridge フレーズが 3〜4 秒間隔で繰り返さ
+    # れる機械感」への根本対処。
+    # - (A) bridge filler は最大 2 回まで再生 (= 同じキャッシュ wav の繰り返し感を緩和)
+    # - (D) bridge 2 回後 → 10 秒経過するごとに LLM continue を再生成・再生
+    #   (= 動的フレーズで多様性、LLM コストは Phase 4 全体で最大 ~4 回程度)
+    #
+    # Phase 2 (= LLM 推論待ち中の bridge) は短時間 (1-2 回程度) で済むので 4〜8 秒
+    # ランダム化のみ。Phase 4 (= post-continue 本命待ち、最大 60 秒) は長時間化する
+    # ことが多いので段階制御で「機械的繰り返し感」を構造的に抑制する。
     last_bridge_idx2 = -1
     phase4_deadline = time.monotonic() + 60.0
+    bridge_play_count = 0
+    MAX_BRIDGE_PLAYS = 2  # (A) bridge filler 再生回数の上限
 
     while not stop_event.is_set() and time.monotonic() < phase4_deadline:
-        bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx2)
-        if bridge_path is None:
-            stop_event.wait(timeout=0.5)
+        if bridge_play_count < MAX_BRIDGE_PLAYS:
+            # (A) bridge filler を最大 2 回まで再生
+            bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx2)
+            if bridge_path is None:
+                stop_event.wait(timeout=0.5)
+                continue
+            last_bridge_idx2 = idx
+            # bridge 間のインターバル: 4〜8 秒ランダム (= 上の Phase 2 と同じ範囲)
+            stop_event.wait(timeout=random.uniform(4.0, 8.0))
+            if stop_event.is_set():
+                break
+            logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
+            play_audio_file(str(bridge_path))
+            bridge_play_count += 1
             continue
-        last_bridge_idx2 = idx
-        # bridge 間のインターバル。中間実走 3 回目で観察された「ブリッジフレーズが
-        # しつこい」問題への対処として 3 秒固定 → 4〜8 秒ランダムに変更
-        # (= 上の Phase 2 と同じ範囲)。
-        stop_event.wait(timeout=random.uniform(4.0, 8.0))
+
+        # (D) bridge 2 回後は 10 秒待ち → LLM continue を動的再生成・再生
+        # WHY: 既存 bridge wav (= キャッシュから 2-3 種類のローテーション) の繰り返しを
+        # 避け、状況に応じた多様な発話で「機械的繰り返し感」を解消する。LLM 呼出は
+        # 10 秒間隔に制限することで Phase 4 内で最大 ~4 回程度に抑える (= コスト制限的)。
+        stop_event.wait(timeout=10.0)
         if stop_event.is_set():
             break
-        logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
-        play_audio_file(str(bridge_path))
+
+        char = get_character(slug)
+        additional_filler_text = _generate_filler_text(slug, user_text=user_text)
+        if additional_filler_text and char:
+            from .tts import _parse_voicepeak_json
+            _, _, _, additional_pose = _parse_voicepeak_json(additional_filler_text)
+            logger.info(
+                "フィラー continue (LLM, additional): [%s] %r",
+                slug, additional_filler_text[:60],
+            )
+            try:
+                out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                tts_result = synthesize(
+                    additional_filler_text,
+                    provider=char.tts_provider,
+                    voice=char.tts_voice,
+                    output_dir=str(out_dir),
+                )
+                additional_audio = tts_result.audio_url.replace("file:///", "").replace("file://", "")
+                if additional_pose:
+                    from .obs import set_pose
+                    set_pose(slug, additional_pose)
+                time.sleep(0.3)
+                play_audio_file(additional_audio)
+            except Exception as exc:
+                logger.warning(
+                    "追加 LLM フィラー TTS 失敗 (= 無音待機継続): [%s] %s",
+                    slug, exc,
+                )
+        else:
+            # LLM 失敗 / 空応答時は無音待機継続 (= bridge 連発を避ける)
+            logger.debug("追加 LLM フィラー生成失敗、無音待機継続: %s", slug)
 
     logger.debug("フィラー終了: %s", slug)
