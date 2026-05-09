@@ -511,6 +511,45 @@ class TestDispatcherEnvVarOverride:
         d = Dispatcher()
         assert d._approval_bg_completed_timeout == 60.0
 
+    # ─── Phase 0.5-D-e-4-2: 起動時 timeout 値ログ ───────────────────────
+
+    def test_init_logs_timeout_value(self, monkeypatch, caplog):
+        """Dispatcher 起動時に bg_completed_timeout 値が INFO ログに出る。
+
+        Phase 0.5-D-e-4-2 (= 中間実走 12 検分): 環境変数 typo / 不正値 fallback
+        / 運用ミスでの 30s 戻り等を実走で早期発見できるよう、起動時 1 行だけ
+        現在の解決値 + 環境変数の生値を出す。
+        """
+        import logging as _logging
+        monkeypatch.delenv("L2_APPROVAL_BG_TIMEOUT_SEC", raising=False)
+        caplog.set_level(_logging.INFO, logger="lab_lounge.dispatcher")
+        Dispatcher()
+        matched = [
+            r for r in caplog.records
+            if "bg_completed_timeout=60.0s" in r.message
+            and "(未設定)" in r.message
+        ]
+        assert matched, (
+            f"Dispatcher 設定ログが出ていない: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+    def test_init_logs_timeout_value_with_env_override(self, monkeypatch, caplog):
+        """環境変数 override 時には override 値が起動時ログに出る。"""
+        import logging as _logging
+        monkeypatch.setenv("L2_APPROVAL_BG_TIMEOUT_SEC", "90")
+        caplog.set_level(_logging.INFO, logger="lab_lounge.dispatcher")
+        Dispatcher()
+        matched = [
+            r for r in caplog.records
+            if "bg_completed_timeout=90.0s" in r.message
+            and "L2_APPROVAL_BG_TIMEOUT_SEC=90" in r.message
+        ]
+        assert matched, (
+            f"override timeout ログが出ていない: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
 
 # ─── Phase 0.5-A 用テストヘルパー ──────────────────────────────────
 

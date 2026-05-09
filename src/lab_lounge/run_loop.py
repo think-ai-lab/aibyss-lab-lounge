@@ -2433,6 +2433,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    # Phase 0.5-D-e-4-2 (= 中間実走 12 検分):
+    # 起動時に L2_FALLBACK_TIMEOUT_SEC の解決値を INFO 出力。
+    # 環境変数 typo / 不正値 fallback を実走で早期発見できるようにする
+    # (= dispatcher.py の bg_completed_timeout ログと対応する fallback 側ログ)。
+    _fb_timeout_env = os.environ.get("L2_FALLBACK_TIMEOUT_SEC", "(未設定)")
+    try:
+        _fb_timeout_resolved = (
+            float(_fb_timeout_env) if _fb_timeout_env != "(未設定)" else 30.0
+        )
+    except ValueError:
+        _fb_timeout_resolved = 30.0
+    logger.info(
+        "run_loop 設定: fallback_timeout=%.1fs (env L2_FALLBACK_TIMEOUT_SEC=%s)",
+        _fb_timeout_resolved, _fb_timeout_env,
+    )
+
     record_seconds = args.record_seconds or float(
         os.environ.get("L2_RECORD_SECONDS", "5")
     )
