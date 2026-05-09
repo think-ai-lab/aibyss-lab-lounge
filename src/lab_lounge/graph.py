@@ -178,7 +178,10 @@ def _get_or_create_llm_client(
     with _llm_client_pool_lock:
         if key not in _llm_client_pool:
             _llm_client_pool[key] = _create_llm_client_raw(provider, model)
-            logger.debug(
+            # Phase 0.5-D-e-4-1 (= 中間実走 12 検分):
+            # debug → INFO 昇格。配信事故再発時に「pool 分離が機能したか」追跡用。
+            # ターンあたり最大 2-3 行で noise にならない (= INFO 全体の 1.5-3%)。
+            logger.info(
                 "LLM client pool: created [session=%s mode=%s provider=%s model=%s]",
                 session_id, mode, provider, model,
             )
@@ -200,7 +203,8 @@ def _cleanup_llm_client_pool(session_id: str) -> None:
         for k in keys_to_remove:
             _llm_client_pool.pop(k, None)
         if keys_to_remove:
-            logger.debug(
+            # Phase 0.5-D-e-4-1: debug → INFO 昇格 (= 配信事故再発時のトレース用)。
+            logger.info(
                 "LLM client pool: cleaned up [session=%s removed_count=%d]",
                 session_id, len(keys_to_remove),
             )
@@ -221,7 +225,9 @@ def _cleanup_llm_client_pool_except(active_session_id: str) -> None:
             removed = len(_llm_client_pool)
             _llm_client_pool.clear()
             if removed:
-                logger.debug(
+                # Phase 0.5-D-e-4-1: debug → INFO 昇格 (= テスト fixture 経由の cleared all
+                # は本番では reset_ask_character_context 経由でしか起こらない、稀な経路)。
+                logger.info(
                     "LLM client pool: cleared all [removed_count=%d]", removed,
                 )
             return
@@ -231,7 +237,9 @@ def _cleanup_llm_client_pool_except(active_session_id: str) -> None:
         for k in keys_to_remove:
             _llm_client_pool.pop(k, None)
         if keys_to_remove:
-            logger.debug(
+            # Phase 0.5-D-e-4-1: debug → INFO 昇格 (= 配信事故再発時のトレース用)。
+            # 各ターン開始時に 1 行出る (= 前ターンの client 解放証跡)。
+            logger.info(
                 "LLM client pool: cleaned up except [active=%s removed_count=%d]",
                 active_session_id, len(keys_to_remove),
             )
