@@ -324,6 +324,114 @@ def _spawn_handraise_response_playback(
     return t
 
 
+def _spawn_handraise_response_playback_streaming(
+    slug: str,
+    initial_chunks: list[dict],
+    trace_id: str,
+    *,
+    session_stream_id: str,
+    session_id_root: str,
+    status_manager: "CharacterStatusManager | None" = None,
+    talking_metadata: "dict | None" = None,
+) -> "tuple[threading.Thread, queue.Queue]":
+    """Phase 0.5-D-3 follow-up 2: 動的 chunks 追加対応の streaming 版 spawn。
+
+    既存 ``_spawn_handraise_response_playback`` と異なり、None sentinel は caller が
+    後から投入する。これにより run_pipeline_tts_only の TTS 合成中にも、合成完了した
+    chunk から順次 queue に動的追加できる。
+
+    【WHY: bg_chunks 即時再生 + tts_only 並行投入】
+    実走テスト 2026-05-09 logs/runs/run_loop_20260509_190927.log で観察された
+    「approval 後 18.5 秒の空白」(= run_pipeline_tts_only が同期 blocking で全
+    tts_only chunks 蓄積完了まで待ってから spawn) の根本対処。bg_chunks (= 既に
+    合成済の導入セリフ + bridge filler + sakura 本応答 = 4 件) を即時再生開始し、
+    tts_only chunks (= caller の〆セリフ) は合成完了次第 queue に投入することで、
+    視聴者の体感を「approval → 即「ルカ、その問いは…」」に近づける (= 案 W'-1 の
+    本来の設計意図)。
+
+    Args:
+        slug:               挙手キャラ slug
+        initial_chunks:     起動時に投入する chunks (= bg_chunks 等の既蓄積分)
+        trace_id:           bubble.update 発行時の handraise 単位 trace_id
+        session_stream_id:  bubble.update の stream_id
+        session_id_root:    bubble.update の session_id
+        status_manager:     CharacterStatusManager
+        talking_metadata:   Talking 反映時の metadata
+
+    Returns:
+        (起動した daemon thread, 投入用 queue) のタプル。caller は queue.put(chunk) で
+        chunks を動的追加し、最後に queue.put(None) で worker 終了通知する。
+    """
+    q: queue.Queue = queue.Queue()
+    for chunk in initial_chunks:
+        q.put(chunk)
+    # 注: None sentinel は caller が後から投入する (= 既存 _spawn_handraise_response_playback
+    # との挙動の違い)。run_pipeline_tts_only 完了後に caller が queue.put(None) を呼ぶ。
+
+    def _publish_bubble_for_handraise(character: str, step: str, text: str) -> None:
+        """既存 _spawn_handraise_response_playback と同じ bubble 発行ロジック。"""
+        try:
+            event = build_bubble_update(
+                character=character,
+                step=step,
+                text=text,
+                stream_id=session_stream_id,
+                session_id=session_id_root,
+                trace_id=_new_uuid(),
+                category="speech",
+            )
+            publish(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "handraise playback (streaming) bubble.update(%s) publish 失敗: %s", step, exc,
+            )
+
+    def _cleanup_audio(url: str) -> None:
+        try:
+            from .audio_io import _uri_to_path
+            p = Path(_uri_to_path(url))
+            if p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+
+    def _set_pose_safe(character: str, pose: str) -> None:
+        try:
+            from .obs import set_pose
+            set_pose(character, pose)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "handraise playback (streaming) set_pose 失敗 (無視): %s", exc,
+            )
+
+    if status_manager is not None:
+        status_manager.set_status(
+            slug, CharacterStatus.TALKING, metadata=talking_metadata,
+        )
+
+    def _worker_with_status_tracking() -> None:
+        try:
+            _run_playback_worker(
+                q,
+                publish_bubble_fn=_publish_bubble_for_handraise,
+                play_audio_fn=play_audio_file,
+                cleanup_audio_fn=_cleanup_audio,
+                set_pose_fn=_set_pose_safe,
+                status_manager=status_manager,
+            )
+        finally:
+            if status_manager is not None:
+                status_manager.set_status(slug, CharacterStatus.READY)
+
+    t = threading.Thread(
+        target=_worker_with_status_tracking,
+        daemon=True,
+        name=f"handraise-playback-streaming-{slug}",
+    )
+    t.start()
+    return t, q
+
+
 def _approved_synthesize_fallback(
     slug: str,
     transcript_snapshot,
@@ -786,17 +894,27 @@ def _create_handraise_runner_and_callbacks(
 
         # TTS-only graph で TTS 実行 + chunks 蓄積 → playback worker (daemon thread)
         def _tts_and_play() -> None:
-            # Phase 0.5-D-2: BG LLM 経路で蓄積された対話 TTS chunks (= ask_character
-            # 内の target 応答) を buffer から取得し、tts_only chunks (= caller の
-            # 最終 〆セリフ) と concat する。承認時の自然な対話演出
-            # (= 「導入 → target 応答 → caller の〆」) を専用 mini playback worker
-            # で物理再生する。これによりターン跨ぎ問題 (= 配信事故レベル) を構造的に
-            # 解消する (= chunks の lifecycle が通常応答 _playback_queue から独立)。
+            # Phase 0.5-D-3 follow-up 2: streaming spawn 設計に変更。
             #
-            # 【WHY: drain 前に wait_deferred_bg_tts_complete】
-            # bg_tts thread が承認時にまだ合成中の chunks を取りこぼさないようにする
-            # (= bg_tts thread 完了 = buffer に全 chunks 蓄積完了の同期点)。tail
-            # 取りこぼしを防ぎ、視聴者には「自然な完結した対話」が再生される。
+            # 【WHY: 旧設計の問題】
+            # 旧設計 (D-2/D-3 まで) は run_pipeline_tts_only を同期 blocking で呼び、
+            # 全 tts_only chunks 蓄積完了を待ってから _spawn_handraise_response_playback
+            # を起動していた。実走テスト 2026-05-09 logs/runs/run_loop_20260509_190927.log
+            # で「approval 後 18.5 秒の空白」(= mimi 〆セリフ chunk 1 の VOICEPEAK 合成
+            # 18 秒 + chunk 2 合成 18 秒 = 直列 36 秒) 中、視聴者は何も聞こえない
+            # フライング待ちが発生していた。
+            #
+            # 【新設計】
+            # 1. bg_chunks (= 既に合成済の導入セリフ + bridge filler + 本応答 = 通常 4 件)
+            #    を _spawn_handraise_response_playback_streaming で即時 spawn → 物理再生開始
+            # 2. run_pipeline_tts_only を並行で同期実行、各 tts_only chunk が合成完了次第
+            #    on_chunk_ready callback で queue に動的追加
+            # 3. worker は bg_chunks 再生中 (= 約 30 秒) に tts_only chunks が queue に
+            #    流れてくるので、バッファ切れなしで連続再生可能
+            # 4. run_pipeline_tts_only 完了後、queue.put(None) で worker 終了通知
+            #
+            # 視聴者体感: 「approval → 即「ルカ、その問いは…」(= 導入セリフ) → 各キャラ
+            # 応答 → 自然に〆セリフ」のシームレスな対話が、合成時間に関わらず実現する。
             from .mcp_servers.ask_character import (
                 _drain_bg_chunks,
                 wait_deferred_bg_tts_complete,
@@ -810,19 +928,46 @@ def _create_handraise_runner_and_callbacks(
                     slug, len(bg_chunks),
                 )
 
-            chunks: list[dict] = []
-            # Phase 0.5-D-3 follow-up: tts_only chunks の first に answering bubble の
-            # inline metadata を埋め込むため first 判定 closure 変数を保持する。
+            # Talking metadata 構築 (= caller の HUD 表示用)。
+            # tts_only chunks の first pose は合成完了前に取得不可なので、bg_chunks
+            # の最初 (= 通常 caller の導入セリフ first chunk) の pose を一旦使う。
+            # bg_chunks 空時は pose=None で起動 (= text のみの metadata)。
+            caller_initial_pose: "str | None" = None
+            if bg_chunks:
+                # bg_chunks の最初は caller (= slug) の導入セリフ first chunk
+                first_bg = bg_chunks[0]
+                if first_bg.get("character") == slug:
+                    caller_initial_pose = first_bg.get("pose")
+            talking_metadata = _build_talking_metadata(
+                slug, answering_text, caller_initial_pose,
+            )
+
+            # Phase 0.5-D-3 follow-up 2: streaming spawn (= bg_chunks 即時再生開始)
+            logger.info(
+                "挙手承認 streaming spawn [character=%s]: bg_chunks=%d (= 即時再生開始)",
+                slug, len(bg_chunks),
+            )
+            _streaming_thread, _streaming_queue = (
+                _spawn_handraise_response_playback_streaming(
+                    slug,
+                    bg_chunks,
+                    bg_trace_id,
+                    session_stream_id=session_stream_id,
+                    session_id_root=session_id_root,
+                    status_manager=status_manager,
+                    talking_metadata=talking_metadata if talking_metadata else None,
+                )
+            )
+
+            # tts_only chunks の動的追加用 closure 変数
             _first_tts_only_chunk_seen = [False]
+            _tts_only_count = [0]
 
             def on_chunk(url, chunk_text, is_last, character, pose=None):
-                """on_tts_chunk_ready 用、chunks 蓄積 + first chunk に answering bubble inline 埋込。
+                """on_tts_chunk_ready 用、tts_only chunks を queue に動的追加。
 
-                旧設計では approval 直後に bubble.update("answering") を事前 publish して
-                いたが、物理再生開始の 21 秒前に bubble 表示されるフライング UX 不具合
-                があった (= 中間実走 3 回目で観察)。本関数で first tts_only chunk に
-                `_pre_play_bubble` inline metadata を埋め込み、物理再生開始時に
-                playback worker が発火する経路に移行する。
+                Phase 0.5-D-3 follow-up: first tts_only chunk に caller answering bubble
+                を inline metadata で埋込。物理再生開始時に worker が発火する経路。
                 """
                 chunk: dict = {
                     "url": url,
@@ -833,9 +978,7 @@ def _create_handraise_runner_and_callbacks(
                 if pose is not None:
                     chunk["pose"] = pose
 
-                # Phase 0.5-D-3 follow-up: first tts_only chunk のみに caller (= slug)
-                # の answering bubble を inline metadata で埋込
-                # (= 旧設計の事前 publish の代替経路)。
+                # first tts_only chunk のみに caller answering bubble inline 埋込
                 if not _first_tts_only_chunk_seen[0]:
                     _first_tts_only_chunk_seen[0] = True
                     chunk["_pre_play_bubble"] = {
@@ -844,7 +987,9 @@ def _create_handraise_runner_and_callbacks(
                         "text": answering_text,
                     }
 
-                chunks.append(chunk)
+                # streaming queue に動的追加 (= worker が並行で再生)
+                _streaming_queue.put(chunk)
+                _tts_only_count[0] += 1
 
             logger.info(
                 "挙手承認 TTS 同期実行 開始 [character=%s]: trace_id=%s text_len=%d",
@@ -864,25 +1009,28 @@ def _create_handraise_runner_and_callbacks(
                     "挙手承認 TTS 同期実行失敗 [character=%s]: %s → fallback パス",
                     slug, exc,
                 )
-                _approved_synthesize_fallback(
-                    slug, transcript_snapshot, trace_id,
-                    session_stream_id=session_stream_id,
-                    session_id_root=session_id_root,
-                    stream_context=stream_context,
-                    status_manager=status_manager,
-                )
+                # 例外時: worker 終了通知 (= bg_chunks 再生は継続済み or 完了済み)
+                _streaming_queue.put(None)
+                # bg_chunks 空なら fallback で救済、bg_chunks ありなら既に再生中で完結
+                if not bg_chunks:
+                    _approved_synthesize_fallback(
+                        slug, transcript_snapshot, trace_id,
+                        session_stream_id=session_stream_id,
+                        session_id_root=session_id_root,
+                        stream_context=stream_context,
+                        status_manager=status_manager,
+                    )
                 return
 
-            # Phase 0.5-D-2: bg_chunks (= target 応答) を tts_only chunks (= caller
-            # の〆セリフ) の前に concat。順序保証 = 「target 応答 → caller の〆」。
-            # bg_chunks が空 (= ask_character 不使用 / defer モード未配線) の場合
-            # combined_chunks = chunks となり既存挙動と等価。
-            combined_chunks = bg_chunks + chunks
+            # tts_only 完了 → queue に None sentinel 投入で worker 終了通知
+            # (= bg_chunks + tts_only chunks 全て再生完了後 worker break)
+            _streaming_queue.put(None)
 
-            if not combined_chunks:
-                # ダミー TTS モード or TTS 出力なし → fallback パスで救済
+            # 全 chunks 空 (= bg_chunks 空 + tts_only 空) のみ fallback 必要
+            # bg_chunks 4 件あれば再生される、tts_only 空でも導入 + bridge + 本応答は OK
+            if not bg_chunks and _tts_only_count[0] == 0:
                 logger.warning(
-                    "挙手承認 TTS [character=%s]: chunks 空 → fallback パス",
+                    "挙手承認 TTS [character=%s]: 全 chunks 空 → fallback パス",
                     slug,
                 )
                 _approved_synthesize_fallback(
@@ -895,39 +1043,13 @@ def _create_handraise_runner_and_callbacks(
                 return
 
             logger.info(
-                "挙手承認 TTS 同期実行 完了 [character=%s]: bg=%d + tts_only=%d = total=%d",
-                slug, len(bg_chunks), len(chunks), len(combined_chunks),
+                "挙手承認 TTS streaming 投入完了 [character=%s]: bg=%d + tts_only=%d = total=%d",
+                slug, len(bg_chunks), _tts_only_count[0],
+                len(bg_chunks) + _tts_only_count[0],
             )
-            # ログ強化 W'-3: playback worker 起動を明示。実走時に「TTS は完了
-            # したが playback まで到達したか」を 1 行 grep で追跡可能にする。
             logger.info(
-                "挙手承認 playback worker 起動 [character=%s]",
+                "挙手承認 playback worker 起動 (streaming) [character=%s]",
                 slug,
-            )
-            # Phase 0.5-B-α: Talking metadata 構築 (HUD で立ち絵 + 発話全文を表示)。
-            # answering_text は既に bg_result.result.events から抽出済 (line 上方)、
-            # pose は caller (= slug) の first chunk から取得する。
-            #
-            # 【WHY: combined_chunks[0] でなく chunks[0] (= tts_only の最初) を参照】
-            # combined_chunks の先頭は bg_chunks (= target キャラの chunk) なので、
-            # その pose は target の pose (= 例: chisame の special_doya)。caller
-            # (= slug、例: mimi) の talking_metadata に target の pose を入れると
-            # HUD で「mimi が doya 顔」のような不整合表示になる。tts_only の最初
-            # (= caller の最初の chunk) の pose を参照することで、caller の pose を
-            # 正しく反映する。target の TALKING / pose は chunk dict 内の
-            # `_pre_play_status` 経由で物理再生時に発火 (= Phase 0.5-D-2 で配線)。
-            caller_first_chunk_pose = chunks[0].get("pose") if chunks else None
-            talking_metadata = _build_talking_metadata(
-                slug, answering_text, caller_first_chunk_pose,
-            )
-            _spawn_handraise_response_playback(
-                slug,
-                combined_chunks,
-                bg_trace_id,
-                session_stream_id=session_stream_id,
-                session_id_root=session_id_root,
-                status_manager=status_manager,
-                talking_metadata=talking_metadata if talking_metadata else None,
             )
 
         threading.Thread(
