@@ -543,6 +543,186 @@ class TestRunPlaybackWorkerStatusReady:
         )
 
 
+class TestRunPlaybackWorkerPrePlay:
+    """_run_playback_worker の _pre_play_status / _pre_play_bubble dispatch (Phase 0.5-D-2)。
+
+    案 C 設計の核心: defer モード (= BG LLM 経路) で chunk dict に埋め込まれた
+    inline metadata を物理再生開始時に発火することで、TALKING / answering bubble
+    の「buffer 投入時 → 物理再生時」タイミング移動を実現する。承認前に target が
+    TALKING 表示される UX 不具合を構造的に防ぐ。
+
+    通常応答経路 (= defer=False) の chunks にはこのキーが含まれないため (=
+    ask_character.py の defer 分岐でのみ埋め込み)、本 dispatch は既存 chunks には
+    影響しない (= 後方互換)。
+    """
+
+    def _start_worker(self, q, *, status_manager=None, publish_fn=None,
+                      play_fn=None, cleanup_fn=None, done_delay=0.01):
+        publish_fn = publish_fn or MagicMock()
+        play_fn = play_fn or MagicMock()
+        cleanup_fn = cleanup_fn or MagicMock()
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "done_delay_seconds": done_delay,
+                "status_manager": status_manager,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread, publish_fn, play_fn
+
+    def test_pre_play_status_dispatched_at_chunk_pop(self):
+        """chunk dict の _pre_play_status を pop 時に status_manager.set_status で発火。"""
+        from lab_lounge.character_status import CharacterStatus
+        q: queue.Queue = queue.Queue()
+        mock_status = MagicMock()
+
+        thread, _, _ = self._start_worker(q, status_manager=mock_status)
+        q.put({
+            "url": "file:///a.wav", "text": "x", "is_last": True, "character": "chisame",
+            "_pre_play_status": {
+                "slug": "chisame",
+                "status": "TALKING",
+                "metadata": {"pose": "special_doya", "text": "テスト応答"},
+            },
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # chisame の TALKING が呼ばれたことを確認 (= chunk pop 時に inline metadata から発火)
+        talking_calls = [
+            c for c in mock_status.set_status.call_args_list
+            if c.args[:2] == ("chisame", CharacterStatus.TALKING)
+        ]
+        assert len(talking_calls) == 1, (
+            f"_pre_play_status から TALKING 反映 1 回 (実際: {talking_calls})"
+        )
+        # metadata も伝播
+        metadata = talking_calls[0].kwargs.get("metadata", {})
+        assert metadata.get("pose") == "special_doya"
+        assert metadata.get("text") == "テスト応答"
+
+    def test_pre_play_bubble_dispatched_at_chunk_pop(self):
+        """chunk dict の _pre_play_bubble を pop 時に publish_bubble_fn で発火。"""
+        q: queue.Queue = queue.Queue()
+        mock_publish = MagicMock()
+
+        thread, _, _ = self._start_worker(q, publish_fn=mock_publish)
+        q.put({
+            "url": "file:///a.wav", "text": "x", "is_last": True, "character": "chisame",
+            "_pre_play_bubble": {
+                "slug": "chisame",
+                "step": "answering",
+                "text": "ええ、答えますわね",
+            },
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # chisame の answering bubble が発行されたことを確認
+        answering_calls = [
+            c for c in mock_publish.call_args_list
+            if c.args[:2] == ("chisame", "answering")
+        ]
+        assert len(answering_calls) == 1, (
+            f"_pre_play_bubble から answering bubble 発行 1 回 (実際: {answering_calls})"
+        )
+        # text も伝播
+        assert answering_calls[0].args[2] == "ええ、答えますわね"
+
+    def test_pre_play_dispatched_before_audio_play(self):
+        """_pre_play_status / _pre_play_bubble の dispatch は play_audio_fn より先に呼ばれる。
+
+        WHY: 「物理再生開始の直前」に metadata 発火するのが案 C 設計の核 (= HUD
+        表示と音声再生の同期)。順序逆転すると「音だけ流れて HUD 反応なし」の
+        UX 違和感が出るため、play_audio_fn の前に dispatch されることを保証する。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        q: queue.Queue = queue.Queue()
+        mock_status = MagicMock()
+        mock_publish = MagicMock()
+        mock_play = MagicMock()
+
+        # call 順を記録するため shared list を使う
+        call_log: list[str] = []
+        mock_status.set_status.side_effect = lambda *a, **kw: call_log.append("set_status")
+        mock_publish.side_effect = lambda *a, **kw: call_log.append(
+            f"publish:{a[1] if len(a) > 1 else '?'}"
+        )
+        mock_play.side_effect = lambda *a, **kw: call_log.append("play_audio")
+
+        thread, _, _ = self._start_worker(
+            q, status_manager=mock_status,
+            publish_fn=mock_publish, play_fn=mock_play,
+        )
+        q.put({
+            "url": "file:///a.wav", "text": "テスト", "is_last": True, "character": "chisame",
+            "_pre_play_status": {
+                "slug": "chisame", "status": "TALKING",
+                "metadata": {"pose": "neutral"},
+            },
+            "_pre_play_bubble": {
+                "slug": "chisame", "step": "answering", "text": "返答",
+            },
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # play_audio の前に set_status と publish:answering が呼ばれている
+        play_idx = call_log.index("play_audio")
+        set_status_idx = call_log.index("set_status")
+        answering_idx = next(
+            (i for i, c in enumerate(call_log) if c == "publish:answering"),
+            -1,
+        )
+        assert set_status_idx < play_idx, (
+            f"set_status は play_audio より先 (call_log={call_log})"
+        )
+        assert answering_idx < play_idx, (
+            f"publish(answering) は play_audio より先 (call_log={call_log})"
+        )
+
+    def test_no_pre_play_keys_existing_behavior_preserved(self):
+        """通常応答 chunks (= _pre_play_* キーなし) は dispatch なし、既存挙動維持。"""
+        from lab_lounge.character_status import CharacterStatus
+        q: queue.Queue = queue.Queue()
+        mock_status = MagicMock()
+        mock_publish = MagicMock()
+
+        thread, _, _ = self._start_worker(
+            q, status_manager=mock_status, publish_fn=mock_publish,
+        )
+        # _pre_play_* 無しの chunk (= 通常応答経路)
+        q.put({
+            "url": "file:///a.wav", "text": "通常応答", "is_last": True, "character": "mimi",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # set_status は is_last=True の READY 反映のみ (= 既存挙動)
+        # _pre_play_status からの TALKING 発火はない
+        talking_calls = [
+            c for c in mock_status.set_status.call_args_list
+            if len(c.args) >= 2 and c.args[1] == CharacterStatus.TALKING
+        ]
+        assert talking_calls == [], (
+            f"_pre_play_status なし時は TALKING 反映なし (実際: {talking_calls})"
+        )
+        # publish_bubble は speaking + done のみ (= answering 発火なし)
+        answering_calls = [
+            c for c in mock_publish.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "answering"
+        ]
+        assert answering_calls == [], (
+            f"_pre_play_bubble なし時は answering 発行なし (実際: {answering_calls})"
+        )
+
+
 class TestHandraiseCloseFlow:
     """factory の on_handraise_close callback (Phase 0.5-B-β-2 commit 3)。"""
 
