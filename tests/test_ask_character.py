@@ -22,6 +22,35 @@ def _reset_context():
     reset_ask_character_context()
 
 
+@pytest.fixture
+def mock_bridge_filler_path():
+    """bridge filler の `select_filler_path` を mock する (Phase 0.5-D-d-9)。
+
+    【WHY】
+    実走環境では `data/audio/cache/<slug>/bridge_*.wav` が存在し
+    `select_filler_path(slug, "bridge")` が `(Path, idx)` を返す。
+    しかしテスト環境 / CI では .gitignore で *.wav が除外されているため
+    `(None, -1)` が返り、ask_character.py の bridge filler 投入経路
+    (line 1024-1097) が `bridge_path is None` で skip されてしまう。
+
+    本 fixture は `lab_lounge.filler.select_filler_path` を patch し、
+    テストでも bridge filler chunk 投入経路を検証可能にする。実走挙動は
+    中間実走 12 シナリオ B (= run_loop_20260510_014113.log) で確認済。
+
+    Path object は MagicMock で stub (= Windows / Linux 両対応の as_uri)。
+    """
+    mock_path = MagicMock()
+    mock_path.as_uri.return_value = "file:///tmp/bridge_dummy.wav"
+    mock_path.name = "bridge_dummy.wav"
+    # 関数スコープ動的 import (ask_character.py:1025) のため、
+    # patch 対象は元 module の名前空間 `lab_lounge.filler.select_filler_path`。
+    with patch(
+        "lab_lounge.filler.select_filler_path",
+        return_value=(mock_path, 0),
+    ):
+        yield mock_path
+
+
 class TestSetAskCharacterContext:
     """contextvars のセット/リセットを検証する。"""
 
@@ -2051,7 +2080,9 @@ class TestBridgeFillerDeferIntegration:
     THINKING / thinking bubble を発火する (= 「承認前 target THINKING」表示の解消)。
     """
 
-    def test_defer_true_appends_bridge_filler_chunk_to_buffer(self, monkeypatch):
+    def test_defer_true_appends_bridge_filler_chunk_to_buffer(
+        self, monkeypatch, mock_bridge_filler_path,
+    ):
         """defer モードで bridge filler chunk が _bg_chunk_buffers に蓄積される。"""
         from lab_lounge.mcp_servers.ask_character import (
             _drain_bg_chunks, wait_deferred_bg_tts_complete,
@@ -2109,7 +2140,9 @@ class TestBridgeFillerDeferIntegration:
             f"(実際 全 chunks: {chunks})"
         )
 
-    def test_bridge_filler_chunk_has_pre_play_status_thinking(self, monkeypatch):
+    def test_bridge_filler_chunk_has_pre_play_status_thinking(
+        self, monkeypatch, mock_bridge_filler_path,
+    ):
         """bridge filler chunk の `_pre_play_status` は target THINKING を持つ。
 
         WHY: 物理再生開始時に worker が `_pre_play_status` を読んで
@@ -2165,7 +2198,9 @@ class TestBridgeFillerDeferIntegration:
         assert pre_play_status["slug"] == "chisame"
         assert pre_play_status["status"] == "THINKING"
 
-    def test_bridge_filler_chunk_has_pre_play_bubble_thinking(self, monkeypatch):
+    def test_bridge_filler_chunk_has_pre_play_bubble_thinking(
+        self, monkeypatch, mock_bridge_filler_path,
+    ):
         """bridge filler chunk の `_pre_play_bubble` は thinking step を持つ。
 
         WHY: 物理再生開始時に worker が `_pre_play_bubble` を読んで
@@ -2227,7 +2262,9 @@ class TestBridgeFillerDeferIntegration:
 class TestDeferModeFullChunkOrder:
     """Phase 0.5-D-3 統合: defer モードで「導入 → bridge filler → 本応答」順保証テスト。"""
 
-    def test_buffer_order_intro_bridge_response(self, monkeypatch):
+    def test_buffer_order_intro_bridge_response(
+        self, monkeypatch, mock_bridge_filler_path,
+    ):
         """defer モードで buffer 順序が「導入セリフ → bridge filler → 本応答」になる。
 
         WHY: 視聴者には「caller 問いかけ → target 思案 → target 応答」の自然な対話演出
