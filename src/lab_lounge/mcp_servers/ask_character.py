@@ -581,6 +581,17 @@ def set_ask_character_context(
     if session_id:
         with _ask_state_lock:
             _bg_cancel_flags[session_id] = threading.Event()
+    # Phase 0.5-D-e-2: 前ターン以前の LLM client pool を解放 (= メモリリーク防止)。
+    # 新ターン開始のタイミングで active_session_id 以外を一括 cleanup する。
+    # 承認/却下/lapse のいずれで前ターンが終わっていても、確実に解放される設計。
+    # 同 session_id の client (= 同ターン内 normal/bg) は保持され、ターン中の
+    # 連続呼出 (= bg_runner + collab agent + fallback) で再利用される。
+    try:
+        from ..graph import _cleanup_llm_client_pool_except
+        _cleanup_llm_client_pool_except(session_id)
+    except Exception as exc:  # noqa: BLE001
+        # graph.py の import 失敗等は本流に影響させない (= 防衛的)
+        logger.debug("LLM client pool cleanup_except 失敗 (続行): %s", exc)
 
 
 def reset_ask_character_context() -> None:
@@ -603,6 +614,13 @@ def reset_ask_character_context() -> None:
         _bg_chunk_buffers.clear()
         # Phase 0.5-D-2: deferred bg_tts events も全 session 分クリーン
         _deferred_bg_tts_events.clear()
+    # Phase 0.5-D-e-2: LLM client pool もテスト間で漏れないようクリア。
+    # graph.py の import 失敗 (= 単体テストでの軽量環境) は黙殺。
+    try:
+        from ..graph import _clear_llm_client_pool
+        _clear_llm_client_pool()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ─── MCP サーバー ──────────────────────────────────────────────────
