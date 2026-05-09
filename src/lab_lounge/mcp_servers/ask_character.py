@@ -145,6 +145,17 @@ _bg_cancel_flags: dict[str, threading.Event] = {}
 # caller LLM の戻り値ベース推論を進めるため即時再生が必要)。
 _bg_chunk_buffers: dict[str, list[dict]] = {}
 
+# Phase 0.5-D-2: defer モード (= BG LLM 経路) 用の bg_tts 完了 event 登録 dict。
+#
+# 【WHY: _bg_tts_events から分離する理由】
+# 既存の `wait_bg_tts_complete` (= run_loop.py:1804 のターン終了時に呼ばれる) は
+# `_bg_tts_events` の全 event を join する。defer モードの bg_tts thread を同 dict
+# に登録すると、通常応答ターン終了時に 188 秒の BG LLM 完了を待ってしまい、次
+# ターン開始が遅延する (= 配信品質低下)。defer 経路は承認時に
+# `wait_deferred_bg_tts_complete` で別途待つので、通常応答ターン終了側は影響を
+# 受けないように分離する。
+_deferred_bg_tts_events: dict[str, list[threading.Event]] = {}
+
 
 def _reset_session_state(session_id: str) -> None:
     """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
@@ -158,6 +169,9 @@ def _reset_session_state(session_id: str) -> None:
         # (= defer_chunks=False で buffer を読まない) が、続く挙手 BG LLM ターンで
         # 想定外の合算が起こりうるため、ターン開始時に明示的にクリアする。
         _bg_chunk_buffers.pop(session_id, None)
+        # Phase 0.5-D-2: deferred bg_tts events も同 session 分クリーン
+        # (= 前ターンの未消化 event が残らないように)
+        _deferred_bg_tts_events.pop(session_id, None)
 
 
 def _next_ask_state(session_id: str) -> tuple[int, str]:
@@ -249,11 +263,47 @@ def _peek_bg_chunks_count(session_id: str) -> int:
 
 
 def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
-    """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。"""
+    """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。
+
+    Phase 0.5-D-2: defer モード (= BG LLM 経路、_defer_chunks_var=True) では
+    `_deferred_bg_tts_events` に登録し、通常応答経路 (= False) では既存の
+    `_bg_tts_events` に登録する。これにより `wait_bg_tts_complete` (= 通常応答
+    ターン終了時に呼ばれる) が defer 経路の event を待たないため、188 秒の
+    BG LLM 完了でターン終了が遅延しない。defer 経路の event は
+    `wait_deferred_bg_tts_complete` (= 承認時に呼ばれる) で待つ。
+    """
+    if not session_id:
+        return
+    target_dict = _deferred_bg_tts_events if _defer_chunks_var.get() else _bg_tts_events
+    with _ask_state_lock:
+        target_dict.setdefault(session_id, []).append(event)
+
+
+def wait_deferred_bg_tts_complete(session_id: str, timeout: float = 180.0) -> None:
+    """Phase 0.5-D-2: defer モードの bg_tts thread 完了を待つ (承認時用)。
+
+    `wait_bg_tts_complete` (= 通常応答経路用) と同じ実装パターンだが、対象 dict
+    が `_deferred_bg_tts_events` に分離されている。`run_loop.on_handraise_approved`
+    が drain 直前に本関数を呼び、buffer に全 chunks が蓄積された状態で
+    `_drain_bg_chunks` するための同期点を提供する。
+
+    Args:
+        session_id: 待機対象の session_id (空文字なら no-op)
+        timeout:    1 event あたりの最大待機秒数 (default: 180)
+    """
     if not session_id:
         return
     with _ask_state_lock:
-        _bg_tts_events.setdefault(session_id, []).append(event)
+        events = _deferred_bg_tts_events.pop(session_id, [])
+    if not events:
+        return
+    logger.info(
+        "wait_deferred_bg_tts_complete: session=%s pending=%d events 待機開始",
+        session_id, len(events),
+    )
+    for ev in events:
+        ev.wait(timeout=timeout)
+    logger.info("wait_deferred_bg_tts_complete: session=%s 全 events 完了", session_id)
 
 
 def cancel_bg_tts(session_id: str) -> int:
@@ -288,10 +338,16 @@ def cancel_bg_tts(session_id: str) -> int:
             return 0
         flag.set()
         # 影響範囲は登録済 bg_tts event 数で示す (= 起動済 bg_tts thread の概数)
-        n = len(_bg_tts_events.get(session_id, []))
+        # Phase 0.5-D-2: defer 経路と通常応答経路の両方の event を合算する。
+        # cancel は両方の経路の bg_tts thread に対して有効 (= cancel_flag は session
+        # 単位で 1 つ、defer モードに関係なく set される)。
+        n_normal = len(_bg_tts_events.get(session_id, []))
+        n_deferred = len(_deferred_bg_tts_events.get(session_id, []))
+        n = n_normal + n_deferred
     logger.info(
-        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d",
-        session_id, n,
+        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d "
+        "(normal=%d, deferred=%d)",
+        session_id, n, n_normal, n_deferred,
     )
     return n
 
@@ -389,6 +445,8 @@ def reset_ask_character_context() -> None:
         # Phase 0.5-D-1a: BG chunk buffer も全 session 分クリーン
         # (= テスト間の漏れ防止、後方互換性に影響なし)
         _bg_chunk_buffers.clear()
+        # Phase 0.5-D-2: deferred bg_tts events も全 session 分クリーン
+        _deferred_bg_tts_events.clear()
 
 
 # ─── MCP サーバー ──────────────────────────────────────────────────
@@ -777,8 +835,46 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     "url": url, "text": chunk_text,
                     "is_last": is_last, "character": character,
                 }
-                if not first_chunk_seen[0] and target_pose:
-                    chunk["pose"] = target_pose
+                if not first_chunk_seen[0]:
+                    # first chunk: 物理再生時 (= playback worker pop 時) に発火する
+                    # metadata を chunk dict に埋め込む。worker 側で
+                    # `_pre_play_status` / `_pre_play_bubble` を読んで dispatch する
+                    # (= run_loop._run_playback_worker、Phase 0.5-D-2 で配線)。
+                    if target_pose:
+                        chunk["pose"] = target_pose
+                    # _pre_play_status: target キャラの TALKING を物理再生開始時に反映。
+                    # 通常応答経路 (= defer=False) では本 closure 内で即時
+                    # set_status を呼ぶが、defer 経路では「承認前は再生しない」ため
+                    # 「buffer 投入時」ではなく「物理再生開始時」に反映するのが正しい
+                    # (= 承認前に target が TALKING 表示される UX 不具合の防止)。
+                    if status_manager_capture is not None:
+                        chunk["_pre_play_status"] = {
+                            "slug": target_char.slug,
+                            "status": "TALKING",
+                            "metadata": {
+                                "pose": target_pose if target_pose else None,
+                                "text": target_say_text or response_text,
+                            },
+                        }
+                    # _pre_play_bubble: answering bubble を物理再生開始時に発行。
+                    # 通常応答経路の `_publish_bubble("answering", target_char.slug,
+                    # common)` 相当の text を _load_bubble_messages から取得する
+                    # (= ask_character.py:632 の通常モード経路と同じテキスト生成方法、
+                    # キャラ別 yaml の "answering" メッセージ)。
+                    if common:
+                        try:
+                            from ..pipeline import _load_bubble_messages
+                            bubble_msgs = _load_bubble_messages().get(target_char.slug, {})
+                            chunk["_pre_play_bubble"] = {
+                                "slug": target_char.slug,
+                                "step": "answering",
+                                "text": bubble_msgs.get("answering", ""),
+                            }
+                        except Exception as exc:
+                            logger.warning(
+                                "ask_character defer mode bubble messages 取得失敗 (%s): %s",
+                                target_char.slug, exc,
+                            )
                 first_chunk_seen[0] = True
                 _append_bg_chunk(session_id, chunk)
                 return

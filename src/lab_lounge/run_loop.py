@@ -762,6 +762,30 @@ def _create_handraise_runner_and_callbacks(
 
         # TTS-only graph で TTS 実行 + chunks 蓄積 → playback worker (daemon thread)
         def _tts_and_play() -> None:
+            # Phase 0.5-D-2: BG LLM 経路で蓄積された対話 TTS chunks (= ask_character
+            # 内の target 応答) を buffer から取得し、tts_only chunks (= caller の
+            # 最終 〆セリフ) と concat する。承認時の自然な対話演出
+            # (= 「導入 → target 応答 → caller の〆」) を専用 mini playback worker
+            # で物理再生する。これによりターン跨ぎ問題 (= 配信事故レベル) を構造的に
+            # 解消する (= chunks の lifecycle が通常応答 _playback_queue から独立)。
+            #
+            # 【WHY: drain 前に wait_deferred_bg_tts_complete】
+            # bg_tts thread が承認時にまだ合成中の chunks を取りこぼさないようにする
+            # (= bg_tts thread 完了 = buffer に全 chunks 蓄積完了の同期点)。tail
+            # 取りこぼしを防ぎ、視聴者には「自然な完結した対話」が再生される。
+            from .mcp_servers.ask_character import (
+                _drain_bg_chunks,
+                wait_deferred_bg_tts_complete,
+            )
+
+            wait_deferred_bg_tts_complete(session_id_root)
+            bg_chunks = _drain_bg_chunks(session_id_root)
+            if bg_chunks:
+                logger.info(
+                    "挙手承認 BG buffer drain [character=%s]: chunks=%d",
+                    slug, len(bg_chunks),
+                )
+
             chunks: list[dict] = []
 
             def on_chunk(url, chunk_text, is_last, character, pose=None):
@@ -803,7 +827,13 @@ def _create_handraise_runner_and_callbacks(
                 )
                 return
 
-            if not chunks:
+            # Phase 0.5-D-2: bg_chunks (= target 応答) を tts_only chunks (= caller
+            # の〆セリフ) の前に concat。順序保証 = 「target 応答 → caller の〆」。
+            # bg_chunks が空 (= ask_character 不使用 / defer モード未配線) の場合
+            # combined_chunks = chunks となり既存挙動と等価。
+            combined_chunks = bg_chunks + chunks
+
+            if not combined_chunks:
                 # ダミー TTS モード or TTS 出力なし → fallback パスで救済
                 logger.warning(
                     "挙手承認 TTS [character=%s]: chunks 空 → fallback パス",
@@ -819,8 +849,8 @@ def _create_handraise_runner_and_callbacks(
                 return
 
             logger.info(
-                "挙手承認 TTS 同期実行 完了 [character=%s]: chunks=%d",
-                slug, len(chunks),
+                "挙手承認 TTS 同期実行 完了 [character=%s]: bg=%d + tts_only=%d = total=%d",
+                slug, len(bg_chunks), len(chunks), len(combined_chunks),
             )
             # ログ強化 W'-3: playback worker 起動を明示。実走時に「TTS は完了
             # したが playback まで到達したか」を 1 行 grep で追跡可能にする。
@@ -830,14 +860,23 @@ def _create_handraise_runner_and_callbacks(
             )
             # Phase 0.5-B-α: Talking metadata 構築 (HUD で立ち絵 + 発話全文を表示)。
             # answering_text は既に bg_result.result.events から抽出済 (line 上方)、
-            # pose は first_chunk.pose を再利用 (graph._tts_node 内で chunk に埋め込み済)。
-            first_chunk_pose = chunks[0].get("pose") if chunks else None
+            # pose は caller (= slug) の first chunk から取得する。
+            #
+            # 【WHY: combined_chunks[0] でなく chunks[0] (= tts_only の最初) を参照】
+            # combined_chunks の先頭は bg_chunks (= target キャラの chunk) なので、
+            # その pose は target の pose (= 例: chisame の special_doya)。caller
+            # (= slug、例: mimi) の talking_metadata に target の pose を入れると
+            # HUD で「mimi が doya 顔」のような不整合表示になる。tts_only の最初
+            # (= caller の最初の chunk) の pose を参照することで、caller の pose を
+            # 正しく反映する。target の TALKING / pose は chunk dict 内の
+            # `_pre_play_status` 経由で物理再生時に発火 (= Phase 0.5-D-2 で配線)。
+            caller_first_chunk_pose = chunks[0].get("pose") if chunks else None
             talking_metadata = _build_talking_metadata(
-                slug, answering_text, first_chunk_pose,
+                slug, answering_text, caller_first_chunk_pose,
             )
             _spawn_handraise_response_playback(
                 slug,
-                chunks,
+                combined_chunks,
                 bg_trace_id,
                 session_stream_id=session_stream_id,
                 session_id_root=session_id_root,
@@ -1135,6 +1174,50 @@ def _run_playback_worker(
                 time.sleep(done_delay_seconds)
                 publish_bubble_fn(last_character, "done", "")
             break
+
+        # Phase 0.5-D-2: defer 経路 chunk の物理再生直前 metadata 発火。
+        # ask_character の defer モード _wrapped_on_chunk_ready が chunk dict に
+        # 埋め込んだ `_pre_play_status` / `_pre_play_bubble` を、worker が pop した
+        # 直後 (= 物理再生開始の直前) に発火する。
+        #
+        # 【WHY: chunk 投入時ではなく物理再生時に発火する理由】
+        # 案 C リファクタで挙手中の対話 TTS chunks は buffer に蓄積されてから承認時
+        # に専用 mini playback worker で再生される。「buffer 投入時」に TALKING /
+        # answering bubble を発火すると、視聴者から「承認前なのに target が話して
+        # いる」ように見える UX 不具合が起こる。物理再生開始時に発火させることで
+        # 「実際に音声が流れ始める瞬間」と HUD 表示が同期する。
+        #
+        # 通常応答経路 (= defer=False) の chunks にはこのキーが含まれないため
+        # (= ask_character.py の defer 分岐でのみ埋め込み)、本 dispatch の影響なし
+        # = 既存挙動完全維持。
+        if isinstance(task, dict):
+            pre_play_status = task.get("_pre_play_status")
+            if pre_play_status and status_manager is not None:
+                try:
+                    status_manager.set_status(
+                        pre_play_status["slug"],
+                        CharacterStatus[pre_play_status["status"]],
+                        metadata=pre_play_status.get("metadata"),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "playback worker pre_play_status 反映失敗 [character=%s]: %s",
+                        pre_play_status.get("slug"), exc,
+                    )
+            pre_play_bubble = task.get("_pre_play_bubble")
+            if pre_play_bubble:
+                try:
+                    publish_bubble_fn(
+                        pre_play_bubble["slug"],
+                        pre_play_bubble["step"],
+                        pre_play_bubble.get("text", ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "playback worker pre_play_bubble 発行失敗 [character=%s]: %s",
+                        pre_play_bubble.get("slug"), exc,
+                    )
+
         # Phase 3: 再生直前にキャラクターが変わったら立ち絵切替 + HUD 通知
         # task["pose"] の値:
         #   - 文字列 (e.g., "special_doya")  → その pose に切替 (chunk 1 など、新規予約時)

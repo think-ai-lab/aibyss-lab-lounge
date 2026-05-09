@@ -872,7 +872,7 @@ class TestDeferChunksMode:
         本応答の 1 回だけ呼ばれ、テスト挙動が決定的になる。
         """
         from lab_lounge.mcp_servers.ask_character import (
-            _drain_bg_chunks, wait_bg_tts_complete,
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
         )
         monkeypatch.setenv("L2_USE_REAL_TTS", "true")
 
@@ -911,7 +911,9 @@ class TestDeferChunksMode:
             return_value="",  # 導入セリフ skip → 本応答 TTS のみ実行
         ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
             _ask_character_impl("chisame", "質問")
-            wait_bg_tts_complete(session_id, timeout=5.0)
+            # Phase 0.5-D-2: defer モードでは bg_tts event は _deferred_bg_tts_events
+            # に登録されるため wait_deferred_bg_tts_complete で待つ
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
 
         # target = chisame の chunks (= 本応答) は callback に流れない (= defer モード)
         target_callbacks = [c for c in callback_invocations if c[3] == "chisame"
@@ -1000,7 +1002,7 @@ class TestDeferChunksMode:
         OBS 立ち絵切替する経路を担保する。
         """
         from lab_lounge.mcp_servers.ask_character import (
-            _drain_bg_chunks, wait_bg_tts_complete,
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
         )
         monkeypatch.setenv("L2_USE_REAL_TTS", "true")
 
@@ -1040,7 +1042,8 @@ class TestDeferChunksMode:
             return_value="",  # 導入セリフ skip でテスト決定性確保
         ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
             _ask_character_impl("chisame", "質問")
-            wait_bg_tts_complete(session_id, timeout=5.0)
+            # Phase 0.5-D-2: defer モード用の wait
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
 
         # defer モードでは on_pose_ready callback は呼ばれない
         # (= chunk dict に直接埋込が代替経路)
@@ -1058,6 +1061,211 @@ class TestDeferChunksMode:
         assert chunks[1].get("pose") in (None, ""), (
             f"後続 chunk の pose は未指定 (実際: {chunks[1].get('pose')})"
         )
+
+    def test_defer_mode_first_chunk_carries_pre_play_status(self, monkeypatch):
+        """Phase 0.5-D-2: defer モードの first chunk に _pre_play_status が埋め込まれる。
+
+        WHY: 案 C で TALKING タイミングを「buffer 投入時」から「物理再生開始時」に
+        移動するための inline metadata 設計。playback worker (= D-2 で配線) が
+        chunk pop 時にこのキーを読んで set_status を発火する経路。承認前に target
+        が TALKING 表示される UX 不具合を構造的に解消する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        from lab_lounge.character_status import CharacterStatusManager
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        status_manager = CharacterStatusManager()
+        session_id = "defer_test_pre_play_status"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=status_manager,
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "こんにちは", "emotion": {"happy": 70}, '
+            '"speed": 100, "pose": "special_smile"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}_c1.wav", "こん", False, speaker)
+                on_chunk(f"file://{speaker}_c2.wav", "にちは", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+        assert len(chunks) == 2
+
+        # first chunk に _pre_play_status が埋め込まれている
+        first_status = chunks[0].get("_pre_play_status")
+        assert first_status is not None, "first chunk に _pre_play_status が必要"
+        assert first_status["slug"] == "chisame"
+        assert first_status["status"] == "TALKING"
+        # metadata に pose と text が含まれる (= HUD 表示用)
+        meta = first_status.get("metadata", {})
+        assert meta.get("pose") == "special_smile"
+        assert meta.get("text") == "こんにちは"  # _parse_voicepeak_json 通過後
+
+        # 後続 chunk には _pre_play_status は埋まらない (= 1 度だけ反映、冪等保護)
+        assert chunks[1].get("_pre_play_status") is None
+
+    def test_defer_mode_first_chunk_carries_pre_play_bubble(self, monkeypatch):
+        """Phase 0.5-D-2: defer モードの first chunk に _pre_play_bubble が埋め込まれる。
+
+        WHY: answering bubble の発行タイミングも TALKING と同様に「物理再生開始時」
+        に移動 (= 承認前に「target が話している」HUD 表示を防ぐ)。playback worker
+        が chunk pop 時に publish_bubble_fn(slug, "answering", text) を呼ぶ経路。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "defer_test_pre_play_bubble"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "テスト", "emotion": {"happy": 50}, '
+            '"speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}_c1.wav", "テスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+        assert len(chunks) == 1
+
+        # first chunk に _pre_play_bubble が埋め込まれている
+        first_bubble = chunks[0].get("_pre_play_bubble")
+        assert first_bubble is not None, "first chunk に _pre_play_bubble が必要"
+        assert first_bubble["slug"] == "chisame"
+        assert first_bubble["step"] == "answering"
+        # text は _load_bubble_messages から取得 (= キャラ別 yaml の "answering")。
+        # bubble_messages.yml が存在する前提で chisame の answering が空でない可能性。
+        # str 型であれば本テストの目的 (= キーが存在する) は達成。
+        assert "text" in first_bubble
+
+
+class TestDeferredBgTtsEvents:
+    """Phase 0.5-D-2: bg_tts event の defer 経路分離テスト。
+
+    既存の `wait_bg_tts_complete` が defer 経路の event を待たないようにするため
+    `_deferred_bg_tts_events` に分離した経路の動作確認。
+    """
+
+    def test_register_routes_to_deferred_dict_when_defer_true(self):
+        """defer=True 時は _register_bg_tts_event が _deferred_bg_tts_events に登録する。"""
+        import threading
+        from lab_lounge.mcp_servers.ask_character import (
+            _bg_tts_events, _deferred_bg_tts_events,
+            _register_bg_tts_event,
+        )
+
+        set_ask_character_context(defer_chunks=True)
+        ev = threading.Event()
+        _register_bg_tts_event("sess-defer", ev)
+
+        # defer=True → _deferred_bg_tts_events に登録、_bg_tts_events には登録されない
+        assert "sess-defer" in _deferred_bg_tts_events
+        assert ev in _deferred_bg_tts_events["sess-defer"]
+        assert "sess-defer" not in _bg_tts_events
+
+    def test_register_routes_to_normal_dict_when_defer_false(self):
+        """defer=False 時は _register_bg_tts_event が _bg_tts_events に登録する (= 既存挙動)。"""
+        import threading
+        from lab_lounge.mcp_servers.ask_character import (
+            _bg_tts_events, _deferred_bg_tts_events,
+            _register_bg_tts_event,
+        )
+
+        set_ask_character_context(defer_chunks=False)
+        ev = threading.Event()
+        _register_bg_tts_event("sess-normal", ev)
+
+        # defer=False → _bg_tts_events に登録 (= 既存挙動)
+        assert "sess-normal" in _bg_tts_events
+        assert ev in _bg_tts_events["sess-normal"]
+        assert "sess-normal" not in _deferred_bg_tts_events
+
+    def test_wait_deferred_bg_tts_complete_returns_immediately_for_no_events(self):
+        """未登録 session の wait_deferred_bg_tts_complete は即 return。"""
+        from lab_lounge.mcp_servers.ask_character import wait_deferred_bg_tts_complete
+        # 例外なく即 return すれば pass (= 空 list 経路)
+        wait_deferred_bg_tts_complete("unknown-session", timeout=0.1)
+
+    def test_wait_deferred_bg_tts_complete_waits_for_completed_events(self):
+        """登録済 events を join し、全完了で return する。"""
+        import threading
+        from lab_lounge.mcp_servers.ask_character import (
+            _deferred_bg_tts_events, _ask_state_lock, wait_deferred_bg_tts_complete,
+        )
+        # 完了済 event を 2 件登録
+        ev1 = threading.Event()
+        ev1.set()
+        ev2 = threading.Event()
+        ev2.set()
+        with _ask_state_lock:
+            _deferred_bg_tts_events["sess-w"] = [ev1, ev2]
+
+        wait_deferred_bg_tts_complete("sess-w", timeout=1.0)
+
+        # wait 後 dict から消える (= pop 設計、wait_bg_tts_complete と同じパターン)
+        assert "sess-w" not in _deferred_bg_tts_events
+
+    def test_cancel_bg_tts_counts_both_dicts(self):
+        """cancel_bg_tts は normal + deferred 両方の event 数を合算で返す。"""
+        import threading
+        from lab_lounge.mcp_servers.ask_character import (
+            _bg_cancel_flags, _bg_tts_events, _deferred_bg_tts_events,
+            _ask_state_lock, cancel_bg_tts,
+        )
+        # 各 dict に events を入れて cancel_flag も用意 (= cancel_bg_tts の前提)
+        with _ask_state_lock:
+            _bg_cancel_flags["sess-multi"] = threading.Event()
+            _bg_tts_events["sess-multi"] = [threading.Event()]
+            _deferred_bg_tts_events["sess-multi"] = [
+                threading.Event(), threading.Event(),
+            ]
+
+        n = cancel_bg_tts("sess-multi")
+
+        # normal=1 + deferred=2 = 3 件返却
+        assert n == 3
 
 
 class TestAskCharacterImplCountAndPrevious:
