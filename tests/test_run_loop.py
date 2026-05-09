@@ -723,6 +723,147 @@ class TestRunPlaybackWorkerPrePlay:
         )
 
 
+class TestRunPlaybackWorkerSpeakerSwitchSleep:
+    """Phase 0.5-D-3 follow-up 3: 話者切替時の 0.5 秒間挿入テスト。
+
+    中間実走 5 回目 (logs/runs/run_loop_20260509_194304.log) で観察された
+    「フローが滑らかすぎて畳み掛けられている感じ」への対処。話者切替境界で
+    0.5 秒の間を取ることで、視聴者の認知的に「会話のターン交代」が知覚
+    しやすくなる。streaming spawn (= follow-up 2) の連続再生の自然さを
+    補完する設計。
+    """
+
+    def _start_worker(self, q, *, status_manager=None, publish_fn=None,
+                      play_fn=None, cleanup_fn=None, done_delay=0.01):
+        publish_fn = publish_fn or MagicMock()
+        play_fn = play_fn or MagicMock()
+        cleanup_fn = cleanup_fn or MagicMock()
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "done_delay_seconds": done_delay,
+                "status_manager": status_manager,
+            },
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def test_no_sleep_on_first_chunk(self, monkeypatch):
+        """初回 chunk (= prev_played_character=None) では話者切替 sleep が呼ばれない。
+
+        WHY: approval → 即時音声再生 (= follow-up 2 streaming spawn) の効果を維持
+        するため、最初の chunk の物理再生開始は遅延させない。
+        """
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("lab_lounge.run_loop.time.sleep", sleep_calls.append)
+
+        q: queue.Queue = queue.Queue()
+        thread = self._start_worker(q)
+        q.put({
+            "url": "file:///a.wav", "text": "first", "is_last": True, "character": "mimi",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # 話者切替 sleep (= 0.5 秒) のみフィルタ (done_delay=0.01 とは別物)
+        switch_sleeps = [s for s in sleep_calls if 0.49 <= s <= 0.51]
+        assert switch_sleeps == [], (
+            f"初回 chunk では話者切替 sleep 呼ばれない (実際: {switch_sleeps})"
+        )
+
+    def test_no_sleep_on_same_character_consecutive(self, monkeypatch):
+        """同一キャラ連続 chunks では話者切替 sleep が呼ばれない。"""
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("lab_lounge.run_loop.time.sleep", sleep_calls.append)
+
+        q: queue.Queue = queue.Queue()
+        thread = self._start_worker(q)
+        for i in range(3):
+            q.put({
+                "url": f"file:///{i}.wav", "text": str(i),
+                "is_last": (i == 2), "character": "mimi",
+            })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        switch_sleeps = [s for s in sleep_calls if 0.49 <= s <= 0.51]
+        assert switch_sleeps == [], (
+            f"同一キャラ連続では話者切替 sleep 呼ばれない (実際: {switch_sleeps})"
+        )
+
+    def test_sleep_inserted_on_character_switch(self, monkeypatch):
+        """話者切替時に time.sleep(0.5) が呼ばれる。
+
+        WHY: 「caller 導入セリフ → bridge filler (target) → target 応答 → caller 〆」
+        のような切替境界で短い間を入れる。chunks: mimi → chisame → mimi の場合、
+        切替 2 箇所で sleep(0.5) が 2 回呼ばれる。
+        """
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("lab_lounge.run_loop.time.sleep", sleep_calls.append)
+
+        q: queue.Queue = queue.Queue()
+        thread = self._start_worker(q)
+        chunks_data = [
+            ("mimi", "intro"),
+            ("chisame", "response"),
+            ("mimi", "outro"),
+        ]
+        for i, (char, text) in enumerate(chunks_data):
+            q.put({
+                "url": f"file:///{i}.wav", "text": text,
+                "is_last": (i == len(chunks_data) - 1), "character": char,
+            })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        switch_sleeps = [s for s in sleep_calls if 0.49 <= s <= 0.51]
+        assert len(switch_sleeps) == 2, (
+            f"mimi → chisame → mimi の 2 切替で sleep 2 回 "
+            f"(実際: {switch_sleeps}、全 sleep: {sleep_calls})"
+        )
+
+    def test_sleep_inserted_even_for_text_empty_bridge_filler(self, monkeypatch):
+        """text="" (= bridge filler) でも話者切替判定が機能する。
+
+        WHY: bridge filler (= caller=mimi 後の target=sakura、text="") を挟んで
+        「mimi → sakura(bridge) → sakura(本応答)」となるシナリオで、
+        mimi → sakura で 1 回 sleep、sakura(bridge) → sakura(本応答) で 0 回 sleep
+        になることを保証。prev_played_character は text 有無に関わらず更新される。
+        """
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("lab_lounge.run_loop.time.sleep", sleep_calls.append)
+
+        q: queue.Queue = queue.Queue()
+        thread = self._start_worker(q)
+        # mimi 導入 → sakura bridge filler (text="") → sakura 本応答
+        q.put({
+            "url": "file:///mimi.wav", "text": "ルカ、その問いは",
+            "is_last": False, "character": "mimi",
+        })
+        q.put({
+            "url": "file:///sakura_bridge.wav", "text": "",
+            "is_last": False, "character": "sakura",
+        })
+        q.put({
+            "url": "file:///sakura_resp.wav", "text": "ん〜……",
+            "is_last": True, "character": "sakura",
+        })
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        switch_sleeps = [s for s in sleep_calls if 0.49 <= s <= 0.51]
+        # mimi → sakura で 1 回 (= bridge filler 投入時点)、sakura → sakura で 0 回
+        assert len(switch_sleeps) == 1, (
+            f"mimi → sakura(bridge) で 1 切替、sakura(bridge) → sakura(本応答) で 0 切替 "
+            f"(実際: {switch_sleeps}、全 sleep: {sleep_calls})"
+        )
+
+
 class TestApprovedSynthesizeFallbackCancelBgTts:
     """Phase 0.5-D-2-α: _approved_synthesize_fallback が cancel_bg_tts を呼ぶ。
 

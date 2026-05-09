@@ -1295,6 +1295,12 @@ def _run_playback_worker(
     last_character: str | None = None
     current_pose_character: str | None = None
     current_pose: str | None = None
+    # Phase 0.5-D-3 follow-up 3: 話者切替時に間を入れるための追跡変数。
+    # last_character は speaking publish 時のみ更新 (= text 非空 chunks のみ、done bubble 用)
+    # だが、本変数は物理再生完了時に毎回更新する (= text="" の bridge filler 含む)。
+    # これにより「caller chunk → bridge filler → 本応答 chunks」で正しくキャラ切替
+    # 判定ができる。
+    prev_played_character: str | None = None
     while True:
         task = q.get()
         # Phase 0.5-B-β-2 commit 3: drain task の処理 (= 却下/lapse 時の残 chunks 破棄)。
@@ -1389,6 +1395,25 @@ def _run_playback_worker(
                         pre_play_bubble.get("slug"), exc,
                     )
 
+        # Phase 0.5-D-3 follow-up 3: 話者切替時に 0.5 秒の間を挿入。
+        #
+        # 【WHY】
+        # 中間実走 5 回目 (logs/runs/run_loop_20260509_194304.log) で「フローが
+        # 滑らかすぎて畳み掛けられている感じ」が観察された。streaming spawn 設計
+        # (= follow-up 2) で「caller 導入セリフ → bridge filler → target 応答 →
+        # caller 〆」の連続再生が実現したが、話者切替境界に間がないため、視聴者の
+        # 認知的に「会話のターン交代」が知覚しにくくなっていた。0.5 秒の間は人間の
+        # 自然な会話の間 (= 互いの発言を受け止める無音時間) に近い値で、聞きやすさを
+        # 向上させる。
+        #
+        # 初回 chunk (= prev_played_character is None) では sleep しない (=
+        # approval → 即時音声再生の効果を維持、follow-up 2 設計の趣旨を壊さない)。
+        # 同一キャラ連続 chunks (= caller の長い応答を分割した chunk 2, 3, ...) では
+        # 間を入れない (= 同じキャラが続けて話している自然な流れを保つ)。
+        character = task["character"]
+        if prev_played_character is not None and character != prev_played_character:
+            time.sleep(0.5)
+
         # Phase 3: 再生直前にキャラクターが変わったら立ち絵切替 + HUD 通知
         # task["pose"] の値:
         #   - 文字列 (e.g., "special_doya")  → その pose に切替 (chunk 1 など、新規予約時)
@@ -1397,7 +1422,6 @@ def _run_playback_worker(
         # 「キャラが変わった + pose=None」 のみ neutral にフォールバック。
         # これがないと、chunk 1 で special_doya に切替えた後の chunk 2/3 で neutral
         # に逆戻りしてしまう (chunk 1 だけが pose 値を持ち、後続は None になるため)。
-        character = task["character"]
         pose = task.get("pose")  # None or str
 
         if set_pose_fn:
@@ -1436,6 +1460,12 @@ def _run_playback_worker(
             last_character = character
         play_audio_fn(task["url"])
         cleanup_audio_fn(task["url"])
+
+        # Phase 0.5-D-3 follow-up 3: 物理再生完了後に prev_played_character を更新。
+        # text 有無 (= bridge filler 含む) に関わらず毎回更新することで、次の chunk
+        # で正しくキャラ切替判定 (= 上の time.sleep(0.5)) ができる。
+        prev_played_character = character
+
         # Phase 0.5-B-β-3 commit 2: is_last=True chunk の **物理再生完了時** に
         # status_manager で READY 反映。bg_tts 合成完了 != 再生完了の不整合を
         # 解消する (= シナリオ 2 で観察、HUD で発話途中に灰色化する不具合)。
