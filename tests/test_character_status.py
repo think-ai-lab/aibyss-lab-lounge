@@ -20,12 +20,18 @@ from lab_lounge.character_status import (
 
 
 class TestCharacterStatusEnum:
-    def test_five_values(self):
-        """5 値の .value が plan で確定したラベルと一致する。"""
+    def test_seven_values(self):
+        """7 値の .value が plan で確定したラベルと一致する。
+
+        Phase 0.5-D-d-1 で RAISEHAND_PROGRESSING / RAISEHAND_READY を追加 (= 5 → 7 値)。
+        BG LLM 進捗の HUD 視覚化 + 承認時の待ち合わせ用に挙手中状態を細分化。
+        """
         assert CharacterStatus.READY.value == "ready"
         assert CharacterStatus.THINKING.value == "thinking"
         assert CharacterStatus.TOOL_CALLING.value == "tool_calling"
         assert CharacterStatus.RAISEHAND.value == "raisehand"
+        assert CharacterStatus.RAISEHAND_PROGRESSING.value == "raisehand_progressing"
+        assert CharacterStatus.RAISEHAND_READY.value == "raisehand_ready"
         assert CharacterStatus.TALKING.value == "talking"
 
     def test_str_inheritance(self):
@@ -34,11 +40,23 @@ class TestCharacterStatusEnum:
         assert CharacterStatus.THINKING == "thinking"
         assert isinstance(CharacterStatus.TALKING, str)
 
+    def test_str_inheritance_for_progressing_ready(self):
+        """Phase 0.5-D-d-1: 新ステータスも str 継承が機能する (= V2 HUD payload 比較で動作)。"""
+        assert CharacterStatus.RAISEHAND_PROGRESSING == "raisehand_progressing"
+        assert CharacterStatus.RAISEHAND_READY == "raisehand_ready"
+        assert isinstance(CharacterStatus.RAISEHAND_PROGRESSING, str)
+        assert isinstance(CharacterStatus.RAISEHAND_READY, str)
+
     def test_json_serializable(self):
         """JSON 化時に value が出る (= Enum 名ではなく文字列値)。"""
         # str 継承なので json.dumps で .value 相当の文字列が出る
         assert json.dumps(CharacterStatus.THINKING) == '"thinking"'
         assert json.dumps(CharacterStatus.RAISEHAND) == '"raisehand"'
+
+    def test_json_serializable_progressing_ready(self):
+        """Phase 0.5-D-d-1: 新ステータスも JSON 化で value が出る (= event payload 互換)。"""
+        assert json.dumps(CharacterStatus.RAISEHAND_PROGRESSING) == '"raisehand_progressing"'
+        assert json.dumps(CharacterStatus.RAISEHAND_READY) == '"raisehand_ready"'
 
 
 # ─── TestCharacterStatusManagerInit ──────────────────────────────────
