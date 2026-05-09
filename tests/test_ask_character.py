@@ -1546,6 +1546,264 @@ class TestIntroPlaybackOrdering:
         )
 
 
+class TestIntroDeferIntegration:
+    """Phase 0.5-D-3-b: 導入セリフ TTS chunks の defer 経路統合テスト。
+
+    BG LLM 経路 (= defer=True) で導入セリフ chunks も _bg_chunk_buffers に蓄積する
+    ことで、ターン跨ぎ漏れを構造的に阻止する。通常応答経路 (= defer=False) では
+    既存挙動 (= on_tts_chunk 直接呼出で _playback_queue 投入) を完全維持する。
+    """
+
+    def test_defer_true_appends_intro_chunks_to_buffer(self, monkeypatch):
+        """defer モードで導入セリフ chunks が _bg_chunk_buffers に蓄積される (caller character)。
+
+        WHY: 案 W'-1 の本来の意図 = 「LLM 先行生成 → 承認時 TTS 再利用」を実現するため、
+        導入セリフ chunks も承認時まで保持して bg_chunks + tts_only chunks の concat
+        で「導入 → 対象応答 → 〆」のシームレス再生を実現する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_defer_buffer"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ chunks (= caller=mimi、text 非空) は callback に流れない (= defer モード)
+        intro_callbacks = [c for c in callback_invocations
+                           if c[3] == "mimi" and c[1] != ""]
+        assert len(intro_callbacks) == 0, (
+            f"defer=True で導入セリフ chunks は callback に流れない "
+            f"(実際: {intro_callbacks})"
+        )
+
+        # buffer に蓄積されている (= 導入セリフ chunks + その他)
+        chunks = _drain_bg_chunks(session_id)
+        # caller=mimi の chunks (= 導入セリフ) が含まれる
+        mimi_buffer_chunks = [c for c in chunks if c["character"] == "mimi"]
+        assert len(mimi_buffer_chunks) >= 1, (
+            f"buffer に caller (mimi) の導入セリフ chunks が蓄積される "
+            f"(実際 全 chunks: {chunks})"
+        )
+        # 各 chunk の必須フィールド確認
+        for c in mimi_buffer_chunks:
+            assert "url" in c and "text" in c and "is_last" in c and "character" in c
+
+    def test_defer_false_intro_chunks_use_existing_callback(self, monkeypatch):
+        """通常応答経路 (defer=False) で導入セリフ chunks は既存 callback 経路を維持。
+
+        WHY: 通常応答経路の不変保証。caller LLM の戻り値ベース推論を進めるため
+        導入セリフは即時再生が必要 (= defer=True にすると逆順バグ)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _peek_bg_chunks_count, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_non_defer_callback"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=False,  # 通常応答経路
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ chunks (= caller=mimi、text 非空) は callback 経由で来る (= 既存挙動)
+        intro_callbacks = [c for c in callback_invocations
+                           if c[3] == "mimi" and c[1] != ""]
+        assert len(intro_callbacks) >= 1, (
+            f"defer=False で導入セリフ chunks は callback 経由 "
+            f"(実際: {len(intro_callbacks)} 件)"
+        )
+        # buffer は空 (= 通常応答経路では使われない)
+        assert _peek_bg_chunks_count(session_id) == 0, (
+            f"defer=False で buffer は使われない "
+            f"(実際: {_peek_bg_chunks_count(session_id)} 件)"
+        )
+
+    def test_intro_cancel_guard_works_in_defer_mode(self, monkeypatch):
+        """defer モードでも導入セリフ TTS の cancel ガード (= D-2-α) が機能する。
+
+        WHY: cancel_flag set 後の chunks 投入阻止は defer 経路でも維持される必要が
+        ある (= 却下/lapse 後に旧 BG LLM の導入セリフ chunks が buffer に蓄積される
+        漏れを防ぐ)。defer 分岐は cancel_flag check **後** に走るため、cancel された
+        chunks は buffer にも入らない。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _peek_bg_chunks_count, cancel_bg_tts, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_defer_cancel"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if speaker == "mimi":  # 導入セリフ TTS = caller=mimi
+                cancel_bg_tts(session_id)  # 合成中に cancel 発火
+            if on_chunk:
+                # cancel 後に chunk を投入するが、wrapper で skip されるはず (defer モードでも)
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ chunks (= caller=mimi) は buffer にも callback にも来ない
+        # (= cancel_flag check で skip)
+        # cancel_bg_tts 自体が _bg_chunk_buffers.pop を呼ぶので、buffer は空
+        # ただし fake_synth で on_chunk_ready 呼出後に cancel される設計なので、
+        # 導入 mimi chunks は wrapper の cancel_flag check で skip される
+        # (cancel が呼ばれるタイミング次第)
+        intro_callbacks = [c for c in callback_invocations
+                           if c[3] == "mimi" and c[1] != ""]
+        assert intro_callbacks == [], (
+            f"cancel_flag set 後の導入セリフ chunks は callback 経路でも skip される "
+            f"(実際: {intro_callbacks})"
+        )
+        # buffer も空 (= cancel_bg_tts で pop された + その後の chunks も skip)
+        # ただし正確には「cancel 前に append された chunks があるか」次第
+        # ここは _peek_bg_chunks_count で確認 (= 0 が期待値、cancel_bg_tts が pop したため)
+        assert _peek_bg_chunks_count(session_id) == 0, (
+            f"cancel_bg_tts で buffer がクリアされている "
+            f"(実際: {_peek_bg_chunks_count(session_id)} 件)"
+        )
+
+    def test_defer_mode_intro_chunks_no_pre_play_metadata(self, monkeypatch):
+        """defer モードの導入セリフ chunks には inline metadata (_pre_play_*) が含まれない。
+
+        WHY: caller の TALKING は _spawn_handraise_response_playback の起動直前で
+        反映済 (= talking_metadata 経由) のため、chunk dict に inline で持たせると
+        二重発火になる。導入セリフ chunks には url/text/is_last/character のみで OK。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _drain_bg_chunks, wait_deferred_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "intro_defer_no_metadata"
+        set_ask_character_context(
+            on_tts_chunk=lambda *a: None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            defer_chunks=True,
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_deferred_bg_tts_complete(session_id, timeout=5.0)
+
+        chunks = _drain_bg_chunks(session_id)
+        mimi_chunks = [c for c in chunks if c["character"] == "mimi"]
+        assert len(mimi_chunks) >= 1, "caller=mimi の導入セリフ chunks が蓄積される"
+
+        for chunk in mimi_chunks:
+            # 導入セリフ chunks には inline metadata が含まれない
+            assert "_pre_play_status" not in chunk, (
+                f"導入セリフ chunk に _pre_play_status は不要 "
+                f"(caller TALKING は worker 起動直前で反映済) (実際: {chunk})"
+            )
+            assert "_pre_play_bubble" not in chunk, (
+                f"導入セリフ chunk に _pre_play_bubble は不要 (実際: {chunk})"
+            )
+
+
 class TestAskCharacterImplCountAndPrevious:
     """同一ターン内の連続 ask_character 呼出しで count/previous が更新されることを検証。"""
 
