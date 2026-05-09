@@ -1429,18 +1429,22 @@ class TestCreateHandraiseRunnerAndCallbacks:
                 break
             time.sleep(0.05)
 
-        # bubble.update("answering") が 1 回発行
-        bubble_calls = [
-            e for e in published
-            if e.get("type") == "bubble.update"
-            and e.get("payload", {}).get("step") == "answering"
-        ]
-        assert len(bubble_calls) == 1
-        assert bubble_calls[0]["payload"]["character"] == "mimi"
-        # バグ 4 修正: bubble.text は JSON の response 部分のみ (= 生 JSON 文字列ではない)
-        assert bubble_calls[0]["payload"]["text"] == "わたくしの見解は…"
-        # Phase 0.5-A 8-10 (A2 確定): 承認後応答は category="speech"
-        assert bubble_calls[0]["payload"]["category"] == "speech"
+        # Phase 0.5-D-3 follow-up: 事前 publish 廃止 → first chunk inline metadata で発火
+        # に変更されたため、bubble.update("answering") は事前 publish されず、
+        # tts_only first chunk の `_pre_play_bubble` 経由で物理再生時に発火する設計。
+        # ここでは spawn_calls[0][1] = chunks の first chunk に inline metadata が
+        # 埋め込まれていることを検証する。
+        chunks = spawn_calls[0][1]
+        assert len(chunks) >= 1
+        first_chunk = chunks[0]
+        pre_play_bubble = first_chunk.get("_pre_play_bubble")
+        assert pre_play_bubble is not None, (
+            f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
+        )
+        assert pre_play_bubble["slug"] == "mimi"
+        assert pre_play_bubble["step"] == "answering"
+        # バグ 4 修正: text は JSON の response 部分のみ (= 生 JSON 文字列ではない)
+        assert pre_play_bubble["text"] == "わたくしの見解は…"
         # run_pipeline_tts_only が呼ばれた (= TTS-only graph 経由)
         assert len(tts_only_calls) == 1
         # _spawn_handraise_response_playback が呼ばれた
@@ -1461,18 +1465,23 @@ class TestCreateHandraiseRunnerAndCallbacks:
         ある (= バグ 4 の核心テスト)。
         """
         from lab_lounge.dispatcher import HandraiseBgResult
-        published: list = []
-        monkeypatch.setattr(
-            "lab_lounge.run_loop.publish",
-            lambda ev: published.append(ev),
-        )
+        spawn_calls: list[tuple] = []
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda *a, **kw: None,
+            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
+                (slug, list(chunks), trace_id),
+            ),
         )
+
+        # run_pipeline_tts_only mock: on_chunk で 1 件流す (= first chunk への
+        # inline metadata 埋込を発火するため最低 1 件必要)
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "test", True, "sakura", None)
+            return llm_result
+
         monkeypatch.setattr(
-            "lab_lounge.pipeline.run_pipeline_tts_only",
-            lambda llm_result, **kw: llm_result,
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
         _, _, _, on_approved, _ = self._factory()
@@ -1492,24 +1501,24 @@ class TestCreateHandraiseRunnerAndCallbacks:
         bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-x")
         on_approved("sakura", bg, "snap", "trace-x")
 
-        # daemon thread が走るので bubble 発行を待つ
+        # daemon thread が走るので spawn を待つ
         for _ in range(40):
-            if any(
-                e.get("payload", {}).get("step") == "answering"
-                for e in published
-                if e.get("type") == "bubble.update"
-            ):
+            if spawn_calls:
                 break
             time.sleep(0.05)
 
-        bubble_calls = [
-            e for e in published
-            if e.get("type") == "bubble.update"
-            and e.get("payload", {}).get("step") == "answering"
-        ]
-        assert len(bubble_calls) == 1
-        bubble_text = bubble_calls[0]["payload"]["text"]
-        # 期待: response 部分のみ (= response key の値)
+        # Phase 0.5-D-3 follow-up: 事前 publish 廃止 → first chunk inline metadata 経由
+        # spawn_calls[0][1] = chunks list、first chunk の `_pre_play_bubble.text` を検証
+        assert len(spawn_calls) == 1
+        chunks = spawn_calls[0][1]
+        assert len(chunks) >= 1
+        first_chunk = chunks[0]
+        pre_play_bubble = first_chunk.get("_pre_play_bubble")
+        assert pre_play_bubble is not None, (
+            f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
+        )
+        bubble_text = pre_play_bubble["text"]
+        # 期待: response 部分のみ (= response key の値、バグ 4 修正の核心)
         assert bubble_text == (
             "ん〜……AI倫理って、深く考えれば考えるほど、答えが一つじゃないって気づきますよねぇ。"
         )
@@ -1528,18 +1537,22 @@ class TestCreateHandraiseRunnerAndCallbacks:
         そのまま入る (= 過去動作との後方互換)。
         """
         from lab_lounge.dispatcher import HandraiseBgResult
-        published: list = []
-        monkeypatch.setattr(
-            "lab_lounge.run_loop.publish",
-            lambda ev: published.append(ev),
-        )
+        spawn_calls: list[tuple] = []
         monkeypatch.setattr(
             "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda *a, **kw: None,
+            lambda slug, chunks, trace_id, **kw: spawn_calls.append(
+                (slug, list(chunks), trace_id),
+            ),
         )
+
+        # run_pipeline_tts_only mock: on_chunk で 1 件流す
+        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
+            if on_tts_chunk_ready is not None:
+                on_tts_chunk_ready("u1", "test", True, "sakura", None)
+            return llm_result
+
         monkeypatch.setattr(
-            "lab_lounge.pipeline.run_pipeline_tts_only",
-            lambda llm_result, **kw: llm_result,
+            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
         )
 
         _, _, _, on_approved, _ = self._factory()
@@ -1555,22 +1568,21 @@ class TestCreateHandraiseRunnerAndCallbacks:
         on_approved("sakura", bg, "snap", "trace-x")
 
         for _ in range(40):
-            if any(
-                e.get("payload", {}).get("step") == "answering"
-                for e in published
-                if e.get("type") == "bubble.update"
-            ):
+            if spawn_calls:
                 break
             time.sleep(0.05)
 
-        bubble_calls = [
-            e for e in published
-            if e.get("type") == "bubble.update"
-            and e.get("payload", {}).get("step") == "answering"
-        ]
-        assert len(bubble_calls) == 1
-        # parse 失敗時は元テキストをそのまま使う
-        assert bubble_calls[0]["payload"]["text"] == plain_text
+        # Phase 0.5-D-3 follow-up: first chunk inline metadata 経由
+        assert len(spawn_calls) == 1
+        chunks = spawn_calls[0][1]
+        assert len(chunks) >= 1
+        first_chunk = chunks[0]
+        pre_play_bubble = first_chunk.get("_pre_play_bubble")
+        assert pre_play_bubble is not None, (
+            f"first chunk に _pre_play_bubble が必要 (実際: {first_chunk})"
+        )
+        # parse 失敗時は元テキストをそのまま使う (= 後方互換)
+        assert pre_play_bubble["text"] == plain_text
 
     def test_on_handraise_approved_with_none_result_uses_fallback(self, monkeypatch):
         """bg_result=None でフォールバックスレッドが起動する。"""
