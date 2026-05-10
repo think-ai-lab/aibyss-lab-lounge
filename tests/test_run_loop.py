@@ -14,7 +14,6 @@ from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
 from lab_lounge.run_loop import (
     _create_handraise_runner_and_callbacks,
     _run_playback_worker,
-    _spawn_handraise_response_playback,
 )
 
 
@@ -2330,168 +2329,15 @@ class TestCreateHandraiseRunnerAndCallbacks:
             assert llm_only_calls[0].get("on_pose_ready") is None
 
 
-# ─── Phase 0.5-A 案 W'-3: ログ強化境界テスト ──────────────────────
-
-
-class TestApprovedFlowLoggingProgression:
-    """Phase 0.5-A 案 W'-3: 挙手承認パス各経路のログ進行を caplog で検証。
-
-    実走時のシナリオ B/C 再走で「TTS 再生キュー投入」が出ない問題 (= 問題 5) を
-    確実に検出できるよう、各ステージにログを仕込んだことの単体保証。grep パターン
-    で「どの経路を通ったか」が 1 行で追跡可能になることを保証する。
-    """
-
-    def test_approved_tts_logs_progression(self, monkeypatch, caplog):
-        """承認 TTS 同期実行パスで「開始 → 完了 → playback 起動」順にログが出る。
-
-        WHY: シナリオ B/C 再走で「TTS まで完了したが playback まで到達したか」を
-        1 行 grep で追跡可能にするための保証。
-        """
-        import logging
-        import time
-        from lab_lounge.dispatcher import HandraiseBgResult
-        from lab_lounge.run_loop import _create_handraise_runner_and_callbacks
-
-        # run_pipeline_tts_only spy: chunks を on_chunk で 1 件流す
-        def fake_tts_only(llm_result, *, on_tts_chunk_ready=None, on_pose_ready=None):
-            if on_tts_chunk_ready is not None:
-                on_tts_chunk_ready("u1", "test", True, "mimi", None)
-            return llm_result
-
-        monkeypatch.setattr(
-            "lab_lounge.pipeline.run_pipeline_tts_only", fake_tts_only,
-        )
-        monkeypatch.setattr(
-            "lab_lounge.run_loop._spawn_handraise_response_playback",
-            lambda *a, **kw: None,
-        )
-        monkeypatch.setattr(
-            "lab_lounge.run_loop.publish", lambda ev: None,
-        )
-
-        _, _, _, on_approved, _, _ = _create_handraise_runner_and_callbacks(
-            session_stream_id="s1", session_id_root="ses1", stream_context=None,
-        )
-
-        fake_result = MagicMock()
-        fake_result.events = [
-            {"type": "utterance.final"},
-            {"type": "llm.final", "payload": {"text": "わたくしの見解は…"}},
-        ]
-        bg = HandraiseBgResult(chunks=[], result=fake_result, trace_id="bg-tr")
-
-        with caplog.at_level(logging.INFO, logger="lab_lounge.run_loop"):
-            on_approved("mimi", bg, "snap", "trace-orig")
-            # daemon thread 内で _tts_and_play が走る
-            for _ in range(40):
-                if any(
-                    "挙手承認 playback worker 起動" in r.getMessage()
-                    for r in caplog.records
-                ):
-                    break
-                time.sleep(0.05)
-
-        # 期待: 開始 → 完了 → playback 起動 の 3 ログが順序で出ている
-        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-        starts = [m for m in msgs if "挙手承認 TTS 同期実行 開始" in m and "[character=mimi]" in m]
-        completes = [m for m in msgs if "挙手承認 TTS 同期実行 完了" in m and "[character=mimi]" in m]
-        playbacks = [m for m in msgs if "挙手承認 playback worker 起動" in m and "[character=mimi]" in m]
-        assert len(starts) == 1
-        assert len(completes) == 1
-        assert len(playbacks) == 1
-        # 順序確認: starts → completes → playbacks の index 関係
-        start_idx = msgs.index(starts[0])
-        complete_idx = msgs.index(completes[0])
-        playback_idx = msgs.index(playbacks[0])
-        assert start_idx < complete_idx < playback_idx
-
-
 # ─── TestStatusManagerWiring (Phase 0.5-B-α) ─────────────────────
 
 
 class TestStatusManagerWiring:
     """Phase 0.5-B-α: run_loop 経由の CharacterStatusManager 配線検証。
 
-    _spawn_handraise_response_playback /
     _create_handraise_runner_and_callbacks に optional な status_manager 引数が
     伝播し、Talking + Ready 反映 / metadata 流れが正しいことを検証する。
     """
-
-    def test_spawn_handraise_response_playback_sets_talking_then_ready(self):
-        """_spawn_handraise_response_playback で Talking + metadata 反映、worker 完了で Ready。
-
-        chunks=[] なら worker は即 sentinel を受信して終了するため、外部依存
-        (audio_io 等) の mock 不要で完結する。
-        """
-        callback = MagicMock()
-        manager = CharacterStatusManager(on_status_changed=callback)
-        metadata = {"pose": "smile", "text": "こんにちは"}
-
-        t = _spawn_handraise_response_playback(
-            slug="mimi",
-            chunks=[],
-            trace_id="t1",
-            session_stream_id="s1",
-            session_id_root="ss1",
-            status_manager=manager,
-            talking_metadata=metadata,
-        )
-        t.join(timeout=2.0)
-
-        # callback は 2 回発火: Ready→Talking, Talking→Ready
-        assert callback.call_count == 2
-        # 1 回目: Talking 反映 + metadata 付き
-        first = callback.call_args_list[0]
-        assert first.args == (
-            "mimi", CharacterStatus.TALKING, CharacterStatus.READY, metadata,
-        )
-        # 2 回目: Ready 反映 (metadata=None)
-        second = callback.call_args_list[1]
-        assert second.args == (
-            "mimi", CharacterStatus.READY, CharacterStatus.TALKING, None,
-        )
-        # 最終状態は Ready
-        assert manager.get_status("mimi") == CharacterStatus.READY
-
-    def test_spawn_handraise_response_playback_no_status_manager_no_op(self):
-        """status_manager=None で例外なく動く (= 後方互換、既存呼出経路の互換性確認)。"""
-        t = _spawn_handraise_response_playback(
-            slug="mimi",
-            chunks=[],
-            trace_id="t1",
-            session_stream_id="s1",
-            session_id_root="ss1",
-            # status_manager / talking_metadata を渡さない (default None)
-        )
-        t.join(timeout=2.0)
-        # 例外なく完了
-
-    def test_spawn_handraise_response_playback_ready_on_worker_exception(self, monkeypatch):
-        """worker 内例外時も finally 経路で Ready 反映 (= 状態が Talking のまま残らない)。"""
-        callback = MagicMock()
-        manager = CharacterStatusManager(on_status_changed=callback)
-
-        # _run_playback_worker を例外を上げる関数に差し替え
-        def boom(*args, **kwargs):
-            raise RuntimeError("worker 例外テスト")
-
-        monkeypatch.setattr("lab_lounge.run_loop._run_playback_worker", boom)
-
-        t = _spawn_handraise_response_playback(
-            slug="mimi",
-            chunks=[],
-            trace_id="t1",
-            session_stream_id="s1",
-            session_id_root="ss1",
-            status_manager=manager,
-            talking_metadata={"pose": "smile"},
-        )
-        t.join(timeout=2.0)
-
-        # 例外発生でも finally で Ready 反映される
-        assert manager.get_status("mimi") == CharacterStatus.READY
-        # callback: TALKING + READY の 2 回 (= finally 経由)
-        assert callback.call_count == 2
 
     def test_create_factory_accepts_status_manager(self):
         """_create_handraise_runner_and_callbacks が status_manager 引数を受け取れる。"""
