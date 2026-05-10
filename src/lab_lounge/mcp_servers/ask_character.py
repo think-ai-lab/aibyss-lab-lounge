@@ -122,17 +122,6 @@ _bg_tts_events: dict[str, list[threading.Event]] = {}
 # が、バッファ済の未再生 chunks は β-2-3 の playback queue drain で破棄する。
 _bg_cancel_flags: dict[str, threading.Event] = {}
 
-# Phase 0.5-D-2: defer モード (= BG LLM 経路) 用の bg_tts 完了 event 登録 dict。
-#
-# 【WHY: _bg_tts_events から分離する理由】
-# 既存の `wait_bg_tts_complete` (= run_loop.py:1804 のターン終了時に呼ばれる) は
-# `_bg_tts_events` の全 event を join する。defer モードの bg_tts thread を同 dict
-# に登録すると、通常応答ターン終了時に 188 秒の BG LLM 完了を待ってしまい、次
-# ターン開始が遅延する (= 配信品質低下)。defer 経路は承認時に
-# `wait_deferred_bg_tts_complete` で別途待つので、通常応答ターン終了側は影響を
-# 受けないように分離する。
-_deferred_bg_tts_events: dict[str, list[threading.Event]] = {}
-
 
 def _reset_session_state(session_id: str) -> None:
     """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
@@ -141,9 +130,6 @@ def _reset_session_state(session_id: str) -> None:
     with _ask_state_lock:
         _ask_counts[session_id] = 0
         _previous_targets[session_id] = ""
-        # Phase 0.5-D-2: deferred bg_tts events も同 session 分クリーン
-        # (= 前ターンの未消化 event が残らないように)
-        _deferred_bg_tts_events.pop(session_id, None)
 
 
 def _next_ask_state(session_id: str) -> tuple[int, str]:
@@ -171,45 +157,13 @@ def _record_target(session_id: str, target_display: str) -> None:
 def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
     """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。
 
-    Phase 0.5-D-2: defer モード (= BG LLM 経路、_defer_chunks_var=True) では
-    `_deferred_bg_tts_events` に登録し、通常応答経路 (= False) では既存の
-    `_bg_tts_events` に登録する。これにより `wait_bg_tts_complete` (= 通常応答
-    ターン終了時に呼ばれる) が defer 経路の event を待たないため、188 秒の
-    BG LLM 完了でターン終了が遅延しない。defer 経路の event は
-    `wait_deferred_bg_tts_complete` (= 承認時に呼ばれる) で待つ。
-    """
-    if not session_id:
-        return
-    target_dict = _deferred_bg_tts_events if _defer_chunks_var.get() else _bg_tts_events
-    with _ask_state_lock:
-        target_dict.setdefault(session_id, []).append(event)
-
-
-def wait_deferred_bg_tts_complete(session_id: str, timeout: float = 180.0) -> None:
-    """Phase 0.5-D-2: defer モードの bg_tts thread 完了を待つ (承認時用)。
-
-    `wait_bg_tts_complete` (= 通常応答経路用) と同じ実装パターンだが、対象 dict
-    が `_deferred_bg_tts_events` に分離されている。`run_loop.on_handraise_approved`
-    が drain 直前に本関数を呼び、buffer に全 chunks が蓄積された状態で
-    `_drain_bg_chunks` するための同期点を提供する。
-
-    Args:
-        session_id: 待機対象の session_id (空文字なら no-op)
-        timeout:    1 event あたりの最大待機秒数 (default: 180)
+    `wait_bg_tts_complete` (= graph._tts_node の caller 最終応答 TTS 投入前 +
+    run_loop の playback queue close 前) で完了を待つために使用する。
     """
     if not session_id:
         return
     with _ask_state_lock:
-        events = _deferred_bg_tts_events.pop(session_id, [])
-    if not events:
-        return
-    logger.info(
-        "wait_deferred_bg_tts_complete: session=%s pending=%d events 待機開始",
-        session_id, len(events),
-    )
-    for ev in events:
-        ev.wait(timeout=timeout)
-    logger.info("wait_deferred_bg_tts_complete: session=%s 全 events 完了", session_id)
+        _bg_tts_events.setdefault(session_id, []).append(event)
 
 
 def cancel_bg_tts(session_id: str) -> int:
@@ -243,17 +197,11 @@ def cancel_bg_tts(session_id: str) -> int:
         if flag is None:
             return 0
         flag.set()
-        # 影響範囲は登録済 bg_tts event 数で示す (= 起動済 bg_tts thread の概数)
-        # Phase 0.5-D-2: defer 経路と通常応答経路の両方の event を合算する。
-        # cancel は両方の経路の bg_tts thread に対して有効 (= cancel_flag は session
-        # 単位で 1 つ、defer モードに関係なく set される)。
-        n_normal = len(_bg_tts_events.get(session_id, []))
-        n_deferred = len(_deferred_bg_tts_events.get(session_id, []))
-        n = n_normal + n_deferred
+        # 影響範囲は登録済 bg_tts event 数で示す (= 起動済 bg_tts thread の概数)。
+        n = len(_bg_tts_events.get(session_id, []))
     logger.info(
-        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d "
-        "(normal=%d, deferred=%d)",
-        session_id, n, n_normal, n_deferred,
+        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d",
+        session_id, n,
     )
     return n
 
@@ -359,8 +307,6 @@ def reset_ask_character_context() -> None:
         _previous_targets.clear()
         _bg_tts_events.clear()
         _bg_cancel_flags.clear()
-        # Phase 0.5-D-2: deferred bg_tts events も全 session 分クリーン
-        _deferred_bg_tts_events.clear()
     # Phase 0.5-D-e-2: LLM client pool もテスト間で漏れないようクリア。
     # graph.py の import 失敗 (= 単体テストでの軽量環境) は黙殺。
     try:
