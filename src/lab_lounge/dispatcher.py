@@ -157,37 +157,6 @@ class QueuedWakeEvent:
 
 
 @dataclass
-class HandraiseBgResult:
-    """
-    Phase 0.5-A フェーズ 7: BG LLM スレッドが先行生成した応答結果。
-
-    挙手判定 → ``_start_handraise()`` → 注入された ``bg_runner`` で起動された
-    BG スレッドが ``pipeline.run_pipeline`` (LLM + graph 内 TTS) を実行し、
-    結果を chunks + result + trace_id でまとめてここに格納する。承認時
-    (``on_approval_granted``) に run_loop 側へ ``on_handraise_approved`` callback
-    で渡され、TTS chunks を専用 mini playback worker で再生する。
-
-    cancel_event がセットされていた場合 (denied / lapse 後の chunk)、
-    ``cancel_aware_chunk_hook`` が chunk ファイル削除 + 蓄積スキップを行うため
-    chunks は空リストで届く。LLM 呼出失敗時は result=None で chunks=[]。
-    run_loop は両ケースとも fallback (= 同期再生成) に流す。
-
-    フィールド:
-      chunks:    TTS chunks のリスト。各 dict は ``_run_playback_worker`` が読む
-                 形式 (``{"url", "text", "is_last", "character", "pose"}`` 等)
-      result:    ``pipeline.PipelineResult``。bubble.update("answering") の text を
-                 events 内の llm.final から抽出する元データ。失敗時は None。
-                 循環 import 回避で型は Any (run_loop 側で narrowing)
-      trace_id:  handraise 単位の trace_id。承認後の bubble.update / playback で
-                 同じ trace_id を引き継ぐことで HUD の関連付けを維持する
-    """
-
-    chunks: list[dict[str, Any]] = field(default_factory=list)
-    result: Any = None
-    trace_id: str = ""
-
-
-@dataclass
 class HandraiseState:
     """
     Phase 0.5-A で使う挙手中キャラの状態。
@@ -218,8 +187,6 @@ class HandraiseState:
     started_at: float
     transcript_snapshot: Any = None         # TranscriptBuffer (循環 import 回避で Any)
     cancel_event: threading.Event = field(default_factory=threading.Event)
-    bg_thread: threading.Thread | None = None
-    bg_result: HandraiseBgResult | None = None
     bg_completed: threading.Event = field(default_factory=threading.Event)
     phrase: str = ""
     phrase_path: Path | None = None
@@ -277,14 +244,9 @@ class Dispatcher:
             [dict[str, "HandraiseState"], dict[str, "CooldownState"]], None
         ] | None = None,
         on_bubble_update: Callable[[str, str, str, int | None], None] | None = None,
-        bg_runner: Callable[..., threading.Thread] | None = None,
         on_handraise_started: Callable[[str, "Path | None", bool], None] | None = None,
         on_handraise_phrase_pending_release: Callable[[str, "Path | None"], None] | None = None,
-        on_handraise_approved: Callable[
-            [str, "HandraiseBgResult | None", Any, str], None
-        ] | None = None,
         on_handraise_close: Callable[[str, str], None] | None = None,
-        on_approval_progressing: Callable[[str], None] | None = None,
         on_approval_replay: Callable[[str, Any], None] | None = None,
         status_manager: CharacterStatusManager | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
@@ -304,11 +266,6 @@ class Dispatcher:
                 引数 (character, step, text, ttl_ms) を受け取り、run_loop が
                 ``build_bubble_update(...)`` で event を組み立てて publish する想定。
                 Lock 外で呼ばれる。
-            bg_runner: 挙手 BG LLM スレッドを起動する関数 (Phase 0.5-A フェーズ 7)。
-                シグネチャ ``(target_slug, transcript_snapshot, cancel_event,
-                on_complete) -> threading.Thread``。run_loop が依存性注入する。
-                None なら BG LLM 機能 off (フェーズ 5 placeholder と同等の no-op:
-                ``state.bg_completed.set()`` を即時呼んで完了状態とする)。
             on_handraise_started: 挙手状態が確定した直後 (= ``_start_handraise`` の
                 Lock 解除後) に呼ばれる callback。引数 ``(slug, phrase_path, se_pending)``。
                 run_loop が ``se_pending=False`` なら handraise wav を即再生、
@@ -317,11 +274,6 @@ class Dispatcher:
                 応答完了時の保留 wav リリースに呼ばれる callback。引数
                 ``(slug, phrase_path)``。RESPONDING 中に挙手したキャラの wav を
                 IDLE 復帰時に再生する経路。
-            on_handraise_approved: 承認 (``on_approval_granted``) 時、state pop の
-                直前にデータを抽出して呼ばれる callback。引数
-                ``(slug, bg_result, transcript_snapshot, trace_id)``。run_loop が
-                bg_result の chunks を再生 + bubble.update("answering") を発行。
-                bg_result が None の場合は run_loop が同期 fallback (再生成) する。
             on_handraise_close: 却下 (``on_approval_denied``) / lapse
                 (``on_lapse_timeout``) 時、Lock 解除後に呼ばれる close 通知 callback
                 (Phase 0.5-B-β-2)。引数 ``(target_slug, reason)`` で、reason は
@@ -329,22 +281,11 @@ class Dispatcher:
                 の bg_tts キャンセル + playback queue drain を実行し、案 A の音声漏れ
                 (= 挙手中に流れた対話 TTS が却下後も再生キューに残る問題) を最小化する。
                 None 時は通知スキップ (= 後方互換、Phase 0.5-A 以前と同じ挙動)。
-            on_approval_progressing: 承認 (``on_approval_granted``) 時に BG LLM が
-                未完了 (= ``state.bg_completed.is_set()`` が False) の場合に呼ばれる
-                callback (Phase 0.5-D-d-2)。引数 ``(target_slug,)`` で、run_loop が
-                「bridge filler を即時再生」して 30 秒 wait 中の沈黙を埋めるフック。
-                ``state.se_pending=True`` (= RESPONDING 中) のキャラには発火されない
-                (= 通常応答 TTS との 3 重音声重なり防止、★R4 対処)。None 時は通知
-                スキップ (= 後方互換、Phase 0.5-D-d 以前と同じ挙動)。
-            on_approval_replay: 承認 (``on_approval_granted``) 時、案 R 経路に切替えた
-                ときに呼ばれる callback (Phase 0.5-F-1 で導入)。引数
+            on_approval_replay: 承認 (``on_approval_granted``) 時に呼ばれる callback
+                (Phase 0.5-F-1 で導入、F-3 で wiring されて以降は唯一の承認経路)。引数
                 ``(target_slug, transcript_snapshot)``。run_loop は内部で
                 ``dispatcher.on_wake_detected(WakeWordResult(transcript=...))`` を
-                呼んで callout 経路と統合する想定。
-                None 時は **既存の `on_handraise_approved` 経路を使う** (= 後方互換)、
-                non-None 時は **`on_handraise_approved` を skip して replay 優先** で
-                呼ばれる。これにより opt-in で新経路に切替できる (= partial revert
-                容易性のため、Phase 0.5-F-1 の最小単位として追加)。
+                呼んで callout 経路と統合する想定。None 時は承認時に no-op (= 後方互換)。
             status_manager: 全キャラのステータス (Ready/Thinking/ToolCalling/Raisehand/
                 Talking) を一元管理する CharacterStatusManager (Phase 0.5-B-α)。
                 本クラスは handraise 経路 (start / approval_granted / approval_denied /
@@ -372,21 +313,14 @@ class Dispatcher:
         # Phase 0.5-A: 挙手状態 + bubble の publish callback
         self._on_handraise_update = on_handraise_update
         self._on_bubble_update = on_bubble_update
-        # Phase 0.5-A フェーズ 7: BG LLM 起動 + 物理通知 callback (run_loop が注入)
-        self._bg_runner = bg_runner
+        # Phase 0.5-A フェーズ 7: 物理通知 callback (run_loop が注入)
         self._on_handraise_started = on_handraise_started
         self._on_handraise_phrase_pending_release = on_handraise_phrase_pending_release
-        self._on_handraise_approved = on_handraise_approved
         # Phase 0.5-B-β-2: 却下/lapse 時の close 通知 callback。run_loop が
         # ask_character bg_tts キャンセル + playback queue drain を実行する。
         self._on_handraise_close = on_handraise_close
-        # Phase 0.5-D-d-2: 承認時 BG LLM 未完了 → bridge filler 即時再生 callback
-        # (run_loop が注入)。state.se_pending=True のキャラには発火しない。
-        self._on_approval_progressing = on_approval_progressing
-        # Phase 0.5-F-1: 案 R 経路に切替えるための新規 callback。
-        # 承認時に non-None なら on_handraise_approved を skip して replay 経路を
-        # 採用する (= callout 経路と完全統合、廃棄経路の構造的消滅)。
-        # 詳細は `_approve_after_bg_complete` の分岐コメント参照。
+        # Phase 0.5-F-1: 案 R 経路の callback。F-3 で wiring されて以降は
+        # 唯一の承認経路 (= 旧 on_handraise_approved は F-4-c/f-2 で削除済)。
         self._on_approval_replay = on_approval_replay
         # Phase 0.5-B-α: 全キャラ状態を一元管理する Manager (handraise 経路で
         # Raisehand / Ready を反映)。None 時は status 反映スキップ (後方互換)。
@@ -949,44 +883,13 @@ class Dispatcher:
                 # (フェーズ 7: on_pipeline_complete で release callback を発火する経路)
                 se_pending=(self._state == DispatcherState.RESPONDING),
             )
-            if self._bg_runner is None:
-                # bg_runner 未注入 = フェーズ 5 placeholder 同等。bg_completed を即時
-                # set して、承認時に run_loop が bg_result=None を見て fallback に流す。
-                state.bg_completed.set()
+            # F-4-d で旧 bg_runner 経路廃止 (案 R = `on_approval_replay`)。bg_completed
+            # を即時 set して承認時の wait を即 return させ、callout 経路に統合する。
+            state.bg_completed.set()
             # lapse_timer 起動 (委譲メソッド経由でテスト容易性確保)
             state.lapse_timer = self._create_lapse_timer(target_slug, self._lapse_sec)
             state.lapse_timer.start()
             self._handraise_states[target_slug] = state
-
-        # ─── Lock 外: BG LLM 起動 + publish + 物理通知 ───
-        # bg_runner は LLM API 呼出 (数秒〜十数秒) を含むため必ず Lock 外で実行する。
-        # 戻ってきた thread は再度 Lock 取得して state.bg_thread に格納する。
-        # _bg_set_result (on_complete callback) は別スレッドから呼ばれるが、その時点で
-        # state は dict 登録済 → 競合なし。state が既に granted/denied/lapse で削除
-        # されている場合 (起動と完了の極短時間に発生する稀ケース) は冪等 no-op。
-        if self._bg_runner is not None:
-            try:
-                thread = self._bg_runner(
-                    target_slug=target_slug,
-                    transcript_snapshot=transcript_snapshot,
-                    cancel_event=state.cancel_event,
-                    on_complete=lambda result: self._bg_set_result(target_slug, result),
-                )
-                with self._lock:
-                    cur = self._handraise_states.get(target_slug)
-                    if cur is not None:
-                        cur.bg_thread = thread
-            except Exception as exc:  # noqa: BLE001
-                # bg_runner 起動失敗: フェーズ 5 placeholder 同等のフォールバックで
-                # bg_completed を立てる。承認時に run_loop が同期再生成に流す。
-                logger.warning(
-                    "Dispatcher._start_handraise: bg_runner 起動失敗 slug=%s err=%s",
-                    target_slug, exc,
-                )
-                with self._lock:
-                    cur = self._handraise_states.get(target_slug)
-                    if cur is not None:
-                        cur.bg_completed.set()
 
         logger.info(
             "Dispatcher._start_handraise: slug=%s phrase=%r trace_id=%s se_pending=%s",
@@ -1033,62 +936,6 @@ class Dispatcher:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("on_handraise_started callback failed: %s", exc)
-
-    def _bg_set_result(
-        self,
-        target_slug: str,
-        result: HandraiseBgResult,
-    ) -> None:
-        """BG LLM スレッドからの完了通知 (Phase 0.5-A フェーズ 7)。
-
-        state がまだ残っている (= granted/denied/lapse される前) なら bg_result を
-        格納して bg_completed フラグをセットする。state 削除済の場合は冪等 no-op
-        (run_loop は bg_result を取得できないので fallback パスに流れる)。
-
-        呼出スレッドは BG LLM 専用の daemon スレッド (= bg_runner が起動した別スレッド)。
-        本メソッドは Lock を取得するが、callback 内処理は state 更新 + publish のみで
-        短時間に完了する。
-        """
-        # Phase 0.5-D-d-6 (= 中間実走 8 回目 take 1-2 hang 調査用ログ追加):
-        # _bg_set_result 呼出時の thread / state を記録する。take 1-2 では本ログが
-        # 「出ない」はず (= mimi Agent が hang して on_complete callback が呼ばれない)
-        # → 本ログの有無で hang の原因が「BG LLM 内 (= run_pipeline_llm_only)」か
-        # 「dispatcher 経路」かを切り分けられる。
-        logger.info(
-            "_bg_set_result 呼出 [target=%s]: thread_id=%d active_threads=%d",
-            target_slug, threading.get_ident(), threading.active_count(),
-        )
-        with self._lock:
-            state = self._handraise_states.get(target_slug)
-            if state is None:
-                # 既に granted/denied/lapse で削除されている → 冪等で no-op
-                logger.info(
-                    "_bg_set_result no-op (state already removed) [target=%s]",
-                    target_slug,
-                )
-                return
-            state.bg_result = result
-            state.bg_completed.set()
-        # Phase 0.5-D-d-6: bg_completed.set() 直後ログ。dispatcher daemon thread の
-        # bg_completed.wait が解放される瞬間。
-        logger.info(
-            "_bg_set_result bg_completed.set 完了 [target=%s]",
-            target_slug,
-        )
-        # Phase 0.5-D-d-1: BG LLM 完了 → RAISEHAND_READY 反映。
-        # WHY: bg_completed.set() の直後 (= 承認 callback がアクセス可能になった瞬間)
-        # に反映することで、HUD は「考え中 → 準備完了」の遷移を即時観察できる。
-        # ルカは HUD のグリーンチェックを目視で確認してから approval を発する判断材料
-        # にできる (= 「approval 早すぎ」を構造的に避けやすくなる)。
-        # state pop 後の race (= granted/denied/lapse 直後の set 呼出) は既存 dict
-        # ガード経路で _publish_handraise_update が冪等 no-op になるが、status_manager
-        # は削除済キャラに RAISEHAND_READY を反映する。これは直後の granted/denied/
-        # lapse で READY に上書きされるので害なし (= 短時間の不整合のみ、許容範囲)。
-        if self._status_manager is not None:
-            self._status_manager.set_status(
-                target_slug, CharacterStatus.RAISEHAND_READY,
-            )
-        self._publish_handraise_update()
 
     def on_interjection_candidate(
         self,
@@ -1144,24 +991,10 @@ class Dispatcher:
             if state is None:
                 return  # 冪等 (既に granted/denied/lapse 済)
             bg_completed_event = state.bg_completed
-            progressing = not bg_completed_event.is_set()
-            se_pending = state.se_pending  # ★R4: RESPONDING 中フラグ
 
-        # progressing 経路: bridge filler 即時再生 callback を発火
-        # ★R4 対処: RESPONDING 中 (= se_pending=True) のキャラは通常応答 TTS が再生中
-        # なので、bridge filler を投入すると 3 重音声重なり (通常応答 + handraise wav +
-        # bridge filler) の UX 崩壊。se_pending=False (= IDLE 中) のみ即時再生する。
-        if progressing and not se_pending and self._on_approval_progressing is not None:
-            try:
-                self._on_approval_progressing(target_slug)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "on_approval_progressing callback failed [character=%s]: %s",
-                    target_slug, exc,
-                )
-
-        # bg_completed 即 set 済 (= 既存挙動) なら wait() 即 return → 既存テスト無影響
-        # bg_completed 未 set (= BG LLM 進行中) なら wait(timeout=30s) で最大 30 秒待機
+        # F-4-f-2: progressing 経路 + on_approval_progressing 廃止 (= bg_runner も
+        # _start_handraise で即 set されるため bg_completed_event は wait() で即 return)。
+        # bg_completed_event は下の wait() で使うため残す。
         timeout_sec = self._approval_bg_completed_timeout
 
         def _wait_and_approve() -> None:
@@ -1175,18 +1008,18 @@ class Dispatcher:
         ).start()
 
     def _approve_after_bg_complete(self, target_slug: str) -> None:
-        """bg_completed.wait 完了後の本処理 (Phase 0.5-D-d-2)。
+        """bg_completed.wait 完了後の本処理 (Phase 0.5-D-d-2 → F-4-f-2 で簡素化)。
 
-        既存 ``on_approval_granted`` のロジック (= state pop + cancel_event.set +
-        cooldown reset + READY 反映 + handraise.update publish + on_handraise_approved
-        callback 発火) をここに移植。daemon thread 内から呼ばれる。
+        state pop + cancel_event.set + cooldown reset + READY 反映 +
+        handraise.update publish + on_approval_replay callback 発火を行う。
 
         ``state is None`` の場合は冪等 no-op (= wait 中に granted/denied/lapse が別
         経路で発生した場合の race ガード)。
+
+        F-4-f-2 で `on_handraise_approved` 経路 + `bg_result` 抽出を完全削除。
+        承認時の応答経路は `on_approval_replay` (案 R) が唯一の経路。
         """
-        bg_result = None
         transcript_snapshot = None
-        trace_id = ""
         with self._lock:
             state = self._handraise_states.get(target_slug)
             if state is None:
@@ -1197,48 +1030,24 @@ class Dispatcher:
             # 承認なので連続却下カウントをリセット
             if target_slug in self._cooldowns:
                 self._cooldowns[target_slug].consecutive_denials = 0
-            # Phase 0.5-A フェーズ 7: state pop 直前に必要データを抽出
-            bg_result = state.bg_result
             transcript_snapshot = state.transcript_snapshot
-            trace_id = state.trace_id
             del self._handraise_states[target_slug]
 
-        logger.info(
-            "Dispatcher.on_approval_granted: slug=%s bg_result=%s",
-            target_slug, "ready" if bg_result is not None else "none",
-        )
+        logger.info("Dispatcher.on_approval_granted: slug=%s", target_slug)
         # Phase 0.5-B-α: 承認時点で Raisehand_Ready → Ready に戻す。
         # WHY: 承認 → TTS chunks 生成 → 再生開始までに 2-3 秒の gap がある。その間
         # Ready (= ニュートラル) を維持する方が HUD の精度が上がる。Talking への
-        # 上書きは run_loop の _spawn_handraise_response_playback で行われる。
+        # 上書きは run_loop の playback worker (案 R 経路では callout 経路) で行われる。
         if self._status_manager is not None:
             self._status_manager.set_status(target_slug, CharacterStatus.READY)
         self._publish_handraise_update()
-        # Phase 0.5-F-1: 案 R 経路への opt-in 分岐。
-        # `on_approval_replay` が non-None なら、案 R (= raisehand を callout 経路に
-        # 統合) の経路を取り、`on_handraise_approved` は **skip** する。これにより:
-        #   - F-1 commit (本 commit) では callback 受け取り + 分岐のみ追加 (既存挙動不変)
-        #   - F-3 commit で run_loop が `on_approval_replay=replay_callback` を渡すと、
-        #     opt-in で案 R 経路に切替 (= bg_runner 廃止、defer モード廃止、
-        #     fallback 廃止、callout 経路と完全統合)
-        # WHY: 既存 `on_handraise_approved` 経路を一切変えずに新経路を opt-in で
-        # 導入することで、commit 単位で動作切替できる (= partial revert 容易性最優先)。
+        # Phase 0.5-F-1: 案 R 経路 (= raisehand を callout 経路に統合)。F-3 で
+        # wiring されて以降は唯一の承認経路。
         if self._on_approval_replay is not None:
             try:
                 self._on_approval_replay(target_slug, transcript_snapshot)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("on_approval_replay callback failed: %s", exc)
-            return  # ★ replay 経路採用時は on_handraise_approved を呼ばない
-
-        # Phase 0.5-A フェーズ 7: 承認後の TTS 再生 + bubble.update("answering") を
-        # run_loop に委譲。dispatcher は state 管理のみで、IO は run_loop の責務。
-        if self._on_handraise_approved is not None:
-            try:
-                self._on_handraise_approved(
-                    target_slug, bg_result, transcript_snapshot, trace_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("on_handraise_approved callback failed: %s", exc)
 
     def on_approval_denied(self, target_slug: str) -> None:
         """ルカの却下 (「いや、いいわ」) で呼ばれる (Phase 0.5-A)。
