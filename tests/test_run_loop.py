@@ -3112,3 +3112,143 @@ class TestStatusManagerWiring:
         assert meta.get("pose") == "smile"
         # text は chunks の text を結合 (= "chunk text")
         assert meta.get("text") == "chunk text"
+
+
+# ─── Phase 0.5-F-2: 案 R 用 replay factory のテスト ─────────────────
+
+
+class TestCreateReplayRunnerAndCallbacks:
+    """Phase 0.5-F-2: ``_create_replay_runner_and_callbacks`` の単体テスト。
+
+    案 R (= raisehand を callout 経路に統合) のための新 factory。F-2 では wiring
+    していないので、単体テストで return tuple の構造 + 各 callable の動作のみを
+    検証する。F-3 commit で run_loop が本 factory に切替えると初めて動作する。
+    """
+
+    def test_factory_returns_4_callables(self):
+        """factory は 4 つの callable を tuple で返す。
+
+        既存 ``_create_handraise_runner_and_callbacks`` の 6-tuple に対し、
+        案 R 用は 4-tuple (= bg_runner / on_handraise_approved / on_approval_progressing 削除)。
+        """
+        from lab_lounge.run_loop import _create_replay_runner_and_callbacks
+
+        result = _create_replay_runner_and_callbacks(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+        )
+        assert len(result) == 4
+        for cb in result:
+            assert callable(cb), f"factory の return 要素が callable ではない: {cb}"
+
+    def test_on_handraise_close_is_no_op(self, caplog):
+        """on_handraise_close は no-op (= 案 R では cancel 不要)。
+
+        WHY: 案 R では bg_runner._body が起動しないので、cancel 対象の bg_tts thread
+        は存在しない。playback queue drain は通常応答 TTS を誤 drain する害があるため
+        呼ばない。ログのみ残す。
+        """
+        import logging
+        from lab_lounge.run_loop import _create_replay_runner_and_callbacks
+
+        _, _, on_handraise_close, _ = _create_replay_runner_and_callbacks(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+        )
+
+        caplog.set_level(logging.INFO, logger="lab_lounge.run_loop")
+        # 例外 raise なしで完走すること
+        on_handraise_close("mimi", "denied")
+        on_handraise_close("chisame", "lapsed")
+
+        # ログに reason が記録されている
+        denied_logs = [r for r in caplog.records if "reason=denied" in r.message]
+        lapsed_logs = [r for r in caplog.records if "reason=lapsed" in r.message]
+        assert denied_logs, "denied reason のログが出ていない"
+        assert lapsed_logs, "lapsed reason のログが出ていない"
+
+    def test_on_approval_replay_injects_wake_event(self):
+        """on_approval_replay は ``dispatcher.on_wake_detected(WakeWordResult)`` を呼ぶ。
+
+        案 R の中核経路: 承認時に wake_event queue に inject することで、callout 経路と
+        完全に同じコードパスを通る (= run_pipeline 起動)。
+        """
+        from lab_lounge.run_loop import _create_replay_runner_and_callbacks
+
+        # dispatcher_ref に MagicMock を late binding で設定
+        mock_dispatcher = MagicMock()
+        dispatcher_ref = [mock_dispatcher]
+
+        _, _, _, on_approval_replay = _create_replay_runner_and_callbacks(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+            dispatcher_ref=dispatcher_ref,
+        )
+
+        on_approval_replay("mimi", "ルカ発話の transcript")
+
+        # on_wake_detected が呼ばれていること
+        assert mock_dispatcher.on_wake_detected.called, "on_wake_detected が呼ばれていない"
+        wake_result = mock_dispatcher.on_wake_detected.call_args[0][0]
+        assert wake_result.character_slug == "mimi"
+        assert wake_result.transcript == "ルカ発話の transcript"
+        assert wake_result.keyword == "<approval>"  # 案 R 専用識別子
+        assert wake_result.keyword_index == -1
+
+    def test_on_approval_replay_handles_none_transcript(self):
+        """transcript_snapshot が None / 空文字でも空文字で inject する。
+
+        WHY: run_pipeline は空文字でも処理可能 (= 通常応答経路で transcript=None の
+        ケースもある)、no-op で skip するより inject する方が一貫性高い。
+        """
+        from lab_lounge.run_loop import _create_replay_runner_and_callbacks
+
+        mock_dispatcher = MagicMock()
+        dispatcher_ref = [mock_dispatcher]
+        _, _, _, on_approval_replay = _create_replay_runner_and_callbacks(
+            session_stream_id="s1",
+            session_id_root="ses1",
+            stream_context=None,
+            dispatcher_ref=dispatcher_ref,
+        )
+
+        on_approval_replay("chisame", None)
+
+        wake_result = mock_dispatcher.on_wake_detected.call_args[0][0]
+        assert wake_result.transcript == ""
+
+    def test_on_approval_replay_no_op_when_dispatcher_ref_none(self, caplog):
+        """dispatcher_ref が None / [None] のとき、no-op + warning ログ。
+
+        WHY: F-3 wiring 完了前に F-2 factory が単独テストされるとき、dispatcher が
+        構築されていない。warning を出すが例外は raise しない (= 防衛的、F-3 wiring
+        前後の挙動を区別可能)。
+        """
+        import logging
+        from lab_lounge.run_loop import _create_replay_runner_and_callbacks
+
+        # ケース 1: dispatcher_ref=None
+        _, _, _, replay_a = _create_replay_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1",
+            stream_context=None, dispatcher_ref=None,
+        )
+        # ケース 2: dispatcher_ref=[None]
+        _, _, _, replay_b = _create_replay_runner_and_callbacks(
+            session_stream_id="s1", session_id_root="ses1",
+            stream_context=None, dispatcher_ref=[None],
+        )
+
+        caplog.set_level(logging.WARNING, logger="lab_lounge.run_loop")
+        replay_a("mimi", "snap")  # 例外なし
+        replay_b("chisame", "snap")  # 例外なし
+
+        warning_records = [
+            r for r in caplog.records if "dispatcher_ref" in r.message
+        ]
+        assert len(warning_records) >= 2, (
+            f"dispatcher_ref 未設定の warning が 2 件出ていない: "
+            f"{[r.message for r in caplog.records]}"
+        )

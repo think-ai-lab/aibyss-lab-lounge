@@ -60,6 +60,7 @@ from .events import build_bubble_update, build_character_status_update
 from .log_setup import setup_logging
 from .pipeline import PipelineResult, run_pipeline
 from .stream_context import load_stream_context
+from .wake_word import WakeWordResult
 
 setup_logging(session_name="run_loop")
 
@@ -1365,6 +1366,180 @@ def _create_handraise_runner_and_callbacks(
         on_handraise_approved,
         on_handraise_close,
         on_approval_progressing,
+    )
+
+
+# ─── Phase 0.5-F-2: 案 R 用 callback factory (raisehand → callout 統合) ────
+
+
+def _create_replay_runner_and_callbacks(
+    *,
+    session_stream_id: str,
+    session_id_root: str,
+    stream_context: "str | None" = None,
+    status_manager: "CharacterStatusManager | None" = None,
+    dispatcher_ref: "list | None" = None,
+):
+    """Phase 0.5-F-2: 案 R 用の 4 つの callback を生成する factory。
+
+    ``_create_handraise_runner_and_callbacks`` の置き換え候補。中間実走 13
+    シナリオ γ (= raisehand 承認後の沈黙 5 分以上、配信事故レベル) への根本対処。
+
+    【WHY: 案 R = raisehand を callout 経路に統合】
+    Phase 0.5-A 案 W'-1 の「LLM 先行計算 (= bg_runner)」設計が、多段階 ask_character
+    で破綻 (= 60s 超 latency で fallback 起動 → TTS 4 系統廃棄経路)。callout 経路
+    では同じワークロードが廃棄経路を持たず正常動作するため、raisehand 承認時に
+    callout 経路と同じ ``run_pipeline`` (= LLM + TTS 一体) を起動する設計に統合。
+
+    【F-2 では wiring しない】
+    本 factory は **opt-in 用** に併設するだけで、F-2 commit では既存
+    ``_create_handraise_runner_and_callbacks`` を使い続ける。F-3 commit で
+    ``run_loop`` 内の ``Dispatcher(...)`` 引数を切替えると初めて案 R 経路が
+    起動する。これにより partial revert の柔軟性を最大化 (= F-3 wiring 戻しで
+    完全復元可能)。
+
+    【返り値の signature 設計】
+    既存 factory の 6 callable から:
+      - ``bg_runner`` 削除 (= 案 R で LLM 先行計算なし、Dispatcher に None 渡す)
+      - ``on_handraise_approved`` 削除 (= ``on_approval_replay`` で代替)
+      - ``on_approval_progressing`` 削除 (= R-1-b: 通常応答 filler に統合、
+        ``run_pipeline`` 経由で filler が自然に起動するため不要)
+      - ``on_handraise_started`` / ``on_handraise_phrase_pending_release`` 維持
+      - ``on_handraise_close`` 維持 (ただし内部は no-op、bg_runner 起動なしのため)
+      - ``on_approval_replay`` 新規追加 (= F-1 で導入した dispatcher 側 callback)
+
+    Args:
+        session_stream_id: 当該セッションの stream_id (= 既存 factory と互換)
+        session_id_root:   当該セッションの session_id (= 同上)
+        stream_context:    配信文脈 markdown (案 R では未使用、互換のため受領)
+        status_manager:    ステータス管理 (案 R では未使用、互換のため受領)
+        dispatcher_ref:    ``list[Dispatcher | None]`` の mutable list (= late binding)。
+                           ``on_approval_replay`` 内で ``ref[0].on_wake_detected(...)``
+                           で queue に inject する用。F-3 wiring 時に
+                           ``dispatcher_ref[0] = dispatcher`` を設定する。
+
+    Returns:
+        (on_handraise_started, on_handraise_phrase_pending_release,
+         on_handraise_close, on_approval_replay) の 4-tuple。
+    """
+
+    def on_handraise_started(
+        slug: str, phrase_path: "Path | None", se_pending: bool,
+    ) -> None:
+        """挙手検知時の handraise wav 即再生 (= 既存と同等の演出)。
+
+        IDLE 中なら即再生、RESPONDING 中 (= se_pending=True) は IDLE 復帰時の
+        ``on_handraise_phrase_pending_release`` を待つ。
+        """
+        if se_pending:
+            # 通常応答中なので handraise wav は保留 → on_pipeline_complete 後に release
+            logger.info(
+                "挙手検知 [character=%s]: RESPONDING 中のため wav 保留 (= phrase_pending_release で再生)",
+                slug,
+            )
+            return
+        if phrase_path is None:
+            logger.debug("挙手検知 [character=%s]: phrase wav なし (= filler 未生成)", slug)
+            return
+        try:
+            _spawn_handraise_phrase_playback(slug, phrase_path)
+            logger.info(
+                "挙手検知 handraise wav 即再生 [character=%s]: %s",
+                slug, phrase_path.name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "挙手検知 handraise wav 起動失敗 [character=%s]: %s",
+                slug, exc,
+            )
+
+    def on_handraise_phrase_pending_release(
+        slug: str, phrase_path: "Path | None",
+    ) -> None:
+        """RESPONDING → IDLE 遷移時の保留 wav リリース (= 既存と同等)。"""
+        if phrase_path is None:
+            return
+        try:
+            _spawn_handraise_phrase_playback(slug, phrase_path)
+            logger.info(
+                "挙手 phrase pending release [character=%s]: %s",
+                slug, phrase_path.name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "挙手 phrase pending release 起動失敗 [character=%s]: %s",
+                slug, exc,
+            )
+
+    def on_handraise_close(slug: str, reason: str) -> None:
+        """却下/lapse 時の close 通知 (Phase 0.5-F-2、no-op 化)。
+
+        【WHY: no-op】
+        案 R では bg_runner._body が起動しない (= LLM 先行計算なし) ため、
+        cancel 対象の bg_tts thread / buffer が **存在しない**。よって
+        ``cancel_bg_tts(session_id)`` 呼出は無効、playback queue drain も
+        通常応答経路の TTS を誤って drain する害があるため呼ばない。
+
+        ログのみ残して却下/lapse の事実を記録する (= 配信事故再発時のトレース用)。
+        """
+        logger.info(
+            "挙手 close [character=%s reason=%s]: 案 R 経路では no-op "
+            "(bg_runner 起動なしのため cancel 不要)",
+            slug, reason,
+        )
+
+    def on_approval_replay(slug: str, transcript_snapshot) -> None:
+        """承認時に callout 経路に inject する (Phase 0.5-F-2 案 R の中核)。
+
+        ``dispatcher.on_wake_detected(WakeWordResult(transcript=...))`` で wake_event
+        queue にエンキューし、run_loop の ``wait_for_next_event`` が次ターンとして
+        取り出す。次ターンでは callout 経路と同じ ``run_pipeline`` (= LLM + TTS
+        一体) が走り、視聴者に音声が届く。
+
+        【WHY: queue 経由の inject】
+        - 通常応答ターン中の挙手承認 → IDLE 復帰時に自然に次ターンとして処理される
+        - VOICEPEAK FIFO 順序が保たれる (= 1 ターン内で 1 直列)
+        - callout 経路と完全に同じコードパスを通る (= 廃棄経路の構造的消滅)
+
+        Args:
+            slug:                承認された target キャラ slug
+            transcript_snapshot: 挙手判定時の TranscriptBuffer 文字列
+                                 (= 通常 callout の wake_word 転写と同じ役割)
+        """
+        if dispatcher_ref is None or dispatcher_ref[0] is None:
+            logger.warning(
+                "on_approval_replay: dispatcher_ref 未設定 [character=%s] "
+                "(= F-3 wiring 未完了の可能性、no-op で skip)",
+                slug,
+            )
+            return
+        # transcript_snapshot は文字列前提 (= 通常 callout 経路の transcript と同型)。
+        # None / 空文字なら空文字でキューに inject (= run_pipeline は空文字でも処理可能)。
+        transcript_text = str(transcript_snapshot) if transcript_snapshot else ""
+        wake_result = WakeWordResult(
+            keyword="<approval>",  # 専用識別子 (= 通常 wake と区別、ログで判別容易)
+            character_slug=slug,
+            keyword_index=-1,
+            transcript=transcript_text,
+        )
+        try:
+            dispatcher_ref[0].on_wake_detected(wake_result)
+            logger.info(
+                "on_approval_replay: callout 経路 inject 完了 "
+                "[character=%s] transcript_len=%d",
+                slug, len(transcript_text),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "on_approval_replay: on_wake_detected inject 失敗 [character=%s]: %s",
+                slug, exc,
+            )
+
+    return (
+        on_handraise_started,
+        on_handraise_phrase_pending_release,
+        on_handraise_close,
+        on_approval_replay,
     )
 
 
