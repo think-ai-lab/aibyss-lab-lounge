@@ -993,21 +993,19 @@ class TestRunLoopBgContinuousWiring:
         assert callable(dispatcher_kwargs["on_bubble_update"])
 
     def test_dispatcher_receives_phase7_callbacks(self, monkeypatch):
-        """Dispatcher kwargs の signature 検証 (Phase 0.5-F-3 で案 R 用に改変)。
+        """Dispatcher kwargs の signature 検証 (Phase 0.5-F-3 → F-4-f-2 で簡素化)。
 
         【改変履歴】
         - Phase 0.5-A: bg_runner / on_handraise_started / on_handraise_phrase_pending_release
           / on_handraise_approved の 4 callable
         - Phase 0.5-B-β-2 commit 3: on_handraise_close 追加 (= 5 callable)
         - Phase 0.5-D-d-2: on_approval_progressing 追加 (= 6 callable)
-        - **Phase 0.5-F-3 (本テスト改変)**: 案 R 経路に統合
-          - bg_runner=None (= LLM 先行計算なし、Phase 0.5-A 案 W'-1 破棄)
-          - on_handraise_approved=None (= 承認時 callout 経路統合)
-          - on_approval_progressing=None (= bridge filler 専用経路廃止、R-1-b)
-          - on_approval_replay=callable 新規追加 (= 案 R の中核)
-
-        F-3 で本テストは案 R 用に改変済。配信事故レベル沈黙問題 (= 中間実走 13
-        シナリオ γ) への構造的対処。詳細は plan ファイル参照。
+        - Phase 0.5-F-3: 案 R 経路に統合 (= bg_runner / on_handraise_approved /
+          on_approval_progressing を None で wiring、on_approval_replay 新規)
+        - **Phase 0.5-F-4-f-2 (本テスト改変)**: 旧引数完全削除
+          - bg_runner / on_handraise_approved / on_approval_progressing 引数自体を
+            Dispatcher.__init__ から削除 (= None 固定すら不要、引数ごと消滅)
+          - 案 R 経路 (= on_approval_replay) のみが残る
         """
         from lab_lounge.run_loop import run_loop
 
@@ -1020,20 +1018,16 @@ class TestRunLoopBgContinuousWiring:
         )
 
         # 必須 kwargs が dispatcher_kwargs に含まれていること
-        assert "bg_runner" in dispatcher_kwargs
         assert "on_handraise_started" in dispatcher_kwargs
         assert "on_handraise_phrase_pending_release" in dispatcher_kwargs
-        assert "on_handraise_approved" in dispatcher_kwargs
         assert "on_handraise_close" in dispatcher_kwargs
         assert "on_approval_replay" in dispatcher_kwargs
 
-        # 案 R: 廃止経路は None 固定
-        assert dispatcher_kwargs["bg_runner"] is None, (
-            "案 R では bg_runner=None (= LLM 先行計算なし)"
-        )
-        assert dispatcher_kwargs["on_handraise_approved"] is None, (
-            "案 R では on_handraise_approved=None (= callout 経路統合)"
-        )
+        # F-4-f-2: 旧 kwargs (bg_runner / on_handraise_approved / on_approval_progressing)
+        # は引数自体が削除されているので存在しないことを確認
+        assert "bg_runner" not in dispatcher_kwargs
+        assert "on_handraise_approved" not in dispatcher_kwargs
+        assert "on_approval_progressing" not in dispatcher_kwargs
 
         # 残る経路は callable
         assert callable(dispatcher_kwargs["on_handraise_started"])

@@ -1027,13 +1027,10 @@ def run_loop(
             on_queue_update=_publish_queue_update,
             on_handraise_update=_publish_handraise_update,
             on_bubble_update=_publish_bubble_from_dispatcher,
-            # Phase 0.5-F-3: 案 R wiring (= 廃止経路を None に、新経路を有効化)
-            bg_runner=None,                      # ★ LLM 先行計算なし
+            # Phase 0.5-F-3: 案 R wiring (= F-4-f-2 で旧引数完全削除済、案 R 経路のみ)
             on_handraise_started=_on_handraise_started,
             on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
-            on_handraise_approved=None,          # ★ 承認専用経路を廃止
             on_handraise_close=_on_handraise_close,
-            on_approval_progressing=None,        # ★ bridge filler 専用経路を廃止 (R-1-b)
             on_approval_replay=_on_approval_replay,  # ★ 案 R の中核 (= callout 経路統合)
             status_manager=status_manager,
         )
