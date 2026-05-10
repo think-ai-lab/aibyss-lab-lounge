@@ -1457,9 +1457,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    # Phase 0.5-D-e-4-2 で導入していた L2_FALLBACK_TIMEOUT_SEC 起動時ログは
-    # F-4-a で `_approved_synthesize_fallback` (= timeout の唯一 caller) を削除した
-    # 時点で意味を失った (= env var が読まれなくなったため)。F-4-g で削除。
     record_seconds = args.record_seconds or float(
         os.environ.get("L2_RECORD_SECONDS", "5")
     )
