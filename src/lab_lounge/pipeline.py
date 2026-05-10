@@ -386,13 +386,6 @@ def _run_pipeline_graph(
         "stream_context": stream_context,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
-        # Phase 0.5-D-1b: 通常応答経路では既存挙動 (= ask_character の対話 TTS chunks
-        # を即時 _playback_queue に投入) を維持する。caller LLM が ToolNode 戻り値
-        # 「【target からの応答】... 上記は target が話した内容です」を読んで自分の
-        # リアクションを組み立てる前に target の TTS が再生されている必要がある
-        # (= 視聴者には「target が話した → caller がリアクション」の自然な流れに
-        # なる、defer=True にすると逆順バグ)。
-        "defer_chunks_for_ask_character": False,
         "suppress_bubble_answering": suppress_bubble_answering,
         "disable_tools": disable_tools,
         # Phase 0.5-B-α: status_manager は run_loop から透過渡し。
