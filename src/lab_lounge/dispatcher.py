@@ -162,22 +162,20 @@ class HandraiseState:
     Phase 0.5-A で使う挙手中キャラの状態。
 
     Block 0 で予約された target_slug + started_at に加え、Phase 0.5-A で
-    BG LLM スレッド管理 / lapse タイマー / bubble 表示用フィールドを追加。
-    フェーズ 5b で API メソッドが state を読み書きし、フェーズ 7 で
-    bg_thread / phrase_path 再生の実体組込を行う。
+    lapse タイマー / bubble 表示用フィールドを追加。F-4-d/f-2 で旧 BG LLM
+    関連 (bg_thread / bg_result) は完全削除済 (= 案 R で raisehand を callout
+    経路に統合した結果、LLM 先行計算は不要)。
 
     フィールド:
       target_slug:           挙手中キャラの slug (一意キー)
       started_at:            time.monotonic() 基準の開始時刻 (HUD 表示用 age 算出)
-      transcript_snapshot:   挙手判定時の TranscriptBuffer snapshot (T7 で再生成)
-      cancel_event:          却下/lapse 時に set。BG LLM はベストエフォートで観察
-      bg_thread:             BG LLM 生成スレッド (フェーズ 7 で起動、5 では None)
-      bg_result:             BG LLM 生成結果。``HandraiseBgResult`` または None。
-                             フェーズ 7 で実体投入 (フェーズ 5b は None のまま)
-      bg_completed:          BG LLM 完了フラグ (フェーズ 5 では即座 set で no-op)
+      transcript_snapshot:   挙手判定時の TranscriptBuffer snapshot (承認時 replay 経路に渡す)
+      cancel_event:          却下/lapse 時に set (= 既存の cleanup シグナル経路維持)
+      bg_completed:          F-4-d 以降は _start_handraise で即時 set されるため、
+                             承認時 wait は実質 no-op (= 環境変数 timeout 維持の整合のみ)
       phrase:                bubble.text 用、handraise wav と同じテキスト
-      phrase_path:           handraise wav パス (フェーズ 7 で再生)
-      se_pending:            応答中なら True (フェーズ 7 で on_pipeline_complete 後発火)
+      phrase_path:           handraise wav パス
+      se_pending:            応答中なら True (= on_pipeline_complete 後 release 発火)
       lapse_timer:           threading.Timer。utterance count 上限超過でも発火
       utterance_count_since: 挙手以降のルカ発話数 (8 で lapse)
       trace_id:              handraise 単位の trace_id (bubble.update / handraise.update に付与)
@@ -830,13 +828,13 @@ class Dispatcher:
         target_slug: str,
         transcript_snapshot: Any,
     ) -> None:
-        """挙手状態を作成 + lapse_timer 起動 + BG LLM 起動 + 通知発火 (Phase 0.5-A)。
+        """挙手状態を作成 + lapse_timer 起動 + 通知発火 (Phase 0.5-A → F-4-d 簡素化)。
 
         冪等性: target_slug が既に handraising 中なら no-op。
 
-        フェーズ 7 で BG LLM スレッド (= ``self._bg_runner``) を起動。bg_runner が
-        None の場合 (= テスト用 / 未注入) は ``state.bg_completed.set()`` で即座に
-        完了状態にし、承認時に run_loop の fallback (= 同期再生成) パスに流れる。
+        F-4-d で旧 BG LLM 起動経路 (= bg_runner) を完全廃止。`state.bg_completed.set()`
+        を即時呼び、承認時の wait は no-op で即 return → `on_approval_replay` (案 R)
+        で callout 経路に統合される。
 
         bubble.update(handraise) は ttl_ms=None で発行 (承認/却下/lapse まで保持)。
         ``on_handraise_started`` callback は Lock 解除後に発火し、run_loop が
@@ -899,29 +897,18 @@ class Dispatcher:
         # publish 順序: status.update → bubble.update(handraise) → handraise.update。
         # HUD 側は status.update を先に観察してから bubble の詳細を処理する流れと整合。
         #
-        # Phase 0.5-D-d-1: RAISEHAND → RAISEHAND_PROGRESSING (= bg_runner 起動と同
-        # タイミング、HUD で「先行思考中」ローディング表示)。
-        #
-        # bg_runner=None または bg_runner 起動失敗の経路では bg_completed が既に
-        # set() 済 (上の Lock 内 / except 経路) なので、その場合は直後に
-        # RAISEHAND_READY も反映して HUD を「準備完了」表示に進める (= 構造的に
-        # 「PROGRESSING → READY」の自然遷移を維持、テスト経路 + 起動失敗時のフォール
-        # バック経路含む)。実 BG LLM が動く経路では _bg_set_result の完了時に
-        # RAISEHAND_READY が反映される (= こちらは独立経路、無関係)。
+        # Phase 0.5-D-d-1: RAISEHAND_PROGRESSING → RAISEHAND_READY 遷移。
+        # F-4-d で bg_runner 経路廃止 → bg_completed は常に即 set 済のため、
+        # PROGRESSING の直後に READY も反映する (= 「PROGRESSING → READY」の自然遷移を
+        # 維持、HUD で「準備完了」表示に進める)。
         if self._status_manager is not None:
             self._status_manager.set_status(
                 target_slug, CharacterStatus.RAISEHAND_PROGRESSING,
             )
-            # bg_completed が既に set 済 (= bg_runner=None / 起動失敗) なら READY 反映
-            with self._lock:
-                state_now = self._handraise_states.get(target_slug)
-                bg_already_completed = (
-                    state_now is not None and state_now.bg_completed.is_set()
-                )
-            if bg_already_completed:
-                self._status_manager.set_status(
-                    target_slug, CharacterStatus.RAISEHAND_READY,
-                )
+            # bg_completed は _start_handraise 内で常に即 set 済 → READY 反映
+            self._status_manager.set_status(
+                target_slug, CharacterStatus.RAISEHAND_READY,
+            )
         # publish + 物理通知も Lock 外 (callback の長時間処理が dispatcher を止めない)
         self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="handraise")
         self._publish_handraise_update()
@@ -959,30 +946,16 @@ class Dispatcher:
         引き取る (BG LLM 結果 or 最新 buffer での再生成と TTS 開始タイミングを
         同期させるため、dispatcher 側では bubble の next step を発行しない)。
 
-        Phase 0.5-A フェーズ 7: state pop の直前に bg_result / transcript_snapshot
-        を抽出して、Lock 解除後に ``on_handraise_approved`` callback で run_loop に
-        引き渡す。run_loop は bg_result.chunks を専用 mini playback worker で再生する。
-        bg_result が None の場合は run_loop が同期 fallback (再生成) に流す。
+        Phase 0.5-A フェーズ 7 → F-4-d/f-2 で簡素化: state pop + transcript_snapshot
+        抽出 → Lock 解除後に ``on_approval_replay`` (案 R) callback で run_loop に
+        引き渡す。run_loop は callout 経路と同じ ``run_pipeline`` で承認応答を生成する。
 
-        【Phase 0.5-D-d-2: daemon thread 化】
-        承認時に BG LLM 未完了 (= bg_completed が未 set) の場合、daemon thread 内で
-        最大 30 秒 wait してから本処理 (= ``_approve_after_bg_complete``) を実行する。
-        これにより:
-        - approval 早すぎで BG LLM 進行中なら、完了を待ってから state pop + callback
-          (= bg_result が ready で本来の streaming spawn 経路を取れる)
-        - 完了済みなら wait は即 return (= 既存テストへの影響なし)
-        - timeout 30 秒経過で諦めて本処理 (= bg_result=None で fallback パス、真の救済)
-
-        さらに progressing 経路では ``on_approval_progressing`` callback を発火して
-        run_loop が bridge filler を即時再生する (= 30 秒沈黙の配信事故レベル対処)。
-        ただし ``state.se_pending=True`` (= RESPONDING 中) のキャラは発火しない
-        (= 通常応答 TTS との 3 重音声重なり UX 崩壊を防ぐ、★R4 対処)。
-
-        【WHY: daemon thread にする理由】
-        wake_event 処理スレッドが 30 秒ブロックされるのを避ける (= 次の wake_event
-        を処理できなくなるのを防ぐ)。bg_completed 即 set 済 (= 既存挙動) の場合は
-        wait() が即 return するため、daemon thread 起動コスト数 ms のみで結果同じ。
-        既存テストは polling pattern で対応可能 (= max 0.5s の polling で抜ける)。
+        【daemon thread 化 (Phase 0.5-D-d-2)】
+        本メソッドは daemon thread 内で ``_approve_after_bg_complete`` を呼ぶ設計を
+        維持 (= wake_event 処理スレッドのブロック回避)。F-4-d で bg_runner 廃止に
+        伴い ``bg_completed`` は常に即 set 済 → wait() は即 return する。
+        ``_approval_bg_completed_timeout`` は環境変数 (`L2_APPROVAL_BG_TIMEOUT_SEC`)
+        との後方互換維持のため残してあるが、実質 no-op。
         """
         if not self._use_handraise:
             return
