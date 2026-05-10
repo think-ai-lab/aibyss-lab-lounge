@@ -312,33 +312,20 @@ def _run_pipeline_with_pool_context(
     Phase 0.5-D-e-3 で run_pipeline から切り出し。timeout 経路でも本関数を
     別 thread から呼ぶことで contextvars は thread copy 経由で透過する。
     """
-    # Phase 0.5-D-e-2: LLM client pool key を contextvars にセット。
-    # run_pipeline は通常応答 / fallback パスの入口なので mode="normal"。
-    # bg_runner との connection pool 競合を構造的に解消するため (= take 3
-    # の二重 hang 対策)、graph._get_llm_for_agent はこの contextvars を
-    # 読んで pool key を決定する。try/finally で必ず reset (= 同 thread
-    # 内の前後ターンへの漏洩防止)。
-    from .graph import _llm_client_session_id_var, _llm_client_mode_var
-    sid_token = _llm_client_session_id_var.set(session_id)
-    mode_token = _llm_client_mode_var.set("normal")
-    try:
-        return _run_pipeline_graph(
-            text,
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            utterance_meta=utterance_meta,
-            speaker_hint=speaker_hint,
-            on_tts_chunk_ready=on_tts_chunk_ready,
-            on_pose_ready=on_pose_ready,
-            stream_context=stream_context,
-            suppress_bubble_answering=suppress_bubble_answering,
-            disable_tools=disable_tools,
-            status_manager=status_manager,
-        )
-    finally:
-        _llm_client_session_id_var.reset(sid_token)
-        _llm_client_mode_var.reset(mode_token)
+    return _run_pipeline_graph(
+        text,
+        stream_id=stream_id,
+        session_id=session_id,
+        trace_id=trace_id,
+        utterance_meta=utterance_meta,
+        speaker_hint=speaker_hint,
+        on_tts_chunk_ready=on_tts_chunk_ready,
+        on_pose_ready=on_pose_ready,
+        stream_context=stream_context,
+        suppress_bubble_answering=suppress_bubble_answering,
+        disable_tools=disable_tools,
+        status_manager=status_manager,
+    )
 
 
 def _run_pipeline_graph(
