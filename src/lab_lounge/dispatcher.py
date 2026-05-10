@@ -285,6 +285,7 @@ class Dispatcher:
         ] | None = None,
         on_handraise_close: Callable[[str, str], None] | None = None,
         on_approval_progressing: Callable[[str], None] | None = None,
+        on_approval_replay: Callable[[str, Any], None] | None = None,
         status_manager: CharacterStatusManager | None = None,
         max_events: int = DRAIN_MAX_EVENTS,
         max_age_sec: float = DRAIN_MAX_AGE_SEC,
@@ -335,6 +336,15 @@ class Dispatcher:
                 ``state.se_pending=True`` (= RESPONDING 中) のキャラには発火されない
                 (= 通常応答 TTS との 3 重音声重なり防止、★R4 対処)。None 時は通知
                 スキップ (= 後方互換、Phase 0.5-D-d 以前と同じ挙動)。
+            on_approval_replay: 承認 (``on_approval_granted``) 時、案 R 経路に切替えた
+                ときに呼ばれる callback (Phase 0.5-F-1 で導入)。引数
+                ``(target_slug, transcript_snapshot)``。run_loop は内部で
+                ``dispatcher.on_wake_detected(WakeWordResult(transcript=...))`` を
+                呼んで callout 経路と統合する想定。
+                None 時は **既存の `on_handraise_approved` 経路を使う** (= 後方互換)、
+                non-None 時は **`on_handraise_approved` を skip して replay 優先** で
+                呼ばれる。これにより opt-in で新経路に切替できる (= partial revert
+                容易性のため、Phase 0.5-F-1 の最小単位として追加)。
             status_manager: 全キャラのステータス (Ready/Thinking/ToolCalling/Raisehand/
                 Talking) を一元管理する CharacterStatusManager (Phase 0.5-B-α)。
                 本クラスは handraise 経路 (start / approval_granted / approval_denied /
@@ -373,6 +383,11 @@ class Dispatcher:
         # Phase 0.5-D-d-2: 承認時 BG LLM 未完了 → bridge filler 即時再生 callback
         # (run_loop が注入)。state.se_pending=True のキャラには発火しない。
         self._on_approval_progressing = on_approval_progressing
+        # Phase 0.5-F-1: 案 R 経路に切替えるための新規 callback。
+        # 承認時に non-None なら on_handraise_approved を skip して replay 経路を
+        # 採用する (= callout 経路と完全統合、廃棄経路の構造的消滅)。
+        # 詳細は `_approve_after_bg_complete` の分岐コメント参照。
+        self._on_approval_replay = on_approval_replay
         # Phase 0.5-B-α: 全キャラ状態を一元管理する Manager (handraise 経路で
         # Raisehand / Ready を反映)。None 時は status 反映スキップ (後方互換)。
         self._status_manager = status_manager
@@ -1199,6 +1214,22 @@ class Dispatcher:
         if self._status_manager is not None:
             self._status_manager.set_status(target_slug, CharacterStatus.READY)
         self._publish_handraise_update()
+        # Phase 0.5-F-1: 案 R 経路への opt-in 分岐。
+        # `on_approval_replay` が non-None なら、案 R (= raisehand を callout 経路に
+        # 統合) の経路を取り、`on_handraise_approved` は **skip** する。これにより:
+        #   - F-1 commit (本 commit) では callback 受け取り + 分岐のみ追加 (既存挙動不変)
+        #   - F-3 commit で run_loop が `on_approval_replay=replay_callback` を渡すと、
+        #     opt-in で案 R 経路に切替 (= bg_runner 廃止、defer モード廃止、
+        #     fallback 廃止、callout 経路と完全統合)
+        # WHY: 既存 `on_handraise_approved` 経路を一切変えずに新経路を opt-in で
+        # 導入することで、commit 単位で動作切替できる (= partial revert 容易性最優先)。
+        if self._on_approval_replay is not None:
+            try:
+                self._on_approval_replay(target_slug, transcript_snapshot)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_approval_replay callback failed: %s", exc)
+            return  # ★ replay 経路採用時は on_handraise_approved を呼ばない
+
         # Phase 0.5-A フェーズ 7: 承認後の TTS 再生 + bubble.update("answering") を
         # run_loop に委譲。dispatcher は state 管理のみで、IO は run_loop の責務。
         if self._on_handraise_approved is not None:

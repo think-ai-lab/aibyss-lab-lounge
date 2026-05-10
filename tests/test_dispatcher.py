@@ -79,6 +79,24 @@ class TestDispatcherInit:
         assert d._on_handraise_update is None
         assert d._on_bubble_update is None
 
+    # ─── Phase 0.5-F-1: on_approval_replay callback ──────────────────
+
+    def test_on_approval_replay_default_is_none(self):
+        """on_approval_replay は default None (= F-1 で追加された opt-in callback)。
+
+        Phase 0.5-F-1 (案 R 移行): 既存 on_handraise_approved 経路を破壊せず、
+        opt-in で案 R 経路に切替できるよう default None。non-None なら
+        approve 後に on_handraise_approved を skip して replay を呼ぶ仕様。
+        """
+        d = Dispatcher()
+        assert d._on_approval_replay is None
+
+    def test_on_approval_replay_stored_when_provided(self):
+        """on_approval_replay=callable を渡すと self._on_approval_replay に格納される。"""
+        replay_callback = lambda slug, snapshot: None  # noqa: E731
+        d = Dispatcher(on_approval_replay=replay_callback)
+        assert d._on_approval_replay is replay_callback
+
     def test_default_use_handraise_is_true(self, monkeypatch):
         """L2_USE_HANDRAISE 未設定時は True (default)。"""
         monkeypatch.delenv("L2_USE_HANDRAISE", raising=False)
