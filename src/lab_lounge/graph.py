@@ -120,13 +120,7 @@ def _load_mcp_tools(
                         ターン毎に Agent 構築されるため、ログを「どのキャラの Agent
                         のためのツール登録か」識別できるようにする。
         disable_tools:  特定ツールを除外するためのリスト (例: ["ask_character"])。
-                        Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A) で追加。
-                        実走 logs/runs/run_loop_20260508_181051.log で観察された
-                        fallback パス + ask_character + 並行 TTS の deadlock を
-                        回避するため、_approved_synthesize_fallback 経路で
-                        ["ask_character"] を渡して同ツールを無効化する。
-                        通常応答ターン (= bg_result=ready 経路) では None で
-                        全ツール有効 (= キャラ間協働応答が動作)。
+                        None で全ツール有効 (= キャラ間協働応答が動作)。
     """
     disable_set = set(disable_tools or [])
     # ログ強化 L-2: 3 行に分かれていたツール登録ログを 1 行に集約 (冗長削減)。
