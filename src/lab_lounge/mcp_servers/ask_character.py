@@ -895,16 +895,32 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                             session_id, character,
                         )
                         return
+                    # Phase 0.5-F-3-fix (= 中間実走 14 シナリオ 1 で発覚した HUD 早期 READY 遷移修正):
+                    # 導入セリフ chunk は **caller 応答全体の中の中間 chunk** であって、
+                    # 真の最後ではない。VOICEPEAK の合成単位で is_last=True が立つが、
+                    # 後続する caller まとめ TTS の最後 chunk が真の caller 応答最終。
+                    # is_last=False に強制することで、`_run_playback_worker` の
+                    # 「is_last=True chunk 物理再生完了時に set_status(READY)」ロジック
+                    # (= run_loop.py:1897、Phase 0.5-B-β-3 commit 2 導入) の誤発火を防ぐ。
+                    #
+                    # 【WHY: F-3 wiring 切替で顕在化したが本質的に F-3 以前から潜在】
+                    # 本バグは Phase 0.5-B-β-3 commit 2 から潜在していたタイミング依存
+                    # バグ。callout 経路では caller まとめ LLM が ask_character 完了より
+                    # 遅く完了する場合が多く偶然顕在化していなかったが、Gemini 多段階
+                    # ask_character の高速ケース (= 中間実走 14 シナリオ 1) で顕在化。
+                    # 案 R wiring (F-3) で raisehand 承認経路も callout 経路と同じ
+                    # `run_pipeline` を通るようになり、同じ条件で顕在化しやすくなった。
+                    is_last_safe = False
                     if _defer_chunks_var.get():
                         # BG LLM 経路: buffer 蓄積 (= 承認時に専用 mini worker で再生)
                         chunk = {
                             "url": url, "text": chunk_text,
-                            "is_last": is_last, "character": character,
+                            "is_last": is_last_safe, "character": character,
                         }
                         _append_bg_chunk(session_id, chunk)
                         return
-                    # 通常応答経路: 既存挙動完全維持
-                    on_tts_chunk(url, chunk_text, is_last, character)
+                    # 通常応答経路: 既存挙動完全維持 (= ただし is_last は False 強制)
+                    on_tts_chunk(url, chunk_text, is_last_safe, character)
 
                 logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
                 tts_synthesize(
