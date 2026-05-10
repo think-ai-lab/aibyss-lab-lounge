@@ -122,30 +122,6 @@ _bg_tts_events: dict[str, list[threading.Event]] = {}
 # が、バッファ済の未再生 chunks は β-2-3 の playback queue drain で破棄する。
 _bg_cancel_flags: dict[str, threading.Event] = {}
 
-# Phase 0.5-D-1a: BG LLM 経路の対話 TTS chunks を session 単位で蓄積する buffer。
-#
-# 【WHY: ターン跨ぎ問題 (= 配信事故レベル) の根本解決のため】
-# Phase 0.5-B-β までは ask_character の対話 TTS chunks は通常応答用の
-# `_playback_queue` に直接投入されていた。しかし通常応答ターン中に挙手 BG LLM が
-# 動き、承認時に bg_result=none (= LLM 推論未完了) で fallback パスに入ると、
-# 通常応答ターン終了 → playback worker が None sentinel で break → その後に
-# ようやく完了した旧 BG LLM の ask_character chunks が queue に投入されても
-# 物理再生されない (= 数分間の無音、シナリオ 3 take 2 で観察)。
-#
-# 【解】
-# BG LLM 経路 (= run_pipeline_llm_only) では chunks を本 buffer に蓄積し、通常応答
-# `_playback_queue` には投入しない。承認時 (= run_loop.on_handraise_approved) で
-# `_drain_bg_chunks` で取得して run_pipeline_tts_only の chunks と concat し、
-# 専用 mini playback worker (= _spawn_handraise_response_playback) で再生する。
-# これにより chunks の lifecycle がターン境界から構造的に独立する。
-#
-# 【経路分岐 (= D-1b で実装)】
-# `set_ask_character_context(defer_chunks=True)` で BG LLM 経路を指定する。
-# 通常応答経路 (= defer_chunks=False、default) では本 buffer は使わず、既存挙動
-# (= `_playback_queue` 即時投入) を維持する (= 通常応答での ask_character は
-# caller LLM の戻り値ベース推論を進めるため即時再生が必要)。
-_bg_chunk_buffers: dict[str, list[dict]] = {}
-
 # Phase 0.5-D-2: defer モード (= BG LLM 経路) 用の bg_tts 完了 event 登録 dict。
 #
 # 【WHY: _bg_tts_events から分離する理由】
@@ -165,11 +141,6 @@ def _reset_session_state(session_id: str) -> None:
     with _ask_state_lock:
         _ask_counts[session_id] = 0
         _previous_targets[session_id] = ""
-        # Phase 0.5-D-1a: BG chunk buffer も同時にリセット。
-        # 前ターンの未承認 buffer が残ると、次ターンの通常応答経路には影響しない
-        # (= defer_chunks=False で buffer を読まない) が、続く挙手 BG LLM ターンで
-        # 想定外の合算が起こりうるため、ターン開始時に明示的にクリアする。
-        _bg_chunk_buffers.pop(session_id, None)
         # Phase 0.5-D-2: deferred bg_tts events も同 session 分クリーン
         # (= 前ターンの未消化 event が残らないように)
         _deferred_bg_tts_events.pop(session_id, None)
@@ -195,72 +166,6 @@ def _record_target(session_id: str, target_display: str) -> None:
         return
     with _ask_state_lock:
         _previous_targets[session_id] = target_display
-
-
-# ─── Phase 0.5-D-1a: BG chunk buffer 操作 API ──────────────────────
-# BG LLM 経路で生成された対話 TTS chunks を session 単位で蓄積/取得/カウントする。
-# `_bg_chunk_buffers` dict 直接操作の代わりに本 API 経由で `_ask_state_lock` 配下
-# の atomic 操作にする (= 並行 daemon thread からの append と承認 callback からの
-# drain の race を防ぐ)。
-#
-# 【module-private】
-# `_` 接頭辞で示す通り module-private API。外部は run_loop 経由で `drain_bg_chunks`
-# (D-1b で公開ラッパー追加予定) を呼ぶ。本 phase (D-1a) では未配線のため、テスト
-# 以外からは呼ばれない。
-
-def _append_bg_chunk(session_id: str, chunk: dict) -> None:
-    """指定 session の BG chunk buffer に chunk dict を末尾追加する。
-
-    `_wrapped_on_chunk_ready` (= ask_character.py 内 closure、D-1b で配線) から
-    defer モード時に呼ばれる。chunk dict は `_run_playback_worker` が読む形式
-    (`{"url", "text", "is_last", "character", "pose"?}`) を想定。
-
-    Args:
-        session_id: BG LLM の session_id (空文字なら no-op、後方互換)
-        chunk:      playback worker 用 chunk dict
-    """
-    if not session_id:
-        return
-    with _ask_state_lock:
-        _bg_chunk_buffers.setdefault(session_id, []).append(chunk)
-
-
-def _drain_bg_chunks(session_id: str) -> list[dict]:
-    """指定 session の BG chunk buffer を atomic に取得 + クリアする。
-
-    `run_loop.on_handraise_approved` (= 承認時、D-2 で配線) と
-    `_approved_synthesize_fallback` (= fallback 起動時、D-4 で配線) と
-    `cancel_bg_tts` (= 却下/lapse 時、D-3 で統合) から呼ばれる。
-
-    取得 + クリアを `_ask_state_lock` 配下で atomic に行うため、append 中の
-    chunk が「取得後に追加されて drain で見逃される」race は発生しない (=
-    drain 時点までの chunks は確実に取得される、それ以降は新 buffer に蓄積)。
-
-    Args:
-        session_id: BG LLM の session_id (空文字なら no-op、空 list 返却)
-
-    Returns:
-        蓄積された chunks の list (= 順序保証、append 順)。未蓄積なら空 list。
-    """
-    if not session_id:
-        return []
-    with _ask_state_lock:
-        return _bg_chunk_buffers.pop(session_id, [])
-
-
-def _peek_bg_chunks_count(session_id: str) -> int:
-    """指定 session の BG chunk buffer の chunks 数を返す (debug/テスト用、変更しない)。
-
-    Args:
-        session_id: BG LLM の session_id (空文字なら 0)
-
-    Returns:
-        蓄積済 chunks の数 (= 未蓄積/未知 session は 0)
-    """
-    if not session_id:
-        return 0
-    with _ask_state_lock:
-        return len(_bg_chunk_buffers.get(session_id, []))
 
 
 def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
@@ -345,24 +250,10 @@ def cancel_bg_tts(session_id: str) -> int:
         n_normal = len(_bg_tts_events.get(session_id, []))
         n_deferred = len(_deferred_bg_tts_events.get(session_id, []))
         n = n_normal + n_deferred
-        # Phase 0.5-D-2-α (= D-3 前倒し): defer モードで buffer に蓄積された chunks
-        # も同時に drain (= 完全クリーン)。
-        #
-        # 【WHY: cancel と drain を統合する】
-        # 却下/lapse/fallback 起動時に「(a) 後続 chunks 投入を阻止 (= cancel_flag set)」
-        # と「(b) 既蓄積 chunks の破棄 (= buffer drain)」は同じ意味論的タイミングで
-        # 発火するべき。これを 2 つの API に分けると呼出側で「片方忘れる」不具合が
-        # 起こりやすい (= 実走テスト 2026-05-09 で発見した「fallback パスでは
-        # buffer drain されず chunks が蓄積されたまま放置」現象)。1 関数で両方を
-        # 統合することで構造的に漏れを防ぐ。
-        #
-        # 影響範囲: TestHandraiseCloseFlow / TestLlmOnlyAskCharacterDenialDrain は
-        # cancel_bg_tts の呼出を spy しているだけなので無変更で pass する想定。
-        drained_buffer_chunks = _bg_chunk_buffers.pop(session_id, [])
     logger.info(
         "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d "
-        "(normal=%d, deferred=%d) drained_buffer_chunks=%d",
-        session_id, n, n_normal, n_deferred, len(drained_buffer_chunks),
+        "(normal=%d, deferred=%d)",
+        session_id, n, n_normal, n_deferred,
     )
     return n
 
@@ -468,9 +359,6 @@ def reset_ask_character_context() -> None:
         _previous_targets.clear()
         _bg_tts_events.clear()
         _bg_cancel_flags.clear()
-        # Phase 0.5-D-1a: BG chunk buffer も全 session 分クリーン
-        # (= テスト間の漏れ防止、後方互換性に影響なし)
-        _bg_chunk_buffers.clear()
         # Phase 0.5-D-2: deferred bg_tts events も全 session 分クリーン
         _deferred_bg_tts_events.clear()
     # Phase 0.5-D-e-2: LLM client pool もテスト間で漏れないようクリア。
