@@ -1624,6 +1624,65 @@ class TestCancelGuardLeakageFix:
             f"(実際: {intro_callbacks})"
         )
 
+    def test_intro_chunk_is_last_forced_to_false(self, monkeypatch):
+        """Phase 0.5-F-3-fix: 導入セリフ chunk の is_last は False に強制される。
+
+        【WHY: HUD 早期 READY 遷移バグの修正】
+        中間実走 14 シナリオ 1 (= run_loop_20260510_154412.log) で観察:
+        - chisame Gemini 多段階 ask_character ケース
+        - chisame 導入セリフ chunk 1 (VOICEPEAK 合成単位で is_last=True) の
+          物理再生完了時に `_run_playback_worker` の line 1897 ロジックが
+          `set_status(chisame, READY)` を発火 → talking → ready 誤遷移
+        - しかし真の caller 応答最終 chunk は別途 chisame まとめ TTS の最後
+
+        導入セリフは「caller 応答全体の中の中間 chunk」のため is_last=False
+        に強制し、playback worker の早期 READY 遷移を防ぐ。
+        """
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-intro-is-last-fix"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # fake_synth で is_last=True のまま on_chunk を呼ぶ (= VOICEPEAK 合成単位の最終)
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "mimi":
+                # 導入セリフは 1 chunk で完結 → is_last=True で投入される (VOICEPEAK 単位)
+                on_chunk(f"file://{speaker}_intro.wav", "ふふ", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "ok", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="まあ、ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+
+        # 導入セリフ chunk が callback に流れた
+        intro_callbacks = [c for c in callback_invocations if c[3] == "mimi"]
+        assert len(intro_callbacks) >= 1, (
+            f"導入セリフ chunk が callback に流れていない (実際: {callback_invocations})"
+        )
+        # ★ 全ての導入セリフ chunk で is_last=False に強制されている
+        for cb in intro_callbacks:
+            url, chunk_text, is_last, character = cb
+            assert is_last is False, (
+                f"導入セリフ chunk の is_last は False に強制される "
+                f"(実際: is_last={is_last} chunk_text={chunk_text!r})"
+            )
+
     def test_bridge_filler_skip_when_cancel_flag_set(self, monkeypatch):
         """bridge filler 投入が cancel_flag set 後に skip される。
 
