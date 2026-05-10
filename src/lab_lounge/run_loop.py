@@ -2152,45 +2152,62 @@ def run_loop(
         # Phase 0.5-B-α: status_manager も factory に注入し、挙手承認応答経路で
         # Talking + Ready を反映できるようにする。
         # Phase 0.5-B-β-1 commit 3: ask_character の対話 TTS を BG LLM 経路でも
-        # playback queue に届けるため、_on_tts_chunk / _on_pose_ready の最新を
-        # bg_runner から参照できる mutable list ラッパーを factory に渡す。
-        # 中身は ターンループ内 (_on_tts_chunk 構築直後) で [0] に書き込む。
-        # IDLE 中 (= ターン外) の挙手では [0] = 前回ターンの closure or None で、
-        # _playback_queue 自体が None なので安全 (= 既存ガードで no-op)。
-        # Phase 0.5-B-β-2 commit 3: 同パターンで _current_playback_queue を追加。
-        # on_handraise_close callback が drain task を投入する経路の最新参照。
+        # Phase 0.5-F-3: 案 R wiring 切替 ★大きな挙動変更点★
+        # 既存 `_create_handraise_runner_and_callbacks` (= 6-callable factory) から
+        # `_create_replay_runner_and_callbacks` (= 4-callable factory) に切替える。
+        #
+        # 【WHY: 案 R に切替えると何が変わる】
+        # - bg_runner=None: 挙手中の LLM 先行計算を停止 (= Phase 0.5-A 案 W'-1 の破棄)
+        # - on_handraise_approved=None: 承認時の専用経路を廃止
+        # - on_approval_replay=replay_callback: 承認時に dispatcher.on_wake_detected で
+        #   wake_event queue に inject → 次ターンとして callout 経路 (= run_pipeline) で
+        #   処理 → 視聴者に音声が確実に届く
+        # - on_approval_progressing=None: bridge filler 専用経路を廃止 (= R-1-b、
+        #   通常応答 filler に統合される、F-8 で詳細実装予定)
+        #
+        # この commit 以降、raisehand 承認の挙動は callout 経路と完全統合される。
+        # 中間実走 13 シナリオ γ で観察された「TTS 4 系統廃棄経路 → 5 分以上沈黙」は
+        # 構造的に解消される (= callout 経路は廃棄経路を持たない)。
+        #
+        # 【既存 mutable list ラッパー (= _current_on_tts_chunk 等) の維持】
+        # F-3 では削除しない (= F-4 で旧 factory + bg_runner / on_handraise_approved
+        # 経路の dead code を一括削除する設計)。F-3 完了時点では旧 factory も module
+        # に残るが、wiring されないので呼ばれない。partial revert は wiring 戻しで瞬時。
         _current_on_tts_chunk: list = [None]
         _current_on_pose_ready: list = [None]
         _current_playback_queue: list = [None]
+        # 案 R 用 dispatcher_ref (= late binding、Dispatcher 構築直後に [0] にセット)
+        _dispatcher_ref: list = [None]
         (
-            _bg_runner,
             _on_handraise_started,
             _on_handraise_phrase_pending_release,
-            _on_handraise_approved,
             _on_handraise_close,
-            _on_approval_progressing,  # Phase 0.5-D-d-2
-        ) = _create_handraise_runner_and_callbacks(
+            _on_approval_replay,
+        ) = _create_replay_runner_and_callbacks(
             session_stream_id=session_stream_id,
             session_id_root=session_id_root,
             stream_context=stream_context,
             status_manager=status_manager,
-            on_tts_chunk_ready_ref=_current_on_tts_chunk,
-            on_pose_ready_ref=_current_on_pose_ready,
-            playback_queue_ref=_current_playback_queue,
+            dispatcher_ref=_dispatcher_ref,
         )
 
         dispatcher = Dispatcher(
             on_queue_update=_publish_queue_update,
             on_handraise_update=_publish_handraise_update,
             on_bubble_update=_publish_bubble_from_dispatcher,
-            bg_runner=_bg_runner,
+            # Phase 0.5-F-3: 案 R wiring (= 廃止経路を None に、新経路を有効化)
+            bg_runner=None,                      # ★ LLM 先行計算なし
             on_handraise_started=_on_handraise_started,
             on_handraise_phrase_pending_release=_on_handraise_phrase_pending_release,
-            on_handraise_approved=_on_handraise_approved,
+            on_handraise_approved=None,          # ★ 承認専用経路を廃止
             on_handraise_close=_on_handraise_close,
-            on_approval_progressing=_on_approval_progressing,  # Phase 0.5-D-d-2
+            on_approval_progressing=None,        # ★ bridge filler 専用経路を廃止 (R-1-b)
+            on_approval_replay=_on_approval_replay,  # ★ 案 R の中核 (= callout 経路統合)
             status_manager=status_manager,
         )
+        # 案 R: dispatcher_ref に Dispatcher 自身を late binding で設定。
+        # on_approval_replay 内で `_dispatcher_ref[0].on_wake_detected(...)` 呼出に使う。
+        _dispatcher_ref[0] = dispatcher
         # BackgroundContinuousListener を起動。録音スレッドが回り始め、
         # 検知された wake_event は dispatcher.on_wake_detected で queue に積まれる。
         # Phase 0.5-A フェーズ 6: 全 segment を dispatcher.on_segment_added に流して
