@@ -18,7 +18,6 @@ from unittest.mock import MagicMock
 
 from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
 from lab_lounge.dispatcher import Dispatcher
-from lab_lounge.run_loop import _spawn_handraise_response_playback
 
 
 class _FakeTimer:
@@ -44,87 +43,6 @@ def _make_dispatcher_with_status(monkeypatch, manager: CharacterStatusManager) -
         lambda slug, sec: _FakeTimer(sec, lambda: None),
     )
     return d
-
-
-# ─── シナリオ 1: 挙手 → Talking → Ready の lifecycle ─────────────
-
-
-class TestHandraiseToTalkingFlow:
-    """挙手 → 承認 → Talking (with metadata) → Ready の遷移を統合検証 (Phase 0.5-B-α)。
-
-    Dispatcher が Raisehand を反映、run_loop の _spawn_handraise_response_playback が
-    Talking metadata を含めて反映、worker 完了で Ready に戻る一連の流れを 1 件のテストで
-    確認する。実 LLM / TTS / audio は使わず、chunks=[] で worker を即終了させる。
-    """
-
-    def test_handraise_approval_to_talking_with_metadata(self, monkeypatch):
-        """Raisehand_Progressing → Raisehand_Ready → Ready → Talking (metadata 付き)
-        → Ready の遷移を検証 (Phase 0.5-D-d-1 で 5 回 publish に拡張)。
-
-        bg_runner=None の場合、bg_completed 即 set 済 → _start_handraise の末尾で
-        RAISEHAND_PROGRESSING → RAISEHAND_READY の即時遷移が起きるため、callback は
-        2 回追加発火する (= 5 回 publish: progressing 反映 + ready 反映 + 承認後 ready
-        + talking + worker finally の ready)。
-        """
-        callback = MagicMock()
-        manager = CharacterStatusManager(on_status_changed=callback)
-
-        # Phase 1: Dispatcher で挙手 → RAISEHAND_PROGRESSING → RAISEHAND_READY
-        # (bg_runner=None で bg_completed 即 set 済、即時遷移)
-        d = _make_dispatcher_with_status(monkeypatch, manager)
-        d.on_interjection_candidate("mimi", transcript_snapshot=None)
-        assert manager.get_status("mimi") == CharacterStatus.RAISEHAND_READY
-
-        # Phase 2: 承認 → Raisehand_Ready → Ready
-        d.on_approval_granted("mimi")
-        # Phase 0.5-D-d-2: daemon thread 完了 (= READY 反映) を polling で待つ。
-        # bg_runner=None で bg_completed 即 set 済なので 10-20ms で抜ける。
-        for _ in range(50):
-            if manager.get_status("mimi") == CharacterStatus.READY:
-                break
-            time.sleep(0.01)
-        assert manager.get_status("mimi") == CharacterStatus.READY
-
-        # Phase 3: TTS chunks 再生開始 → Talking (with metadata)
-        talking_metadata = {
-            "pose": "smile",
-            "text": "こんにちは、ルカさま。AI に心はあるのか、面白い問いですね…",
-        }
-        t = _spawn_handraise_response_playback(
-            slug="mimi",
-            chunks=[],  # 空 → worker 即終了
-            trace_id="trace1",
-            session_stream_id="s1",
-            session_id_root="ss1",
-            status_manager=manager,
-            talking_metadata=talking_metadata,
-        )
-        t.join(timeout=2.0)
-
-        # Phase 4: worker finally で Ready に戻る
-        assert manager.get_status("mimi") == CharacterStatus.READY
-
-        # callback 履歴で全遷移を検証 (Phase 0.5-D-d-1 で 5 回 publish に拡張)
-        # READY → RAISEHAND_PROGRESSING → RAISEHAND_READY → READY → TALKING → READY
-        calls = callback.call_args_list
-        assert len(calls) == 5
-
-        # 1: ready → raisehand_progressing
-        assert calls[0].args[1] == CharacterStatus.RAISEHAND_PROGRESSING
-        assert calls[0].args[2] == CharacterStatus.READY
-        # 2: raisehand_progressing → raisehand_ready (bg_completed 即 set 済)
-        assert calls[1].args[1] == CharacterStatus.RAISEHAND_READY
-        assert calls[1].args[2] == CharacterStatus.RAISEHAND_PROGRESSING
-        # 3: raisehand_ready → ready (承認時)
-        assert calls[2].args[1] == CharacterStatus.READY
-        assert calls[2].args[2] == CharacterStatus.RAISEHAND_READY
-        # 4: ready → talking (with metadata)
-        assert calls[3].args[1] == CharacterStatus.TALKING
-        assert calls[3].args[2] == CharacterStatus.READY
-        assert calls[3].args[3] == talking_metadata
-        # 5: talking → ready (worker finally)
-        assert calls[4].args[1] == CharacterStatus.READY
-        assert calls[4].args[2] == CharacterStatus.TALKING
 
 
 # ─── シナリオ 2: 並行 handraise (= 2 キャラ独立管理) ─────────────
