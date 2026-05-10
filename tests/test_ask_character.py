@@ -624,10 +624,8 @@ class TestLlmOnlyTtsPenetration:
         ), patch("lab_lounge.tts.synthesize") as mock_synth:
             _ask_character_impl("chisame", "質問")
 
-        # gating False → tts.synthesize 一切呼ばれない (= バグ前の状態)
-        # Phase 0.5-D-d-4 確認: defer_chunks 未指定 (= default False) なら旧挙動が維持される
-        # (= 通常応答経路の callback 必須要件を変えない)。defer=True ケースは下の
-        # test_defer_true_with_callback_none_runs_tts で検証。
+        # gating False → tts.synthesize 一切呼ばれない (= on_tts_chunk=None で TTS 起動 skip、
+        # 通常応答経路の callback 必須要件)。
         mock_synth.assert_not_called()
 
 
@@ -737,44 +735,6 @@ class TestCancelBgTts:
 
         # 導入セリフ (caller=mimi) も本応答 (target=chisame) も両方 skip される
         mock_synth.assert_not_called()
-
-
-class TestDeferChunksMode:
-    """Phase 0.5-D-1b: defer_chunks フラグによる _wrapped_on_chunk_ready 分岐テスト。
-
-    set_ask_character_context(defer_chunks=True) で起動された ask_character の本応答
-    chunks (= _wrapped_on_chunk_ready 経由) は _bg_chunk_buffers に蓄積され、
-    on_tts_chunk callback には流れない。通常応答経路 (defer_chunks=False、default)
-    では既存挙動 (= 即時 callback) を完全維持する。
-
-    【BG LLM 経路と通常応答経路の分岐根拠】
-    通常応答経路では ask_character の戻り値文字列を caller LLM が読んで「target が
-    既に話した前提でリアクション」を組み立てる。即時再生でないと caller のリアクション
-    が target の発話前に流れる逆順バグになる。BG LLM 経路では承認時まで再生を遅らせて
-    いいため、ターン跨ぎ問題回避のため buffer 経路にする。
-    """
-
-    def test_set_ask_character_context_default_is_false(self):
-        """set_ask_character_context の defer_chunks 引数の default は False (= 後方互換)。"""
-        from lab_lounge.mcp_servers.ask_character import _defer_chunks_var
-        set_ask_character_context()
-        assert _defer_chunks_var.get() is False
-
-    def test_set_ask_character_context_accepts_defer_chunks_true(self):
-        """set_ask_character_context(defer_chunks=True) で contextvars に True がセットされる。"""
-        from lab_lounge.mcp_servers.ask_character import _defer_chunks_var
-        set_ask_character_context(defer_chunks=True)
-        assert _defer_chunks_var.get() is True
-
-    def test_reset_ask_character_context_resets_defer_flag(self):
-        """reset_ask_character_context で defer_chunks も False にリセットされる。"""
-        from lab_lounge.mcp_servers.ask_character import (
-            _defer_chunks_var, reset_ask_character_context,
-        )
-        set_ask_character_context(defer_chunks=True)
-        assert _defer_chunks_var.get() is True
-        reset_ask_character_context()
-        assert _defer_chunks_var.get() is False
 
 
 class TestCancelGuardLeakageFix:
