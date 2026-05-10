@@ -173,7 +173,6 @@ def run_pipeline(
     suppress_bubble_answering: bool = False,
     disable_tools: list[str] | None = None,
     status_manager=None,
-    timeout_sec: float | None = None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -200,117 +199,11 @@ def run_pipeline(
                          抑制する。挙手 BG 先行生成では承認時に run_loop が
                          TTS 開始時刻と同期して bubble を発行する設計のため、
                          graph 側の二重発行を避ける。デフォルト False で既存挙動。
-        disable_tools:   Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A) で追加。
-                         Agent から除外するツール名のリスト (例: ["ask_character"])。
-                         fallback パス (= _approved_synthesize_fallback) で
-                         ask_character ツールを除外し、並行する他キャラ TTS との
-                         deadlock を回避する (logs/runs/run_loop_20260508_181051.log
-                         で観察されたハングの対処)。デフォルト None で既存挙動。
-        timeout_sec:     Phase 0.5-D-e-3 で追加。指定時は別 thread で実行 +
-                         timeout 経過で ``TimeoutError`` を raise (= fallback
-                         自体の hang 防止経路、中間実走 11 回目 take 3 対処)。
-                         None (default) では従来通り同期実行 (= 後方互換)。
+        disable_tools:   Agent から除外するツール名のリスト (例: ["ask_character"])。
+                         デフォルト None で既存挙動。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
-
-    Raises:
-        TimeoutError: timeout_sec 指定時、その秒数を経過しても ``_run_pipeline_graph``
-                      が完了しない場合 (= bg_runner-fallback 二重 hang 等の検知)。
-    """
-    if timeout_sec is None:
-        # 従来挙動: 直接同期実行 (= 後方互換)
-        return _run_pipeline_with_pool_context(
-            text,
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            utterance_meta=utterance_meta,
-            speaker_hint=speaker_hint,
-            on_tts_chunk_ready=on_tts_chunk_ready,
-            on_pose_ready=on_pose_ready,
-            stream_context=stream_context,
-            suppress_bubble_answering=suppress_bubble_answering,
-            disable_tools=disable_tools,
-            status_manager=status_manager,
-        )
-
-    # Phase 0.5-D-e-3: timeout 付き実行 (= fallback hang 防止経路)。
-    #
-    # 【WHY: ThreadPoolExecutor + future.result(timeout=) 方式】
-    # signal.alarm は Windows 非対応 + メインスレッド限定で、本プロジェクトの
-    # daemon thread 経路 (= _approved_synthesize_fallback は別 thread 内呼出) と
-    # 整合しない。ThreadPoolExecutor は OS / thread 中立で動作する。
-    #
-    # 【R3 対処: contextvars の伝播】
-    # ThreadPoolExecutor.submit は標準では context をコピーしないため、明示的に
-    # contextvars.copy_context().run(...) で wrap して、呼出元の contextvars
-    # (= _llm_client_session_id_var / _llm_client_mode_var 等) を thread 内に
-    # 引き継ぐ。これがないと thread 内で _get_llm_for_agent が default の
-    # mode="normal" を読んで意図しない pool key を使う可能性がある。
-    #
-    # 【R4 対処: timeout 後の VOICEPEAK FIFO 残留】
-    # fallback パスでは ``disable_tools=["ask_character"]`` で ask_character の
-    # bg_tts は起こらず、TTS chunks は呼出側 ``on_chunk`` ローカル関数が貯める
-    # のみ (= playback queue 直接投入なし)。timeout 後に ``_spawn_handraise_response_playback``
-    # に進まないので、視聴者には「真の救済失敗」として無音 (= 後続別経路で対処)。
-    import concurrent.futures
-    import contextvars
-
-    ctx = contextvars.copy_context()
-
-    def _runner():
-        return _run_pipeline_with_pool_context(
-            text,
-            stream_id=stream_id,
-            session_id=session_id,
-            trace_id=trace_id,
-            utterance_meta=utterance_meta,
-            speaker_hint=speaker_hint,
-            on_tts_chunk_ready=on_tts_chunk_ready,
-            on_pose_ready=on_pose_ready,
-            stream_context=stream_context,
-            suppress_bubble_answering=suppress_bubble_answering,
-            disable_tools=disable_tools,
-            status_manager=status_manager,
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="pipeline-timeout",
-    ) as executor:
-        future = executor.submit(ctx.run, _runner)
-        try:
-            return future.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError as exc:
-            # future は cancel しない (= 内部 LLM 呼出は OS レベルで止められない)。
-            # ThreadPoolExecutor の __exit__ で wait=True 既定だが、本ケースでは
-            # 検出後に raise するためここでは abort せずに raise する。
-            # daemon thread 内であれば、呼出側 thread 終了で resource は解放される。
-            raise TimeoutError(
-                f"run_pipeline timeout ({timeout_sec}s) — "
-                f"bg_runner-fallback 二重 hang の可能性"
-            ) from exc
-
-
-def _run_pipeline_with_pool_context(
-    text: str,
-    *,
-    stream_id: str,
-    session_id: str,
-    trace_id: str,
-    utterance_meta: dict[str, Any] | None = None,
-    speaker_hint: str | None = None,
-    on_tts_chunk_ready=None,
-    on_pose_ready=None,
-    stream_context: str | None = None,
-    suppress_bubble_answering: bool = False,
-    disable_tools: list[str] | None = None,
-    status_manager=None,
-) -> PipelineResult:
-    """run_pipeline 本体 — contextvars セット + _run_pipeline_graph 呼出。
-
-    Phase 0.5-D-e-3 で run_pipeline から切り出し。timeout 経路でも本関数を
-    別 thread から呼ぶことで contextvars は thread copy 経由で透過する。
     """
     return _run_pipeline_graph(
         text,
