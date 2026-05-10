@@ -606,21 +606,10 @@ def _run_playback_worker(
                 publish_bubble_fn(last_character, "done", "")
             break
 
-        # Phase 0.5-D-2: defer 経路 chunk の物理再生直前 metadata 発火。
-        # ask_character の defer モード _wrapped_on_chunk_ready が chunk dict に
-        # 埋め込んだ `_pre_play_status` / `_pre_play_bubble` を、worker が pop した
-        # 直後 (= 物理再生開始の直前) に発火する。
-        #
-        # 【WHY: chunk 投入時ではなく物理再生時に発火する理由】
-        # 案 C リファクタで挙手中の対話 TTS chunks は buffer に蓄積されてから承認時
-        # に専用 mini playback worker で再生される。「buffer 投入時」に TALKING /
-        # answering bubble を発火すると、視聴者から「承認前なのに target が話して
-        # いる」ように見える UX 不具合が起こる。物理再生開始時に発火させることで
-        # 「実際に音声が流れ始める瞬間」と HUD 表示が同期する。
-        #
-        # 通常応答経路 (= defer=False) の chunks にはこのキーが含まれないため
-        # (= ask_character.py の defer 分岐でのみ埋め込み)、本 dispatch の影響なし
-        # = 既存挙動完全維持。
+        # chunk dict に inline metadata (`_pre_play_status` / `_pre_play_bubble`) が
+        # 埋め込まれていれば、worker が pop した直後 (= 物理再生開始の直前) に発火する。
+        # 通常 chunks にはこのキーが含まれないため、本 dispatch の影響なし
+        # (= 既存挙動完全維持)。
         if isinstance(task, dict):
             pre_play_status = task.get("_pre_play_status")
             if pre_play_status and status_manager is not None:
