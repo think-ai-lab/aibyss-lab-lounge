@@ -22,6 +22,7 @@ import functools
 import logging
 import operator
 import os
+import time
 from typing import Annotated, Any, TypedDict
 
 from .character_status import CharacterStatus, CharacterStatusManager
@@ -418,13 +419,78 @@ class BubbleToolCallbackHandler:
         # ToolCalling → Thinking を反映する。None 時は status 反映スキップ
         # (= 既存テスト互換、status_manager 未注入時の挙動維持)。
         self._status_manager = status_manager
+        # Phase 0.5-F-6-f: Agent 内部 LLM step の境界観察用 (= hang 調査ログ強化)。
+        # `on_chat_model_start` / `on_llm_end` で step 開始/完了を INFO 出力し、
+        # tool 呼出後の継続 LLM step がどこで応答停止したかを再発時に追えるようにする。
+        # parallel_tool_calls=False で逐次実行のため、単純な counter + t0 で十分。
+        self._llm_step_count = 0
+        self._llm_step_t0: float | None = None
 
     # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
     def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_chain_end(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_chat_model_start(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_llm_end(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
+
+    def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+        """Agent 内部 LLM step 開始時の境界ログ (Phase 0.5-F-6-f)。
+
+        Agent.invoke 内部で Chat model (ChatOpenAI/ChatAnthropic/ChatGoogleGenerativeAI)
+        を呼ぶたびに発火する。tool 呼出後の継続 step (= tool 結果を統合して次の action を
+        判断する LLM 呼出) もここを通る。hang 時の「どの step で停止したか」を
+        ログから読み取るための強化。
+        """
+        self._llm_step_count += 1
+        # messages は list[list[BaseMessage]] (= prompt 単位の list)。総 message 数を集計
+        try:
+            msg_count = sum(len(m) for m in messages) if messages else 0
+        except Exception:  # noqa: BLE001
+            msg_count = -1
+        logger.info(
+            "Agent LLM step %d 開始 [character=%s] msgs=%d",
+            self._llm_step_count, self._character_slug, msg_count,
+        )
+        self._llm_step_t0 = time.monotonic()
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        """Agent 内部 LLM step 完了時の境界ログ (Phase 0.5-F-6-f)。
+
+        `on_chat_model_start` 後に対応する完了ログ。latency_ms + token usage を出す。
+        hang 時はここまで到達せず、ログ末尾が `Agent LLM step N 開始` で止まる。
+        """
+        latency_ms = (
+            int((time.monotonic() - self._llm_step_t0) * 1000)
+            if self._llm_step_t0 is not None else -1
+        )
+        # token usage 取得 (LangChain LLMResult の llm_output から)
+        usage_info = ""
+        try:
+            llm_output = getattr(response, "llm_output", None) or {}
+            usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            if usage:
+                in_tok = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
+                out_tok = usage.get("output_tokens") or usage.get("completion_tokens", 0)
+                usage_info = f" tokens=in:{in_tok}/out:{out_tok}"
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info(
+            "Agent LLM step %d 完了 [character=%s] latency_ms=%d%s",
+            self._llm_step_count, self._character_slug, latency_ms, usage_info,
+        )
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        """Agent 内部 LLM step エラー時のログ (Phase 0.5-F-6-f)。
+
+        TimeoutError / APIConnectionError 等を再発時に検知できるようにする。
+        """
+        logger.warning(
+            "Agent LLM step %d エラー [character=%s]: %s: %s",
+            self._llm_step_count, self._character_slug,
+            type(error).__name__, error,
+        )
+
+    def on_chat_model_error(self, error, **kwargs) -> None:
+        """Chat model エラー時のログ (= on_llm_error と同等、Phase 0.5-F-6-f)。"""
+        self.on_llm_error(error, **kwargs)
 
     def on_tool_end(self, *args, **kwargs) -> None:
         """ツール呼び出し終了時の no-op (LangChain CallbackHandler 互換用)。
@@ -589,8 +655,6 @@ def _run_agent(
     - TD-2 context wrapper 削除 (Agent が自分で retrieve_memory ツールを呼ぶため)
     - BubbleToolCallbackHandler でツール呼び出し時に bubble.update を発行
     """
-    import time
-
     t0 = time.monotonic()
 
     # Agent への入力メッセージ (ツール判断は Agent + system_prompt のガイダンスに委ねる)
@@ -608,6 +672,15 @@ def _run_agent(
             character_slug, common, status_manager=status_manager,
         )
         config["callbacks"] = [handler]
+
+    # Phase 0.5-F-6-f: Agent.invoke 開始ログ (= hang 調査用)。
+    # 入力 text を全文 (%r) で残す。これにより再発時に
+    # 「LLM に何を渡した結果 hang したか」の証跡が確保される。改行は \n に
+    # エスケープされて 1 行ログ化されるため、長文でも grep / tail で読みやすい。
+    logger.info(
+        "Agent.invoke 開始 [character=%s] text_len=%d text=%r",
+        character_slug or "?", len(text), text,
+    )
 
     try:
         result = agent.invoke(input_data, config or None)
@@ -645,9 +718,17 @@ def _run_agent(
                     )
                 source = "structured_response"
             except Exception as exc:  # noqa: BLE001
+                # Phase 0.5-F-6-f: JSON 変換失敗の調査用に生 content を残す。
+                # 「LLM が想定外フォーマットを返した → parse 失敗」の仮説検証用。
+                # repr で長文も 1 行ログ化、300 文字で trim (= ログ膨張防止)。
+                struct_type = type(structured).__name__
+                struct_repr = repr(structured)
+                if len(struct_repr) > 300:
+                    struct_repr = struct_repr[:300] + f"...(truncated, total={len(repr(structured))} chars)"
                 logger.warning(
-                    "structured_response の JSON 変換失敗 → messages フォールバック: %s",
-                    exc,
+                    "structured_response の JSON 変換失敗 → messages フォールバック: %s "
+                    "(type=%s content=%s)",
+                    exc, struct_type, struct_repr,
                 )
                 structured = None  # フォールバックに進む
 
@@ -684,15 +765,15 @@ def _run_agent(
                     usage = getattr(msg, "usage_metadata", None) or {}
                     break
 
-        # ログ強化 L-2: キャラ識別子を先頭に出して、ターン毎にどのキャラの応答か判別容易に。
-        # text は全文出していたが、ログが長くなりがちなので冒頭のみ + 文字数で代替表示
-        # (= 失敗時の手掛かりとしては十分、payload の text が真の発信内容)。
-        text_preview = response_text[:60].replace("\n", " ")
-        text_suffix = "..." if len(response_text) > 60 else ""
+        # Phase 0.5-F-6-f: text 60 文字省略を廃止、全文を %r で出力。
+        # 「LLM が返した JSON が想定外フォーマット → parse 失敗 → hang」仮説の
+        # 検証用に、応答全文の証跡を残す。改行は %r で \n エスケープされて
+        # 1 行ログ化されるため、長文でも grep / tail で読みやすい。
+        # response_text の長さに関わらず全文を出す (= 数 KB 規模が想定上限)。
         logger.info(
-            "Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r%s",
+            "Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r",
             character_slug or "?", latency_ms, source, len(response_text),
-            text_preview, text_suffix,
+            response_text,
         )
         return LLMResult(
             text=response_text,
