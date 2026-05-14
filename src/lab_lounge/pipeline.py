@@ -57,7 +57,7 @@ def _publish_bubble(
     common: dict,
     links: list[str] | None = None,
     *,
-    category: str = "speech",
+    category: str = "speech_status",
 ) -> None:
     """bubble.update イベントを発行する。
 

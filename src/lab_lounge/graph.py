@@ -546,7 +546,7 @@ class BubbleToolCallbackHandler:
                 character=self._character_slug,
                 step="searching",
                 text=text,
-                category="speech",  # Phase 0.5-A 8-10: 通常応答パス (Agent ツール) は speech
+                category="speech_status",  # Phase 0.5-E: ツール呼出中のステータス表示 (= bubble 3 系統分離)
                 **self._common,
             )
             publish(event)

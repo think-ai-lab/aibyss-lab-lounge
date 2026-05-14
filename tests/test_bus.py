@@ -99,7 +99,7 @@ class TestPublish:
                 "character": "mimi",
                 "step": "thinking",
                 "text": "考えていますわ",
-                "category": "speech",
+                "category": "speech_status",
             },
         }
         with caplog.at_level(logging.INFO, logger="lab_lounge.bus"):
@@ -181,22 +181,22 @@ class TestSummarizeEvent:
                 "character": "sakura",
                 "step": "handraise",
                 "text": "あのぉ、ちょっといいですかぁ",
-                "category": "handraise",
+                "category": "raisehand",
             },
         }
         s = _summarize_event(ev)
         assert "character=sakura" in s
         assert "step=handraise" in s
-        assert "category=handraise" in s
+        assert "category=raisehand" in s
 
-    def test_bubble_update_default_category_speech(self):
-        """category 省略時は default の "speech" 表示 (受信側 default 解釈と一致)。"""
+    def test_bubble_update_default_category_speech_status(self):
+        """category 省略時は default の "speech_status" 表示 (= Phase 0.5-E、受信側 default 解釈と一致)。"""
         ev = {
             "type": "bubble.update",
             "payload": {"character": "mimi", "step": "thinking", "text": "..."},
         }
         s = _summarize_event(ev)
-        assert "category=speech" in s
+        assert "category=speech_status" in s
 
     def test_dispatcher_queue_update_lists_slugs(self):
         """dispatcher.queue.update は queue 内の character_slug 一覧 + state を表示。"""
