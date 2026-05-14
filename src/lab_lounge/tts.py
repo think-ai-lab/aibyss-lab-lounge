@@ -740,6 +740,12 @@ def _generate_voicepeak_single_file(
         logger.debug("VOICEPEAK テキスト正規化: %r → %r", text, normalized_text)
 
     safe_text = normalized_text.replace('"', "'")
+    # Phase 0.5-F-6-g (案 C): 改行 sanitize の最終防衛層 (= 案 A の二重防衛)。
+    # _parse_voicepeak_json を経由しない呼出経路 (= filler 等で直接 _synthesize_voicepeak
+    # に text を渡す経路) でも、subprocess 投入直前で必ず改行を除去することで
+    # VOICEPEAK CLI 引数破壊を構造的に阻止する。詳細は _parse_voicepeak_json の
+    # 同等処理を参照 (logs/runs/run_loop_20260515_002506.log で観察された事象)。
+    safe_text = safe_text.replace("\\n", " ").replace("\n", " ")
     safe_voice = voice.replace('"', "'")
 
     cmd_str = (
@@ -886,6 +892,21 @@ def _call_voicepeak(
     # JSON 構造のパース（emotion / speed / pose / response の分離）
     # pose は TTS 内では使用しない（pose.update は graph.py / pipeline.py 側で発行）
     say_text, json_emotion, json_speed, _json_pose = _parse_voicepeak_json(text)
+    # Phase 0.5-F-6-g (案 A): VOICEPEAK 経路限定で改行を sanitize。
+    # LLM が response 内に改行を含めた場合、subprocess の --say 引数に literal
+    # newline (= \n、1 文字) が渡され、Windows の引数解釈で --say の値が分断
+    # されて --out 以降のオプションが無視される事象を防ぐ (logs/runs/
+    # run_loop_20260515_002506.log で観察、VOICEPEAK が cwd の output.wav に出力)。
+    # 加えて、LLM が誤って 2 文字の「\n」(= backslash + n) を含む応答を返す
+    # ケースにも対応 (= 2 文字を空白に置換)。
+    # 順序: \\n (= 2 文字 sequence) を先に置換、その後 \n (= literal newline) を
+    # 置換。逆順だと \n を空白にした後の文字列に \\n が見つからない。
+    # 【WHY: _parse_voicepeak_json 内ではなく呼出後で sanitize する】
+    # _parse_voicepeak_json は HUD 表示用 (= bubble.update / character.status.update
+    # の text 抽出、run_loop._extract_llm_response_text / ask_character.py 等)
+    # にも使われる。HUD では改行を維持したいケースがあるため、関心事分離として
+    # VOICEPEAK 経路でのみ sanitize する。
+    say_text = say_text.replace("\\n", " ").replace("\n", " ")
     effective_speed = json_speed if json_speed is not None else speed
 
     # テキスト分割
