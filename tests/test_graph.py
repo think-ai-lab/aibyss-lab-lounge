@@ -278,8 +278,8 @@ class TestPipelineGraphNodes:
             "answering bubble が default で発行されていない"
         )
         assert bubble_answering_calls[0].args[0]["payload"]["character"] == "octamaid"
-        # Phase 0.5-A 8-10: 通常応答パスは category="speech" 明示
-        assert bubble_answering_calls[0].args[0]["payload"]["category"] == "speech"
+        # Phase 0.5-E: 通常応答パスは category="speech_status" (= bubble 3 系統分離)
+        assert bubble_answering_calls[0].args[0]["payload"]["category"] == "speech_status"
 
     def test_generation_node_suppresses_answering_bubble_when_flag_set(
         self, mock_publish, base_state,

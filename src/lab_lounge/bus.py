@@ -76,7 +76,7 @@ def _summarize_event(event: dict[str, Any]) -> str:
         # Phase 0.5-A 8-10 で category 追加済。speech / handraise の分岐軸。
         char = payload.get("character", "?")
         step = payload.get("step", "?")
-        cat = payload.get("category", "speech")  # default 解釈と合わせる
+        cat = payload.get("category", "speech_status")  # default 解釈と合わせる (Phase 0.5-E: bubble 3 系統分離)
         return f"character={char} step={step} category={cat}"
 
     if type_ == "dispatcher.queue.update":
