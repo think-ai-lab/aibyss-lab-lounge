@@ -807,7 +807,7 @@ class TestDispatcherApprovalFlow:
         assert step == "denied"
         assert text == "また今度"  # mock した bubble_messages から
         assert ttl_ms == 2000
-        assert category == "handraise"
+        assert category == "raisehand"
 
     def test_denied_cancels_lapse_timer(self, monkeypatch):
         d = Dispatcher()
@@ -916,7 +916,7 @@ class TestDispatcherLapse:
         assert step == "lapsed"
         assert text == "静かに"
         assert ttl_ms == 2000
-        assert category == "handraise"
+        assert category == "raisehand"
 
     def test_lapse_idempotent_on_unknown_slug(self, monkeypatch):
         d = Dispatcher()
@@ -1390,7 +1390,7 @@ class TestDispatcherHandraisePublish:
         assert step == "handraise"
         assert text == "挙手"
         assert ttl_ms is None  # handraise は ttl_ms=None で永続表示
-        assert category == "handraise"
+        assert category == "raisehand"
 
     def test_bubble_callback_fires_on_denied_step(self, monkeypatch):
         _patch_filler(monkeypatch, slug="mimi")
@@ -1406,7 +1406,7 @@ class TestDispatcherHandraisePublish:
         d.on_approval_denied("mimi")
         assert len(bubble_calls) == 1
         # Phase 0.5-A 8-10: tuple は (character, step, text, ttl_ms, category)
-        assert bubble_calls[0] == ("mimi", "denied", "また今度", 2000, "handraise")
+        assert bubble_calls[0] == ("mimi", "denied", "また今度", 2000, "raisehand")
 
     def test_bubble_callback_fires_on_lapsed_step(self, monkeypatch):
         _patch_filler(monkeypatch, slug="mimi")
@@ -1422,7 +1422,7 @@ class TestDispatcherHandraisePublish:
         timers[0].fire()
         assert len(bubble_calls) == 1
         # Phase 0.5-A 8-10: tuple は (character, step, text, ttl_ms, category)
-        assert bubble_calls[0] == ("mimi", "lapsed", "静かに", 2000, "handraise")
+        assert bubble_calls[0] == ("mimi", "lapsed", "静かに", 2000, "raisehand")
 
     def test_no_callback_when_not_set(self, monkeypatch):
         """callback 未設定 (None) でも例外なく動く。"""
