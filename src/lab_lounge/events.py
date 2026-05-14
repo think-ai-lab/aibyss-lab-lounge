@@ -289,14 +289,32 @@ def build_bubble_update(
                    Phase 0.5 では denied/lapsed=2000ms を想定し、handraise 自体は
                    None (承認/却下/lapse まで保持) で発行する。
                    payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
-        category:  V2 HUD 側で表示エリアを分岐させるための種別フィールド (Phase 0.5-A 8-10)。
-                     - "speech":    通常応答 + 承認後応答 (thinking/searching/answering/
-                                    speaking/done/pose_change)
-                     - "handraise": 挙手系 (handraise/denied/lapsed/cancelled)
-                   None 時は payload に含めない (受信側 default = "speech" 解釈、後方互換)。
+        category:  V2 HUD 側で表示エリアを分岐させるための種別フィールド。
+                   Phase 0.5-E (= bubble 3 系統分離) で 5 種類に拡張:
+                     - "speech_status":   通常応答のステータス遷移 (thinking/searching/
+                                          answering/done)、bubble_messages.json の固定
+                                          メッセージを表示
+                     - "speech_content":  発話内容 (= chunk text、speaking 中のみ更新)、
+                                          各 chunk 物理再生時に動的更新
+                     - "raisehand":       挙手系 (handraise/denied/lapsed/cancelled)、
+                                          approval/denied/timeout まで独立 lifecycle で
+                                          他カテゴリの影響を受けない
+                     - "speech" (旧):     Phase 0.5-A 8-10 で導入、speech_status/
+                                          speech_content の前身。V2 側で speech_status に
+                                          mapping (後方互換)
+                     - "handraise" (旧):  Phase 0.5-A で導入、raisehand の前身。V2 側で
+                                          raisehand に mapping (後方互換)
+                   None 時は payload に含めない (= 受信側 default で speech_status 解釈)。
                    step は「進捗状態」、category は「分岐軸」として独立した概念。step 拡張で
                    将来の bubble 種別が増えても category 固定で受信側ロジックを単純に保てる。
                    payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
+
+                   【3 系統分離の経緯】
+                   中間実走 4 回目 (= 2026-05-09、logs/runs/run_loop_20260509_190927.log)
+                   で raisehand と speech (thinking) が同 ms 内に publish され、HUD で
+                   raisehand bubble が thinking で上書きされる現象を観察。bubble エリアを
+                   category 別に分離することで、event stream の競合があっても表示は独立に
+                   保たれる設計とする。詳細: Phase 0.5-E 実装 plan 参照。
     """
     payload: dict[str, Any] = {
         "character": character,

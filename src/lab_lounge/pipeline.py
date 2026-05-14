@@ -61,9 +61,17 @@ def _publish_bubble(
 ) -> None:
     """bubble.update イベントを発行する。
 
-    category はデフォルト "speech" (通常応答パス: thinking/searching/answering 等)。
-    挙手系 (handraise/denied/lapsed/cancelled) を発行する経路は dispatcher が直接
-    build_bubble_update を呼ぶため、本 helper は通常応答用に最適化する (Phase 0.5-A 8-10)。
+    category はデフォルト "speech" (= 旧名称、後方互換)。Phase 0.5-E (= bubble 3 系統分離)
+    で以下の新 category に分離予定:
+      - "speech_status":  ステータス遷移 (thinking/searching/answering/done)、本 helper の
+                          中心用途、bubble_messages.json の固定メッセージを表示
+      - "speech_content": 発話内容 (= chunk text)、speaking 中のみ更新、run_loop の
+                          `_publish_bubble_safe` 経路で別途発行 (本 helper 対象外)
+      - "raisehand":      挙手系 (handraise/denied/lapsed/cancelled)、dispatcher が直接
+                          build_bubble_update を呼ぶため本 helper は使わない
+
+    本 helper は通常応答パスの speech_status 系を対象に最適化される。caller 側で
+    category を明示すれば override 可能 (= future-proof: 新 step 追加時に必要なら明示)。
     """
     messages = _load_bubble_messages()
     char_msgs = messages.get(character_slug, {})
