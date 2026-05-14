@@ -38,6 +38,9 @@
     "ask_character": "他のメンバーに照会中です",
     "thinking": "処理中です",
     "answering": "回答を準備しました",
-    "done": ""
+    "done": "",
+    "denied": "承知いたしました",
+    "lapsed": "(機を改めます)",
+    "cancelled": "(発言を取り消します)"
   }
 }
