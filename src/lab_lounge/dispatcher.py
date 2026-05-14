@@ -910,7 +910,7 @@ class Dispatcher:
                 target_slug, CharacterStatus.RAISEHAND_READY,
             )
         # publish + 物理通知も Lock 外 (callback の長時間処理が dispatcher を止めない)
-        self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="handraise")
+        self._publish_bubble_update(target_slug, "handraise", phrase_text, ttl_ms=None, category="raisehand")
         self._publish_handraise_update()
         # フェーズ 7: handraise wav の物理再生は run_loop の責務。dispatcher は
         # 「IDLE 中なら即再生して」という意思を se_pending=False で伝えるだけ。
@@ -1067,7 +1067,7 @@ class Dispatcher:
         # bubble.update("denied") の text を bubble_messages から取得 (フォールバックあり)
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "denied")
-        self._publish_bubble_update(target_slug, "denied", text, ttl_ms=2000, category="handraise")
+        self._publish_bubble_update(target_slug, "denied", text, ttl_ms=2000, category="raisehand")
         self._publish_handraise_update()
 
     def on_lapse_timeout(self, target_slug: str) -> None:
@@ -1106,5 +1106,5 @@ class Dispatcher:
                 )
         messages = _load_bubble_messages()
         text = _get_bubble_text(messages, target_slug, "lapsed")
-        self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000, category="handraise")
+        self._publish_bubble_update(target_slug, "lapsed", text, ttl_ms=2000, category="raisehand")
         self._publish_handraise_update()
