@@ -1150,16 +1150,22 @@ def run_loop(
             def _publish_bubble_safe(character: str, step: str, text: str) -> None:
                 """bubble.update を publish する。失敗は warning log のみ。
 
-                Phase 0.5-A 8-10: 通常応答 playback worker から呼ばれる (speaking/done/
-                pose_change)。すべて category="speech" 固定。挙手系の bubble はこの
-                経路を通らない (dispatcher 経由)。
+                通常応答 playback worker から呼ばれる (speaking/done/pose_change)。
+                step ごとに category を判定して 2 系統に振り分ける (Phase 0.5-E):
+                  - speaking → category="speech_content" (= 発話内容、chunk text を動的に表示)
+                  - done / pose_change / その他 → category="speech_status" (= ステータス遷移)
+                挙手系の bubble はこの経路を通らない (= dispatcher 経由で category="raisehand")。
                 """
+                # Phase 0.5-E: speaking は発話内容 (= chunk text)、それ以外は status 系。
+                # bubble 3 系統分離設計により speech_content と speech_status を分け、
+                # V2 HUD 側で 3 つの独立 bubble エリアに振り分ける。
+                category = "speech_content" if step == "speaking" else "speech_status"
                 try:
                     event = build_bubble_update(
                         character=character,
                         step=step,
                         text=text,
-                        category="speech",
+                        category=category,
                         **turn_common,
                     )
                     publish(event)
