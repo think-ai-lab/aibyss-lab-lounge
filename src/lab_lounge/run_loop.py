@@ -725,6 +725,20 @@ def _run_playback_worker(
                     "playback worker is_last READY 反映失敗 [character=%s]: %s",
                     character, exc,
                 )
+        # Phase 0.5-K-4: is_last chunk の物理再生完了時に立ち絵を neutral に戻す。
+        # 旧設計では speaking 中の pose (= special_overdrive / special_pondering 等) が
+        # 発話終了後もそのまま残り、配信中に「無言の特殊ポーズ」状態が継続していた
+        # (= run_loop_20260516_045722.log で観察)。 ask_character の caller / target
+        # それぞれ独立に is_last chunk を持つため、各キャラ自然に neutral に戻る。
+        # set_pose_fn が None (= OBS 接続なし test 環境等) なら no-op。
+        if task.get("is_last") and set_pose_fn is not None:
+            try:
+                set_pose_fn(character, "neutral")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "playback worker is_last pose neutral 戻し失敗 [character=%s]: %s",
+                    character, exc,
+                )
         # Phase 3: 再生完了通知 (ask_character の導入セリフ同期用)
         done_event = task.get("done_event")
         if done_event is not None:
