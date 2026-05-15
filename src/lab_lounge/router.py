@@ -26,6 +26,17 @@ from .characters import (
     get_default_character,
 )
 
+# Phase 0.5-J: filler.py と同じく google.genai を module top で eager import する。
+# router.py の _call_router_llm でも google branch があり、filler との並列実行で
+# circular import race を起こす可能性があるため、両者で同じ予防策を採る。
+# 詳細は filler.py 冒頭コメント参照。
+try:
+    import google.genai as _GOOGLE_GENAI  # noqa: F401
+    from google.genai import types as _GOOGLE_GENAI_TYPES  # noqa: F401
+except ImportError:
+    _GOOGLE_GENAI = None  # type: ignore[assignment]
+    _GOOGLE_GENAI_TYPES = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 _LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5-20251001")
@@ -168,12 +179,14 @@ def _call_router_llm(
             return resp.content[0].text.strip().lower()
 
         elif provider == "google":
-            import google.genai as genai
-            client = genai.Client()
+            # Phase 0.5-J: module top の eager import を参照 (= 旧 lazy import を削除)。
+            if _GOOGLE_GENAI is None or _GOOGLE_GENAI_TYPES is None:
+                raise ImportError("google.genai is required for provider=google")
+            client = _GOOGLE_GENAI.Client()
             resp = client.models.generate_content(
                 model=model,
                 contents=user_text,
-                config=genai.types.GenerateContentConfig(
+                config=_GOOGLE_GENAI_TYPES.GenerateContentConfig(
                     system_instruction=system_prompt,
                     max_output_tokens=20,
                     temperature=0,
