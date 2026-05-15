@@ -768,6 +768,39 @@ class TestDispatcherApprovalFlow:
         d.on_approval_granted("nonexistent")  # 例外なく動く
         assert d._handraise_states == {}
 
+    def test_granted_publishes_approved_bubble(self, monkeypatch):
+        """Phase 0.5-K: 承認時に raisehand bubble を消すための bubble.update を発行。
+
+        Phase 0.5-H で raisehand と status が物理分離された結果、approval 時に
+        raisehand bubble を能動的に hide する event が必要になった (= 旧 Phase 0.5-E
+        では単一 bubble で「挙手中」→「思考中」と自然遷移していた)。 denied/lapsed と
+        同じパターンで step="approved" + category="raisehand" を発行し、V2 側で
+        即 hide させる。
+
+        on_approval_granted は daemon thread で動作するため、polling で待機 (= 既存
+        test_handraise_callback_fires_on_grant と同パターン)。
+        """
+        bubble_calls: list[tuple] = []
+        d = Dispatcher(
+            on_bubble_update=lambda *a: bubble_calls.append(a),
+        )
+        self._setup_handraise(monkeypatch, d)
+        bubble_calls.clear()  # handraise bubble を捨てて approved だけ確認
+        d.on_approval_granted("mimi")
+        # daemon thread の完了を polling で待つ (bg_completed 即 set 済なので 10-20ms)
+        for _ in range(50):
+            if len(bubble_calls) >= 1:
+                break
+            time.sleep(0.01)
+        # approved bubble が 1 件発行されること (= denied/lapsed と同様のシグネチャ)
+        assert len(bubble_calls) == 1
+        char, step, text, ttl_ms, category = bubble_calls[0]
+        assert char == "mimi"
+        assert step == "approved"
+        assert text == ""  # text は空 (= V2 側で step="approved" を見て即 hide する)
+        assert ttl_ms is None  # ttl_ms 不要 (= V2 側で即 hide)
+        assert category == "raisehand"
+
     def test_denied_removes_state(self, monkeypatch):
         d = Dispatcher()
         self._setup_handraise(monkeypatch, d)
