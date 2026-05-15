@@ -1014,6 +1014,14 @@ class Dispatcher:
         if self._status_manager is not None:
             self._status_manager.set_status(target_slug, CharacterStatus.READY)
         self._publish_handraise_update()
+        # Phase 0.5-K: 承認時に raisehand bubble を消すための bubble.update を発行。
+        # Phase 0.5-E までは単一 bubble で「挙手中」→「思考中」と同じエリアで自然に
+        # 上書きされていたが、Phase 0.5-H で raisehand と status の bubble が物理的に
+        # 分離された結果、approval 時の hide event がない設計ギャップが顕在化した
+        # (= raisehand bubble が 60 秒 safety timer まで残る、`run_loop_20260516_040458.log`
+        # で観察)。 denied/lapsed と同じパターンで step="approved" の event を発行し、
+        # V2 bubble.html 側で受信後に即 hide させる (= STEP_LABELS["approved"] + 入口 hide)。
+        self._publish_bubble_update(target_slug, "approved", "", ttl_ms=None, category="raisehand")
         # Phase 0.5-F-1: 案 R 経路 (= raisehand を callout 経路に統合)。F-3 で
         # wiring されて以降は唯一の承認経路。
         if self._on_approval_replay is not None:
