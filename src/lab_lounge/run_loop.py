@@ -731,14 +731,21 @@ def _run_playback_worker(
         # (= run_loop_20260516_045722.log で観察)。 ask_character の caller / target
         # それぞれ独立に is_last chunk を持つため、各キャラ自然に neutral に戻る。
         # set_pose_fn が None (= OBS 接続なし test 環境等) なら no-op。
+        #
+        # Phase 0.5-K-4-2: 即時 reset では表情の切替が硬く感じるため、done_delay_seconds
+        # (= 5 秒、done bubble publish と同 timing) 後に遅延させて「感情を引きずる
+        # 余韻」を残す (= run_loop_20260516_052247.log 実走時のルカ feedback)。
+        # threading.Timer で非同期発火、playback worker 本体は引き続き次 task を処理する。
         if task.get("is_last") and set_pose_fn is not None:
-            try:
-                set_pose_fn(character, "neutral")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "playback worker is_last pose neutral 戻し失敗 [character=%s]: %s",
-                    character, exc,
-                )
+            def _delayed_neutral(character_slug: str = character) -> None:
+                try:
+                    set_pose_fn(character_slug, "neutral")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "playback worker delayed pose neutral 戻し失敗 [character=%s]: %s",
+                        character_slug, exc,
+                    )
+            threading.Timer(done_delay_seconds, _delayed_neutral).start()
         # Phase 3: 再生完了通知 (ask_character の導入セリフ同期用)
         done_event = task.get("done_event")
         if done_event is not None:
