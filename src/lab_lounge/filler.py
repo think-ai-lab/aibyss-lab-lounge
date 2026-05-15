@@ -45,6 +45,25 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Phase 0.5-J: google.genai を module top で eager import することで、複数スレッド間の
+# 並列 import (= filler スレッド + 本命 LLM スレッド経由の langchain-google-genai が
+# 同 ms 内で google.genai.types を import) による circular import race condition を
+# 構造的に回避する。
+#
+# 旧設計 (= 関数内 lazy import `import google.genai as genai`) では、セッション内で
+# Gemini を初めて使う瞬間に「partially initialized module 'google.genai.types'」
+# エラーが間欠的に発生 (= 2026-04-11 起票の Notion 課題、2026-05-15 実走で実害確認:
+# logs/runs/run_loop_20260515_121353.log、chisame の callout ターンが丸ごと skip)。
+#
+# eager import により program startup 時 (= 単一スレッド) に 1 回だけ import される
+# ため、その後の並列呼出時には既にキャッシュ済モジュールが返り、race window が消失。
+try:
+    import google.genai as _GOOGLE_GENAI  # noqa: F401  (function 内で参照)
+    from google.genai import types as _GOOGLE_GENAI_TYPES  # noqa: F401  (function 内で参照)
+except ImportError:
+    _GOOGLE_GENAI = None  # type: ignore[assignment]
+    _GOOGLE_GENAI_TYPES = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 _FILLER_PHRASES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_phrases"
@@ -509,12 +528,15 @@ def _call_filler_llm(
             return resp.content[0].text.strip()
 
         elif provider == "google":
-            import google.genai as genai
-            client = genai.Client()
+            # Phase 0.5-J: module top の eager import を参照 (= 旧 lazy import を削除)。
+            # _GOOGLE_GENAI が None なら package 未インストール、明示的 ImportError を投げる。
+            if _GOOGLE_GENAI is None or _GOOGLE_GENAI_TYPES is None:
+                raise ImportError("google.genai is required for provider=google")
+            client = _GOOGLE_GENAI.Client()
             resp = client.models.generate_content(
                 model=model,
                 contents=user_text,
-                config=genai.types.GenerateContentConfig(
+                config=_GOOGLE_GENAI_TYPES.GenerateContentConfig(
                     system_instruction=system_prompt,
                     max_output_tokens=150,
                     temperature=0.9,
