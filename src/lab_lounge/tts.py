@@ -210,9 +210,17 @@ def _call_voicevox(
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase 0.5-M: VOICEPEAK と同様に JSON parse → response field 抽出 + SAY 行抽出
+    # (= _parse_voicepeak_json 経由)。 旧設計では VOICEVOX path がこの parse を呼ばず、
+    # octamaid 用に LLM JSON 全文をそのまま VOICEVOX に投入していたため、
+    # `{} "response" :` 等の JSON syntax を音声合成 + bubble 表示する事象が発生
+    # (= run_loop_20260516_070847.log で観察)。
+    # JSON でない / response field なしの場合は text そのまま返るため、後方互換維持。
+    say_text, _emotion, _speed, _pose = _parse_voicepeak_json(text)
+
     # テキスト分割 (VOICEPEAK と同じロジック。140 字以内の短文は 1 チャンク)
-    chunks = _split_text_for_voicepeak(text)
-    logger.info("VOICEVOX チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(text))
+    chunks = _split_text_for_voicepeak(say_text)
+    logger.info("VOICEVOX チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(say_text))
 
     chunk_paths: list[Path] = []
     chunk_durations: list[int] = []
@@ -280,6 +288,37 @@ def _normalize_for_voicepeak(text: str) -> str:
     return text
 
 
+def _extract_say_lines(text: str) -> str:
+    """
+    octamaid 等の "SAY: ...\\nLOG: ..." 形式から SAY 行のみを抽出する (Phase 0.5-M)。
+
+    octamaid の system prompt (= system_octamaid.txt) は次の 3 軸出力を要求する設計:
+      - SAY: 読み上げ前提の短文 (= TTS で発声、bubble 表示対象)
+      - LOG: 画面用の状態表示 (= 配信に出さない、メタ情報)
+      - MODE: 現在の個体 (= 同上、必要時のみ)
+
+    TTS / bubble には SAY 内容だけ流したいため、本関数で LOG / MODE 行を除去 +
+    SAY 行の prefix を strip する。
+
+    SAY: prefix が含まれない場合 (= mimi/chisame/sakura 等の他キャラ、もしくは
+    octamaid が SAY: 形式に従わない自由応答) は元 text をそのまま返す
+    (= 安全側挙動、既存挙動への regression なし)。
+
+    複数 SAY: 行は半角スペースで連結 (= TTS で自然な間で発声)。
+    """
+    lines = text.split("\n")
+    say_contents: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("SAY:"):
+            content = stripped[len("SAY:"):].strip()
+            if content:
+                say_contents.append(content)
+    if say_contents:
+        return " ".join(say_contents)
+    return text
+
+
 def _parse_voicepeak_json(
     text: str,
 ) -> tuple[str, dict[str, int] | None, int | None, str | None]:
@@ -290,6 +329,9 @@ def _parse_voicepeak_json(
         {"emotion": {"happy": 50, ...}, "speed": 100, "pose": "happy", "response": "テキスト"}
 
     全角記号に正規化済みの JSON も半角に戻してからパースを試みる。
+
+    Phase 0.5-M: response field 抽出後、octamaid の "SAY: ...\\nLOG: ..." 形式から
+    SAY 行のみ抽出する (= _extract_say_lines 経由、他キャラは影響なし)。
 
     Returns:
         (say_text, emotion_dict_or_None, speed_or_None, pose_or_None)
@@ -325,6 +367,9 @@ def _parse_voicepeak_json(
         return text, None, None, None
 
     say_text = str(obj["response"])
+    # Phase 0.5-M: octamaid 形式 ("SAY: ...\nLOG: ...") から SAY 行のみ抽出。
+    # 他キャラ (mimi/chisame/sakura) は SAY: prefix なしなので変更なし (= 安全側)。
+    say_text = _extract_say_lines(say_text)
     emotion = obj.get("emotion")
     if isinstance(emotion, dict):
         emotion = {str(k): int(v) for k, v in emotion.items()}
