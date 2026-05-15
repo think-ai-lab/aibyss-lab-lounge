@@ -158,6 +158,52 @@ class TestRunPlaybackWorker:
         done_call = publish_fn.call_args_list[-1]
         assert done_call.args == ("sakura", "done", "")
 
+    def test_is_last_resets_pose_to_neutral(self):
+        """Phase 0.5-K-4: is_last=True chunk の物理再生完了時に set_pose_fn(character, "neutral")
+        が呼ばれる。
+
+        発話終了後に立ち絵が special_overdrive / special_pondering 等の特殊ポーズの
+        ままになる事象 (= run_loop_20260516_045722.log で観察) を構造的に解消する。
+        ask_character の caller / target それぞれ独立に is_last chunk を持つため、
+        本テストは複数キャラ混在シナリオで個別に neutral 戻しが呼ばれることを検証する。
+        """
+        q: queue.Queue = queue.Queue()
+        pose_calls: list[tuple[str, str]] = []
+        publish_fn = MagicMock()
+        play_fn = MagicMock()
+        cleanup_fn = MagicMock()
+
+        def set_pose_fn(character: str, pose: str) -> None:
+            pose_calls.append((character, pose))
+
+        thread = threading.Thread(
+            target=_run_playback_worker,
+            args=(q,),
+            kwargs={
+                "publish_bubble_fn": publish_fn,
+                "play_audio_fn": play_fn,
+                "cleanup_audio_fn": cleanup_fn,
+                "set_pose_fn": set_pose_fn,
+                "done_delay_seconds": 0.01,
+            },
+            daemon=True,
+        )
+        thread.start()
+
+        # mimi → sakura → mimi、最後 is_last はキャラごとに発火
+        # 注: pose 変更は set_pose_fn 経由で起きるため、character 切替ごとに先頭の pose 切替も
+        #     pose_calls に乗る。 本 test では neutral 戻しが is_last chunk 後に発火することのみ確認。
+        q.put({"url": "file:///a.wav", "text": "A", "is_last": False, "character": "mimi", "pose": "happy"})
+        q.put({"url": "file:///b.wav", "text": "B", "is_last": True, "character": "sakura", "pose": "fun"})
+        q.put({"url": "file:///c.wav", "text": "C", "is_last": True, "character": "mimi", "pose": "happy"})
+        q.put(None)
+        thread.join(timeout=2.0)
+
+        # is_last=True chunk ごとに neutral 戻しが呼ばれていること
+        neutral_calls = [c for c in pose_calls if c[1] == "neutral"]
+        assert ("sakura", "neutral") in neutral_calls
+        assert ("mimi", "neutral") in neutral_calls
+
     def test_resilient_publish_fn_allows_worker_to_continue(self):
         """publish_fn 内で例外処理する実装 (= _publish_bubble_safe) では
         worker が次の task を処理し続けることを検証する。
