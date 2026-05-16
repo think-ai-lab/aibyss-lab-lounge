@@ -1,0 +1,19 @@
+# pre-commit hooks for OSS publication safety.
+#
+# WHY: 秘匿情報（API キー・トークン等）の混入を commit 段階で検出してブロックする。
+# Push protection (GitHub 側) と二段構えで防御する。
+#
+# セットアップ (clone 直後 / 初回):
+#   uv tool install pre-commit
+#   pre-commit install
+#
+# 手動全件スキャン:
+#   pre-commit run --all-files
+#
+# 参考: https://pre-commit.com/ / https://github.com/gitleaks/gitleaks
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
