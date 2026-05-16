@@ -3,14 +3,24 @@
 A.I.byss Suite の「会話ランタイム」。発話テキストを受け取り、Event Bus (Redis Streams) に
 `utterance.final` → `llm.final` → `tts.done` の 3 イベントを publish する。
 
-> **実装状況** (2026-04-12):
+> **実装状況** (2026-05-16):
 > - Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ
 > - Phase 1-5 完了 — real STT / LLM / TTS / マイク / LangSmith
 > - Grounded E2E v1 — RAG 統合 (seed corpus + C2Retriever + RecentC2Retriever + CompositeRetriever)
 > - **Axis A** — マルチキャラクター (mimi/chisame/sakura/octamaid/ruka)、Porcupine ウェイクワード、意図ゲート
 > - **Axis B** — 立ち絵切替 (OBS WebSocket)、呼び出しゲート Phase 2、VAD (WebRTC)、C2 RAG v0.1 スケルトン
-> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生 + チャンク自動削除、立ち絵タイミング同期 (本命応答 + フィラー)、VOICEPEAK クラッシュリトライ、操作ログ網羅性改善
-> - テスト: **586 passed**
+> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生 + チャンク自動削除、立ち絵タイミング同期、VOICEPEAK クラッシュリトライ、操作ログ網羅性改善
+> - **Axis D** — Agent 自律化 (= LangGraph create_agent + structured output)、Skills v0.1、faster-whisper、ask_character ツール、配信演出強化
+> - **Phase 0.5-A** — 挙手制自発介入 (= check_intent 4 値化、interjection_candidate、handraise/denied/lapsed/cancelled bubble、dispatcher state machine)
+> - **Phase 0.5-B-α** — CharacterStatusManager + V2 `/status` dashboard (= 7 ステータス: READY/THINKING/TOOL_CALLING/RAISEHAND_PROGRESSING/RAISEHAND_READY/RAISEHAND/TALKING)
+> - **Phase 0.5-B-β** — ask_character TTS 修復、却下時 cleanup、実走 follow-up
+> - **Phase 0.5-D-1a〜D-2** — 案 C リファクタ (buffer + 物理再生時発火、ターン跨ぎ問題の構造解消)
+> - **Phase 0.5-D-d/D-e + F-1〜F-6** — 案 R 移行 (= raisehand を callout 経路に統合) + dead code cleanup (累計 -7,400 行 / -144 件削除)
+> - **Phase 0.5-E** — bubble 3 系統分離 (raisehand / speech_status / speech_content category)
+> - **Phase 0.5-J** — Google genai 循環 import race 修正 (= filler.py + router.py eager import)
+> - **Phase 0.5-K** — approval 時 raisehand bubble 自動 hide、status mode で speaking 中 hide、is_last 後 pose neutral 余韻 5 秒、content mode で done event hide
+> - **Phase 0.5-M** — octamaid VOICEVOX 経路の JSON parse 追加 + SAY/LOG 形式から SAY 抽出 (= TTS / bubble に JSON 全文が出る事象を解消)
+> - テスト: **1082 passed** (= 警告 0 維持)
 
 ---
 
