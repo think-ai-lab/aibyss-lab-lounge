@@ -389,7 +389,7 @@ class TestCheckIntent:
         monkeypatch.delenv("L2_INTENT_GATE_MODEL", raising=False)
         with patch("lab_lounge.router._call_router_llm", return_value="callout") as mock_llm:
             check_intent("テスト", "mimi")
-        # デフォルトモデル (claude-haiku-4-5-20251001) が使われる
+        # デフォルトモデル (claude-haiku-4-5 alias) が使われる
         assert "claude" in mock_llm.call_args.args[0].lower()
 
     def test_prompt_includes_character_slug(self):

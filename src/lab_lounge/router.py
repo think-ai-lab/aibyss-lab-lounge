@@ -39,7 +39,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5-20251001")
+# WHY (既定が alias / 日付なし): 日付付きスナップショット (例
+# claude-haiku-4-5-20251001) は新版へトラフィックが移ると割当容量が絞られ、
+# overloaded_error (529) を返しやすくなる。alias (claude-haiku-4-5) は常に
+# 最新・潤沢な容量へルーティングされるため 529 を踏みにくい。ルーティングは
+# max_tokens=20 程度の単純分類タスクで挙動ドリフトの影響が小さいので alias を採用。
+# 特定バージョンに固定したい場合は L2_LLM_ROUTER_MODEL で上書きする。
+_LLM_ROUTER_MODEL = os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5")
 
 # ログ強化 L-3 (Phase 0.5-A 後): ルーティング/判定ログに「どの発話に対する判定か」
 # が分かるように発話テキスト先頭をログに含める。長すぎると 1 行が見にくいので
@@ -371,7 +377,11 @@ def route(
 #              check_approval を新規追加し、handraising 中のルカ承認/却下を判定。
 # ────────────────────────────────────────────────────────────
 
-_INTENT_GATE_MODEL = os.environ.get("L2_INTENT_GATE_MODEL", "claude-haiku-4-5-20251001")
+# WHY (既定が alias): _LLM_ROUTER_MODEL と同じ理由。日付付きスナップショットは
+# 容量が絞られ 529 が出やすいため alias を既定にする。意図ゲート / 挙手・承認判定
+# (check_intent / check_approval) も単純分類タスクなので alias で十分。
+# 特定バージョンに固定したい場合は L2_INTENT_GATE_MODEL で上書きする。
+_INTENT_GATE_MODEL = os.environ.get("L2_INTENT_GATE_MODEL", "claude-haiku-4-5")
 
 
 @dataclass(frozen=True)
