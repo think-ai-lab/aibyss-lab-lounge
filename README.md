@@ -1,26 +1,57 @@
 # aibyss-lab-lounge (L2)
 
-A.I.byss Suite の「会話ランタイム」。発話テキストを受け取り、Event Bus (Redis Streams) に
-`utterance.final` → `llm.final` → `tts.done` の 3 イベントを publish する。
+A.I.byss Suite の **会話ランタイム**（港の現場を回す心臓部）。マイク音声やテキストを受け取り、
+**STT → キャラクター・ルーティング → LLM → TTS** のパイプラインを実行し、その過程を
+Event Bus (Redis Streams) に Event Envelope として publish する。複数キャラクターの協調、
+挙手制の自発介入、MCP ツール、立ち絵連携 (OBS) までを束ねる。
 
-> **実装状況** (2026-05-16):
-> - Step 4–6 完了 — 開発用テキスト・音声ファイルエミッタ
-> - Phase 1-5 完了 — real STT / LLM / TTS / マイク / LangSmith
-> - Grounded E2E v1 — RAG 統合 (seed corpus + C2Retriever + RecentC2Retriever + CompositeRetriever)
-> - **Axis A** — マルチキャラクター (mimi/chisame/sakura/octamaid/ruka)、Porcupine ウェイクワード、意図ゲート
-> - **Axis B** — 立ち絵切替 (OBS WebSocket)、呼び出しゲート Phase 2、VAD (WebRTC)、C2 RAG v0.1 スケルトン
-> - **Axis C** — C2 semantic search 統合 (RRF merge)、フィラー emotion/pose、WAV ストリーミング再生 + チャンク自動削除、立ち絵タイミング同期、VOICEPEAK クラッシュリトライ、操作ログ網羅性改善
-> - **Axis D** — Agent 自律化 (= LangGraph create_agent + structured output)、Skills v0.1、faster-whisper、ask_character ツール、配信演出強化
-> - **Phase 0.5-A** — 挙手制自発介入 (= check_intent 4 値化、interjection_candidate、handraise/denied/lapsed/cancelled bubble、dispatcher state machine)
-> - **Phase 0.5-B-α** — CharacterStatusManager + V2 `/status` dashboard (= 7 ステータス: READY/THINKING/TOOL_CALLING/RAISEHAND_PROGRESSING/RAISEHAND_READY/RAISEHAND/TALKING)
-> - **Phase 0.5-B-β** — ask_character TTS 修復、却下時 cleanup、実走 follow-up
-> - **Phase 0.5-D-1a〜D-2** — 案 C リファクタ (buffer + 物理再生時発火、ターン跨ぎ問題の構造解消)
-> - **Phase 0.5-D-d/D-e + F-1〜F-6** — 案 R 移行 (= raisehand を callout 経路に統合) + dead code cleanup (累計 -7,400 行 / -144 件削除)
-> - **Phase 0.5-E** — bubble 3 系統分離 (raisehand / speech_status / speech_content category)
-> - **Phase 0.5-J** — Google genai 循環 import race 修正 (= filler.py + router.py eager import)
-> - **Phase 0.5-K** — approval 時 raisehand bubble 自動 hide、status mode で speaking 中 hide、is_last 後 pose neutral 余韻 5 秒、content mode で done event hide
-> - **Phase 0.5-M** — octamaid VOICEVOX 経路の JSON parse 追加 + SAY/LOG 形式から SAY 抽出 (= TTS / bubble に JSON 全文が出る事象を解消)
-> - テスト: **1082 passed** (= 警告 0 維持)
+> 深海×AI をテーマにした AITuber 配信を「反応するだけ」から「待ち感のない対話」へ。
+> L2 は *崩れない配信体験* を支える低レイテンシ＆フォールバック重視のランタイム。
+
+> **実装状況** (2026-05-25):
+> - Walking Skeleton 〜 Real E2E 〜 Grounded E2E (RAG) — テキスト/音声エミッタ・real STT/LLM/TTS・seed corpus + C2 検索
+> - **Axis A〜D** — マルチキャラクター・Porcupine ウェイクワード・意図ゲート・OBS 立ち絵・WebRTC VAD・C2 意味検索 (RRF merge)・フィラー・Agent 自律化 (LangGraph) + MCP ツール・faster-whisper
+> - **Phase 0.5 系列** — 挙手制自発介入 (dispatcher 状態機械)・CharacterStatusManager (7 状態)・案 R リファクタ + dead code cleanup・bubble 3 系統分離・各種実走品質改善
+> - テスト: **1082 passed**（警告 0 維持）
+
+関連リポジトリ: [C2 = aibyss-coral-chronicle](https://github.com/think-ai-lab/aibyss-coral-chronicle)（歴史書 / RAG）・[V2 = aibyss-nautilus-v2](https://github.com/think-ai-lab/aibyss-nautilus-v2)（HUD）・[aibyss-workspace](https://github.com/think-ai-lab/aibyss-workspace)（港 / 共通スキーマ）。
+
+---
+
+## アーキテクチャ
+
+```mermaid
+flowchart TD
+    subgraph LOOP["run_loop（連続ループ）"]
+        direction TB
+        WK["Wake backend<br/>porcupine / keyboard / speech / bg-continuous"]
+        REC["audio_io 録音 + VAD（webrtc / rms）"]
+        STT["STT（OpenAI Whisper / faster-whisper / sherpa-onnx）"]
+        RTR["router（wake hint → 文字列一致 → LLM router → default）"]
+        DSP["Dispatcher（応答可否・挙手・承認判定）"]
+        PIP["run_pipeline() 実行"]
+        PLY["audio_io 再生 + OBS 立ち絵同期"]
+        WK --> REC --> STT --> RTR --> DSP --> PIP --> PLY
+        PLY -->|次ターンへ| WK
+    end
+    subgraph PIPE["run_pipeline() / LangGraph StateGraph"]
+        direction TB
+        UF["utterance.final（発行）"]
+        RET["retrieval<br/>CompositeRetriever: LocalRetriever（seed） + C2Retriever（HTTP /retrieve）を RRF merge"]
+        GEN["generation<br/>simple LLM node ｜ ReAct agent + MCP tools"]
+        LF["llm.final（発行）"]
+        TTS["TTS 合成（VOICEVOX / VOICEPEAK / Edge TTS, chunk 再生）"]
+        TD["tts.done（発行）"]
+        UF --> RET --> GEN --> LF --> TTS --> TD
+    end
+    PIP -.->|run_pipeline| UF
+    GEN -.->|処理中に逐次発行| BUB["bubble.update / character.status.update"]
+    
+```
+
+編集可能な詳細図（run_loop ループ・pipeline ノード・Dispatcher / CharacterStatusManager 状態機械）:
+[`../aibyss-workspace/docs/diagrams/lab-lounge-internals.drawio`](../aibyss-workspace/docs/diagrams/lab-lounge-internals.drawio)
+（draw.io / diagrams.net・VS Code draw.io 拡張で開ける）
 
 ---
 
@@ -30,707 +61,280 @@ A.I.byss Suite の「会話ランタイム」。発話テキストを受け取�
 
 - Python 3.11 以上
 - [uv](https://github.com/astral-sh/uv) がインストール済み
-- `aibyss-workspace` が兄弟ディレクトリに clone 済み（スキーマ自動探索に使用）
-- `aibyss-workspace` で Redis が起動済み（本番実行時）
+- `aibyss-workspace` が兄弟ディレクトリに clone 済み（Event Envelope スキーマの自動探索に使用）
+- `aibyss-workspace` で Redis が起動済み（`docker compose up -d`、本番実行時）
 
 ```
 repos/
   aibyss-workspace/          <- specs/event-envelope-0.1.schema.json, docker-compose.yml
   aibyss-lab-lounge/         <- このリポジトリ
-  aibyss-coral-chronicle/    <- C2（購読・タイムライン API）
+  aibyss-coral-chronicle/    <- C2（購読・タイムライン API・RAG）
 ```
 
 ### インストール
 
 ```bash
 cd aibyss-lab-lounge
-
-# 依存ライブラリをインストール（.venv を自動作成）
-uv sync
-
-# 開発用ツール（pytest 等）を含めてインストール
-uv sync --extra dev
+uv sync                # 基本依存（.venv 自動作成）
+uv sync --extra dev    # 開発用ツール（pytest 等）を含める
 ```
 
 ### optional extras
 
-機能ごとに extra を追加インストールする。複数同時指定可能。
+機能ごとに extra を追加する（複数同時指定可）。
 
-| extra | 含まれるパッケージ | 必要な機能 |
-|-------|-------------------|-----------|
+| extra | 含まれるパッケージ | 機能 |
+|-------|-------------------|------|
 | `dev` | pytest, pytest-asyncio | テスト実行 |
-| `llm` | langgraph, langchain-openai, python-dotenv | real LLM (OpenAI) |
-| `tts` | edge-tts, mutagen, python-dotenv | real TTS (edge_tts) |
-| `stt` | openai, python-dotenv | real STT (Whisper API) |
-| `obs` | langsmith, python-dotenv | LangSmith tracing |
-| `mic` | sounddevice, soundfile, python-dotenv | マイク録音・スピーカー再生 |
-| `rag` | openai, numpy, python-dotenv | RAG（知識ベース検索） |
-| `wake` | pvporcupine>=3.0, python-dotenv | Porcupine ウェイクワード検知 |
+| `llm` | langgraph, langchain-openai | real LLM（OpenAI）+ LangGraph |
+| `llm-google` | langchain-google-genai | real LLM（Google Gemini） |
+| `llm-anthropic` | langchain-anthropic | real LLM（Anthropic Claude） |
+| `tts` | edge-tts, mutagen | real TTS（Edge TTS） |
+| `stt` | openai | real STT（OpenAI Whisper API） |
+| `stt-local` | faster-whisper | ローカル STT（faster-whisper, GPU 推奨） |
+| `stt-sherpa` | sherpa-onnx | ローカル STT（sherpa-onnx） |
+| `mic` | sounddevice, soundfile, numpy | マイク録音・スピーカー再生 |
+| `rag` | openai, numpy | RAG（埋め込み生成 + ローカル検索） |
+| `wake` | pvporcupine | Porcupine ウェイクワード検知 |
+| `vad-webrtc` | webrtcvad-wheels | WebRTC VAD（発話検知） |
+| `tools` | fastmcp, langchain-mcp-adapters, langchain-tavily | MCP ツール（Agent モード / Web 検索） |
+| `obsws` | obsws-python | OBS WebSocket（立ち絵 pose/emotion 切替） |
+| `obs` | langsmith | LangSmith トレーシング |
 
 ```powershell
-# real E2E 全部入り（VOICEVOX + OpenAI + LangSmith + マイク）
-uv sync --extra llm --extra tts --extra stt --extra obs --extra mic
-
-# RAG 込みで実行
-uv sync --extra llm --extra tts --extra stt --extra rag
-
-# audio-file path のみ（マイク不要）
-uv sync --extra stt --extra llm --extra tts
-
-# テストのみ
-uv sync --extra dev
+# 配信フル構成（マルチキャラ + 挙手 + OBS + ツール）の一例
+uv sync --extra llm --extra llm-google --extra llm-anthropic `
+        --extra stt-local --extra mic --extra wake --extra vad-webrtc `
+        --extra rag --extra tools --extra obsws
 ```
+
+> **TTS の VOICEPEAK / VOICEVOX について**: VOICEPEAK は別途インストールし PATH を通すか
+> `L2_TTS_VOICEPEAK_PATH` で指定する。VOICEVOX は Engine をローカル起動する
+> （`docker run -p 50021:50021 voicevox/voicevox_engine:latest`）。
 
 ### 環境変数
 
 ```bash
-cp .env.example .env
-# 必要に応じて .env を編集する（既定値のまま動作する）
+cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー）は .env にのみ記載しコミット禁止
 ```
 
-主要変数:
+主要変数（全項目と詳細コメントは [`.env.example`](.env.example) を参照）:
 
 | 変数 | 既定値 | 説明 |
 |------|--------|------|
 | `REDIS_URL` | `redis://localhost:6379` | Redis 接続 URL |
 | `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー |
-| `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマファイルの絶対パス（省略で兄弟 workspace を探索） |
-| `L2_USE_REAL_LLM` | `false` | `true` にすると real LLM を呼ぶ（ダミー応答を無効化） |
-| `L2_LLM_PROVIDER` | `openai` | LLM プロバイダ（現在 `openai` のみ対応） |
-| `L2_LLM_MODEL` | `gpt-4o-mini` | 使用するモデル名 |
-| `OPENAI_API_KEY` | *(必須 / real mode のみ)* | OpenAI API キー（`.env` に記載。リポジトリにコミット禁止） |
-| `L2_USE_REAL_TTS` | `false` | `true` にすると real TTS を呼ぶ |
-| `L2_TTS_PROVIDER` | `voicevox` | TTS プロバイダ (`edge_tts` / `voicevox`) |
-| `L2_USE_REAL_STT` | `false` | `true` にすると `--audio-file` で real STT を呼ぶ |
-| `L2_STT_PROVIDER` | `openai` | STT プロバイダ（現在 `openai` Whisper API のみ） |
-| `L2_STT_LANG` | `ja` | 認識言語 (ISO 639-1) |
-| `LANGSMITH_TRACING` | `false` | `true` にすると LangChain / LangGraph 実行を LangSmith に送信する |
-| `LANGSMITH_API_KEY` | *(必須 / tracing on のみ)* | LangSmith API キー（`.env` に記載。コミット禁止） |
-| `LANGSMITH_PROJECT` | `aibyss-lab-lounge` | LangSmith プロジェクト名 |
-| `L2_ENABLE_RAG` | `false` | `true` にすると知識ベース検索（RAG）を有効化する |
-| `L2_RAG_TOP_K` | `3` | RAG で取得する文書数 |
-| `L2_KB_PATH` | `./data/index` | index ファイル（chunks.json / embeddings.npy）の配置パス |
-| `L2_DEBUG_ARTIFACTS` | `false` | `true` にすると `logs/` 以下に STT/RAG/LLM の中間ファイルを出力する |
-| `L2_DEBUG_LOG_DIR` | `./logs` | debug artifacts の出力ディレクトリ |
-| `L2_DEFAULT_SPEAKER` | `octamaid` | デフォルトキャラクター slug（name_hint / text_match なし時） |
-| `L2_PORCUPINE_ACCESS_KEY` | *(wake word 使用時必須)* | Picovoice アクセスキー |
-| `L2_PORCUPINE_MODEL_DIR` | `./porcupine/` | .ppn / .pv ファイル配置先 |
-| `L2_TTS_VOICEPEAK_PATH` | `voicepeak` | VOICEPEAK コマンドパス（PATH 非通過環境で指定） |
-| `L2_WAKE_TIMEOUT` | `30` | ウェイクワード待機秒数 |
+| `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマ絶対パス（省略で兄弟 workspace を探索） |
+| `L2_USE_REAL_LLM` | `false` | `true` で real LLM を呼ぶ（ダミー応答を無効化） |
+| `L2_LLM_PROVIDER` / `L2_LLM_MODEL` | `openai` / `gpt-5.4` | 既定プロバイダ・モデル（**フォールバック**。キャラ別の指定が `characters.py` にあればそちらが優先） |
+| `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` | *(real mode 時)* | 各 LLM プロバイダの API キー |
+| `L2_USE_REAL_TTS` | `false` | `true` で real TTS を呼ぶ |
+| `L2_TTS_PROVIDER` | `voicevox` | TTS プロバイダ（`edge_tts` / `voicevox` / `voicepeak`） |
+| `L2_USE_REAL_STT` | `false` | `true` で real STT を呼ぶ |
+| `L2_STT_PROVIDER` | `faster-whisper` | STT プロバイダ（`openai` / `faster-whisper` / `sherpa-onnx`） |
+| `L2_DEFAULT_SPEAKER` | `octamaid` | 既定キャラ slug（wake hint / 文字列一致なし時） |
+| `L2_USE_LLM_ROUTER` / `L2_LLM_ROUTER_MODEL` | `true` / `claude-haiku-4-5` | LLM によるキャラ・ルーティング |
+| `L2_USE_INTENT_GATE` / `L2_INTENT_GATE_MODEL` | `true` / `claude-haiku-4-5` | 挙手・承認の意図判定（軽量分類 LLM） |
+| `L2_ENABLE_RAG` / `L2_USE_C2_RETRIEVER` | `false` / `false` | seed corpus RAG / C2 会話メモリ RAG |
+| `L2_C2_URL` | `http://localhost:8100` | C2 のベース URL（RAG 参照先） |
+| `L2_USE_HANDRAISE` | `true` | 挙手制自発介入の有効化（`bg-continuous` 上で動作） |
+| `L2_ENABLE_TOOLS` | `false` | MCP ツール（Agent モード）の有効化 |
+| `L2_VAD_BACKEND` / `L2_VAD_AGGRESSIVENESS` | `webrtc` / `3` | VAD バックエンドと感度 |
+| `L2_OBS_WS_URL` / `L2_OBS_WS_PASSWORD` | *(任意)* | OBS WebSocket 接続情報（立ち絵切替） |
+| `LANGSMITH_TRACING` | `false` | `true` で LangChain/LangGraph 実行を LangSmith に送信 |
 
 ---
 
-## 実行方法（開発用エミッタ）
+## キャラクター
 
-### テキスト入力（ダミーモード・デフォルト）
+`characters.py` で一元管理（環境変数の爆発を避け、キャラ固有設定はコードで定義）。
+既定キャラは `L2_DEFAULT_SPEAKER`（既定 `octamaid`）。
 
-Redis に 3 イベントを publish する。LLM / TTS / STT は呼ばない。
+| slug | 表示名 | ウェイクワード | LLM | TTS（ボイス） |
+|------|--------|--------------|-----|--------------|
+| `mimi` | ミミ・オクタヴィア | ミミ様 | OpenAI `gpt-5.5` | VOICEPEAK（Asumi Ririse） |
+| `chisame` | 波心ちさめ | ちさめさん | Google `gemini-3.1-pro-preview` | VOICEPEAK（Miyamai Moca） |
+| `sakura` | 八重笠さくら | さくらさん | Anthropic `claude-sonnet-4-6` | VOICEPEAK（Haruno Sora） |
+| `octamaid` | オクタメイド | オクタメイド | 既定（OpenAI） | VOICEVOX（89 / Voidoll） |
+| `ruka` | 坂東ルカ | *(なし)* | 既定（OpenAI） | VOICEPEAK（Frimomen） |
+
+各キャラのシステムプロンプトは `src/lab_lounge/system_prompts/` に配置。
+VOICEPEAK キャラは emotion キー（happy/fun/angry/sad/sulky 等）を持ち、フィラーや感情表現に使う。
+
+---
+
+## 実行方法
+
+L2 には 3 つのエントリポイントがある。
+
+### 1. `emitter` — 開発用エミッタ（テキスト / 音声ファイル）
+
+テキスト or `--audio-file` を入力に 1 パスを流す。CI/手動検証向け。
 
 ```powershell
+# ダミーモード（LLM/TTS/STT を呼ばず Redis に 3 イベントを publish）
 uv run python -m lab_lounge.emitter "今日の天気を教えて"
+
+# stream_id を固定したい場合
+uv run python -m lab_lounge.emitter "テスト発話" --stream-id my-stream-002
 ```
 
-### 音声ファイル入力（real STT モード）
-
-`--audio-file` で音声ファイルを指定する。`L2_USE_REAL_STT=true` のとき real STT API を呼ぶ。
-
-```powershell
-# 1. stt extra をインストール（初回のみ）
-uv sync --extra stt
-
-# 2. 環境変数をセット（OPENAI_API_KEY は LLM と共用）
-$env:L2_USE_REAL_STT  = "true"
-$env:L2_STT_PROVIDER  = "openai"
-$env:L2_STT_LANG      = "ja"
-
-# 3. 音声ファイルを指定して実行
-uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
-
-# 環境変数をリセット
-Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_STT_PROVIDER, Env:\L2_STT_LANG
-```
-
-> **ダミー STT モード** (`L2_USE_REAL_STT=false`): `--audio-file` を指定しても 警告ログを出してダミーテキストでパイプラインが続く。
-
-### real LLM モード
-
-`L2_USE_REAL_LLM=true` を設定すると `llm.final` が OpenAI を実際に呼ぶ。
-
-```bash
-# 1. llm extra をインストール（初回のみ）
-uv sync --extra llm
-
-# 2. .env に API キーを設定
-echo "L2_USE_REAL_LLM=true" >> .env
-echo "OPENAI_API_KEY=sk-..." >> .env  # 実際のキーに差し替える
-
-# 3. 実行
-uv run python -m lab_lounge.emitter "今日の天気を教えて"
-```
-
-**PowerShell からお試しの場合**:
-
-```powershell
-$env:L2_USE_REAL_LLM = "true"; $env:L2_LLM_MODEL = "gpt-4o-mini"
-uv run python -m lab_lounge.emitter "今日の天気を教えて"
-Remove-Item Env:\L2_USE_REAL_LLM, Env:\L2_LLM_MODEL
-```
-
-### real TTS モード
-
-```powershell
-# VOICEVOX Engine を起動した後（別ターミナル）:
-# docker run -p 50021:50021 voicevox/voicevox_engine:latest
-
-$env:L2_USE_REAL_TTS      = "true"
-$env:L2_TTS_PROVIDER      = "voicevox"
-$env:L2_TTS_VOICE         = "89"   # Voidoll
-$env:L2_TTS_SPEAKER       = "Voidoll"
-$env:L2_TTS_OUTPUT_DIR    = "./data/audio"
-$env:L2_TTS_VOICEVOX_URL  = "http://localhost:50021"
-uv run python -m lab_lounge.emitter "こんにちは"
-Remove-Item Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR, Env:\L2_TTS_VOICEVOX_URL
-```
-
-### real STT + real LLM + real TTS 最短手順
-
-**前提**: Redis + VOICEVOX Engine 起動済み、`OPENAI_API_KEY` 設定済み。
+real STT + real LLM + real TTS の最短手順（Redis + VOICEVOX 起動済み・`OPENAI_API_KEY` 設定済み）:
 
 ```powershell
 uv sync --extra stt --extra llm --extra tts
 
-$env:L2_USE_REAL_STT      = "true"
-$env:L2_USE_REAL_LLM      = "true"
-$env:L2_USE_REAL_TTS      = "true"
-$env:L2_TTS_PROVIDER      = "voicevox"
-$env:L2_TTS_VOICE         = "89"
-$env:L2_TTS_SPEAKER       = "Voidoll"
-$env:L2_TTS_OUTPUT_DIR    = "./data/audio"
-uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
-Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR
-```
-
-出力例:
-
-```
-stream_id  : 3fa85f64-5717-4562-b3fc-2c963f66afa6
-session_id : 7c9e6679-7425-40de-944b-e07fc1f90ae7
-trace_id   : 550e8400-e29b-41d4-a716-446655440000
-  published: type=utterance.final event_id=...
-  published: type=llm.final       event_id=...
-  published: type=tts.done        event_id=...
-```
-
-`--stream-id` で stream_id を固定することもできる:
-
-```bash
-uv run python -m lab_lounge.emitter "テスト発話" --stream-id my-stream-002
-```
-
-### RAG モード（Grounded E2E v1）
-
-知識ベースを参照して応答を生成する RAG モード。seed corpus から index を作成しておく必要がある。
-
-#### 初回セットアップ（index ビルド）
-
-```powershell
-# rag extra をインストール（初回のみ）
-uv sync --extra rag
-
-# seed corpus（aibyss-workspace/docs/kb/）から index を生成
-uv run python scripts/build_index.py
-# -> data/index/chunks.json, data/index/embeddings.npy を生成
-```
-
-#### RAG on で実行
-
-```powershell
-$env:L2_USE_REAL_LLM = "true"
-$env:L2_ENABLE_RAG   = "true"
-$env:L2_KB_PATH      = "./data/index"
-$env:L2_RAG_TOP_K    = "3"
-uv run python -m lab_lounge.emitter "Think-AI Lab.のメンバーを教えてください"
-Remove-Item Env:\L2_USE_REAL_LLM, Env:\L2_ENABLE_RAG, Env:\L2_KB_PATH, Env:\L2_RAG_TOP_K
-```
-
-#### debug artifacts の確認
-
-```powershell
-$env:L2_DEBUG_ARTIFACTS = "true"
-$env:L2_DEBUG_LOG_DIR   = "./logs"
-# 実行後 logs/ 以下に以下のファイルが生成される:
-#   stt_output.json   - STT 結果
-#   retrieval.json    - 検索結果 (doc_ids / scores / latency)
-#   llm_prompt.txt    - LLM に渡したプロンプト全文
-#   llm_response.txt  - LLM の応答全文
-```
-
-`llm.final.payload` の RAG 関連フィールド:
-
-| フィールド | 説明 |
-|-----------|------|
-| `rag_used` | RAG を使ったか（`true` / `false`） |
-| `answer_mode` | `grounded`（RAG 使用）/ `fallback`（非 RAG） |
-| `retrieval_latency_ms` | 検索にかかった時間 [ms] |
-| `retrieved_doc_count` | 取得した文書数 |
-| `retrieved_doc_ids` | 取得した文書の ID リスト |
-
----
-
-### LangSmith 観測（Phase 5）
-
-LangChain / LangGraph の内部 run / trace / latency を LangSmith で観測できる。  
-**C2 は system of record、LangSmith は system of observation** として役割分離を保つ。
-
-#### 有効化手順
-
-```powershell
-# 1. obs extra をインストール（初回のみ）
-uv sync --extra obs
-
-# 2. .env に追加
-#    LANGSMITH_TRACING=true
-#    LANGSMITH_API_KEY=lsv2_pt_...
-#    LANGSMITH_PROJECT=aibyss-lab-lounge
-```
-
-#### audio-file E2E を LangSmith で観測する最短手順
-
-**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` + `LANGSMITH_API_KEY` 設定済み。
-
-```powershell
-uv sync --extra stt --extra llm --extra tts --extra obs
-
-$env:LANGSMITH_TRACING  = "true"
-$env:LANGSMITH_PROJECT  = "aibyss-lab-lounge"
-$env:L2_USE_REAL_STT    = "true"
-$env:L2_USE_REAL_LLM    = "true"
-$env:L2_USE_REAL_TTS    = "true"
-$env:L2_TTS_PROVIDER    = "voicevox"
-$env:L2_TTS_VOICE       = "89"
-$env:L2_TTS_SPEAKER     = "Voidoll"
-$env:L2_TTS_OUTPUT_DIR  = "./data/audio"
-uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
-Remove-Item Env:\LANGSMITH_TRACING, Env:\LANGSMITH_PROJECT, `
-  Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, `
-  Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER, Env:\L2_TTS_OUTPUT_DIR
-```
-
-実行後、[https://smith.langchain.com](https://smith.langchain.com) → プロジェクト `aibyss-lab-lounge` を開くと  
-1 往復の run / latency / token 数が `aibyss.trace_id` / `aibyss.stream_id` で検索できる。
-
-> **tracing off のとき**: `LANGSMITH_TRACING=false`（既定）のままでも全機能が動く。  
-> `observability.py` は metadata を組み立てるが外部に送信しない。
-
-### マイク入力・スピーカー出力（Phase 4）
-
-`run_once.py` は 1 回録音 → STT → LLM → TTS → デバイス再生までを 1 往復で実行する最小ランタイム。  
-常時ストリーミングでなく、**1 往復終わると先に進む固定秒数録音方式**で実装している。
-
-#### インストール
-
-```powershell
-# mic extra (録音 + 再生) を含む全 extra を同時インストール
-uv sync --extra mic --extra stt --extra llm --extra tts
-```
-
-#### 実機確認手順 (LangSmith 無効)
-
-**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` 設定済み。
-
-```powershell
-# デフォルト 5 秒録音
-uv run python -m lab_lounge.run_once
-
-# 録音秒数を指定
-uv run python -m lab_lounge.run_once --record-seconds 10
-
-# TTS 再生をスキップ（ファイルパスのみ表示）
-uv run python -m lab_lounge.run_once --no-play
-```
-
-#### 実機確認手順 (LangSmith 有効)
-
-**前提**: Redis + VOICEVOX 起動済み、`.env` に `OPENAI_API_KEY` + `LANGSMITH_API_KEY` 設定済み。
-
-```powershell
-uv sync --extra mic --extra stt --extra llm --extra tts --extra obs
-
-$env:LANGSMITH_TRACING = "true"
-uv run python -m lab_lounge.run_once --record-seconds 5
-Remove-Item Env:\LANGSMITH_TRACING
-```
-
-実行後、[https://smith.langchain.com](https://smith.langchain.com) → `aibyss-lab-lounge` で LLM run を確認できる。
-
-#### デバイス一覧確認
-
-```powershell
-uv run python -c "import sounddevice; print(sounddevice.query_devices())"
-```
-
-#### フォールバック動作
-
-| 事象 | 内容 |
-|---|---|
-| 無音検出 | `処理を中断しました。` と表示して終了 |
-| 録音デバイスエラー | 同上 |
-| STT 失敗 | `処理を中断しました。` と表示。LLM / TTS には進まない |
-| 再生失敗 (MP3 等) | 警告ログのみ。PipelineResult は返す |
-
----
-
-### ウェイクワード連続ループ（Axis A）
-
-`run_loop.py` はウェイクワード検知 → 録音 → STT → Pipeline → TTS → 再生 のループを繰り返す本番向けランタイム。
-
-#### 前提
-
-- `pvporcupine` がインストール済み（`uv sync --extra wake --extra mic --extra stt --extra llm --extra tts`）
-- `porcupine/` ディレクトリに `.ppn` モデルファイルと `porcupine_params_ja.pv` が配置済み
-- `L2_PORCUPINE_ACCESS_KEY` が設定済み（[Picovoice Console](https://console.picovoice.ai/) で取得）
-
-#### 実行
-
-```powershell
-# ループ起動（Ctrl+C で終了）
-uv run python -m lab_lounge.run_loop
-
-# 1 ターンで停止（テスト用）
-uv run python -m lab_lounge.run_loop --max-turns 1
-
-# TTS 再生をスキップ
-uv run python -m lab_lounge.run_loop --no-play
-
-# 録音秒数 / ウェイクワード待機時間を指定
-uv run python -m lab_lounge.run_loop --record-seconds 10 --wake-timeout 60
-```
-
-> **フォールバック**: `L2_PORCUPINE_ACCESS_KEY` が未設定の場合、Enter キーで手動トリガーするモードに自動切替。
-
-#### キャラクター別ウェイクワード
-
-| キャラクター | ウェイクワード | TTS ボイス |
-|-------------|--------------|-----------|
-| ミミ・オクタヴィア | 「ミミ様」 | 彩澄りりせ (VOICEPEAK) |
-| 波心ちさめ | 「ちさめさん」 | 宮舞モカ (VOICEPEAK) |
-| 八重笠さくら | 「さくらさん」 | 桜乃そら (VOICEPEAK) |
-| オクタメイド | 「オクタメイド」 | Voidoll/89 (VOICEVOX) |
-
----
-
-### セマンティックスモーク WAV の生成（初回セットアップ）
-
-STT 検証用の短い実発話 WAV を生成する。VOICEVOX Engine が必要。
-
-```powershell
-# VOICEVOX Engine を起動してから（別ターミナル）:
-# docker run -p 50021:50021 voicevox/voicevox_engine:latest
-
-uv run python scripts/generate_smoke_wav.py
-# -> samples/test_greeting.wav を生成
-
-# STT 検証:
 $env:L2_USE_REAL_STT = "true"; $env:L2_USE_REAL_LLM = "true"; $env:L2_USE_REAL_TTS = "true"
-$env:L2_TTS_PROVIDER = "voicevox"; $env:L2_TTS_VOICE = "89"
-uv run python -m lab_lounge.emitter --audio-file samples/test_greeting.wav --stream-id semantic-smoke
-Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE
+$env:L2_TTS_PROVIDER = "voicevox"; $env:L2_TTS_VOICE = "89"; $env:L2_TTS_SPEAKER = "Voidoll"
+uv run python -m lab_lounge.emitter --audio-file samples/q1.wav
+Remove-Item Env:\L2_USE_REAL_STT, Env:\L2_USE_REAL_LLM, Env:\L2_USE_REAL_TTS, `
+  Env:\L2_TTS_PROVIDER, Env:\L2_TTS_VOICE, Env:\L2_TTS_SPEAKER
 ```
 
-utterance.final.payload.text に "こんにちは" 程度の内容が返れば OK。
+出力に `utterance.final` / `llm.final` / `tts.done` の 3 イベントの `event_id` と `stream_id` が表示される。
 
-### silence threshold の校正
+### 2. `run_once` — 1 往復会話
 
-マイク環境に合わせた `L2_SILENCE_THRESHOLD` の推奨値を測定する。
+1 回録音 → STT → LLM → TTS → デバイス再生までを 1 往復で実行する最小ランタイム（固定秒数録音）。
 
 ```powershell
-# mic extra をインストール済みの場合:
-uv run python scripts/calibrate_silence.py
-
-# 測定秒数・デバイスを指定する場合:
-uv run python scripts/calibrate_silence.py --seconds 5 --device 2
+uv sync --extra mic --extra stt --extra llm --extra tts
+uv run python -m lab_lounge.run_once                    # 既定 5 秒録音
+uv run python -m lab_lounge.run_once --record-seconds 10
+uv run python -m lab_lounge.run_once --no-play          # 再生をスキップ
 ```
 
-出力された `L2_SILENCE_THRESHOLD=X.XXXX` を `.env` に追記する。
+### 3. `run_loop` — ウェイクワード連続ループ（本番向け）
+
+ウェイクワード検知 → 録音 → STT → ルーティング → Pipeline → TTS → 再生 を繰り返す。
+
+```powershell
+uv sync --extra wake --extra mic --extra stt --extra llm --extra tts --extra vad-webrtc
+
+uv run python -m lab_lounge.run_loop                        # wake backend 自動選択
+uv run python -m lab_lounge.run_loop --wake-backend porcupine   # 選択肢: porcupine / speech / sherpa / continuous / bg-continuous / keyboard
+uv run python -m lab_lounge.run_loop --max-turns 1          # 1 ターンで停止（検証用）
+uv run python -m lab_lounge.run_loop --no-play
+```
+
+> **wake backend**（`--wake-backend`）: `porcupine`（ウェイクワード、要 `L2_PORCUPINE_ACCESS_KEY` + `porcupine/*.ppn`）/ `speech`（発話で起動）/ `sherpa`（sherpa-onnx 連続認識）/ `continuous`（常時文字起こし + バッファ）/ `bg-continuous`（常時録音 + Dispatcher、応答中も録音継続。**挙手制介入はこのモードのみ**）/ `keyboard`（Enter 手動トリガー）。省略時は自動選択、`porcupine` のキー未設定時は `keyboard` にフォールバック。
+
+#### dev プロファイルで起動する（`scripts/run_dev.ps1`）
+
+本番履歴（`c2.db`）を汚さずに会話ループを試すための開発モード起動スクリプト。内部的には上記の `run_loop` を呼ぶだけだが、環境変数の読み込みと dev/prod 分離を自動で行う。
+
+```powershell
+.\scripts\run_dev.ps1                              # 既定: -WakeBackend continuous -MaxTurns 3
+.\scripts\run_dev.ps1 -MaxTurns 0                  # 無制限（Ctrl+C で停止、prod と同仕様）
+.\scripts\run_dev.ps1 -WakeBackend bg-continuous -MaxTurns 5
+```
+
+実行の流れ:
+
+1. **環境変数の読み込み（ファイルが source of truth）** — `.env`（本番と共通の設定 = `OPENAI_API_KEY` / `L2_USE_REAL_LLM` 等を継承）→ `.env.dev`（dev 固有の上書き = ストリーム名・C2 URL）の順に読み込み、いずれも既存のプロセス環境変数を上書きする（過去実行の残値による事故を防ぐ）。
+2. **分離値の確認表示** — `REDIS_STREAM_KEY` / `L2_C2_URL`（主）/ `L2_C2_URL_READONLY`（副）/ VAD 設定 / `OPENAI_API_KEY`（先頭のみ）を出力。
+3. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（dev 発話が本番 C2 に混入するのを防ぐ）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
+4. **`run_loop` 起動** — `uv run python -m lab_lounge.run_loop --wake-backend <WakeBackend> [--max-turns <MaxTurns>]` を実行。ループ本体（Wake → 録音 → STT → ルーティング → Pipeline → TTS → 再生）は冒頭の[アーキテクチャ](#アーキテクチャ)図のとおり。
+
+| パラメータ | 既定 | 説明 |
+|-----------|------|------|
+| `-WakeBackend` | `continuous` | run_loop の `--wake-backend` に渡す（上記 6 種から選択） |
+| `-MaxTurns` | `3` | 暴走防止のターン上限。`0` 以下なら `--max-turns` を渡さず **無制限** にする |
+
+**分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://localhost:8101`（dev・書き込み先）、副 C2 = `http://localhost:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。
+
+**前提**:
+- Redis 起動済み（`aibyss-workspace` で `docker compose up -d`）
+- 本番 C2（port 8100 / `c2.db`）と開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`）の両方が稼働（`aibyss-coral-chronicle/scripts/run_prod.ps1` と `run_dev.ps1`）
+- `.env.dev` を作成済み（`cp .env.dev.example .env.dev`）
 
 ---
 
-### よくある失敗例（トラブルシューティング）
+## 主要サブシステム
 
-#### TTS プロバイダの選択基準
+- **キャラクター・ルーティング** (`router.py`) — wake hint → 文字列一致 → LLM router（`L2_USE_LLM_ROUTER`）→ default の優先順で担当キャラを決定。
+- **挙手制自発介入 / Dispatcher** (`dispatcher.py`) — `bg-continuous` 上で「呼ばれていないが自分の関心領域に触れた」発話に対しキャラが自発的に挙手し、ルカが承認/却下する。状態機械は IDLE / RESPONDING / HANDRAISING。承認/却下/lapse（既定 300 秒）で解消し、`bubble.update`（raisehand 系）と `dispatcher.*` イベントで HUD に可視化。`L2_USE_HANDRAISE` で on/off。
+- **CharacterStatusManager** (`character_status.py`) — 全キャラの内部状態を 7 値（READY / THINKING / TOOL_CALLING / RAISEHAND / RAISEHAND_PROGRESSING / RAISEHAND_READY / TALKING）で一元管理。変化時に `character.status.update` を発行し、V2 の `/status` dashboard が可視化する。
+- **Agent モード / MCP ツール** (`graph.py`, `mcp_servers/`) — `L2_ENABLE_TOOLS=true` で LangGraph の ReAct エージェントが `ask_character`（他キャラへ質問）/ `web_search`（Tavily）/ `retrieve_memory`（C2 会話メモリ）を呼ぶ。
+- **Retriever** (`retriever.py`) — `LocalRetriever`（seed corpus を numpy コサイン類似度で検索）/ `C2Retriever`（C2 の `/retrieve` を HTTP で叩く）/ `CompositeRetriever`（両者を RRF でマージ）。`L2_ENABLE_RAG` / `L2_USE_C2_RETRIEVER` で構成。
+- **フィラー** (`filler.py`) — 「えーっと」等のつなぎ発話を事前生成・キャッシュし、LLM 応答までの沈黙を埋める。VOICEPEAK キャラは emotion 付き。
+- **OBS 立ち絵連携** (`obs.py`) — OBS WebSocket でキャラの pose/emotion ソースを切り替え、発話タイミングと同期。
+- **VAD（発話検知）** (`audio_io.py`) — WebRTC VAD（推奨、`aggressiveness` 0–3）または RMS 閾値方式。
+- **配信文脈** (`stream_context.py`) — 「今日の配信内容」を全キャラのシステムプロンプトに重ねる（下記参照）。
 
-| プロバイダ | 出力形式 | 再生可否 | 用途 |
-|-----------|---------|---------|------|
-| `voicevox` | WAV | ✅ soundfile で再生可 | **標準（推奨）** |
-| `edge_tts` | MP3 | ❌ soundfile は MP3 非対応 | 再生なし or WAV 変換ありの環境のみ |
+---
 
-**標準は `voicevox`。** VOICEVOX Engine がローカルで起動している場合は自動的に WAV で出力・再生できる。
-`edge_tts` は再生を伴わないバッチ生成（ファイル書き出しのみ）や、MP3→WAV 変換ツールがある環境での使用を想定している。
+## 発行イベント
 
-#### MP3 が再生できない（edge_tts 利用時）
+L2 はすべて Event Envelope (v0.1) でラップし、publish 前にスキーマ検証する（`stream_idx` は付与しない = Guardrail G-1）。
 
-edge_tts は MP3 を出力するが `soundfile` は MP3 非対応。
-再生時に `WARNING lab_lounge.audio_io: 再生失敗: *.mp3 (Error opening ...)` が出る。
+| type | 用途 | 主な consumer |
+|------|------|--------------|
+| `utterance.final` | STT 確定テキスト（lang / confidence / words） | C2（正史保存） |
+| `llm.final` | LLM 応答（model / token / latency / RAG メタ / character） | C2 |
+| `tts.done` | 音声合成完了（audio_url / duration / voice / character） | C2・V2（→ hud.caption） |
+| `bubble.update` | 進捗・挙手の吹き出し（category: speech_status / speech_content / raisehand） | V2（OBS 吹き出し） |
+| `character.status.update` | キャラ内部状態（7 状態 + metadata） | V2（`/status` dashboard） |
+| `dispatcher.queue.update` | wake_event キュー状態（運用デバッグ用） | V2（デバッグ HUD） |
+| `dispatcher.handraise.update` | 挙手中キャラ + 連続却下 cooldown（運用デバッグ用） | V2（デバッグ HUD） |
 
-**解決策**: TTS provider を `voicevox` に切り替える（WAV 出力のため soundfile で再生可能）。
-
-```powershell
-# VOICEVOX Engine を起動してから
-docker run -p 50021:50021 voicevox/voicevox_engine:latest
-
-$env:L2_TTS_PROVIDER = "voicevox"
-uv run python -m lab_lounge.run_once
-```
-
-#### 無音検知で処理が中断する
-
-`SilenceError: 無音を検出しました (RMS=0.0023 < threshold=0.005)` が出る場合は、  
-`L2_SILENCE_THRESHOLD` を下げる（マイクの感度やノイズに応じて調整）。
-
-```powershell
-$env:L2_SILENCE_THRESHOLD = "0.001"
-uv run python -m lab_lounge.run_once
-Remove-Item Env:\L2_SILENCE_THRESHOLD
-```
-
-目安: 静かな環境 `0.001`–`0.003` / 騒がしい環境 `0.005` 以上 / デフォルト `0.005`
-
-#### 別のマイクやスピーカーを使いたい
-
-```powershell
-# デバイス番号の確認
-uv run python -c "import sounddevice; print(sounddevice.query_devices())"
-
-# デバイス番号 (例: 2) を指定して実行
-uv run python -m lab_lounge.run_once --device 2
-
-# 環境変数で固定する場合
-$env:L2_AUDIO_DEVICE = "2"
-uv run python -m lab_lounge.run_once
-Remove-Item Env:\L2_AUDIO_DEVICE
-```
-
-#### LANGSMITH_TRACING 未設定で 401 警告が出る
-
-`langsmith` パッケージは `langgraph` の依存として自動インストールされる。  
-`LANGSMITH_TRACING` を未設定のままにすると起動時に API キー検証を試みて警告ログが出ることがある。
-
-**解決策**: `.env` に `LANGSMITH_TRACING=false` を明示する（`.env.example` から引き継がれているはず）。
-
----（Step 4 受け入れ条件）
-
-### 1. Redis を起動する
-
-```bash
-cd ../aibyss-workspace
-docker compose up -d
-docker compose exec redis redis-cli ping
-# -> PONG
-```
-
-### 2. C2 を起動する
-
-```bash
-cd ../aibyss-coral-chronicle
-# .env に REDIS_URL=redis://localhost:6379 が設定されていることを確認
-uv run uvicorn coral_chronicle.main:app --host 0.0.0.0 --port 8100
-```
-
-C2 の起動ログに以下が出れば Consumer 準備完了:
-
-```
-INFO  coral_chronicle.bus  Consumer Group 'cg-c2' を確認/作成しました
-```
-
-### 3. テキストエミッタを実行する
-
-別ターミナルで:
-
-```bash
-cd ../aibyss-lab-lounge
-uv run python -m lab_lounge.emitter "今日の天気を教えて"
-```
-
-表示された `stream_id` をメモしておく。
-
-### 4. C2 のタイムラインで 3 件を確認する
-
-**PowerShell（推奨 — 日本語が文字化けしない）**:
-
-```powershell
-$sid = "<上記の stream_id>"
-Invoke-RestMethod "http://localhost:8100/timeline?stream_id=$sid" | ConvertTo-Json -Depth 5
-```
-
-**curl を使う場合（注意）**: Windows では `curl.exe ... | python -m json.tool` は  
-`python -m json.tool` が stdin を cp932 で読む場合があるため **日本語が文字化けして見える** ことがある。  
-データ自体（SQLite / Redis 内）は正常な UTF-8 で保持されているため、  
-`Invoke-RestMethod` や `curl.exe ... | python -c "import sys,json; ..."`  
-で UTF-8 指定して確認すること。
-
-```powershell
-# UTF-8 を明示して標準入力を読む確認コマンド
-$sid = "<上記の stream_id>"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-curl.exe -s "http://localhost:8100/timeline?stream_id=$sid" | `
-  python -c "import sys,json; sys.stdin.reconfigure(encoding='utf-8'); print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))"
-```
-
-期待レスポンス:
-
-```json
-{
-  "events": [
-    {"type": "utterance.final", "stream_idx": 0, "...": "..."},
-    {"type": "llm.final",       "stream_idx": 1, "...": "..."},
-    {"type": "tts.done",        "stream_idx": 2, "...": "..."}
-  ],
-  "total": 3
-}
-```
-
-### 5. links の因果関係を確認する
-
-```bash
-curl -s "http://localhost:8100/timeline?stream_id=<stream_id>" \
-  | python -c "import json,sys; evs=json.load(sys.stdin)['events']; [print(e['type'], e.get('links')) for e in evs]"
-```
-
-期待出力:
-
-```
-utterance.final None
-llm.final       ['<utterance.final の event_id>']
-tts.done        ['<llm.final の event_id>']
-```
+links による因果: `llm.final.links = [utterance.final.event_id]`、`tts.done.links = [llm.final.event_id]`。
 
 ---
 
 ## 配信文脈のカスタマイズ
 
-「今日の配信内容」を別ファイルで管理し、システムプロンプトに重ねて全キャラに
-共通の前提を共有させる仕組みです。例えば「今日は1年ぶりの配信、大神をプレイ」
-のような配信単位の状況を、`mimi` / `chisame` / `sakura` / `octamaid` / `ruka`
-すべてに同時に伝えられます。
+「今日の配信内容」を別ファイルで管理し、全キャラのシステムプロンプトに `## 本日の配信` として
+重ねる仕組み。起動時（`run_loop` / `run_once` / `emitter`）に 1 度だけ読み込む。
 
-### 仕組み
-
-`run_loop` / `run_once` / `emitter` の起動時に1度だけ
-`data/stream_context/current.md` を読み込み、その内容をキャラごとの
-システムプロンプトに `## 本日の配信` セクションとしてマージします。
-
-最終的に LLM へ渡るシステムメッセージは3層構造になります:
+最終的に LLM へ渡るシステムメッセージは 3 層構造:
 
 ```
-<キャラ素体 system_prompt>          ← 不変・人格基盤
-
----
-
-## 本日の配信                       ← 配信単位の前提 (current.md)
-
-<stream_context Markdown 本文>
-
----
-
-## 参照情報                         ← ターン毎に変わる動的情報 (RAG)
-
-<RAG context>
+<キャラ素体 system_prompt>     ← 不変・人格基盤
+## 本日の配信                  ← 配信単位の前提（stream_context）
+## 参照情報                    ← ターン毎に変わる動的情報（RAG）
 ```
 
-### ファイル命名規約 — 2 種類のファイル
-
-`data/stream_context/` 配下の実ファイルはすべて gitignore 対象です。配信文脈は
-性質上、個人メモや配信外で得た情報を含みうるため、git の外で管理します。
-構造を伝えるテンプレ `current.example.md` のみ commit 対象です。
+`data/stream_context/` 配下の実ファイルはすべて gitignore 対象（個人メモや配信外情報を含みうるため）。
+構造を伝える `current.example.md` のみ commit する。
 
 | ファイル | git 管理 | 用途 |
 |---------|---------|------|
-| `current.example.md` | **commit** | 構造を伝えるテンプレ (新規利用者向け) |
-| `current.md` | **gitignore** | 「今、起動時に読まれるファイル」を指す一時参照 |
-| `yyyymmdd_NN.md` | **gitignore** | 配信単位の本体ファイル。過去ログ archive / 将来の予定を蓄積 |
-
-- `yyyymmdd`: 配信予定日 (例: `20260506`)
-- `NN`: 同日内の通し番号 (`01`, `02`, ...) — 同じ日に複数配信する場合に増やす
-
-過去の配信文脈を後から振り返ったり、将来の配信を事前に書き溜めておく運用は
-**ローカル / Notion 等の別場所で管理** するのが想定です。
-
-### 使い方 — 通常運用 (将来予定 → 配信 → archive)
+| `current.example.md` | commit | 構造を伝えるテンプレ |
+| `current.md` | gitignore | 「起動時に読まれるファイル」を指す一時参照 |
+| `yyyymmdd_NN.md` | gitignore | 配信単位の本体（予定/archive） |
 
 ```bash
-# 1. 配信予定を事前に書く (例: 2026-05-06 の初回配信)
-cp data/stream_context/current.example.md data/stream_context/20260506_01.md
-# 20260506_01.md を編集 (## 今日の予定 / ## ハイライト / ## キャラへの共有事項)
-# このファイルは gitignore 対象なのでローカルにのみ残る
-
-# 2. 配信当日、今回使うファイルを current.md として参照
-#    (案A) コピーする
-cp data/stream_context/20260506_01.md data/stream_context/current.md
-#    (案B) .env で直接指定
+# 日付ベースのファイルを直接参照（current.md コピー不要・推奨）
 echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
-
-# 3. 起動 — 起動時に1度だけ読み込まれる
-uv run python -m lab_lounge.run_loop --wake-backend speech
-
-# 4. 配信終了後、yyyymmdd_NN.md がローカル archive として残る
-#    必要なら別の場所 (Notion 等) に控えを残す運用が安全
 ```
 
-### 環境変数で別パスを指定
+> 配信中の編集は反映されない（再起動が必要）。未存在/空ファイル時は配信文脈なしで動作（後方互換）。
 
-```env
-# 日付ベースのファイルを直接参照する (推奨 — current.md コピー不要)
-L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md
+---
 
-# 任意のパスを参照する (絶対パスも可)
-# L2_STREAM_CONTEXT_FILE=/path/to/your/today.md
-```
+## トラブルシューティング
 
-### 仕様メモ
-
-- 配信中にファイルを編集しても**反映されない** (再起動が必要)。
-  → 配信単位の固定前提を扱う設計のため。
-- ファイル未存在 / 空ファイル時は配信文脈なしで動作する (後方互換)。
-- 全キャラ共通の1ファイル。キャラ別出し分けは現バージョンでは未対応。
-- Agent モード (`L2_ENABLE_TOOLS=true`) や `ask_character` ツール経由のキャラ間
-  対話でも同じ配信文脈が伝播する (routing ノードで合成済みのため)。
-- 実ファイル全体が gitignore 対象なので、配信外で得たコメントや個人メモを書き
-  込んでも誤って公開リポに混入する事故を防げる。
+- **TTS プロバイダ選択**: 標準は `voicevox`（WAV 出力で `soundfile` 再生可）。`edge_tts` は MP3 出力で `soundfile` が非対応のため、再生を伴わないバッチ生成向け。再生したい場合は `voicevox` か `voicepeak`。
+- **無音検知で中断する**（RMS バックエンド時）: `L2_SILENCE_THRESHOLD` を下げる（静かな環境 0.001–0.003 / 騒がしい環境 0.005 以上）。`scripts/calibrate_silence.py` で計測可。WebRTC VAD（既定）はキャリブレーション不要。
+- **別のマイク/スピーカーを使う**: `uv run python -c "import sounddevice; print(sounddevice.query_devices())"` で番号を確認し `--device N` または `L2_AUDIO_DEVICE` を指定。
+- **VOICEPEAK が並列実行エラー/クラッシュ**: 1 プロセス制限のためフィラーと本応答が衝突しうる。`L2_VOICEPEAK_RETRY_WAIT_SEC` / `L2_VOICEPEAK_MAX_RETRIES`（既定 1.0s × 8 回）で自動リトライ。
+- **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
 
 ---
 
 ## テスト
 
 ```bash
-uv run pytest -v
+uv run pytest -q     # 1082 passed
+uv run pytest -v     # 詳細表示
 ```
 
-**586 passed** (2026-04-12 時点)
-
-テスト一覧:
-
-| ファイル | 内容 |
-|---------|------|
-| `tests/test_events.py` | スキーマ検証・ビルダー・STT/LLM/TTS フィールド・Guardrail G-1 |
-| `tests/test_pipeline.py` | 3 イベント順序・links 因果関係・seq 連番・utterance_meta パススルー |
-| `tests/test_bus.py` | XADD フィールド名・JSON 値・クライアント close |
-| `tests/test_stt.py` | `transcribe_audio_file`・`_file_duration_ms`・ImportError |
-| `tests/test_tts.py` | `synthesize`・provider ディスパッチ・ImportError |
-| `tests/test_voicepeak_tts.py` | VOICEPEAK チャンク分割・emotion/speed・ストリーミング |
-| `tests/test_llm.py` | `call_llm`・provider ディスパッチ・LLMResult |
-| `tests/test_graph.py` | `run_graph`・LangGraph ノード・ReAct Agent・RAG context ラッパー |
-| `tests/test_observability.py` | LangSmith tracing on/off |
-| `tests/test_run_once.py` | 録音成功フロー・無音・録音失敗・STT 失敗・skip_playback |
-| `tests/test_retriever.py` | LocalRetriever + C2Retriever + RecentC2Retriever + RRF merge (51 件) |
-| `tests/test_rag_pipeline.py` | RAG on/off・fallback・debug artifacts・C2 profile 分離 |
-| `tests/test_router.py` | テキストマッチ・LLM ルーター・意図ゲート |
-| `tests/test_wake_word.py` | Porcupine・speech・continuous バックエンド |
-| `tests/test_obs.py` | OBS WebSocket pose 切替・init/disconnect |
-| `tests/test_filler.py` | フィラーフレーズ・LLM 生成・emotion/pose 対応 |
-| `tests/test_speech_activated.py` | VAD・silence 検知・WebRTC |
-| `tests/test_transcript_buffer.py` | 常時文字起こしバッファ |
-| `tests/test_web_search.py` | Web 検索ツール |
-| `tests/test_sherpa_streaming.py` | Sherpa ストリーミング STT |
+主なテスト領域: イベント/スキーマ (`test_events`)・パイプライン (`test_3stage_pipeline`, `test_pipeline`)・
+ルーティング (`test_router`)・挙手 (`test_dispatcher`, `test_character_status*`)・グラフ/Agent (`test_graph`, `test_graph_agent`)・
+Retriever/RAG (`test_retriever`, `test_rag_pipeline`)・STT/TTS (`test_stt`, `test_tts`, `test_voicepeak_tts`, `test_sherpa_streaming`)・
+ウェイクワード/VAD (`test_wake_word`, `test_speech_activated`)・MCP ツール (`test_ask_character`, `test_web_search`, `test_retrieve_memory`)・
+OBS (`test_obs`)・フィラー (`test_filler`)・配信文脈 (`test_stream_context`)。LLM/STT/TTS 等の外部呼び出しはすべて mock。
 
 ---
 
@@ -738,140 +342,52 @@ uv run pytest -v
 
 ```
 aibyss-lab-lounge/
-  .env.example
-  .gitignore
-  pyproject.toml
-  src/
-    lab_lounge/
-      __init__.py
-      events.py      # Event Envelope ビルダー + スキーマ検証
-      bus.py         # Redis Streams publisher (XADD)
-      pipeline.py    # 3 イベントを順に作って publish
-      emitter.py     # CLI エントリポイント (text / --audio-file)
-      stt.py         # STT アダプタ (OpenAI Whisper API)
-      llm.py         # LLM アダプタ (OpenAI)
-      graph.py       # LangGraph 1-node グラフ
-      tts.py         # TTS アダプタ (edge-tts / VOICEVOX)
-      observability.py  # LangSmith 観測ヘルパー (tracing on/off 判定・run metadata 組み立て)
-      audio_io.py       # 録音・再生アダプタ (sounddevice/soundfile ラッパー)
-      run_once.py       # 1 往復会話 CLI (--mic / --record-seconds)
-      kb_loader.py      # Markdown 読み込み + チャンク化 (RAG 用)
-      retriever.py      # LocalRetriever (numpy コサイン類似度 + OpenAI embeddings)
-      debug.py          # debug artifacts 書き出し (L2_DEBUG_ARTIFACTS=true のときのみ)
-  scripts/
-    build_index.py      # seed corpus → chunks.json + embeddings.npy 生成
-    generate_smoke_wav.py
-    calibrate_silence.py
-  tests/
-    conftest.py
-    test_events.py
-    test_pipeline.py
-    test_bus.py
-    test_stt.py
-    test_llm.py
-    test_graph.py
-    test_tts.py
-    test_observability.py
-    test_run_once.py
-    test_retriever.py   # kb_loader / LocalRetriever ユニットテスト
-    test_rag_pipeline.py  # RAG パイプライン統合テスト
+  .env.example / pyproject.toml / uv.lock
+  porcupine/          # Porcupine .ppn / .pv モデル
+  sherpa-models/      # sherpa-onnx STT モデル
+  samples/            # 検証用 WAV
+  data/               # index / audio / filler_phrases / stream_context（多くは gitignore）
+  scripts/            # build_index / generate_smoke_wav / calibrate_silence / generate_filler_cache 等
+  src/lab_lounge/
+    events.py             # Event Envelope ビルダー + スキーマ検証
+    bus.py                # Redis Streams publisher (XADD)
+    pipeline.py           # utterance/llm/tts を順に発行
+    graph.py              # LangGraph（simple node ｜ ReAct agent）
+    llm.py / stt.py / tts.py    # LLM / STT / TTS アダプタ（複数プロバイダ）
+    audio_io.py           # 録音・再生・VAD
+    router.py             # キャラクター・ルーティング
+    characters.py         # キャラクターレジストリ（5 名）
+    wake_word.py          # Porcupine / speech / continuous バックエンド
+    dispatcher.py         # 挙手・承認の状態機械
+    character_status.py   # CharacterStatusManager（7 状態）
+    filler.py             # フィラーフレーズ管理
+    retriever.py          # Local / C2 / Composite (RRF) retriever
+    kb_loader.py          # seed corpus → index
+    stream_context.py     # 配信文脈の合成
+    transcript_buffer.py  # 常時文字起こしバッファ
+    skill_loader.py       # MCP スキル読み込み
+    obs.py                # OBS WebSocket 立ち絵切替
+    observability.py / log_setup.py / debug.py
+    emitter.py / run_once.py / run_loop.py   # 3 つのエントリポイント
+    mcp_servers/          # ask_character / web_search / retrieve_memory
+    system_prompts/       # キャラ別システムプロンプト
+  tests/                  # 34 テストファイル
 ```
 
 ---
 
-## Step 5 に入る前の前提条件
-
-- [ ] `uv run pytest -v` が全テスト PASS する
-- [ ] `docker compose up -d` で Redis が起動している
-- [ ] C2 起動後にエミッタを実行し、`GET /timeline` で `stream_idx` 0/1/2 の 3 件が取得できる
-- [ ] `llm.final.links` に `utterance.final` の `event_id` が入っている
-- [ ] `tts.done.links` に `llm.final` の `event_id` が入っている
-
----
-
-## Step 6 スモークテスト — L2 の役割
-
-Step 6 では L2 エミッタを 1 回実行するだけで全イベントが流れる。
-
-```powershell
-cd aibyss-lab-lounge
-uv run python -m lab_lounge.emitter "今日の天気を教えて"
-```
-
-出力例：
-
-```
-stream_id  : 3fa85f64-5717-4562-b3fc-2c963f66afa6   ← これをコピーして C2 確認に使う
-session_id : 7c9e6679-7425-40de-944b-e07fc1f90ae7
-trace_id   : 4bf92f3577b34da6a3ce929d0e0e4736
-  published: type=utterance.final event_id=aaaaaaaa-...   seq=0
-  published: type=llm.final       event_id=bbbbbbbb-...   seq=1
-  published: type=tts.done        event_id=cccccccc-...   seq=2
-```
-
-`stream_id` をコピーして C2 タイムライン確認に使う:
-
-```powershell
-$sid = "3fa85f64-5717-4562-b3fc-2c963f66afa6"   # ← 上記出力から貼り付け
-Invoke-RestMethod "http://localhost:8100/timeline?stream_id=$sid" | ConvertTo-Json -Depth 5
-```
-
-**L2 の成功ログ**: `published: type=...` が 3 行出ること。  
-**V2 の成功**: ブラウザ `http://localhost:3200` の字幕エリアに `llm.final.payload.text` が表示されること（tts.done を V2 が受けて hud.caption を生成するため）。
-
----
-
-## 設計概要（詳細は設計ドキュメント参照）
+## 設計ドキュメント・Guardrails
 
 | ドキュメント | 場所 |
 |------------|------|
-| システム全体設計 | `../aibyss-workspace/docs/design/system.md` |
+| システム連携全体図 / イベントライフサイクル | [`../aibyss-workspace/docs/diagrams/`](../aibyss-workspace/docs/diagrams/) |
+| システム全体設計 | [`../aibyss-workspace/docs/architecture.md`](../aibyss-workspace/docs/architecture.md) |
 | L2 詳細設計 | `../aibyss-workspace/docs/design/lab-lounge.md` |
-| Walking Skeleton 計画 | `../aibyss-workspace/docs/plan/walking-skeleton.md` |
-| Event Envelope スキーマ | `../aibyss-workspace/specs/event-envelope-0.1.schema.json` |
+| L2 retriever 設計 (RRF) | `../aibyss-workspace/docs/design/lab-lounge-retriever.md` |
+| Event Envelope スキーマ | [`../aibyss-workspace/specs/event-envelope-0.1.schema.json`](../aibyss-workspace/specs/event-envelope-0.1.schema.json) |
 
 **設計契約上の重要事項**:
-
-- `stream_idx` を Event Envelope に含めない（G-1）。
-- `POST /events` に直接送信しない（G-2）。Event Bus（Redis Streams）経由のみ。
+- `stream_idx` を Event Envelope に含めない（G-1。全体順序は C2 の専権）。
+- `POST /events` に直接送信しない（G-2）。正規経路は Redis Streams (XADD) のみ。
 - `seq` を全体ソートキーに使わない（G-3）。全体順序は C2 の `stream_idx` による。
-
----
-
-## 1. Lab-Lounge（L2）機能概要
-
-### 1.1 目的
-
-AITuberとの会話を **止めずに・速く・安定して**成立させる会話実行基盤。
-
-### 1.2 機能（想定）
-
-- **会話パイプライン**
-    - STT（音声→テキスト）
-    - （必要時）RAG：C2検索 / Web検索
-    - LLM応答生成（外部ホスト）
-    - TTS（テキスト→音声）
-- **3人AITuberの協調**
-    - 通常：1人が応答（ルーターで担当決定）
-    - 必要時：複数参加（素材収集）→ **最終出力の整形は1回**（API回数を抑える）
-- **フォールバック設計（ライブ耐性）**
-    - C2検索が遅い/失敗 → 検索無しで先に結論返す
-    - Web検索は「必要時のみ」＆タイムアウト短め
-- **短期記憶（実行状態）**
-    - 直近Nターン、会話の一時状態、直前のツール結果など（LangGraph state）
-- **ローカル活用（速度/安定）** *(将来目標)*
-    - VAD/録音制御、STT、TTS、Embedding生成などは可能な限りローカルで実行（LLMは外部）
-    - *v0.1 Walking Skeleton では開発用テキストエミッタで代替（本物の STT/TTS/Embedding は非スコープ）*
-
-### 1.3 何が嬉しいのか（価値）
-
-- **ライブ体験が崩れない**（沈黙が短い／失敗しても会話が続く）
-- **会話の品質が上がる**（必要な時だけC2やWebを参照）
-- **運用コストが読める**（呼び出し回数とタイムアウトで制御できる）
-- **後続ツール（V2）につながるログが自動で溜まる**（C2にイベントとして残せる）
-
-### 1.4 境界線（非目標）
-
-- L2は「長期記憶の整理」や「統計・レポート作り」を主目的にしない
-    
-    → それはC2/V2側へ寄せる（L2はライブ優先）。
+- フォールバック優先: C2 検索が遅い/失敗しても検索なしで結論を返す（ライブ耐性）。
