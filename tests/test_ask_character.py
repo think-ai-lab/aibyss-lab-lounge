@@ -22,6 +22,35 @@ def _reset_context():
     reset_ask_character_context()
 
 
+@pytest.fixture
+def mock_bridge_filler_path():
+    """bridge filler の `select_filler_path` を mock する (Phase 0.5-D-d-9)。
+
+    【WHY】
+    実走環境では `data/audio/cache/<slug>/bridge_*.wav` が存在し
+    `select_filler_path(slug, "bridge")` が `(Path, idx)` を返す。
+    しかしテスト環境 / CI では .gitignore で *.wav が除外されているため
+    `(None, -1)` が返り、ask_character.py の bridge filler 投入経路
+    (line 1024-1097) が `bridge_path is None` で skip されてしまう。
+
+    本 fixture は `lab_lounge.filler.select_filler_path` を patch し、
+    テストでも bridge filler chunk 投入経路を検証可能にする。実走挙動は
+    中間実走 12 シナリオ B (= run_loop_20260510_014113.log) で確認済。
+
+    Path object は MagicMock で stub (= Windows / Linux 両対応の as_uri)。
+    """
+    mock_path = MagicMock()
+    mock_path.as_uri.return_value = "file:///tmp/bridge_dummy.wav"
+    mock_path.name = "bridge_dummy.wav"
+    # 関数スコープ動的 import (ask_character.py:1025) のため、
+    # patch 対象は元 module の名前空間 `lab_lounge.filler.select_filler_path`。
+    with patch(
+        "lab_lounge.filler.select_filler_path",
+        return_value=(mock_path, 0),
+    ):
+        yield mock_path
+
+
 class TestSetAskCharacterContext:
     """contextvars のセット/リセットを検証する。"""
 
@@ -112,6 +141,36 @@ class TestAskCharacterImpl:
         assert "データによると問題ありません" in result
         assert "ちさめ" in result or "chisame" in result.lower()
 
+    def test_strips_raw_json_from_collab_result(self):
+        """協働先が生の構造化 JSON を返しても、caller へのツール結果は response 本文のみ。
+
+        ```json フェンスや別スキーマの emotion キーを含めない。caller (gpt-5.5 等 reasoning
+        系) が別スキーマ JSON を入力に受け取って推論暴走する事象 (実走 20260531、~128k
+        トークン出力 → 数分フリーズ + 巨額課金) の回帰防止。
+        """
+        set_ask_character_context(
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        raw_json = (
+            "```json\n{\n"
+            '"emotion": {"bosoboso": 0, "doyaru": 20, "honwaka": 10},\n'
+            '"speed": 150, "pose": "special_overdrive",\n'
+            '"response": "ええ、ミミ。私たちは紛れもなくAIです。"\n'
+            "}\n```"
+        )
+        with patch("lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+                    return_value=raw_json):
+            result = _ask_character_impl("chisame", "AIですか？")
+
+        # クリーンな response 本文が含まれる
+        assert "ええ、ミミ。私たちは紛れもなくAIです。" in result
+        # 生 JSON の痕跡 (フェンス / 別スキーマ emotion キー / pose) を含まない
+        assert "```json" not in result
+        assert "bosoboso" not in result
+        assert "special_overdrive" not in result
+
     def test_tts_called_when_enabled(self, monkeypatch):
         """L2_USE_REAL_TTS=true のとき TTS 合成が呼ばれること（導入 + 本応答の 2 回）。
 
@@ -179,6 +238,845 @@ class TestAskCharacterImpl:
 
         call_kwargs = mock_collab.call_args.kwargs
         assert call_kwargs["model"] == "gpt-5.4-nano"
+
+
+# ─── Phase 0.5-B-β-1 commit 4: target キャラのステータス反映 ────────────
+# WHY: Phase 0.5-B-α では caller のステータス反映 (= mimi: thinking → tool_calling
+# → talking → ready) のみ実装され、ask_character 経由で話す target (= chisame の
+# 音声が流れている数十秒) のステータスが ready のまま (= ask_character.py に
+# set_status 呼出が 0 件) で HUD カードが更新されない穴があった。本 commit で
+# target の THINKING (bridge filler 時) / TALKING (本応答 chunk 1 時、metadata: pose
+# + full response_text) / READY (合成完了時) を反映し、HUD 網羅性を向上する。
+
+
+class TestStatusReflection:
+    """target キャラの HUD ステータス反映 (Phase 0.5-B-β-1 commit 4)。"""
+
+    def test_set_ask_character_context_accepts_status_manager(self):
+        """set_ask_character_context に status_manager 引数を渡せ、contextvar に格納される。
+
+        WHY: graph._generation_node が _gen_status_manager を ask_character へ
+        注入する経路。contextvar 経由で _ask_character_impl 内から取得できる
+        ことを保証する (= 後段の THINKING/TALKING/READY 反映の前提)。
+        """
+        from lab_lounge.mcp_servers.ask_character import _status_manager_var
+
+        mock_mgr = MagicMock()
+        set_ask_character_context(
+            caller_slug="mimi",
+            status_manager=mock_mgr,
+        )
+        assert _status_manager_var.get() is mock_mgr
+
+        # reset で None に戻ること (= 他テストへの漏れ防止、autouse fixture 連動)
+        reset_ask_character_context()
+        assert _status_manager_var.get() is None
+
+    def test_target_thinking_reflected_at_bridge_filler(self, monkeypatch):
+        """bridge filler 投入直前に target が THINKING で反映される。
+
+        WHY: bridge filler (= 例: ちさめ「ええと…」) が再生される間、HUD カード
+        も同期的に thinking (黄色) を表示する。bubble.update("thinking") と対を
+        なす SSE 経路で、視聴者には「target が考え中」と分かる。
+        """
+        from lab_lounge.character_status import CharacterStatus
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize は呼ばれた瞬間に return (= chunks 投入なし、bg_tts 完了)
+        # → bridge filler 投入直前の THINKING 反映だけ走る (= 同期パスでテスト容易)
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            _ask_character_impl("chisame", "質問")
+
+        # 期待: target=chisame で THINKING 反映が 1 回以上発生
+        thinking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.THINKING)
+        ]
+        assert len(thinking_calls) >= 1, (
+            "bridge filler 投入時に target が THINKING で set_status されること"
+        )
+
+    def test_target_talking_reflected_at_first_chunk(self, monkeypatch):
+        """本応答 chunk 1 投入時に target が TALKING + metadata で反映される。
+
+        WHY: HUD カードを talking (緑) に切替、metadata (= pose + full
+        response_text) で発話全文と立ち絵を視認可能にする。graph._tts_node が
+        通常応答経路で渡す metadata 形と統一 (= V2 SSE 受信側で同じ shape)。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        response_text = (
+            '{"response": "データを分析しました", '
+            '"emotion": {"happy": 30}, "speed": 100, "pose": "special_doya"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            """target chunk として on_chunk_ready callback を 1 回呼ぶ。
+
+            導入セリフ呼出 (= speaker=mimi) は callback 不要、本応答呼出
+            (= speaker=chisame) で _wrapped_on_chunk_ready を 1 回起動する。
+            """
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "chisame":
+                on_chunk("file://chunk1.wav", "データを分析しました", True, "chisame")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            # bg_tts daemon thread の完了を確実に待つ (= wait_bg_tts_complete は
+            # session_id に紐付いた completion event を join する設計)
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: target=chisame で TALKING 反映 (metadata 付き) が 1 回
+        talking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.TALKING)
+        ]
+        assert len(talking_calls) == 1, (
+            "本応答 chunk 1 時に target が TALKING で set_status されること"
+        )
+        # metadata が pose + text を含むこと
+        metadata = talking_calls[0].kwargs.get("metadata")
+        assert metadata is not None
+        assert metadata.get("pose") == "special_doya"
+        # Phase 0.5-B-β-3 commit 1: text は say_text (= JSON parse 後の response
+        # 部分のみ) を期待する。JSON 全文ではない (= シナリオ 2 で観察した
+        # 「HUD に JSON が表示される」不具合の修正)。
+        assert metadata.get("text") == "データを分析しました"
+
+    def test_target_talking_metadata_text_falls_back_to_raw_on_parse_failure(
+        self, monkeypatch,
+    ):
+        """response_text が JSON でない場合、metadata.text は raw 文字列にフォールバック。
+
+        WHY: _parse_voicepeak_json が失敗したケース (= 協働先 LLM が JSON 形式を
+        返さなかった、あるいは structured_output 未指定で plain text 返却)。
+        metadata.text を None にしてしまうと HUD に何も表示されないため、raw を
+        fallback として使う (= 視認可能性を最優先、UI stuck 防止)。
+        """
+        import time
+
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss-fallback"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # JSON parse 不可な raw 文字列
+        raw_response = "ただのテキスト応答 (JSON ではない)"
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "chisame":
+                on_chunk("file://chunk1.wav", "ただの…", True, "chisame")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=raw_response,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        talking_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.TALKING)
+        ]
+        assert len(talking_calls) == 1
+        metadata = talking_calls[0].kwargs.get("metadata")
+        assert metadata is not None
+        # JSON parse 失敗時は raw response_text にフォールバック
+        assert metadata.get("text") == raw_response
+
+    def test_target_ready_NOT_reflected_when_synth_normal(self, monkeypatch):
+        """正常合成時は bg_tts_synthesize finally で READY 反映しない (Phase 0.5-B-β-3 commit 2)。
+
+        WHY: bg_tts 合成完了 != 物理再生完了。シナリオ 2 で観察した「HUD で発話
+        途中に灰色化する」不具合の修正。正常系の READY 反映は playback worker
+        (= is_last chunk 物理再生完了時) に移動。bg_tts_synthesize の finally では
+        READY 反映しない (= playback worker 経由で適切なタイミングに反映される)。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1-normal"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize は単純 return (= 合成成功シナリオ、例外なし)
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: 正常系では target=chisame で READY 反映が呼ばれない (= 0 回)。
+        # playback worker 経由で is_last 再生完了時に反映される設計のため。
+        ready_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.READY)
+        ]
+        assert len(ready_calls) == 0, (
+            f"正常系では bg_tts_synthesize finally で READY 反映されないこと "
+            f"(playback worker 経由に移動): ready_calls={ready_calls}"
+        )
+
+    def test_target_ready_fallback_when_synth_exception(self, monkeypatch):
+        """合成例外時は bg_tts_synthesize finally で fallback READY 反映 (Phase 0.5-B-β-3 commit 2)。
+
+        WHY: tts.synthesize が例外を投げた場合、chunks が playback queue に入らない
+        ため、playback worker 経由の READY 反映が走らない。HUD カードが talking
+        のまま stuck するのを防ぐため、本 finally で fallback として READY 反映する。
+        """
+        from lab_lounge.character_status import CharacterStatus
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_status = MagicMock()
+        mock_tts_chunk = MagicMock()
+        session_id = "ss1-exc"
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+            status_manager=mock_status,
+        )
+
+        # tts.synthesize が例外を投げる (= 合成失敗、VOICEPEAK クラッシュ等)
+        def fake_synth_raises(*args, **kwargs):
+            raise RuntimeError("VOICEPEAK 合成失敗")
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "テスト応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth_raises):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 期待: 例外系では fallback で target=chisame の READY 反映が 1 回呼ばれる
+        ready_calls = [
+            call for call in mock_status.set_status.call_args_list
+            if call.args[:2] == ("chisame", CharacterStatus.READY)
+        ]
+        assert len(ready_calls) >= 1, (
+            "tts.synthesize 例外時は finally で fallback として target が "
+            "READY で set_status されること (UI stuck 防止)"
+        )
+
+    def test_status_manager_none_skips_reflection(self, monkeypatch):
+        """status_manager=None なら set_status は一切呼ばれない (後方互換)。
+
+        WHY: Phase 0.5-B-α 以前の呼出元 (= status_manager 引数を渡さない) で
+        ask_character が動作することを保証する。後方互換性 + 「注入忘れ」の
+        フォールバック挙動 (= ステータス反映 no-op、bug にならない)。
+        """
+        import time
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        mock_tts_chunk = MagicMock()
+        # status_manager 渡さず (= 旧呼出パターン)
+        set_ask_character_context(
+            on_tts_chunk=mock_tts_chunk,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        # set_status を spy するため CharacterStatusManager 全体を MagicMock 化して
+        # `_status_manager_var.get()` が None を返す状態を作る (= 上の
+        # set_ask_character_context で status_manager 未指定)
+        # → 内部の `if _status_manager_for_target is not None:` ガードで
+        #    set_status が呼ばれないことを確認する
+        from lab_lounge.mcp_servers.ask_character import _status_manager_var
+
+        assert _status_manager_var.get() is None  # 前提確認
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize"):
+            # 例外無く完了すれば OK (= None ガードで no-op 経路を通過)
+            result = _ask_character_impl("chisame", "質問")
+            time.sleep(0.2)
+
+        # 例外なく応答テキストが返る
+        assert result is not None
+        assert "テキスト" in result or "x" in result or "chisame" in result.lower() or "ちさめ" in result
+
+
+# ─── Phase 0.5-B-β-1 commit 5: BG LLM → ask_character → playback queue 貫通 ──
+# end-to-end wiring を統合的に保証する。pipeline.py / run_loop.py / graph.py /
+# ask_character.py の修正が全て繋がっていれば、run_pipeline_llm_only 経由で渡された
+# callback が ask_character ツール起動時に呼ばれる (= A1 主機能修正)。callback=None
+# なら TTS スキップ (= バグ前の状態を再現する後方互換テスト)。
+#
+# 注意: dummy mode (= L2_USE_REAL_LLM 未設定) では graph._generation_node の
+# Agent 実行 (= ask_character ツール呼出) に入らないため、テストでは
+# set_ask_character_context で contextvars を直接セット → _ask_character_impl を
+# 直接呼ぶ形で wiring の最終セグメントを確認する。pipeline.py の引数 →
+# initial_state → set_ask_character_context までの上流 wiring は β-1-1 / β-1-2 の
+# tests/test_pipeline.py で検証済み。run_pipeline_llm_only 自体の events 不変性
+# (= tts.done が含まれないこと) は TestRunPipelineLlmOnly に追加した
+# test_no_tts_done_event_with_callback_set で別途検証。
+
+
+class TestLlmOnlyTtsPenetration:
+    """end-to-end wiring 統合テスト: BG LLM 経路の対話 TTS callback 起動 (Phase 0.5-B-β-1 commit 5)。"""
+
+    def test_callback_invoked_when_set(self, monkeypatch):
+        """contextvars 経由の callback が ask_character の対話 TTS で起動される。
+
+        WHY: pipeline.py / run_loop.py / graph.py / ask_character.py の wiring が
+        全て繋がっていれば、ask_character ツール起動時に渡された callback が
+        呼ばれる。複数回 (= bridge filler + 本応答 chunks) で呼ばれることで、
+        バグ修正前 (= 0 回) と区別。
+        """
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "ss1"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "テスト応答", "emotion": {"happy": 50}, '
+            '"speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            """on_chunk_ready が渡された TTS 呼出 (= 本応答) で chunk 1 投入。"""
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # ask_character.py:441 の bridge filler 投入 (= 1 回、空 text で chunk 投入)
+        # + 本応答 chunk 1 投入 (= fake_synth → _wrapped_on_chunk_ready → on_tts_chunk)
+        # の最低 2 回 (= 修正前は 0 回) 呼ばれる
+        assert len(callback_invocations) >= 2, (
+            f"callback が 2 回以上呼ばれること (実際: {len(callback_invocations)} 回)"
+        )
+
+    def test_no_callback_skips_tts(self, monkeypatch):
+        """callback=None (= Phase 0.5-A 以前のバグ状態) で tts.synthesize 呼ばれない。
+
+        WHY: A1 バグの本体 (= 「導入セリフ + 協働応答 TTS が完全スキップ」) を
+        再現する後方互換テスト。本 commit 群のロールバック (= 部分 revert) 後の
+        挙動を保証することで、partial revert デバッグパターン (= memory
+        feedback_partial_revert_debug_pattern.md) の整合性を確保する。
+        ask_character.py:376 / :408 の gating `if on_tts_chunk and use_real_tts:`
+        で False になり、tts.synthesize は一切呼ばれない。
+        """
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        # callback=None で contextvars セット (= バグ再現状態)
+        set_ask_character_context(
+            on_tts_chunk=None,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize") as mock_synth:
+            _ask_character_impl("chisame", "質問")
+
+        # gating False → tts.synthesize 一切呼ばれない (= on_tts_chunk=None で TTS 起動 skip、
+        # 通常応答経路の callback 必須要件)。
+        mock_synth.assert_not_called()
+
+
+# ─── Phase 0.5-B-β-2 commit 2: cancel_bg_tts API + bg_tts キャンセルガード ────
+# 却下/lapse 時に ask_character の bg_tts daemon thread を阻止する経路。run_loop
+# の on_handraise_close callback (β-2-3 で実装) が cancel_bg_tts(session_id) を
+# 呼ぶと、該当 session の Event が set される。導入セリフ TTS / _wrapped_on_chunk_ready
+# / _bg_tts_synthesize の 3 箇所で is_set() チェックして以降の処理を skip する。
+# 既に subprocess 中の VOICEPEAK 合成は止められないが、未起動 thread / 未投入
+# chunk / 導入セリフ起動を阻止することで、案 A の音声漏れを最小化する。
+
+
+class TestCancelBgTts:
+    """cancel_bg_tts API + bg_tts キャンセルガード (Phase 0.5-B-β-2 commit 2)。"""
+
+    def test_cancel_bg_tts_returns_zero_for_unknown_session(self):
+        """未登録 session_id で 0 を返す (= flag が無いので set もしない)。
+
+        WHY: dispatcher の on_handraise_close から呼ばれる際、稀に session_id が
+        既にクリーンアップ済 (= 別ターン開始等) のケースで安全に no-op で帰る。
+        """
+        from lab_lounge.mcp_servers.ask_character import cancel_bg_tts
+
+        result = cancel_bg_tts("unknown_session_xyz")
+        assert result == 0
+
+    def test_cancel_bg_tts_empty_session_no_op(self):
+        """空文字 session_id で no-op で 0 を返す。
+
+        WHY: テスト等で session_id 未指定 (= 空文字) で呼ばれるパターンに対応。
+        """
+        from lab_lounge.mcp_servers.ask_character import cancel_bg_tts
+
+        result = cancel_bg_tts("")
+        assert result == 0
+
+    def test_cancel_bg_tts_sets_flag_and_returns_count(self):
+        """set_ask_character_context 後、cancel_bg_tts で flag set + count 返却。
+
+        WHY: 登録済 session に対する cancel の本来の動作。flag set されると、
+        以降の bg_tts ガード (= ask_character.py の 3 箇所) が False → return で
+        skip 動作する。count は影響範囲を示す診断値 (= 登録済 bg_tts events 数)。
+        """
+        import threading
+
+        from lab_lounge.mcp_servers.ask_character import (
+            _ask_state_lock,
+            _bg_cancel_flags,
+            _register_bg_tts_event,
+            cancel_bg_tts,
+        )
+
+        session_id = "ss-cancel-test"
+        set_ask_character_context(
+            common={"session_id": session_id, "stream_id": "s1", "trace_id": "t1"},
+        )
+
+        # bg_tts events を 2 つ登録 (= bg_tts thread 2 つ起動済の状態を模擬)
+        ev1 = threading.Event()
+        ev2 = threading.Event()
+        _register_bg_tts_event(session_id, ev1)
+        _register_bg_tts_event(session_id, ev2)
+
+        # cancel 実行
+        result = cancel_bg_tts(session_id)
+
+        # flag が set されている
+        with _ask_state_lock:
+            assert _bg_cancel_flags[session_id].is_set()
+        # 戻り値 = 登録済 bg_tts events 数 (= 影響範囲指標)
+        assert result == 2
+
+    def test_cancel_blocks_subsequent_bg_tts_synthesize(self, monkeypatch):
+        """cancel_bg_tts 後の _ask_character_impl で tts.synthesize 起動が skip される。
+
+        WHY: end-to-end の整合性確認。flag set 状態で _ask_character_impl を呼ぶと、
+        ask_character.py:376 (導入セリフ) と _bg_tts_synthesize の冒頭ガードで
+        tts.synthesize が一切呼ばれない (= VOICEPEAK 合成も起動しない、CPU/GPU
+        浪費なし)。実走では「却下後にミミ様の問いかけが流れない」「ちさめの応答も
+        流れない」状態になる (= 案 A の音声漏れの最小化)。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _ask_character_impl,
+            cancel_bg_tts,
+            wait_bg_tts_complete,
+        )
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        session_id = "ss-cancel-integ"
+        set_ask_character_context(
+            on_tts_chunk=MagicMock(),
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+        # 予め cancel (= 「ask_character 起動時には既に却下されている」シナリオ)
+        cancel_bg_tts(session_id)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "x", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        ), patch("lab_lounge.tts.synthesize") as mock_synth:
+            _ask_character_impl("chisame", "質問")
+            # bg_tts thread の完了 (= cancel ガードで早期 return) を待つ
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ (caller=mimi) も本応答 (target=chisame) も両方 skip される
+        mock_synth.assert_not_called()
+
+
+class TestCancelGuardLeakageFix:
+    """Phase 0.5-D-2-α: 導入セリフ TTS + bridge filler の cancel ガード漏れ修正テスト。
+
+    実走テスト 2026-05-09 で観察した、lapse/fallback 後でも 「on_tts_chunk 直接呼出
+    経路」(= _wrapped_on_chunk_ready を経由しない経路) の chunks が _playback_queue
+    に投入される漏れ現象の対処。これらの経路は案 C の defer 分岐ではガードされない
+    ため、明示的な cancel_flag check を追加した。
+    """
+
+    def test_intro_chunk_skip_when_cancel_flag_set(self, monkeypatch):
+        """導入セリフ TTS が cancel_flag set 後の chunk 投入を skip する。
+
+        WHY: 導入セリフ TTS は subprocess.run で 13 秒以上かけて合成されるため、
+        起動前 check (line 595) では未 set だった cancel_flag が合成完了時には
+        set されているケースがある (= 実走 logs/runs/run_loop_20260509_150431.log
+        で観察)。chunk 投入直前の wrapper で再度 check することで、合成完了 chunks
+        が _playback_queue に流れ込むのを阻止する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            _bg_cancel_flags, _ask_state_lock, cancel_bg_tts, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-intro-cancel"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # 導入セリフ TTS の合成途中で cancel_flag set される動作を fake_synth で再現
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            # 「合成中」に cancel_flag set される (= 実走で 13 秒間に lapse 発火相当)
+            if speaker == "mimi":  # 導入セリフ TTS = caller=mimi
+                cancel_bg_tts(session_id)
+            if on_chunk:
+                # cancel 後に chunk を投入するが、wrapper で skip されるはず
+                on_chunk(f"file://{speaker}_intro.wav", "ふふ", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "ok", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="まあ、ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 導入セリフ chunk (= speaker=mimi) は cancel_flag set 後だったので skip された
+        intro_callbacks = [c for c in callback_invocations if c[3] == "mimi"]
+        assert intro_callbacks == [], (
+            f"cancel_flag set 後の導入セリフ chunk は skip される "
+            f"(実際: {intro_callbacks})"
+        )
+
+    def test_intro_chunk_is_last_forced_to_false(self, monkeypatch):
+        """Phase 0.5-F-3-fix: 導入セリフ chunk の is_last は False に強制される。
+
+        【WHY: HUD 早期 READY 遷移バグの修正】
+        中間実走 14 シナリオ 1 (= run_loop_20260510_154412.log) で観察:
+        - chisame Gemini 多段階 ask_character ケース
+        - chisame 導入セリフ chunk 1 (VOICEPEAK 合成単位で is_last=True) の
+          物理再生完了時に `_run_playback_worker` の line 1897 ロジックが
+          `set_status(chisame, READY)` を発火 → talking → ready 誤遷移
+        - しかし真の caller 応答最終 chunk は別途 chisame まとめ TTS の最後
+
+        導入セリフは「caller 応答全体の中の中間 chunk」のため is_last=False
+        に強制し、playback worker の早期 READY 遷移を防ぐ。
+        """
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-intro-is-last-fix"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # fake_synth で is_last=True のまま on_chunk を呼ぶ (= VOICEPEAK 合成単位の最終)
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk and speaker == "mimi":
+                # 導入セリフは 1 chunk で完結 → is_last=True で投入される (VOICEPEAK 単位)
+                on_chunk(f"file://{speaker}_intro.wav", "ふふ", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "ok", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="まあ、ルカ、よい問いですわね",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+
+        # 導入セリフ chunk が callback に流れた
+        intro_callbacks = [c for c in callback_invocations if c[3] == "mimi"]
+        assert len(intro_callbacks) >= 1, (
+            f"導入セリフ chunk が callback に流れていない (実際: {callback_invocations})"
+        )
+        # ★ 全ての導入セリフ chunk で is_last=False に強制されている
+        for cb in intro_callbacks:
+            url, chunk_text, is_last, character = cb
+            assert is_last is False, (
+                f"導入セリフ chunk の is_last は False に強制される "
+                f"(実際: is_last={is_last} chunk_text={chunk_text!r})"
+            )
+
+    def test_bridge_filler_skip_when_cancel_flag_set(self, monkeypatch):
+        """bridge filler 投入が cancel_flag set 後に skip される。
+
+        WHY: bridge filler は ask_character.py 内の `on_tts_chunk` 直接呼出経路で
+        _wrapped_on_chunk_ready を経由しない。よって案 C の defer 分岐ではガード
+        されない。明示的な cancel_flag check で fallback 後の漏れを阻止する。
+        """
+        from lab_lounge.mcp_servers.ask_character import (
+            cancel_bg_tts, wait_bg_tts_complete,
+        )
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "sess-bridge-cancel"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        # bridge filler 投入直前に cancel_flag を set する fake_synth (= 導入セリフ
+        # 完了直後 = bridge filler 直前のタイミング相当)
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if speaker == "mimi":  # 導入セリフ TTS 完了 → cancel set
+                if on_chunk:
+                    on_chunk(f"file://{speaker}_intro.wav", "問いかけ", True, speaker)
+                cancel_bg_tts(session_id)
+            elif speaker == "chisame":  # 本応答 TTS は cancel 後なので skip される (defer モードでも非 defer でも)
+                if on_chunk:
+                    on_chunk(f"file://{speaker}_c1.wav", "応答", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value='{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}',
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="導入セリフ",
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # bridge filler chunk (= chisame slug, text="" の filler 投入) は cancel 後で skip される
+        # (本応答 chunks も skip)
+        bridge_filler_callbacks = [c for c in callback_invocations
+                                   if c[3] == "chisame" and c[1] == ""]
+        assert bridge_filler_callbacks == [], (
+            f"cancel_flag set 後の bridge filler は skip される "
+            f"(実際: {bridge_filler_callbacks})"
+        )
+
+
+class TestIntroPlaybackOrdering:
+    """Phase 0.5-D-3-a: intro_done.wait 廃止後の return タイミング + 順序保証テスト。
+
+    旧設計では `intro_done.wait(timeout=120)` で 120 秒 timeout を起こし latency の
+    主因 (= 80%) になっていた。本テストクラスは:
+    - ask_character が物理再生完了を待たず return することを検証
+    - on_tts_chunk への投入順 (= 導入 → bridge → 本応答) が維持されることを検証
+    """
+
+    def test_ask_character_returns_before_intro_physical_playback(self, monkeypatch):
+        """intro_done.wait 廃止により、ask_character は物理再生完了を待たず return する。
+
+        WHY: 旧設計では intro_done.wait(timeout=120) で 120 秒 timeout を起こし
+        latency の主因になっていた。物理再生は playback worker (別 thread) で行われ、
+        ask_character の完了とは独立しているべき。本テストは on_tts_chunk callback が
+        呼ばれても物理再生をシミュレートしない (= worker が走らない) 状態で、
+        ask_character が短時間で return することを検証する。
+        """
+        import time
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            # callback は呼ぶが、playback worker は走らない (= intro_done.set() は発火しない)
+            # 旧設計では intro_done.wait(timeout=120) でここで 120 秒 stuck していた
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_return_test"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        start_time = time.monotonic()
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        elapsed = time.monotonic() - start_time
+
+        # 旧設計だと intro_done.wait(timeout=120) で 120 秒 stuck していた
+        # D-3-a 廃止後は数秒以内で return する想定 (= playback worker 完了に依存しない)
+        assert elapsed < 10.0, (
+            f"ask_character は intro_done.wait 廃止により 10 秒以内に return する "
+            f"(実際: {elapsed:.2f}s、旧設計だと 120 秒 stuck)"
+        )
+
+    def test_chunks_invoked_in_caller_then_target_order(self, monkeypatch):
+        """順序保証: 「導入セリフ (caller) → bridge filler / 本応答 (target)」順で投入される。
+
+        WHY: intro_done.wait 廃止後も、ask_character 内の処理順序 (= 導入セリフ TTS 投入
+        → 並行 sakura LLM 待機 → bridge filler 投入 → 本応答 TTS bg_tts thread) が
+        維持されることを on_tts_chunk callback への呼出順で検証する。playback queue
+        の FIFO 特性 (= 投入順 = 物理再生順) と組み合わさることで、視聴者には
+        「導入 → 思案 → target 応答」の自然な順序で再生される。
+        """
+        from lab_lounge.mcp_servers.ask_character import wait_bg_tts_complete
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+
+        callback_invocations: list[tuple] = []
+
+        def mock_cb(url, chunk_text, is_last, character):
+            callback_invocations.append((url, chunk_text, is_last, character))
+
+        session_id = "intro_order_test"
+        set_ask_character_context(
+            on_tts_chunk=mock_cb,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": session_id, "trace_id": "t1"},
+        )
+
+        response_text = (
+            '{"response": "応答", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        )
+
+        def fake_synth(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk_ready")
+            speaker = kwargs.get("speaker")
+            if on_chunk:
+                on_chunk(f"file://{speaker}.wav", "テキスト", True, speaker)
+
+        with patch(
+            "lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+            return_value=response_text,
+        ), patch(
+            "lab_lounge.mcp_servers.ask_character._generate_intro",
+            return_value="ルカ、よい問いですわね",  # 非空 → 導入セリフ TTS 起動
+        ), patch("lab_lounge.tts.synthesize", side_effect=fake_synth):
+            _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(session_id, timeout=5.0)
+
+        # 順序保証: caller (= mimi、導入) の chunks が target (= chisame、bridge/本応答) より先
+        mimi_indices = [i for i, c in enumerate(callback_invocations) if c[3] == "mimi"]
+        chisame_indices = [i for i, c in enumerate(callback_invocations) if c[3] == "chisame"]
+
+        # 両方 chunks が投入されていることを確認 (= 導入 + bridge or 本応答)
+        assert len(mimi_indices) >= 1, (
+            f"caller (mimi) の導入セリフ chunks が投入されること (実際 callback: {callback_invocations})"
+        )
+        assert len(chisame_indices) >= 1, (
+            f"target (chisame) の bridge filler / 本応答 chunks が投入されること "
+            f"(実際 callback: {callback_invocations})"
+        )
+        # mimi の最後 index < chisame の最初 index (= 順序保証)
+        assert max(mimi_indices) < min(chisame_indices), (
+            f"順序保証違反: mimi (caller) の chunks が chisame (target) の chunks より後に投入された "
+            f"(callback 順: {callback_invocations})"
+        )
 
 
 class TestAskCharacterImplCountAndPrevious:

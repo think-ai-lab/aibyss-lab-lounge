@@ -349,3 +349,34 @@ class TestParseVoicepeakJson:
         """戻り値は 4-tuple である。"""
         result = tts_mod._parse_voicepeak_json('{"response": "x"}')
         assert len(result) == 4
+
+    # Phase 0.5-M: octamaid 形式 (SAY:/LOG:) からの SAY 抽出テスト
+    def test_octamaid_say_log_format_extracts_say_only(self):
+        """response が "SAY: ...\\nLOG: ..." 形式なら SAY 部分のみ抽出される (= Phase 0.5-M)。"""
+        text = '{"response": "SAY: まあまあ安定です。\\nLOG: 状態=待機 / 確度=安定", "pose": "neutral"}'
+        say, _, _, _ = tts_mod._parse_voicepeak_json(text)
+        assert say == "まあまあ安定です。"
+        assert "LOG:" not in say
+        assert "状態=待機" not in say
+
+    def test_octamaid_multiple_say_lines_joined_with_space(self):
+        """複数の SAY: 行は半角スペースで連結される。"""
+        text = '{"response": "SAY: 了解です。\\nSAY: 次は検証です。\\nLOG: 状態=進行"}'
+        say, _, _, _ = tts_mod._parse_voicepeak_json(text)
+        assert say == "了解です。 次は検証です。"
+
+    def test_non_octamaid_response_returns_as_is(self):
+        """SAY: prefix を持たない response (= mimi/chisame/sakura 形式) はそのまま返る。"""
+        text = '{"response": "わたくしからもよろしいかしら", "pose": "happy"}'
+        say, _, _, _ = tts_mod._parse_voicepeak_json(text)
+        assert say == "わたくしからもよろしいかしら"
+
+    def test_extract_say_lines_no_say_returns_text_unchanged(self):
+        """_extract_say_lines 単体テスト: SAY: なしのテキストはそのまま。"""
+        text = "通常の発話テキスト\n複数行も維持"
+        assert tts_mod._extract_say_lines(text) == text
+
+    def test_extract_say_lines_with_mode_and_log_lines_filtered(self):
+        """_extract_say_lines: SAY 以外の行 (MODE / LOG / 自由文) は除去される。"""
+        text = "MODE: solo\nSAY: 主機能を試験中です。\nLOG: 状態=点検 / 確度=高"
+        assert tts_mod._extract_say_lines(text) == "主機能を試験中です。"

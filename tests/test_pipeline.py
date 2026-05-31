@@ -480,3 +480,101 @@ class TestRunPipelineWithLangSmith:
         with patch("lab_lounge.graph.run_graph") as mock_graph:
             run_pipeline("テスト", **COMMON)
         mock_graph.assert_not_called()
+
+
+class TestRunPipelineDisableTools:
+    """Phase 0.5-A バグ 3 修正 (案 A): run_pipeline に disable_tools 引数を伝播。
+
+    _approved_synthesize_fallback (= LLM 失敗時の救済パス) で
+    disable_tools=["ask_character"] が渡された時、graph._generation_node の
+    Agent 構築時に ask_character ツールが除外されることを保証する。
+    """
+
+    def test_disable_tools_passed_to_run_graph(self, monkeypatch):
+        """run_pipeline(disable_tools=[...]) → run_graph に伝播される。"""
+        monkeypatch.setenv("L2_USE_REAL_LLM", "true")
+        captured: list[dict] = []
+
+        def fake_run_graph(text, **kwargs):
+            captured.append(dict(kwargs))
+            return MagicMock(
+                text="ok", model="x", input_tokens=0, output_tokens=0,
+                latency_ms=0, finish_reason="stop",
+            )
+
+        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+            with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
+                run_pipeline(
+                    "テスト",
+                    disable_tools=["ask_character"],
+                    **COMMON,
+                )
+
+        assert len(captured) == 1
+        assert captured[0].get("disable_tools") == ["ask_character"]
+
+    def test_disable_tools_default_is_none(self, monkeypatch):
+        """disable_tools を渡さなければ run_graph に None が伝播 (= 既存挙動互換)。"""
+        monkeypatch.setenv("L2_USE_REAL_LLM", "true")
+        captured: list[dict] = []
+
+        def fake_run_graph(text, **kwargs):
+            captured.append(dict(kwargs))
+            return MagicMock(
+                text="ok", model="x", input_tokens=0, output_tokens=0,
+                latency_ms=0, finish_reason="stop",
+            )
+
+        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+            with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
+                run_pipeline("テスト", **COMMON)
+
+        assert len(captured) == 1
+        assert captured[0].get("disable_tools") is None
+
+
+
+
+# ─── TestRunPipelineStatusManager (Phase 0.5-B-α) ──────────────
+
+
+class TestRunPipelineStatusManager:
+    """Phase 0.5-B-α: run_pipeline 系の status_manager 透過渡し検証。"""
+
+    def test_run_pipeline_passes_status_manager_to_graph(self, monkeypatch):
+        """run_pipeline(status_manager=...) で _run_pipeline_graph に透過渡しされる。"""
+        from lab_lounge.pipeline import run_pipeline
+
+        captured: dict = {}
+
+        def fake_graph(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        sentinel_manager = object()  # CharacterStatusManager の代わりの sentinel
+        run_pipeline(
+            "test text",
+            status_manager=sentinel_manager,
+            **COMMON,
+        )
+
+        # _run_pipeline_graph に同じ object が渡されている
+        assert captured.get("status_manager") is sentinel_manager
+
+    def test_run_pipeline_default_status_manager_is_none(self, monkeypatch):
+        """status_manager 未指定時は None が透過 (= 既存テスト互換)。"""
+        from lab_lounge.pipeline import run_pipeline
+
+        captured: dict = {}
+
+        def fake_graph(text, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_graph", fake_graph)
+
+        run_pipeline("test text", **COMMON)
+        # default = None (= 既存挙動互換)
+        assert captured.get("status_manager") is None

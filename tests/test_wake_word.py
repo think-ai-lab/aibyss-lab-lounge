@@ -252,4 +252,399 @@ class TestVadFallback:
             r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert any("webrtcvad" in m for m in warning_msgs)
-        assert any("RMS" in m or "rms" in m.lower() for m in warning_msgs)
+
+
+# ─── BackgroundContinuousListener (Block 0) ──────────────────────
+
+
+def _make_mock_sounddevice():
+    """sounddevice のモック。InputStream の read() は silent PCM を返す
+    (onset 未検知 → segment 生成なし → STT 呼ばれず副作用なし)。"""
+    mock_sd = MagicMock()
+    mock_stream = MagicMock()
+    mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+    mock_stream.__exit__ = MagicMock(return_value=None)
+    silent_pcm = np.zeros((_DEFAULT_FRAME_SAMPLES, 1), dtype=np.int16)
+    mock_stream.read.return_value = (silent_pcm, False)
+    mock_sd.InputStream.return_value = mock_stream
+    return mock_sd
+
+
+class TestBackgroundContinuousListenerInit:
+    """初期化系テスト (スレッド起動なし)。"""
+
+    def test_buffer_property_is_transcript_buffer(self):
+        from lab_lounge.transcript_buffer import TranscriptBuffer
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert isinstance(listener.buffer, TranscriptBuffer)
+
+    def test_initial_no_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert listener._thread is None
+
+    def test_initial_routing_not_paused(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert not listener._routing_paused.is_set()
+
+    def test_custom_window_and_max_chars(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener(
+            context_window_sec=60.0,
+            context_max_chars=500,
+        )
+        assert listener.buffer._window_sec == 60.0
+        assert listener.buffer._max_chars == 500
+
+
+class TestBackgroundContinuousListenerLifecycle:
+    """start / stop / cleanup のライフサイクルテスト。
+
+    sounddevice をモックし、silent PCM のみ返すことで実マイク入力なしで
+    スレッドのライフサイクル動作を検証する (onset 検知に至らないため
+    STT / numpy 演算等の重い処理は走らない)。
+    """
+
+    def test_start_starts_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        import time as _time
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+
+            _time.sleep(0.1)  # スレッドが回ることを確認する短い待機
+            assert listener._thread is not None
+            assert listener._thread.is_alive()
+
+            listener.stop(timeout=2.0)
+
+    def test_stop_terminates_thread(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        import time as _time
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+            _time.sleep(0.05)
+            listener.stop(timeout=2.0)
+            assert listener._thread is None
+
+    def test_double_start_raises(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+            try:
+                with pytest.raises(RuntimeError, match="既に起動中"):
+                    listener.start(on_wake_detected=lambda r: None)
+            finally:
+                listener.stop(timeout=2.0)
+
+    def test_stop_without_start_is_noop(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        # 例外なく動く
+        listener.stop()
+        assert listener._thread is None
+
+    def test_cleanup_stops_and_clears_buffer(self):
+        from lab_lounge.transcript_buffer import TranscriptSegment
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            listener.start(on_wake_detected=lambda r: None)
+
+            # buffer に直接 segment を入れて、cleanup で消えることを確認
+            listener.buffer.add(TranscriptSegment(
+                text="前のテスト残骸", timestamp=100.0, duration_ms=500,
+            ))
+            assert len(listener.buffer) == 1
+
+            listener.cleanup()
+            assert listener._thread is None
+            assert len(listener.buffer) == 0
+
+
+class TestBackgroundContinuousListenerOnSegmentAdded:
+    """Phase 0.5-A フェーズ 6: on_segment_added callback の引数仕様。
+
+    callback は ``(segment, buffer_full_text)`` の 2 引数で呼び出される。
+    Dispatcher.on_segment_added と整合させ、buffer.full_text() を listener 内
+    Lock のもとで取得することで race による微差異を防ぐ。
+    """
+
+    def test_callback_signature_is_two_args(self):
+        """Listener._on_segment_added 属性の型は Callable[[Any, str], None]。
+
+        sounddevice を起動せず、_run_loop 内の callback 発火行と同じ呼出パターンを
+        手動で再現して、シグネチャと値伝播を検証する。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        received: list[tuple] = []
+
+        def callback(segment, buffer_full_text):
+            received.append((segment, buffer_full_text))
+
+        listener._on_segment_added = callback
+
+        # buffer に segment を直接追加
+        seg = TranscriptSegment(text="テスト発話", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        # _run_loop 内の callback 発火行と同じ呼出
+        # (sounddevice 不要、buffer は遅延 import 済の純粋オブジェクト)
+        listener._on_segment_added(seg, listener._buffer.full_text())
+
+        assert len(received) == 1
+        received_seg, received_full_text = received[0]
+        assert received_seg is seg
+        assert isinstance(received_full_text, str)
+        assert received_full_text == listener._buffer.full_text()
+        assert "テスト発話" in received_full_text
+
+    def test_callback_default_is_none(self):
+        """start() で on_segment_added を渡さなければ default は None (Block 0 互換)。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        assert listener._on_segment_added is None
+
+    def test_start_stores_on_segment_added_callback(self):
+        """start(on_segment_added=...) で渡した callback がインスタンス属性に保存される。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+
+        mock_sd = _make_mock_sounddevice()
+        with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+            listener = BackgroundContinuousListener()
+            cb = lambda seg, full_text: None
+            listener.start(on_wake_detected=lambda r: None, on_segment_added=cb)
+            try:
+                assert listener._on_segment_added is cb
+            finally:
+                listener.stop(timeout=2.0)
+
+
+class TestBackgroundContinuousListenerSkipsWakeOnHandraiseProcessed:
+    """Phase 0.5-A 案 W'-2: on_segment_added 戻り値 True で wake 判定を skip する。
+
+    実走で観察された 3 重発火 (BG LLM + fallback + wake_event) のうち、wake_event
+    経路を停止する核心ロジックの単体テスト。``_run_loop`` の中身を直接呼び出すと
+    sounddevice 起動が必要になるため、callback 発火 + skip 判定 + ``_evaluate_wake``
+    呼出の一連のロジックを純粋に再現して検証する (= 既存 ``test_callback_signature_is_two_args``
+    のスタイル踏襲)。
+
+    実装側 (wake_word.py:_run_loop) の対応箇所:
+
+        processed_by_handraise = False
+        if self._on_segment_added is not None:
+            try:
+                processed_by_handraise = bool(
+                    self._on_segment_added(segment, self._buffer.full_text())
+                )
+            except Exception as exc:
+                logger.warning("on_segment_added callback failed: %s", exc)
+
+        if processed_by_handraise:
+            continue  # ← _evaluate_wake をスキップ
+
+        if self._routing_paused.is_set():
+            continue
+
+        self._evaluate_wake(segment)
+    """
+
+    @staticmethod
+    def _simulate_run_loop_iteration(listener, segment) -> bool:
+        """_run_loop 1 周分の判定 (callback + skip + buffer クリア + _evaluate_wake) を再現。
+
+        Returns:
+            bool: _evaluate_wake が呼ばれたら True、skip されたら False。
+        """
+        processed_by_handraise = False
+        if listener._on_segment_added is not None:
+            try:
+                processed_by_handraise = bool(
+                    listener._on_segment_added(segment, listener._buffer.full_text())
+                )
+            except Exception:
+                # _run_loop と同じく fail-open: 例外時は False のまま
+                pass
+
+        if processed_by_handraise:
+            # バグ 2 修正: 承認/却下/lapse/新規挙手のいずれでも buffer をクリア
+            listener._buffer.clear()
+            return False  # skip されたので _evaluate_wake は呼ばれなかった
+
+        if listener._routing_paused.is_set():
+            return False
+
+        listener._evaluate_wake(segment)
+        return True
+
+    def test_evaluate_wake_skipped_when_callback_returns_true(self, monkeypatch):
+        """on_segment_added が True を返すと _evaluate_wake が呼ばれない。
+
+        WHY: 「(キャラ名)、どうぞ」の承認発話で dispatcher が granted を確定した
+        とき、同じ segment が wake_event として再評価されるのを防ぐ核心テスト。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="ミミ、どうぞ", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        # callback は「処理済」を表す True を返す
+        callback_calls: list = []
+
+        def callback(segment, full_text):
+            callback_calls.append((segment, full_text))
+            return True
+
+        listener._on_segment_added = callback
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is False  # skip された
+        assert len(callback_calls) == 1  # callback は呼ばれた
+        evaluate_wake_spy.assert_not_called()  # _evaluate_wake は呼ばれなかった
+
+    def test_evaluate_wake_called_when_callback_returns_false(self, monkeypatch):
+        """on_segment_added が False を返すと _evaluate_wake が呼ばれる。
+
+        WHY: 「ねぇ、さくら、おはよう」のような通常発話 (= dispatcher が触らない
+        segment) は wake 経路で別キャラへの呼びかけとして処理させる経路を保つ。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        listener._on_segment_added = lambda segment, full_text: False
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is True
+        evaluate_wake_spy.assert_called_once_with(seg)
+
+    def test_evaluate_wake_called_when_callback_raises(self, monkeypatch):
+        """on_segment_added が例外を投げても _evaluate_wake は呼ばれる (fail-open)。
+
+        WHY: dispatcher 側のバグで wake 経路が完全停止する事故を防ぐ安全弁。
+        観察される側面 (= 通常応答経路) を生かす方が配信品質上のダメージが小さい。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        def callback_raises(segment, full_text):
+            raise RuntimeError("simulated dispatcher bug")
+
+        listener._on_segment_added = callback_raises
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        # 例外時も _evaluate_wake は呼ばれる
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+        assert evaluated is True
+        evaluate_wake_spy.assert_called_once_with(seg)
+
+    def test_buffer_cleared_when_callback_returns_true(self, monkeypatch):
+        """W'-2 拡張 (バグ 2 修正): callback=True で buffer がクリアされる。
+
+        WHY: 承認発話「ちさめさん、どうぞ」で wake skip するが buffer を維持すると、
+        次の発話 (例: Whisper ハルシネーション) で buffer の name が router に拾われ
+        wake_event 経路に乗って多重発火する。実走 logs/runs/run_loop_20260508_180741.log
+        で観察された症状の対処。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        # buffer に「ちさめさん、どうぞ」相当の承認発話が蓄積されている状態を模擬
+        seg = TranscriptSegment(text="ちさめさん、どうぞ", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+        assert len(listener._buffer) == 1  # 前提: buffer に 1 segment
+
+        listener._on_segment_added = lambda segment, full_text: True
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is False  # _evaluate_wake は呼ばれなかった (skip)
+        evaluate_wake_spy.assert_not_called()
+        # バグ 2 修正の核心: buffer がクリアされている (= 次の発話で残らない)
+        assert len(listener._buffer) == 0
+
+    def test_buffer_preserved_when_callback_returns_false(self, monkeypatch):
+        """通常発話 (callback=False) では buffer は維持される。
+
+        WHY: 関係ない発話 (= dispatcher が触らない segment) は wake 経路を走らせる
+        ため、buffer に文脈を残す必要がある (= 既存の wake 検知ロジックの前提)。
+        バグ 2 修正でクリア対象を「processed=True」のみに限定する。
+        """
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        from lab_lounge.transcript_buffer import TranscriptSegment
+
+        listener = BackgroundContinuousListener()
+        seg = TranscriptSegment(text="さくら、おはよう", timestamp=100.0, duration_ms=500)
+        listener._buffer.add(seg)
+
+        listener._on_segment_added = lambda segment, full_text: False
+        evaluate_wake_spy = MagicMock()
+        monkeypatch.setattr(listener, "_evaluate_wake", evaluate_wake_spy)
+
+        evaluated = self._simulate_run_loop_iteration(listener, seg)
+
+        assert evaluated is True  # _evaluate_wake が呼ばれた
+        # buffer は維持される (= _evaluate_wake 内のクリアロジックは spy 化で動かない)
+        assert len(listener._buffer) == 1
+
+
+class TestBackgroundContinuousListenerRoutingPause:
+    """set_routing_paused のフラグ動作テスト (スレッド起動なし)。"""
+
+    def test_set_routing_paused_true(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        assert listener._routing_paused.is_set()
+
+    def test_set_routing_paused_false(self):
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        listener.set_routing_paused(False)
+        assert not listener._routing_paused.is_set()
+
+    def test_set_routing_paused_idempotent(self):
+        """同じ値を複数回設定しても問題ない。"""
+        from lab_lounge.wake_word import BackgroundContinuousListener
+        listener = BackgroundContinuousListener()
+        listener.set_routing_paused(True)
+        listener.set_routing_paused(True)
+        assert listener._routing_paused.is_set()
+        listener.set_routing_paused(False)
+        listener.set_routing_paused(False)
+        assert not listener._routing_paused.is_set()

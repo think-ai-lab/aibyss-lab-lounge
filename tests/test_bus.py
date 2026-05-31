@@ -5,12 +5,13 @@ redis.from_url をモックして実際の Redis 接続なしで検証する。
 """
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import lab_lounge.bus as bus_mod
-from lab_lounge.bus import publish
+from lab_lounge.bus import _summarize_event, publish
 
 SAMPLE_EVENT = {
     "ver": "0.1",
@@ -84,3 +85,215 @@ class TestPublish:
         assert isinstance(raw, bytes), "publish は UTF-8 bytes を送るべき"
         parsed = json.loads(raw.decode("utf-8"))
         assert parsed["payload"]["text"] == "今日の天気を教えて"
+
+    def test_log_includes_summary(self, mock_redis_client, caplog):
+        """ログ強化 L-1: publish 時のログに type 別 summary が含まれる。
+
+        bubble.update なら character / step / category が、調査時の手掛かりとして
+        パッと分かる形で出ること。
+        """
+        bubble_event = {
+            **SAMPLE_EVENT,
+            "type": "bubble.update",
+            "payload": {
+                "character": "mimi",
+                "step": "thinking",
+                "text": "考えていますわ",
+                "category": "speech_status",
+            },
+        }
+        with caplog.at_level(logging.INFO, logger="lab_lounge.bus"):
+            publish(bubble_event)
+        # 「published type=bubble.update [character=mimi step=thinking category=speech]」のような形
+        msg = "\n".join(rec.message for rec in caplog.records)
+        assert "type=bubble.update" in msg
+        assert "character=mimi" in msg
+        assert "step=thinking" in msg
+        assert "category=speech" in msg
+
+
+# ─── ログ強化 L-1: _summarize_event の type 別挙動 ─────────────────
+
+
+class TestSummarizeEvent:
+    """_summarize_event が type 別に payload から手掛かりを抽出することを検証する。
+
+    Phase 0.5-A 後のログ強化 L-1: 実走ログで「どのキャラの動作か」を即座に
+    把握できるようにする目的。
+    """
+
+    def test_utterance_final_includes_text_preview(self):
+        """utterance.final はルカ発話 → text 先頭でターン識別。"""
+        ev = {
+            "type": "utterance.final",
+            "payload": {"text": "最近のAI倫理について気になっています"},
+        }
+        s = _summarize_event(ev)
+        assert "text=" in s
+        assert "最近のAI倫理について" in s  # 先頭部分
+        assert "chars=" in s
+
+    def test_utterance_final_long_text_truncated(self):
+        """30 文字超の text は ... で切り詰める (ログ可読性)。"""
+        long_text = "あ" * 100
+        ev = {"type": "utterance.final", "payload": {"text": long_text}}
+        s = _summarize_event(ev)
+        assert "..." in s
+        assert "chars=100" in s
+
+    def test_llm_final_includes_character_when_present(self):
+        """llm.final に character フィールドがあれば summary に含まれる (L-2 後対応)。"""
+        ev = {
+            "type": "llm.final",
+            "payload": {"character": "mimi", "model": "gpt-5.5", "text": "あら、ルカ"},
+        }
+        s = _summarize_event(ev)
+        assert "character=mimi" in s
+        assert "model=gpt-5.5" in s
+        assert "text_len=" in s
+
+    def test_llm_final_character_unknown_when_missing(self):
+        """character フィールド無しは ? 表示 (= 「明示的に欠けている」と分かる)。"""
+        ev = {"type": "llm.final", "payload": {"model": "x", "text": ""}}
+        s = _summarize_event(ev)
+        assert "character=?" in s
+
+    def test_tts_done_uses_character_or_speaker(self):
+        """tts.done は character > speaker の優先順位で character を表示。"""
+        ev1 = {
+            "type": "tts.done",
+            "payload": {"character": "sakura", "speaker": "sakura", "duration_ms": 1234},
+        }
+        s1 = _summarize_event(ev1)
+        assert "character=sakura" in s1
+        assert "duration_ms=1234" in s1
+
+        # character 無しなら speaker にフォールバック
+        ev2 = {"type": "tts.done", "payload": {"speaker": "chisame", "duration_ms": 999}}
+        s2 = _summarize_event(ev2)
+        assert "character=chisame" in s2
+
+    def test_bubble_update_includes_character_step_category(self):
+        """bubble.update は character / step / category を全部表示。"""
+        ev = {
+            "type": "bubble.update",
+            "payload": {
+                "character": "sakura",
+                "step": "handraise",
+                "text": "あのぉ、ちょっといいですかぁ",
+                "category": "raisehand",
+            },
+        }
+        s = _summarize_event(ev)
+        assert "character=sakura" in s
+        assert "step=handraise" in s
+        assert "category=raisehand" in s
+
+    def test_bubble_update_default_category_speech_status(self):
+        """category 省略時は default の "speech_status" 表示 (= Phase 0.5-E、受信側 default 解釈と一致)。"""
+        ev = {
+            "type": "bubble.update",
+            "payload": {"character": "mimi", "step": "thinking", "text": "..."},
+        }
+        s = _summarize_event(ev)
+        assert "category=speech_status" in s
+
+    def test_dispatcher_queue_update_lists_slugs(self):
+        """dispatcher.queue.update は queue 内の character_slug 一覧 + state を表示。"""
+        ev = {
+            "type": "dispatcher.queue.update",
+            "payload": {
+                "queue": [
+                    {"character_slug": "mimi", "transcript": "..."},
+                    {"character_slug": "chisame", "transcript": "..."},
+                ],
+                "state": "responding",
+            },
+        }
+        s = _summarize_event(ev)
+        assert "state=responding" in s
+        assert "queue_size=2" in s
+        assert "mimi" in s
+        assert "chisame" in s
+
+    def test_dispatcher_handraise_update_lists_slugs(self):
+        """dispatcher.handraise.update は挙手中キャラ + cooldown キーを表示。"""
+        ev = {
+            "type": "dispatcher.handraise.update",
+            "payload": {
+                "handraise_states": [
+                    {"target_slug": "sakura", "phrase": "..."},
+                ],
+                "cooldowns": {"mimi": {"consecutive_denials": 1}},
+            },
+        }
+        s = _summarize_event(ev)
+        assert "handraise_count=1" in s
+        assert "sakura" in s
+        assert "mimi" in s
+
+    def test_unknown_type_returns_no_summary(self):
+        """未知の type は (no summary) を返して後方互換維持。"""
+        ev = {"type": "unknown.weird", "payload": {"some": "data"}}
+        s = _summarize_event(ev)
+        assert s == "(no summary)"
+
+    def test_missing_payload_handled(self):
+        """payload が無い event でも例外で死なない。"""
+        ev = {"type": "bubble.update"}
+        s = _summarize_event(ev)
+        # payload 無し → デフォルト値 (?) でフォールバック
+        assert "character=?" in s
+
+    # ─── character.status.update (Phase 0.5-B-α) ──────────────────
+
+    def test_character_status_update_includes_status_transition(self):
+        """character.status.update: previous_status -> status の形式で summary。"""
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi",
+                "status": "thinking",
+                "previous_status": "ready",
+            },
+        }
+        s = _summarize_event(ev)
+        assert "character=mimi" in s
+        assert "status=ready->thinking" in s
+
+    def test_character_status_update_includes_metadata_pose_and_text(self):
+        """Talking 時の metadata (pose + text) が summary に含まれる。"""
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi",
+                "status": "talking",
+                "previous_status": "thinking",
+                "metadata": {"pose": "smile", "text": "こんにちは、ルカさま"},
+            },
+        }
+        s = _summarize_event(ev)
+        assert "pose=smile" in s
+        assert "text=" in s
+        assert "こんにちは" in s  # 先頭部分 (truncate されても残る)
+
+    def test_character_status_update_long_text_truncated(self):
+        """長文 text は preview chars (30) で truncate される。"""
+        long_text = "深海" * 100  # 200 文字
+        ev = {
+            "type": "character.status.update",
+            "payload": {
+                "character": "mimi", "status": "talking",
+                "metadata": {"pose": "smile", "text": long_text},
+            },
+        }
+        s = _summarize_event(ev)
+        assert "..." in s  # truncate suffix
+        assert len(s) < 200  # 元の text より短い
+
+    def test_character_status_update_default_unknowns(self):
+        """payload 不完全時 character=? status=?->? で fallback。"""
+        ev = {"type": "character.status.update", "payload": {}}
+        s = _summarize_event(ev)
+        assert "character=?" in s
+        assert "status=?->?" in s

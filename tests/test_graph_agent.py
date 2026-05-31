@@ -185,6 +185,84 @@ class TestBubbleToolCallbackHandler:
 
         assert len(published) == 0
 
+    # ─── Phase 0.5-B-α: status_manager 連携テスト ─────────────
+
+    def test_on_tool_start_sets_tool_calling(self):
+        """on_tool_start で status_manager に TOOL_CALLING が反映される。"""
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "retrieve_memory_tool"}, "test")
+
+        assert manager.get_status("mimi") == CharacterStatus.TOOL_CALLING
+
+    def test_on_tool_end_is_no_op(self):
+        """on_tool_end は status を変化させない (Phase 0.5-B-α follow-up)。
+
+        commit 5 では TOOL_CALLING → THINKING を反映していたが、LangChain Agent
+        が web_search 完了後に hang する症状 (実走 TAKE 1/2) を観察したため、本実装
+        を no-op に戻した (= commit 5 partial revert)。TOOL_CALLING 状態は次の chunk
+        投入で TALKING に上書きされるため、HUD dashboard の表示は連続して動作する。
+        """
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        manager.set_status("mimi", CharacterStatus.TOOL_CALLING)
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+        # LangChain は引数構造が揺れるため *args/**kwargs を受ける設計。引数なしで呼べる
+        handler.on_tool_end()
+
+        # status は TOOL_CALLING のまま (= no-op、第 1 chunk 投入で TALKING に上書き)
+        assert manager.get_status("mimi") == CharacterStatus.TOOL_CALLING
+
+    def test_unknown_tool_no_status_change(self):
+        """TOOL_MESSAGE_KEY に無いツールでは status 変化なし (= bubble.update と同様の判定)。"""
+        from lab_lounge.character_status import CharacterStatus, CharacterStatusManager
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        manager = CharacterStatusManager()
+        manager.set_status("mimi", CharacterStatus.THINKING)
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+            status_manager=manager,
+        )
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "unknown_tool"}, "test")
+
+        # status は THINKING のまま (= TOOL_CALLING に変化しない)
+        assert manager.get_status("mimi") == CharacterStatus.THINKING
+
+    def test_status_manager_none_no_op(self):
+        """status_manager=None で例外なく動く (= 既存呼出経路の互換性確認)。"""
+        from lab_lounge.graph import BubbleToolCallbackHandler
+
+        handler = BubbleToolCallbackHandler(
+            "mimi",
+            {"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )  # status_manager=None (default)
+
+        with patch("lab_lounge.bus.publish", side_effect=lambda e: None):
+            handler.on_tool_start({"name": "retrieve_memory_tool"}, "test")
+            handler.on_tool_end()
+        # 例外なく完了
+
 
 class TestAskCharacterToolRegistration:
     """ask_character ツール登録を検証する (Phase 3)。"""
@@ -222,3 +300,254 @@ class TestRetrieveMemoryToolRegistration:
         monkeypatch.delenv("L2_ENABLE_RAG", raising=False)
         from lab_lounge.graph import _is_rag_enabled
         assert _is_rag_enabled() is False
+
+
+class TestGetCharacterResponseSchema:
+    """Phase 0.5-A フェーズ 8: キャラ別 Pydantic スキーマ動的生成。
+
+    create_agent の response_format に渡すことで、LLM が strict JSON のみを
+    返すようにする。VOICEPEAK CLI の引数破壊バグの根本対策。
+    """
+
+    def test_mimi_schema_has_5_emotion_keys(self):
+        """mimi のスキーマは 5 つの emotion キー (happy/fun/angry/sad/sulky)。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("mimi")
+        assert schema.__name__ == "MimiResponse"
+        assert set(schema.model_fields.keys()) == {"response", "emotion", "speed", "pose"}
+        emotion_schema = schema.model_fields["emotion"].annotation
+        assert set(emotion_schema.model_fields.keys()) == {
+            "happy", "fun", "angry", "sad", "sulky",
+        }
+
+    def test_chisame_schema_has_chisame_emotion_keys(self):
+        """chisame のスキーマは bosoboso/doyaru/honwaka/angry/teary。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("chisame")
+        assert schema.__name__ == "ChisameResponse"
+        emotion_schema = schema.model_fields["emotion"].annotation
+        assert set(emotion_schema.model_fields.keys()) == {
+            "bosoboso", "doyaru", "honwaka", "angry", "teary",
+        }
+
+    def test_sakura_schema_has_sakura_emotion_keys(self):
+        """sakura のスキーマは happy/sad/angry/whisper/cool。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("sakura")
+        assert schema.__name__ == "SakuraResponse"
+        emotion_schema = schema.model_fields["emotion"].annotation
+        assert set(emotion_schema.model_fields.keys()) == {
+            "happy", "sad", "angry", "whisper", "cool",
+        }
+
+    def test_octamaid_schema_has_no_emotion(self):
+        """octamaid (voicepeak_emotion_keys 空) は emotion フィールド無し。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("octamaid")
+        assert schema.__name__ == "OctamaidResponse"
+        assert set(schema.model_fields.keys()) == {"response", "speed", "pose"}
+        assert "emotion" not in schema.model_fields
+
+    def test_ruka_schema_has_no_emotion(self):
+        """ruka も emotion 無し (voicepeak_emotion_keys 空)。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("ruka")
+        assert "emotion" not in schema.model_fields
+
+    def test_unknown_slug_returns_generic_schema(self):
+        """未登録 slug は GenericResponse でフォールバック (KeyError 吸収)。"""
+        from lab_lounge.graph import _get_character_response_schema
+        schema = _get_character_response_schema("nonexistent")
+        assert schema.__name__ == "GenericResponse"
+        assert set(schema.model_fields.keys()) == {"response", "speed", "pose"}
+
+    def test_caches_same_class_for_same_slug(self):
+        """@lru_cache で同一 slug は同一クラスを返す (LangChain schema 同一性)。"""
+        from lab_lounge.graph import _get_character_response_schema
+        s1 = _get_character_response_schema("mimi")
+        s2 = _get_character_response_schema("mimi")
+        assert s1 is s2
+
+    def test_speed_validation(self):
+        """speed フィールドは 50-200 の範囲制約付き。"""
+        from lab_lounge.graph import _get_character_response_schema
+        from pydantic import ValidationError
+        Schema = _get_character_response_schema("mimi")
+        # 範囲内 OK
+        Schema(
+            response="test",
+            emotion={"happy": 50, "fun": 0, "angry": 0, "sad": 0, "sulky": 0},
+            speed=100,
+            pose="neutral",
+        )
+        # 範囲外 NG
+        try:
+            Schema(
+                response="test",
+                emotion={"happy": 50, "fun": 0, "angry": 0, "sad": 0, "sulky": 0},
+                speed=500,  # 200 超過
+                pose="neutral",
+            )
+            raise AssertionError("ValidationError が出るはず")
+        except ValidationError:
+            pass
+
+
+class TestRunAgentStructuredResponse:
+    """Phase 0.5-A フェーズ 8: _run_agent の structured_response 経路検証。
+
+    create_agent (新 API) で response_format=Pydantic を有効化した場合、
+    state['structured_response'] に Pydantic instance が入る。これを優先的に
+    取得して LLMResult.text に JSON 文字列化することで、既存パイプライン
+    (_tts_node の _parse_voicepeak_json) と互換性を維持する。
+    """
+
+    def test_structured_response_is_used_as_text(self):
+        """state['structured_response'] が Pydantic ならそれを JSON 文字列化して text に。"""
+        from lab_lounge.graph import _run_agent, _get_character_response_schema
+
+        Schema = _get_character_response_schema("mimi")
+        structured_instance = Schema(
+            response="わたくしの見解ですわ",
+            emotion={"happy": 50, "fun": 0, "angry": 0, "sad": 0, "sulky": 0},
+            speed=100,
+            pose="happy",
+        )
+        # Mock agent: invoke が structured_response 含む dict を返す
+        mock_msg = MagicMock()
+        mock_msg.type = "ai"
+        mock_msg.content = "(無視される)"
+        mock_msg.usage_metadata = {"input_tokens": 100, "output_tokens": 50}
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "messages": [mock_msg],
+            "structured_response": structured_instance,
+        }
+
+        result = _run_agent(mock_agent, "テスト", "mimi-model")
+
+        # text が JSON 文字列化されている
+        assert "わたくしの見解ですわ" in result.text
+        assert '"response":' in result.text
+        assert '"emotion":' in result.text
+        # token usage は messages から取得
+        assert result.input_tokens == 100
+        assert result.output_tokens == 50
+
+    def test_falls_back_to_messages_when_no_structured(self):
+        """structured_response 無しなら messages の最後の AI メッセージを使う (旧経路互換)。"""
+        from lab_lounge.graph import _run_agent
+
+        mock_msg = MagicMock()
+        mock_msg.type = "ai"
+        mock_msg.content = "メッセージから取得"
+        mock_msg.usage_metadata = {}
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "messages": [mock_msg],
+            # structured_response キー無し
+        }
+
+        result = _run_agent(mock_agent, "テスト", "mimi-model")
+
+        assert result.text == "メッセージから取得"
+
+    def test_falls_back_when_structured_serialize_fails(self):
+        """structured_response があっても model_dump_json が失敗したらフォールバック。"""
+        from lab_lounge.graph import _run_agent
+
+        # model_dump_json も model_dump も無いオブジェクト
+        broken_structured = MagicMock(spec=[])  # 属性なし
+
+        mock_msg = MagicMock()
+        mock_msg.type = "ai"
+        mock_msg.content = "フォールバック値"
+        mock_msg.usage_metadata = {}
+
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "messages": [mock_msg],
+            "structured_response": broken_structured,
+        }
+
+        result = _run_agent(mock_agent, "テスト", "mimi-model")
+
+        # フォールバック先 (messages の最後の AI) が使われる
+        assert result.text == "フォールバック値"
+
+
+class TestBuildAgentGraphWithStructuredOutput:
+    """Phase 0.5-A フェーズ 8: _build_agent_graph が response_format を渡す。"""
+
+    def test_passes_response_format_when_character_slug_set(self, monkeypatch):
+        """character_slug 指定時に create_agent の response_format に Pydantic スキーマが渡される。"""
+        from lab_lounge import graph as graph_mod
+
+        # _load_mcp_tools が空でない tool list を返すよう mock
+        mock_tool = MagicMock()
+        mock_tool.name = "fake_tool"
+        # ログ強化 L-2 で _load_mcp_tools(character_slug=...) のシグネチャに変わったため
+        # **kwargs を受け取れるようにする (mock の引数互換維持)
+        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda **_kw: [mock_tool])
+
+        # _get_llm_for_agent も mock (実 LLM 呼出を避ける)
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value = mock_llm
+        monkeypatch.setattr(graph_mod, "_get_llm_for_agent", lambda *a: mock_llm)
+
+        # langchain.agents.create_agent を spy
+        captured_kwargs = {}
+
+        def spy_create_agent(**kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock(name="agent")
+
+        with patch("langchain.agents.create_agent", spy_create_agent):
+            graph_mod._build_agent_graph(
+                provider="anthropic",
+                model="claude-test",
+                system_prompt="prompt",
+                character_slug="mimi",
+            )
+
+        # response_format に Pydantic スキーマが渡されている
+        assert "response_format" in captured_kwargs
+        schema = captured_kwargs["response_format"]
+        assert schema.__name__ == "MimiResponse"
+        # system_prompt も渡される (旧 prompt= からのリネーム)
+        assert "system_prompt" in captured_kwargs
+        # tools も渡される
+        assert "tools" in captured_kwargs
+        assert captured_kwargs["tools"] == [mock_tool]
+
+    def test_no_response_format_when_character_slug_none(self, monkeypatch):
+        """character_slug=None なら response_format は渡されない (旧経路互換)。"""
+        from lab_lounge import graph as graph_mod
+
+        mock_tool = MagicMock()
+        mock_tool.name = "fake_tool"
+        # ログ強化 L-2 で _load_mcp_tools(character_slug=...) のシグネチャに変わったため
+        # **kwargs を受け取れるようにする (mock の引数互換維持)
+        monkeypatch.setattr(graph_mod, "_load_mcp_tools", lambda **_kw: [mock_tool])
+        mock_llm = MagicMock()
+        mock_llm.bind_tools.return_value = mock_llm
+        monkeypatch.setattr(graph_mod, "_get_llm_for_agent", lambda *a: mock_llm)
+
+        captured_kwargs = {}
+
+        def spy_create_agent(**kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        with patch("langchain.agents.create_agent", spy_create_agent):
+            graph_mod._build_agent_graph(
+                provider="anthropic",
+                model="claude-test",
+                system_prompt="prompt",
+                character_slug=None,
+            )
+
+        # response_format が渡されない
+        assert "response_format" not in captured_kwargs

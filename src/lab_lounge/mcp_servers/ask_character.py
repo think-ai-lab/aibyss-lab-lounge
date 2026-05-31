@@ -24,6 +24,7 @@ import contextvars
 import logging
 import os
 import threading
+import time
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,22 @@ _chunk_done_event_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
 _on_pose_ready_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "ask_char_on_pose_ready", default=None,
 )
-
+# Phase 0.5-B-β-1 commit 4: target キャラのステータスを HUD dashboard (V2 /status)
+# に反映するための CharacterStatusManager 参照。set_ask_character_context で
+# graph._generation_node から注入される。bridge filler 投入時に target を THINKING、
+# 本応答 chunk 1 投入時に TALKING (metadata: pose + full response_text)、
+# bg_tts 合成完了時に READY に反映する。
+#
+# 【WHY: caller でなく target だけ反映する】
+# caller (= mimi が ask_character を起動する側) のステータスは通常応答経路の
+# graph._generation_node (THINKING) / BubbleToolCallbackHandler (TOOL_CALLING) /
+# graph._tts_node (TALKING) で既に反映される。target (= chisame の音声が ask_character
+# 経由で playback queue に入って流れている数十秒) のステータスは Phase 0.5-B-α では
+# 未配線 (= ask_character.py に set_status 呼出が 0 件) で、HUD カードが READY のまま
+# だった。本 commit でこの穴を埋める。
+_status_manager_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "ask_char_status_manager", default=None,
+)
 # ─── ターン状態 (session_id をキーにした module-level dict) ──────────
 # contextvars ではなく dict + Lock で管理する理由:
 #   LangGraph の ToolNode は asyncio.create_task() などで子 context を生成して
@@ -77,6 +93,18 @@ _previous_targets: dict[str, str] = {}  # session_id → 直前 target の displ
 #   - playback queue の close sentinel が target chunks 投入完了前に送られて
 #     残りの chunks が再生されないのを防ぐ (途中切れ防止)
 _bg_tts_events: dict[str, list[threading.Event]] = {}
+
+# Phase 0.5-B-β-2: 却下/lapse 時の bg_tts キャンセルフラグ。run_loop の
+# on_handraise_close callback が cancel_bg_tts(session_id) を呼ぶと、該当
+# session の Event が set される。導入セリフ TTS / _wrapped_on_chunk_ready /
+# _bg_tts_synthesize の各箇所で is_set() チェックして以降の処理を skip する。
+#
+# 【WHY: VOICEPEAK 合成中の subprocess は止められない】
+# 既に subprocess.run(voicepeak.exe ...) で合成中の chunk は OS レベルで止め
+# られない。本フラグで阻止できるのは「未起動の bg_tts thread」「未投入の
+# chunk」「導入セリフ TTS の起動」の 3 種類。再生中の chunk は最後まで流れる
+# が、バッファ済の未再生 chunks は β-2-3 の playback queue drain で破棄する。
+_bg_cancel_flags: dict[str, threading.Event] = {}
 
 
 def _reset_session_state(session_id: str) -> None:
@@ -111,11 +139,55 @@ def _record_target(session_id: str, target_display: str) -> None:
 
 
 def _register_bg_tts_event(session_id: str, event: threading.Event) -> None:
-    """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。"""
+    """協働応答 TTS バックグラウンドスレッドの完了 event を session に登録する。
+
+    `wait_bg_tts_complete` (= graph._tts_node の caller 最終応答 TTS 投入前 +
+    run_loop の playback queue close 前) で完了を待つために使用する。
+    """
     if not session_id:
         return
     with _ask_state_lock:
         _bg_tts_events.setdefault(session_id, []).append(event)
+
+
+def cancel_bg_tts(session_id: str) -> int:
+    """指定 session の bg_tts cancel flag を set する (Phase 0.5-B-β-2)。
+
+    run_loop の on_handraise_close callback (= 却下/lapse 時) から呼ばれる。
+    本関数で阻止できるのは以下 3 種類:
+      - 未起動の _bg_tts_synthesize daemon thread の tts_synthesize 呼出
+      - _wrapped_on_chunk_ready の on_tts_chunk 投入
+      - 導入セリフ TTS の起動 (set_ask_character_context 後の最初の _ask_character_impl
+        呼出より前にキャンセルされた場合)
+
+    既に subprocess.run(voicepeak.exe ...) で合成中の chunk は OS レベルで止め
+    られない。再生中の chunk も止められない (playback worker が play_audio_file で
+    block 中)。これらは β-2-3 の playback queue drain でも破棄できないが、未投入
+    の chunks (= まだ queue に乗っていない、もしくは合成中の VOICEPEAK の次の
+    chunk) は本フラグで阻止できる。
+
+    Args:
+        session_id: cancel 対象の session_id (空文字なら no-op で 0 返却)
+
+    Returns:
+        cancel flag set 時点で session に登録されていた bg_tts event 数
+        (= 影響を受ける可能性のある bg_tts thread 数の指標)。0 は「未登録」または
+        「対象なし」を示す (= 呼出側が「効果なかった」と判別する用途、現状ログのみ)。
+    """
+    if not session_id:
+        return 0
+    with _ask_state_lock:
+        flag = _bg_cancel_flags.get(session_id)
+        if flag is None:
+            return 0
+        flag.set()
+        # 影響範囲は登録済 bg_tts event 数で示す (= 起動済 bg_tts thread の概数)。
+        n = len(_bg_tts_events.get(session_id, []))
+    logger.info(
+        "ask_character cancel_bg_tts: session=%s pending_bg_tts=%d",
+        session_id, n,
+    )
+    return n
 
 
 def wait_bg_tts_complete(session_id: str, timeout: float = 180.0) -> None:
@@ -151,6 +223,7 @@ def set_ask_character_context(
     common: dict | None = None,
     caller_slug: str = "",
     on_pose_ready: Callable | None = None,
+    status_manager: Any = None,
 ) -> None:
     """Agent 実行前にコンテキストをセットする。graph.py の _generation_node から呼ばれる。
 
@@ -159,16 +232,27 @@ def set_ask_character_context(
                        (slug: str, pose: str) -> None。
                        graph.py の _tts_node が caller の pose 切替で使うものと
                        同じ関数 (_on_pose_ready) を渡す想定。
+        status_manager: Phase 0.5-B-β-1 commit 4 で追加。target キャラの HUD
+                       ステータス反映に使う CharacterStatusManager。None なら
+                       ステータス反映 no-op (= 後方互換、Phase 0.5-B-α 以前と同じ)。
     """
     _on_tts_chunk_var.set(on_tts_chunk)
     _tts_output_dir_var.set(tts_output_dir)
     _common_var.set(common or {})
     _caller_slug_var.set(caller_slug)
     _on_pose_ready_var.set(on_pose_ready)
+    _status_manager_var.set(status_manager)
     # ターン開始時に呼出し回数と直前 target をリセット (各ターン独立にカウント)。
     # graph.py の _generation_node がターン開始時に 1 回呼ぶ前提。
     session_id = (common or {}).get("session_id", "")
     _reset_session_state(session_id)
+    # Phase 0.5-B-β-2: cancel flag を session_id 単位でクリーンに作る。前ターンで
+    # set されていた flag を継承すると、今ターンの bg_tts が起動直後に skip され
+    # てしまうため、新規 Event で上書きする。session_id 空文字なら no-op (= 後方
+    # 互換、テスト等で session_id 未指定パターンに対応)。
+    if session_id:
+        with _ask_state_lock:
+            _bg_cancel_flags[session_id] = threading.Event()
 
 
 def reset_ask_character_context() -> None:
@@ -179,10 +263,12 @@ def reset_ask_character_context() -> None:
     _caller_slug_var.set("")
     _chunk_done_event_var.set(None)
     _on_pose_ready_var.set(None)
+    _status_manager_var.set(None)
     with _ask_state_lock:
         _ask_counts.clear()
         _previous_targets.clear()
         _bg_tts_events.clear()
+        _bg_cancel_flags.clear()
 
 
 # ─── MCP サーバー ──────────────────────────────────────────────────
@@ -279,6 +365,15 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
     # 発生しない (= 直前の発話が続いている間に wait する形になる)。
     wait_bg_tts_complete(session_id)
 
+    # Phase 0.5-B-β-2: cancel flag を取得して closure に保持する。run_loop の
+    # on_handraise_close callback から cancel_bg_tts(session_id) で set される可能性が
+    # ある。導入セリフ TTS / _wrapped_on_chunk_ready / _bg_tts_synthesize の
+    # 各箇所で is_set() チェックして以降の処理を skip する。
+    # _bg_tts_synthesize は別 thread (= contextvars 引き継ぎ問題あり) で走るため、
+    # ここでメインスレッドの dict から取得して closure 経由で渡す。
+    with _ask_state_lock:
+        cancel_flag = _bg_cancel_flags.get(session_id)
+
     ask_index, previous_target_display = _next_ask_state(session_id)
 
     logger.info(
@@ -374,27 +469,70 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     # 4a-4. 導入セリフ TTS → 再生完了を待つ (並行して協働先 LLM が走る)
     if on_tts_chunk and use_real_tts and caller_char and intro_response_text:
-        try:
-            from ..tts import synthesize as tts_synthesize
-
-            intro_done = threading.Event()
-            _chunk_done_event_var.set(intro_done)
-
-            logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
-            tts_synthesize(
-                intro_response_text,
-                provider=caller_char.tts_provider,
-                voice=caller_char.tts_voice,
-                speaker=caller_char.slug,
-                output_dir=tts_output_dir,
-                on_chunk_ready=on_tts_chunk,
+        # Phase 0.5-B-β-2: cancel flag set されていれば導入セリフ TTS スキップ。
+        # 既に却下/lapse されている場合 (= 稀だが、_generate_intro 中に挙手中
+        # キャラが lapse する等) は導入セリフを流す意味がない。
+        if cancel_flag is not None and cancel_flag.is_set():
+            logger.info(
+                "ask_character 導入セリフ TTS skip (cancel flag set): session=%s",
+                session_id,
             )
+        else:
+            try:
+                from ..tts import synthesize as tts_synthesize
 
-            logger.info("ask_character 導入セリフ再生待ち...")
-            intro_done.wait(timeout=120)
-            logger.info("ask_character 導入セリフ再生完了")
-        except Exception as exc:
-            logger.warning("導入セリフ TTS 失敗: %s", exc)
+                # Phase 0.5-D-2-α: 導入セリフ TTS の合成完了 chunks を投入する直前で
+                # cancel_flag check するラッパー。
+                #
+                # 【WHY: cancel ガードは起動前 check だけでは不十分】
+                # tts_synthesize 起動前 (= 上の cancel_flag check) では未 set だった
+                # cancel_flag が、subprocess.run(voicepeak.exe...) で合成中に
+                # lapse/却下で set されることがある (= 実走テスト 2026-05-09
+                # logs/runs/run_loop_20260509_150431.log で観察)。chunks 投入直前
+                # (= 合成完了後) でもう一度 check することで漏れを完全に阻止する。
+                def _wrapped_intro_chunk_ready(
+                    url: str, chunk_text: str, is_last: bool, character: str,
+                ) -> None:
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        logger.info(
+                            "ask_character 導入セリフ chunk skip (cancel flag set): "
+                            "session=%s character=%s",
+                            session_id, character,
+                        )
+                        return
+                    # Phase 0.5-F-3-fix (= 中間実走 14 シナリオ 1 で発覚した HUD 早期 READY 遷移修正):
+                    # 導入セリフ chunk は **caller 応答全体の中の中間 chunk** であって、
+                    # 真の最後ではない。VOICEPEAK の合成単位で is_last=True が立つが、
+                    # 後続する caller まとめ TTS の最後 chunk が真の caller 応答最終。
+                    # is_last=False に強制することで、`_run_playback_worker` の
+                    # 「is_last=True chunk 物理再生完了時に set_status(READY)」ロジック
+                    # (= run_loop.py:1897、Phase 0.5-B-β-3 commit 2 導入) の誤発火を防ぐ。
+                    #
+                    # 【WHY: F-3 wiring 切替で顕在化したが本質的に F-3 以前から潜在】
+                    # 本バグは Phase 0.5-B-β-3 commit 2 から潜在していたタイミング依存
+                    # バグ。callout 経路では caller まとめ LLM が ask_character 完了より
+                    # 遅く完了する場合が多く偶然顕在化していなかったが、Gemini 多段階
+                    # ask_character の高速ケース (= 中間実走 14 シナリオ 1) で顕在化。
+                    # 案 R wiring (F-3) で raisehand 承認経路も callout 経路と同じ
+                    # `run_pipeline` を通るようになり、同じ条件で顕在化しやすくなった。
+                    is_last_safe = False
+                    on_tts_chunk(url, chunk_text, is_last_safe, character)
+
+                logger.info("ask_character 導入セリフ TTS: [%s] %s", caller_slug, intro_response_text[:60])
+                tts_synthesize(
+                    intro_response_text,
+                    provider=caller_char.tts_provider,
+                    voice=caller_char.tts_voice,
+                    speaker=caller_char.slug,
+                    output_dir=tts_output_dir,
+                    on_chunk_ready=_wrapped_intro_chunk_ready,
+                )
+
+                # 順序保証 (= 「導入セリフ → 本応答」の合成完了順) は VOICEPEAK FIFO
+                # worker (= tts.py:_voicepeak_worker_fn) の直列合成 + playback queue の
+                # FIFO 投入順 + ask_character.py 冒頭の wait_bg_tts_complete で実現する。
+            except Exception as exc:
+                logger.warning("導入セリフ TTS 失敗: %s", exc)
 
     # 4a-5. 協働先 LLM の完了を待つ (導入再生中に並行実行されていたので大部分は完了済み)
     collab_thread.join(timeout=120)
@@ -421,6 +559,24 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     target_char.slug, exc,
                 )
 
+        # Phase 0.5-B-β-1 commit 4: target キャラの HUD ステータスを THINKING に反映。
+        # 上の _publish_bubble("thinking") と対になる V2 SSE event (= /status の
+        # CharacterStatusManager 経由) を発火する。bridge filler が再生されている
+        # 間 HUD カードが「考え中」(黄色) で表示される。bg_tts 合成失敗時は
+        # _bg_tts_synthesize の finally で READY に戻る (= ステータス stuck 防止)。
+        _status_manager_for_target = _status_manager_var.get()
+        if _status_manager_for_target is not None:
+            try:
+                from ..character_status import CharacterStatus
+                _status_manager_for_target.set_status(
+                    target_char.slug, CharacterStatus.THINKING,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ask_character target THINKING 反映失敗 (%s): %s",
+                    target_char.slug, exc,
+                )
+
         # 5-b. target の bridge filler を再生キュー投入する (応答 TTS の合成中の空白を埋める)。
         # 「caller の問いかけ完了 → 即 target の応答が始まる」と target の VOICEPEAK 合成
         # (1 チャンク目 ~22 秒) を待つ間に視聴者の耳が空白を感じる。bridge filler
@@ -431,23 +587,35 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             from ..filler import select_filler_path
             bridge_path, _ = select_filler_path(target_char.slug, "bridge")
             if bridge_path:
-                # chunk_text を空文字にする理由:
-                #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
-                #   bubble.update step="speaking" の表示テキストにそのまま流す。
-                #   filler 用の内部識別ラベル (e.g., "(target bridge filler)") をここに
-                #   渡すと HUD にそのまま出てしまうため、空文字を渡し、playback worker
-                #   側で「空文字なら speaking publish をスキップ」して直前の thinking
-                #   テロップを維持させる。
-                on_tts_chunk(
-                    bridge_path.as_uri(),
-                    "",
-                    False,  # is_last=False — 本応答が続く
-                    target_char.slug,
-                )
-                logger.info(
-                    "ask_character target bridge filler 投入: [%s] %s",
-                    target_char.slug, bridge_path.name,
-                )
+                # Phase 0.5-D-2-α: bridge filler 投入前に cancel_flag check。
+                # 却下/lapse 後 or fallback 起動後に bridge filler が
+                # _playback_queue に投入されないようにガードする (= 実走テスト
+                # 2026-05-09 logs/runs/run_loop_20260509_155109.log で観察された
+                # 「fallback パス後に sakura bridge filler が漏れて再生」現象の対処)。
+                if cancel_flag is not None and cancel_flag.is_set():
+                    logger.info(
+                        "ask_character target bridge filler skip (cancel flag set): "
+                        "[%s] session=%s",
+                        target_char.slug, session_id,
+                    )
+                else:
+                    # chunk_text を空文字にする理由:
+                    #   playback worker (run_loop.py:_run_playback_worker) は task["text"] を
+                    #   bubble.update step="speaking" の表示テキストにそのまま流す。
+                    #   filler 用の内部識別ラベル (e.g., "(target bridge filler)") をここに
+                    #   渡すと HUD にそのまま出てしまうため、空文字を渡し、playback worker
+                    #   側で「空文字なら speaking publish をスキップ」して直前の thinking
+                    #   テロップを維持させる。
+                    on_tts_chunk(
+                        bridge_path.as_uri(),
+                        "",
+                        False,  # is_last=False — 本応答が続く
+                        target_char.slug,
+                    )
+                    logger.info(
+                        "ask_character target bridge filler 投入: [%s] %s",
+                        target_char.slug, bridge_path.name,
+                    )
             else:
                 logger.debug("target bridge filler なし: %s", target_char.slug)
         except Exception as exc:
@@ -479,16 +647,33 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         # 引き継がれない可能性があるため、ここで値を取得してクロージャ経由で
         # _bg_tts_synthesize に渡す。
         on_pose_ready = _on_pose_ready_var.get()
+        # Phase 0.5-B-β-1 commit 4: status_manager も同じく contextvars 引き継ぎ
+        # 問題に対処するためメインスレッドで取得し、クロージャ経由で
+        # _wrapped_on_chunk_ready / _bg_tts_synthesize から参照する。
+        status_manager_capture = _status_manager_var.get()
 
-        # response_text から pose を事前に抽出 (_wrapped_on_chunk_ready で使用)。
-        # 本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
+        # response_text から pose と say_text を事前に抽出 (_wrapped_on_chunk_ready
+        # で使用)。本応答 chunk 1 が投入される直前に on_pose_ready を呼ぶことで、
         # _pending_poses に予約するタイミングと _on_tts_chunk で pop されるタイミング
         # の順序が保証される (= bridge filler 投入時には予約がなく neutral、本応答
         # chunk 1 投入時に target_pose が予約されている状態を作る)。
+        # Phase 0.5-B-β-3 commit 1: say_text も同時に取得し、TALKING metadata.text
+        # に渡すことで HUD ダッシュボードに「response 部分のみ」を表示する
+        # (= JSON 全文 ({"emotion":..., "response":..., ...}) が HUD に出てしまう
+        # 不具合の修正、シナリオ 2 で観察)。通常応答経路の graph._tts_node も
+        # 同じ前処理を行っており、metadata 形を統一する。
         from ..tts import _parse_voicepeak_json
-        _, _, _, target_pose = _parse_voicepeak_json(response_text)
+        target_say_text, _, _, target_pose = _parse_voicepeak_json(response_text)
 
         def _wrapped_on_chunk_ready(url: str, chunk_text: str, is_last: bool, character: str) -> None:
+            # Phase 0.5-B-β-2: cancel flag set されていれば chunk 投入 skip。
+            # bg_tts thread の合成は止められないが、playback queue への投入を阻止
+            # することで「却下後に target の応答音声が流れ続ける」状況を防ぐ。
+            # answering bubble / pose 予約 / TALKING ステータスも合わせて skip する
+            # (= これらは「target が話す」前提の演出なので、cancel 後は不要)。
+            if cancel_flag is not None and cancel_flag.is_set():
+                return
+
             # 本応答 TTS の最初のチャンクが投入される直前のフック
             if not first_chunk_seen[0]:
                 first_chunk_seen[0] = True
@@ -517,10 +702,66 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                             "ask_character target pose 予約失敗 (%s): %s",
                             target_char.slug, exc,
                         )
+                # Phase 0.5-B-β-1 commit 4: target の HUD ステータスを TALKING に
+                # 反映。本応答 chunk 1 が playback queue に投入されるタイミングで
+                # 反映 → V2 HUD カードが緑色 + 発話全文 (response_text) と pose
+                # を metadata に表示。closure キャプチャ (status_manager_capture)
+                # で contextvars の daemon thread 引継ぎ問題を回避済み。
+                #
+                # metadata の構造は graph._tts_node が通常応答経路で渡す形と統一
+                # (= V2 SSE 受信側で同じ shape として扱える):
+                #   - pose: target_pose (None なら null、HUD 側で fallback 描画)
+                #   - text: response_text (= 協働先 LLM の full レスポンス)
+                if status_manager_capture is not None:
+                    try:
+                        from ..character_status import CharacterStatus
+                        # Phase 0.5-B-β-3 commit 1: text は say_text (= JSON parse 後の
+                        # response 部分) を優先する。parse 失敗時は元の response_text に
+                        # fallback (= 旧挙動、JSON 全文だが視認可能性は維持)。
+                        talking_metadata: dict[str, Any] = {
+                            "pose": target_pose if target_pose else None,
+                            "text": target_say_text or response_text,
+                        }
+                        status_manager_capture.set_status(
+                            target_char.slug,
+                            CharacterStatus.TALKING,
+                            metadata=talking_metadata,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ask_character target TALKING 反映失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
             on_tts_chunk(url, chunk_text, is_last, character)
 
         def _bg_tts_synthesize() -> None:
+            # Phase 0.5-D-d-6 (= 中間実走 8 回目 take 1-2 hang 調査用ログ追加):
+            # _bg_tts_synthesize daemon thread のライフサイクルを詳細追跡する。
+            #
+            # take 1-2 で sakura TTS が 50 秒走る間に mimi Agent が hang。本ログで
+            # thread 起動 / 完了タイミングを正確に把握 → 「mimi Agent hang と sakura
+            # TTS 合成」の時系列の関連性を切り分ける。
+            _bg_tts_start = time.monotonic()
+            logger.info(
+                "_bg_tts_synthesize 開始 [target=%s]: session=%s thread_id=%d "
+                "active_threads=%d",
+                character_slug, session_id or "(none)",
+                threading.get_ident(), threading.active_count(),
+            )
+            synthesize_failed = False
+            cancelled = False
             try:
+                # Phase 0.5-B-β-2: cancel flag set されていれば tts_synthesize 起動
+                # を skip。VOICEPEAK の subprocess.run は止められないが、起動前なら
+                # 完全に阻止できる (= 一番早い cancel タイミング、CPU/GPU 浪費なし)。
+                if cancel_flag is not None and cancel_flag.is_set():
+                    cancelled = True
+                    logger.info(
+                        "ask_character 協働応答 TTS skip (cancel flag set): "
+                        "target=%s session=%s",
+                        character_slug, session_id,
+                    )
+                    return
                 from ..tts import synthesize as tts_synthesize
                 tts_synthesize(
                     response_text,
@@ -531,11 +772,42 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                     on_chunk_ready=_wrapped_on_chunk_ready,
                 )
             except Exception as exc:
+                synthesize_failed = True
                 logger.warning(
                     "ask_character 協働応答 TTS 合成失敗 (%s): %s",
                     character_slug, exc,
                 )
             finally:
+                # Phase 0.5-B-β-3 commit 2: 正常系の READY 反映は playback worker
+                # (= is_last chunk 物理再生完了時、run_loop._run_playback_worker)
+                # に移動した。bg_tts 合成完了 != 物理再生完了の不整合を解消する
+                # ため (= シナリオ 2 で観察、HUD で発話途中に灰色化する不具合)。
+                #
+                # ただし例外時 (= 合成失敗) と cancel 時は chunks が playback queue
+                # に入らないため、playback worker 経由の READY 反映が走らない。
+                # その場合は本 finally で READY を反映して UI stuck を防ぐ
+                # (= fallback 経路、HUD カードが talking のまま残らないようにする)。
+                if (synthesize_failed or cancelled) and status_manager_capture is not None:
+                    try:
+                        from ..character_status import CharacterStatus
+                        status_manager_capture.set_status(
+                            target_char.slug, CharacterStatus.READY,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ask_character target READY 反映失敗 (%s): %s",
+                            target_char.slug, exc,
+                        )
+                # Phase 0.5-D-d-6: thread 完了タイミングログ。take 1-2 で sakura TTS
+                # 完了時刻 (= 本ログ) と mimi Agent 完了時刻のギャップを測るシグナル。
+                _bg_tts_latency_ms = int((time.monotonic() - _bg_tts_start) * 1000)
+                logger.info(
+                    "_bg_tts_synthesize 完了 [target=%s]: session=%s "
+                    "latency_ms=%d failed=%s cancelled=%s active_threads=%d",
+                    character_slug, session_id or "(none)",
+                    _bg_tts_latency_ms,
+                    synthesize_failed, cancelled, threading.active_count(),
+                )
                 bg_tts_done.set()
 
         _register_bg_tts_event(session_id, bg_tts_done)
@@ -545,28 +817,69 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
             character_slug, session_id or "(none)",
         )
 
-    logger.info("ask_character 完了: target=%s response_len=%d", character_slug, len(response_text))
+    # Phase 0.5-D-d-6: ask_character return 直前の active_threads を記録。
+    # take 1-2 で「return 後 mimi Agent が走らない」現象の原因切り分け用 (= thread
+    # 数の急増 / Lock contention の兆候を検出するベースライン値)。
+    logger.info(
+        "ask_character 完了: target=%s response_len=%d active_threads=%d",
+        character_slug, len(response_text), threading.active_count(),
+    )
 
     # 直前 target を更新 (次回 ask_character 呼出し時の導入セリフ生成で参照される)
     _record_target(session_id, target_char.display_name)
 
-    # Agent への戻り値: 応答元と再生済みであることを明確に伝える
+    # Agent への戻り値: 応答元と再生済みであることを明確に伝える。
+    # response_text は生の構造化 JSON のことがあるため、クリーンな発話文に整形して渡す
+    # (= caller の暴走生成を防ぐ。_format_collab_result_for_caller の docstring 参照)。
     caller_name = caller_char.display_name if caller_char else "あなた"
+    return _format_collab_result_for_caller(
+        target_char.display_name, caller_name, response_text,
+    )
+
+
+def _format_collab_result_for_caller(
+    target_display: str,
+    caller_name: str,
+    response_text: str,
+) -> str:
+    """ask_character の協働応答を caller(Agent) へ返すツール結果文字列を組み立てる。
+
+    WHY (生 JSON を渡さない): 協働先 Agent の生出力は構造化 JSON
+    (```json{"emotion":{...}, "response":"..."}```) のことが多い。これをそのまま
+    ツール結果として caller に渡すと、caller (特に gpt-5.5 等 reasoning 系) が
+    「自分とは別スキーマの構造化 JSON」を入力に受け取り、推論が膨張・暴走する
+    (実走 run_loop_20260531_164001 で mimi step3 が ~128k トークン出力 → 数分フリーズ +
+    巨額課金。対照: 同じ生 JSON を claude-sonnet は正常処理)。そこで _parse_voicepeak_json
+    で response 本文のみ抽出し、クリーンな発話文を渡す。TTS / HUD 経路と同じ抽出器を再利用
+    し、非 JSON・エラー文字列はそのまま返るため後方互換 (octamaid SAY 形式・プレーン文も安全)。
+
+    Args:
+        target_display: 協働先キャラの表示名 (例 "波心ちさめ")
+        caller_name:    呼出元キャラの表示名 (例 "ミミ・オクタヴィア")
+        response_text:  協働先 Agent の生出力 (構造化 JSON or プレーン文)
+
+    Returns:
+        caller の Agent に渡すツール結果文字列 (クリーンな発話文 + 振る舞い指示)。
+    """
+    from ..tts import _parse_voicepeak_json
+
+    say_text, _, _, _ = _parse_voicepeak_json(response_text)
+    clean = say_text or response_text  # 抽出が空振りしたら元テキストにフォールバック
     return (
-        f"【{target_char.display_name}からの応答】\n"
-        f"{response_text}\n\n"
+        f"【{target_display}からの応答】\n"
+        f"{clean}\n\n"
         f"【重要な指示】\n"
-        f"- 上記は{target_char.display_name}が話した内容です（ルカからの応答ではありません）。\n"
-        f"- この応答はすでに{target_char.display_name}の声で視聴者に直接再生されています。\n"
+        f"- 上記は{target_display}が話した内容です（ルカからの応答ではありません）。\n"
+        f"- この応答はすでに{target_display}の声で視聴者に直接再生されています。\n"
         f"- 逐語的な要約や繰り返しは不要です。「聞いてまいりました」「こう言っていました」"
         f"「○○さんによると」のような第三者報告調も不要です。\n"
-        f"- まず{target_char.display_name}の発言に直接リアクション（同意・補足・関連付け・異論など）を返してください。\n"
+        f"- まず{target_display}の発言に直接リアクション（同意・補足・関連付け・異論など）を返してください。\n"
         f"  例: 「そうですわね、構造としてはまさにその通り」"
-        f"「{target_char.display_name}の言う『◯◯』、まさに核心ですわね」のような直接的な呼応。\n"
+        f"「{target_display}の言う『◯◯』、まさに核心ですわね」のような直接的な呼応。\n"
         f"- そのリアクションを起点に、{caller_name}として自分の視点・感想・次の展開を述べてください。\n"
         f"- 振った相手の発言を無視して独白的に締めることは避けてください"
         f"（視聴者には『振った意味がない』と映ります）。\n"
-        f"- {target_char.display_name}がすでに話し終えた前提で、自然に会話を続けてください。"
+        f"- {target_display}がすでに話し終えた前提で、自然に会話を続けてください。"
     )
 
 
@@ -596,18 +909,28 @@ def _run_collaboration_agent(
         from langgraph.prebuilt import create_react_agent
     except ImportError:
         # LangGraph なし → 単純 LLM 呼出しにフォールバック
+        # ログ強化 L-3: caller_slug=character_slug (target = 応答する側) でログ識別
         from ..llm import call_llm
-        result = call_llm(question, model=model, provider=provider, system_prompt=combined_prompt)
+        result = call_llm(
+            question, model=model, provider=provider,
+            system_prompt=combined_prompt,
+            caller_slug=character_slug,
+        )
         return result.text
 
     # ツールセットから ask_character を除外 (再帰防止)
-    all_tools = _load_mcp_tools()
+    # ログ強化 L-3: ask_character のターゲット (= target、応答する側) を渡してログ識別
+    all_tools = _load_mcp_tools(character_slug=character_slug)
     collab_tools = [t for t in all_tools if t.name != "ask_character_tool"]
 
     if not collab_tools:
         # ツールなし → 単純 LLM 呼出し
         from ..llm import call_llm
-        result = call_llm(question, model=model, provider=provider, system_prompt=combined_prompt)
+        result = call_llm(
+            question, model=model, provider=provider,
+            system_prompt=combined_prompt,
+            caller_slug=character_slug,
+        )
         return result.text
 
     # retrieve_memory 用の contextvars をセット (協働先も記憶検索できるように)
@@ -731,11 +1054,14 @@ def _generate_intro(
         )
 
     try:
+        # ログ強化 L-3: 導入セリフは caller (= 質問する側) が target に対して話すもの
+        # なので、caller_slug=caller_char.slug でログ識別する。
         result = call_llm(
             intro_prompt,
             model=filler_model,
             provider=filler_provider,
             system_prompt=caller_system_prompt,
+            caller_slug=caller_char.slug,
         )
         intro = result.text.strip()
         if intro:

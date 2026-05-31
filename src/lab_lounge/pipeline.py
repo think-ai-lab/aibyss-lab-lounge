@@ -56,8 +56,23 @@ def _publish_bubble(
     character_slug: str,
     common: dict,
     links: list[str] | None = None,
+    *,
+    category: str = "speech_status",
 ) -> None:
-    """bubble.update イベントを発行する。"""
+    """bubble.update イベントを発行する。
+
+    category はデフォルト "speech" (= 旧名称、後方互換)。Phase 0.5-E (= bubble 3 系統分離)
+    で以下の新 category に分離予定:
+      - "speech_status":  ステータス遷移 (thinking/searching/answering/done)、本 helper の
+                          中心用途、bubble_messages.json の固定メッセージを表示
+      - "speech_content": 発話内容 (= chunk text)、speaking 中のみ更新、run_loop の
+                          `_publish_bubble_safe` 経路で別途発行 (本 helper 対象外)
+      - "raisehand":      挙手系 (handraise/denied/lapsed/cancelled)、dispatcher が直接
+                          build_bubble_update を呼ぶため本 helper は使わない
+
+    本 helper は通常応答パスの speech_status 系を対象に最適化される。caller 側で
+    category を明示すれば override 可能 (= future-proof: 新 step 追加時に必要なら明示)。
+    """
     messages = _load_bubble_messages()
     char_msgs = messages.get(character_slug, {})
     text = char_msgs.get(step, "")
@@ -68,6 +83,7 @@ def _publish_bubble(
             step=step,
             text=text,
             links=links,
+            category=category,
             **common,
         )
         publish(bubble)
@@ -162,6 +178,9 @@ def run_pipeline(
     on_tts_chunk_ready=None,
     on_pose_ready=None,
     stream_context: str | None = None,
+    suppress_bubble_answering: bool = False,
+    disable_tools: list[str] | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """
     テキストを受け取り 3 イベントを publish する。
@@ -183,6 +202,13 @@ def run_pipeline(
                          同じ値が渡される。routing ノードでキャラ素体に
                          "## 本日の配信" として重ねられる。
                          None なら配信文脈なしで動作 (後方互換)。
+        suppress_bubble_answering: Phase 0.5-A フェーズ 7 で追加。True にすると
+                         _generation_node 内の bubble.update("answering") 発行を
+                         抑制する。挙手 BG 先行生成では承認時に run_loop が
+                         TTS 開始時刻と同期して bubble を発行する設計のため、
+                         graph 側の二重発行を避ける。デフォルト False で既存挙動。
+        disable_tools:   Agent から除外するツール名のリスト (例: ["ask_character"])。
+                         デフォルト None で既存挙動。
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
@@ -197,6 +223,9 @@ def run_pipeline(
         on_tts_chunk_ready=on_tts_chunk_ready,
         on_pose_ready=on_pose_ready,
         stream_context=stream_context,
+        suppress_bubble_answering=suppress_bubble_answering,
+        disable_tools=disable_tools,
+        status_manager=status_manager,
     )
 
 
@@ -211,6 +240,9 @@ def _run_pipeline_graph(
     on_tts_chunk_ready=None,
     on_pose_ready=None,
     stream_context: str | None = None,
+    suppress_bubble_answering: bool = False,
+    disable_tools: list[str] | None = None,
+    status_manager=None,
 ) -> PipelineResult:
     """LangGraph パイプライングラフ経由で実行する。"""
     from .graph import run_pipeline_graph, PipelineGraphState
@@ -242,6 +274,11 @@ def _run_pipeline_graph(
         "stream_context": stream_context,
         "on_tts_chunk_ready": on_tts_chunk_ready,
         "on_pose_ready": on_pose_ready,
+        "suppress_bubble_answering": suppress_bubble_answering,
+        "disable_tools": disable_tools,
+        # Phase 0.5-B-α: status_manager は run_loop から透過渡し。
+        # _generation_node が Thinking、BubbleToolCallbackHandler が ToolCalling を反映。
+        "status_manager": status_manager,
         "character_slug": "",
         "rag_context": None,
         "rag_used": False,
@@ -268,3 +305,5 @@ def _run_pipeline_graph(
 
 # レガシーパイプライン (_run_pipeline_legacy) は Sprint Axis D で廃止。
 # LangGraph は必須依存。パイプラインは _run_pipeline_graph のみ使用。
+
+

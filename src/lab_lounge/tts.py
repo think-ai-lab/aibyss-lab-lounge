@@ -210,9 +210,17 @@ def _call_voicevox(
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase 0.5-M: VOICEPEAK と同様に JSON parse → response field 抽出 + SAY 行抽出
+    # (= _parse_voicepeak_json 経由)。 旧設計では VOICEVOX path がこの parse を呼ばず、
+    # octamaid 用に LLM JSON 全文をそのまま VOICEVOX に投入していたため、
+    # `{} "response" :` 等の JSON syntax を音声合成 + bubble 表示する事象が発生
+    # (= run_loop_20260516_070847.log で観察)。
+    # JSON でない / response field なしの場合は text そのまま返るため、後方互換維持。
+    say_text, _emotion, _speed, _pose = _parse_voicepeak_json(text)
+
     # テキスト分割 (VOICEPEAK と同じロジック。140 字以内の短文は 1 チャンク)
-    chunks = _split_text_for_voicepeak(text)
-    logger.info("VOICEVOX チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(text))
+    chunks = _split_text_for_voicepeak(say_text)
+    logger.info("VOICEVOX チャンク分割: %d 個 (元テキスト %d 文字)", len(chunks), len(say_text))
 
     chunk_paths: list[Path] = []
     chunk_durations: list[int] = []
@@ -280,6 +288,37 @@ def _normalize_for_voicepeak(text: str) -> str:
     return text
 
 
+def _extract_say_lines(text: str) -> str:
+    """
+    octamaid 等の "SAY: ...\\nLOG: ..." 形式から SAY 行のみを抽出する (Phase 0.5-M)。
+
+    octamaid の system prompt (= system_octamaid.txt) は次の 3 軸出力を要求する設計:
+      - SAY: 読み上げ前提の短文 (= TTS で発声、bubble 表示対象)
+      - LOG: 画面用の状態表示 (= 配信に出さない、メタ情報)
+      - MODE: 現在の個体 (= 同上、必要時のみ)
+
+    TTS / bubble には SAY 内容だけ流したいため、本関数で LOG / MODE 行を除去 +
+    SAY 行の prefix を strip する。
+
+    SAY: prefix が含まれない場合 (= mimi/chisame/sakura 等の他キャラ、もしくは
+    octamaid が SAY: 形式に従わない自由応答) は元 text をそのまま返す
+    (= 安全側挙動、既存挙動への regression なし)。
+
+    複数 SAY: 行は半角スペースで連結 (= TTS で自然な間で発声)。
+    """
+    lines = text.split("\n")
+    say_contents: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("SAY:"):
+            content = stripped[len("SAY:"):].strip()
+            if content:
+                say_contents.append(content)
+    if say_contents:
+        return " ".join(say_contents)
+    return text
+
+
 def _parse_voicepeak_json(
     text: str,
 ) -> tuple[str, dict[str, int] | None, int | None, str | None]:
@@ -290,6 +329,9 @@ def _parse_voicepeak_json(
         {"emotion": {"happy": 50, ...}, "speed": 100, "pose": "happy", "response": "テキスト"}
 
     全角記号に正規化済みの JSON も半角に戻してからパースを試みる。
+
+    Phase 0.5-M: response field 抽出後、octamaid の "SAY: ...\\nLOG: ..." 形式から
+    SAY 行のみ抽出する (= _extract_say_lines 経由、他キャラは影響なし)。
 
     Returns:
         (say_text, emotion_dict_or_None, speed_or_None, pose_or_None)
@@ -325,6 +367,9 @@ def _parse_voicepeak_json(
         return text, None, None, None
 
     say_text = str(obj["response"])
+    # Phase 0.5-M: octamaid 形式 ("SAY: ...\nLOG: ...") から SAY 行のみ抽出。
+    # 他キャラ (mimi/chisame/sakura) は SAY: prefix なしなので変更なし (= 安全側)。
+    say_text = _extract_say_lines(say_text)
     emotion = obj.get("emotion")
     if isinstance(emotion, dict):
         emotion = {str(k): int(v) for k, v in emotion.items()}
@@ -463,17 +508,26 @@ def _is_voicepeak_busy_error(stderr: str, stdout: str) -> bool:
 
 
 def _get_voicepeak_retry_wait_sec() -> float:
-    """並列実行エラー発生時のリトライ待機時間（秒）を返す。
+    """並列実行エラー / クラッシュ発生時のリトライ待機時間（秒）を返す。
 
-    並列実行エラー検知時のみ挿入される (通常成功時は待機しない)。
-    環境変数 L2_VOICEPEAK_RETRY_WAIT_SEC で上書き可能 (デフォルト: 2.0)。
+    リトライ前にのみ挿入される (通常成功時は待機しない)。
+    環境変数 L2_VOICEPEAK_RETRY_WAIT_SEC で上書き可能 (デフォルト: 1.0)。
+
+    busy (並列実行エラー) と crash (非ゼロ exit) の両方で同じ値を使う
+    (Phase 0.5-A フェーズ 8: 倍率撤廃。リトライ回数で確率カバーする方針に変更)。
     """
-    return float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "2.0"))
+    return float(os.environ.get("L2_VOICEPEAK_RETRY_WAIT_SEC", "1.0"))
 
 
 def _get_voicepeak_max_retries() -> int:
-    """並列実行エラー発生時の最大リトライ回数を返す。"""
-    return int(os.environ.get("L2_VOICEPEAK_MAX_RETRIES", "2"))
+    """並列実行エラー / クラッシュ発生時の最大リトライ回数を返す。
+
+    環境変数 L2_VOICEPEAK_MAX_RETRIES で上書き可能 (デフォルト: 8)。
+
+    Phase 0.5-A フェーズ 8 で 2 → 8 に拡大。retry_wait を 2.0 → 1.0 に短縮した
+    のと合わせて、最終的な完走確率を担保する (合計待機時間は 4s → 8s と微増)。
+    """
+    return int(os.environ.get("L2_VOICEPEAK_MAX_RETRIES", "8"))
 
 
 def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
@@ -519,17 +573,24 @@ def _voicepeak_worker_fn(q: _queue_mod.Queue) -> None:
             stdout_text = _decode_voicepeak_output(result.stdout)
             is_busy = _is_voicepeak_busy_error(stderr_text, stdout_text)
 
+            # Phase 0.5-A フェーズ 8: cmd_str 全文も warning に含める
+            # (出力ファイル未生成 / クラッシュ時の引数再現に必要)。
             logger.warning(
                 "VOICEPEAK 非ゼロ終了 (attempt %d/%d): returncode=%d busy=%s"
-                "\n  stderr: %s\n  stdout: %s",
+                "\n  stderr: %s\n  stdout: %s\n  cmd (full): %s",
                 attempt + 1, max_retries + 1,
                 result.returncode, is_busy,
                 stderr_text or "(empty)",
                 stdout_text or "(empty)",
+                cmd_str,
             )
 
             if attempt < max_retries:
-                wait = retry_wait if is_busy else retry_wait * 2
+                # Phase 0.5-A フェーズ 8: busy と crash で wait を共通化 (倍率撤廃)。
+                # 旧設計はクラッシュを重く扱って `retry_wait * 2` だったが、
+                # max_retries を 4 倍 (2 → 8) に拡大したので、回数で確率カバーする
+                # 方針に変更。クラッシュ後の応答開始遅延を短縮する効果。
+                wait = retry_wait
                 reason = "並列実行エラー" if is_busy else f"クラッシュ (returncode={result.returncode})"
                 logger.info(
                     "VOICEPEAK %s検出 → %.1f 秒待機してリトライ",
@@ -560,15 +621,24 @@ def _ensure_voicepeak_worker() -> _queue_mod.Queue:
     return _voicepeak_queue
 
 
-def _submit_voicepeak(cmd_str: str) -> None:
+def _submit_voicepeak(cmd_str: str):
     """
     VOICEPEAK コマンドをキューに投入し、完了を待つ。
 
     FIFO 順序が保証される。先に投入されたジョブが先に実行される。
 
+    Phase 0.5-A フェーズ 8 (出力ファイル未生成バグ調査):
+    成功時 (returncode=0) は subprocess.CompletedProcess を返す。呼出側で
+    stdout / stderr を参照することで「returncode=0 だが --out が無視されて
+    出力ファイルが書かれない」現象の調査に使う。失敗時 (returncode != 0) は
+    従来通り RuntimeError を投げる。
+
+    Returns:
+        subprocess.CompletedProcess (成功時のみ)
+
     Raises:
         FileNotFoundError: VOICEPEAK コマンドが見つからない
-        RuntimeError: VOICEPEAK 実行エラー
+        RuntimeError: VOICEPEAK 実行エラー (returncode != 0)
     """
     q = _ensure_voicepeak_worker()
     future: concurrent.futures.Future = concurrent.futures.Future()
@@ -580,22 +650,108 @@ def _submit_voicepeak(cmd_str: str) -> None:
         raise
     except Exception as exc:
         logger.error("VOICEPEAK 実行中に例外: %s", exc)
-        logger.debug("VOICEPEAK 実行中に例外 cmd (full): %s", cmd_str)
+        logger.error("VOICEPEAK 実行中に例外 cmd (full): %s", cmd_str)
         raise RuntimeError(f"VOICEPEAK 実行エラー: {type(exc).__name__}: {exc}") from exc
 
     if result.returncode != 0:
-        # ワーカー側で既に詳細ログは出力済み。ここでは例外メッセージのみ組み立てる
+        # ワーカー側で既に詳細ログは出力済み。ここでは例外メッセージのみ組み立てる。
+        # Phase 0.5-A フェーズ 8: cmd (full) も warning に格上げ (出力ファイル未生成
+        # バグの再現に必要)。
         stderr_text = _decode_voicepeak_output(result.stderr) or "(empty)"
         stdout_text = _decode_voicepeak_output(result.stdout) or "(empty)"
         logger.error(
             "VOICEPEAK 実行最終失敗: returncode=%d stderr: %s stdout: %s",
             result.returncode, stderr_text, stdout_text,
         )
-        logger.debug("VOICEPEAK 実行最終失敗 cmd (full): %s", cmd_str)
+        logger.error("VOICEPEAK 実行最終失敗 cmd (full): %s", cmd_str)
         raise RuntimeError(
             f"VOICEPEAK 実行エラー: returncode={result.returncode} "
             f"stderr={stderr_text!r} stdout={stdout_text!r}"
         )
+
+    return result
+
+
+def _log_voicepeak_output_missing_diagnostics(
+    *,
+    filepath,
+    result,
+    cmd_str: str,
+    speaker: str | None,
+    attempt: int,
+    max_attempts: int,
+) -> None:
+    """VOICEPEAK 出力ファイル未生成バグの調査用 warning ログ (Phase 0.5-A フェーズ 8)。
+
+    実走 (2026-05-08) で「returncode=0 だが期待した --out のファイルが生成されず、
+    代わりに L2 ルート直下の output.wav に書かれる」という現象が観測された。
+    再現性のないバグなので、次に発生した瞬間に原因を絞り込めるよう、以下の情報を
+    すべて warning レベルで残す:
+
+      - filepath の絶対パス (Windows パスや日本語混入の判別)
+      - 期待ファイルの親ディレクトリの存在 / 書き込み権限の状況
+      - 「cwd の output.wav」(VOICEPEAK のデフォルト出力先) の有無 + サイズ + mtime
+        → 存在すれば --out 無視疑惑が確定する
+      - subprocess の stdout / stderr (decoded)
+      - cmd_str 全文 (引数のエスケープ / クォート問題の再現に必要)
+
+    Args:
+        filepath:    期待された出力ファイルパス (Path)
+        result:      ``subprocess.CompletedProcess`` (returncode=0 だが file なし)
+        cmd_str:     VOICEPEAK 実行コマンド全文
+        speaker:     キャラ slug (ログ識別用)
+        attempt:     試行回数 (0 = 初回、1 以上 = リトライ)
+        max_attempts: 最大リトライ回数
+    """
+    from pathlib import Path as _Path
+    import time as _time
+
+    speaker_label = speaker or "(unknown)"
+    abs_expected = filepath.resolve() if hasattr(filepath, "resolve") else _Path(filepath).resolve()
+    parent = abs_expected.parent
+    parent_status = "exists" if parent.is_dir() else "MISSING"
+
+    # cwd / repo root の output.wav を確認 (VOICEPEAK がデフォルト出力先に書いた疑い)
+    cwd = _Path.cwd()
+    cwd_output = cwd / "output.wav"
+    if cwd_output.is_file():
+        st = cwd_output.stat()
+        cwd_output_info = (
+            f"cwd_output.wav 存在 (size={st.st_size} bytes, "
+            f"mtime={_time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(st.st_mtime))}, "
+            f"path={cwd_output}) — VOICEPEAK が --out を無視した疑い"
+        )
+    else:
+        cwd_output_info = f"cwd_output.wav 不在 (cwd={cwd})"
+
+    # subprocess の stdout / stderr を decode
+    if result is not None:
+        stdout_text = _decode_voicepeak_output(result.stdout) or "(empty)"
+        stderr_text = _decode_voicepeak_output(result.stderr) or "(empty)"
+        returncode = result.returncode
+    else:
+        stdout_text = "(result is None)"
+        stderr_text = "(result is None)"
+        returncode = -1
+
+    label = "初回検出" if attempt == 0 else f"リトライ後再検出 ({attempt}/{max_attempts})"
+
+    logger.warning(
+        "VOICEPEAK 出力ファイル未生成 [%s] speaker=%s\n"
+        "  expected: name=%s abs=%s parent=%s (%s)\n"
+        "  returncode=%d\n"
+        "  stdout: %s\n"
+        "  stderr: %s\n"
+        "  %s\n"
+        "  cmd (full): %s",
+        label, speaker_label,
+        filepath.name, abs_expected, parent, parent_status,
+        returncode,
+        stdout_text,
+        stderr_text,
+        cwd_output_info,
+        cmd_str,
+    )
 
 
 def _generate_voicepeak_single_file(
@@ -629,6 +785,12 @@ def _generate_voicepeak_single_file(
         logger.debug("VOICEPEAK テキスト正規化: %r → %r", text, normalized_text)
 
     safe_text = normalized_text.replace('"', "'")
+    # Phase 0.5-F-6-g (案 C): 改行 sanitize の最終防衛層 (= 案 A の二重防衛)。
+    # _parse_voicepeak_json を経由しない呼出経路 (= filler 等で直接 _synthesize_voicepeak
+    # に text を渡す経路) でも、subprocess 投入直前で必ず改行を除去することで
+    # VOICEPEAK CLI 引数破壊を構造的に阻止する。詳細は _parse_voicepeak_json の
+    # 同等処理を参照 (logs/runs/run_loop_20260515_002506.log で観察された事象)。
+    safe_text = safe_text.replace("\\n", " ").replace("\n", " ")
     safe_voice = voice.replace('"', "'")
 
     cmd_str = (
@@ -644,7 +806,9 @@ def _generate_voicepeak_single_file(
         cmd_str += f" --emotion {emotion_expr}"
 
     # 配信中のコンソール表示でファイルパス (ユーザーディレクトリ等) を漏らさないよう、
-    # ログにはファイル名・narrator・テキスト長のみを出す。完全なコマンドは debug レベルへ。
+    # 「投入」サマリ行はファイル名・narrator・テキスト長のみを出す。
+    # Phase 0.5-A フェーズ 8: voicepeak.exe 実行時の cmd_str 全文を info レベルで残す
+    # (出力ファイル未生成バグの調査用。引数のエスケープ / クォート / 文字化けの再現に必要)。
     # 並行 / バックグラウンド合成中に「誰の何のチャンクか」を即座に追えるよう、
     # speaker と text 先頭 (40 文字) を含める。
     text_preview = safe_text if len(safe_text) <= 40 else safe_text[:40] + "…"
@@ -652,9 +816,9 @@ def _generate_voicepeak_single_file(
         "VOICEPEAK 投入: speaker=%s narrator=%s text_len=%d out=%s text=%r",
         speaker or "(unknown)", voice, len(safe_text), filepath.name, text_preview,
     )
-    logger.debug("VOICEPEAK コマンド (full): %s", cmd_str)
+    logger.info("VOICEPEAK コマンド (full): %s", cmd_str)
 
-    _submit_voicepeak(cmd_str)
+    initial_result = _submit_voicepeak(cmd_str)
 
     # VOICEPEAK が returncode=0 でも出力ファイルを生成しないケースは
     # 「待っても永久に出ない」(= subprocess が正常終了したのにファイル書き込みが発生
@@ -667,19 +831,42 @@ def _generate_voicepeak_single_file(
         interval_sec = float(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_INTERVAL_SEC", "1.0"))
         max_attempts = int(os.environ.get("L2_VOICEPEAK_OUTPUT_RETRY_MAX_ATTEMPTS", "20"))
         import time
+
+        # Phase 0.5-A フェーズ 8: 出力ファイル未生成発生時の調査ログ強化。
+        # VOICEPEAK が --out 引数を無視してデフォルト出力先 (cwd の output.wav) に
+        # 書いている疑いを確認するため、cwd の output.wav を検出 + subprocess の
+        # stdout/stderr を warning に出力 + cmd_str 全文を再掲する。
+        _log_voicepeak_output_missing_diagnostics(
+            filepath=filepath,
+            result=initial_result,
+            cmd_str=cmd_str,
+            speaker=speaker,
+            attempt=0,  # 0 = 初回検出 (リトライ前)
+            max_attempts=max_attempts,
+        )
+
         for attempt in range(1, max_attempts + 1):
             logger.warning(
-                "VOICEPEAK 出力ファイル未生成 (returncode=0): %s → %.1f 秒待機して subprocess 再実行 (%d/%d)",
+                "VOICEPEAK 出力ファイル未生成: %s → %.1f 秒待機して subprocess 再実行 (%d/%d)",
                 filepath.name, interval_sec, attempt, max_attempts,
             )
             time.sleep(interval_sec)
-            _submit_voicepeak(cmd_str)
+            retry_result = _submit_voicepeak(cmd_str)
             if filepath.is_file():
                 logger.info(
                     "VOICEPEAK 再実行成功 (%d/%d): %s",
                     attempt, max_attempts, filepath.name,
                 )
                 break
+            # 再投入後も未生成なら詳細を出す (毎回詳細 + cmd_str 再掲)
+            _log_voicepeak_output_missing_diagnostics(
+                filepath=filepath,
+                result=retry_result,
+                cmd_str=cmd_str,
+                speaker=speaker,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
 
     if not filepath.is_file():
         raise FileNotFoundError(
@@ -750,6 +937,21 @@ def _call_voicepeak(
     # JSON 構造のパース（emotion / speed / pose / response の分離）
     # pose は TTS 内では使用しない（pose.update は graph.py / pipeline.py 側で発行）
     say_text, json_emotion, json_speed, _json_pose = _parse_voicepeak_json(text)
+    # Phase 0.5-F-6-g (案 A): VOICEPEAK 経路限定で改行を sanitize。
+    # LLM が response 内に改行を含めた場合、subprocess の --say 引数に literal
+    # newline (= \n、1 文字) が渡され、Windows の引数解釈で --say の値が分断
+    # されて --out 以降のオプションが無視される事象を防ぐ (logs/runs/
+    # run_loop_20260515_002506.log で観察、VOICEPEAK が cwd の output.wav に出力)。
+    # 加えて、LLM が誤って 2 文字の「\n」(= backslash + n) を含む応答を返す
+    # ケースにも対応 (= 2 文字を空白に置換)。
+    # 順序: \\n (= 2 文字 sequence) を先に置換、その後 \n (= literal newline) を
+    # 置換。逆順だと \n を空白にした後の文字列に \\n が見つからない。
+    # 【WHY: _parse_voicepeak_json 内ではなく呼出後で sanitize する】
+    # _parse_voicepeak_json は HUD 表示用 (= bubble.update / character.status.update
+    # の text 抽出、run_loop._extract_llm_response_text / ask_character.py 等)
+    # にも使われる。HUD では改行を維持したいケースがあるため、関心事分離として
+    # VOICEPEAK 経路でのみ sanitize する。
+    say_text = say_text.replace("\\n", " ").replace("\n", " ")
     effective_speed = json_speed if json_speed is not None else speed
 
     # テキスト分割

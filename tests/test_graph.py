@@ -221,6 +221,7 @@ class TestPipelineGraphNodes:
             stream_context=None,
             on_tts_chunk_ready=None,
             on_pose_ready=None,
+            suppress_bubble_answering=False,
             character_slug="",
             rag_context=None,
             rag_used=False,
@@ -255,6 +256,51 @@ class TestPipelineGraphNodes:
         assert result["llm_text"] == "ダミー応答: テスト入力"
         assert len(result["events"]) == 1
         assert result["events"][0]["type"] == "llm.final"
+
+    def test_generation_node_publishes_answering_bubble_by_default(
+        self, mock_publish, base_state,
+    ):
+        """Phase 0.5-A フェーズ 7: suppress_bubble_answering=False (default) なら
+        bubble.update("answering") が発行される (既存挙動の回帰防止)。
+        """
+        from lab_lounge.graph import _generation_node
+        base_state["character_slug"] = "octamaid"
+        base_state["events"] = [{"event_id": "utt-1", "type": "utterance.final"}]
+        # suppress_bubble_answering は base_state で False (default)
+        _generation_node(base_state)
+        # publish 呼出のうち "bubble.update" + step=="answering" が含まれることを確認
+        bubble_answering_calls = [
+            call for call in mock_publish.call_args_list
+            if call.args[0].get("type") == "bubble.update"
+            and call.args[0].get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_answering_calls) == 1, (
+            "answering bubble が default で発行されていない"
+        )
+        assert bubble_answering_calls[0].args[0]["payload"]["character"] == "octamaid"
+        # Phase 0.5-E: 通常応答パスは category="speech_status" (= bubble 3 系統分離)
+        assert bubble_answering_calls[0].args[0]["payload"]["category"] == "speech_status"
+
+    def test_generation_node_suppresses_answering_bubble_when_flag_set(
+        self, mock_publish, base_state,
+    ):
+        """Phase 0.5-A フェーズ 7: suppress_bubble_answering=True で answering bubble が
+        発行されない (BG LLM 先行生成中は graph 側で発行せず、承認時に run_loop が発行)。
+        """
+        from lab_lounge.graph import _generation_node
+        base_state["character_slug"] = "mimi"
+        base_state["events"] = [{"event_id": "utt-1", "type": "utterance.final"}]
+        base_state["suppress_bubble_answering"] = True
+        _generation_node(base_state)
+        # answering bubble は発行されない。llm.final 等の他イベントは発行される
+        bubble_answering_calls = [
+            call for call in mock_publish.call_args_list
+            if call.args[0].get("type") == "bubble.update"
+            and call.args[0].get("payload", {}).get("step") == "answering"
+        ]
+        assert len(bubble_answering_calls) == 0, (
+            "suppress_bubble_answering=True なのに answering bubble が発行された"
+        )
 
     def test_tts_node_dummy_mode(self, mock_publish, base_state):
         from lab_lounge.graph import _tts_node
@@ -559,3 +605,54 @@ class TestRoutingNodeStreamContextMerge:
         assert "オクタメイド" in merged
         # 配信文脈見出しが入っていないこと (= キャラ素体のみ)
         assert "## 本日の配信" not in merged
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A): disable_tools での選択的ツール除外
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestLoadMcpToolsDisableTools:
+    """_load_mcp_tools の disable_tools 引数 (Phase 0.5-A バグ 3 修正、案 A)。
+
+    fallback パス + ask_character + 並行 TTS の deadlock を回避するため、
+    fallback パス経由で disable_tools=["ask_character"] が渡されたときに
+    Agent ツールリストから ask_character を除外する仕組みを保証する。
+    """
+
+    def test_default_includes_ask_character(self, monkeypatch):
+        """disable_tools 未指定時は ask_character が登録される (= 既存挙動)。"""
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools = _load_mcp_tools(character_slug="mimi")
+        tool_names = {getattr(t, "name", "") for t in tools}
+        assert "ask_character_tool" in tool_names
+
+    def test_disable_tools_excludes_ask_character(self, monkeypatch):
+        """disable_tools=['ask_character'] で Agent から ask_character が除外される。
+
+        WHY: fallback パス + ask_character + 並行 TTS の deadlock 回避の核心。
+        """
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools = _load_mcp_tools(
+            character_slug="mimi",
+            disable_tools=["ask_character"],
+        )
+        tool_names = {getattr(t, "name", "") for t in tools}
+        assert "ask_character_tool" not in tool_names
+        # 他のツール (= web_search) は残る
+        assert "web_search_tool" in tool_names
+
+    def test_disable_tools_none_equals_default(self, monkeypatch):
+        """disable_tools=None は disable_tools 未指定と同じ挙動。"""
+        monkeypatch.setenv("L2_ENABLE_TOOLS", "true")
+        from lab_lounge.graph import _load_mcp_tools
+
+        tools_none = _load_mcp_tools(character_slug="mimi", disable_tools=None)
+        tools_default = _load_mcp_tools(character_slug="mimi")
+        names_none = {getattr(t, "name", "") for t in tools_none}
+        names_default = {getattr(t, "name", "") for t in tools_default}
+        assert names_none == names_default

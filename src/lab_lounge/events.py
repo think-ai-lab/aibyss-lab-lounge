@@ -156,8 +156,33 @@ def build_llm_final(
     retrieval_latency_ms: int = 0,
     retrieved_doc_count: int = 0,
     retrieved_doc_ids: list[str] | None = None,
+    character: str | None = None,
 ) -> dict[str, Any]:
-    """llm.final イベントを組み立てて検証する。"""
+    """llm.final イベントを組み立てて検証する。
+
+    Args:
+        character: 応答キャラクター slug (mimi/chisame/sakura/octamaid/ruka 等)。
+                   ログ強化 L-2 (Phase 0.5-A 後) で payload に追加。受信側 V2 や
+                   bus.publish ログで「どのキャラの llm.final か」を直接読めるよう
+                   にする。None 時は payload に含めない (受信側 default 解釈、後方
+                   互換)。schema は payload 内に追加制約なしのため変更不要。
+    """
+    payload: dict[str, Any] = {
+        "text": text,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "latency_ms": latency_ms,
+        "finish_reason": finish_reason,
+        "rag_used": rag_used,
+        "answer_mode": answer_mode,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "retrieved_doc_count": retrieved_doc_count,
+        "retrieved_doc_ids": retrieved_doc_ids if retrieved_doc_ids is not None else [],
+    }
+    # character はオプション。None 時は payload に含めない (後方互換)。
+    if character is not None:
+        payload["character"] = character
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -169,19 +194,7 @@ def build_llm_final(
         "source": "lab-lounge",
         "seq": seq,
         "links": links,
-        "payload": {
-            "text": text,
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "latency_ms": latency_ms,
-            "finish_reason": finish_reason,
-            "rag_used": rag_used,
-            "answer_mode": answer_mode,
-            "retrieval_latency_ms": retrieval_latency_ms,
-            "retrieved_doc_count": retrieved_doc_count,
-            "retrieved_doc_ids": retrieved_doc_ids if retrieved_doc_ids is not None else [],
-        },
+        "payload": payload,
     }
     validate_event(event)
     return event
@@ -202,8 +215,20 @@ def build_tts_done(
     format: str = "opus",
     sample_rate: int = 24000,
     speaker: str = "dummy",
+    character: str | None = None,
 ) -> dict[str, Any]:
-    """tts.done イベントを組み立てて検証する。"""
+    """tts.done イベントを組み立てて検証する。
+
+    Args:
+        speaker:   音声合成エンジンの voice/narrator (e.g., "Haruno Sora", キャラ slug
+                   と同等の場合もある)。既存フィールド、後方互換維持。
+        character: aibyss キャラ slug (mimi/chisame/sakura/octamaid/ruka 等)。
+                   ログ強化 L-2 (Phase 0.5-A 後) で payload に追加。speaker と概念が
+                   異なるケース (= voicepeak narrator がキャラ slug と異なる将来の
+                   構成) に備えて独立フィールドとして持つ。None 時は payload に
+                   含めない (受信側 default 解釈、後方互換)。schema は payload 内に
+                   追加制約なしのため変更不要。
+    """
     payload: dict[str, Any] = {
         "text": text,
         "audio_url": audio_url,
@@ -215,6 +240,9 @@ def build_tts_done(
     }
     if chunk_audio_urls:
         payload["chunk_audio_urls"] = chunk_audio_urls
+    # character はオプション。None 時は payload に含めない (後方互換)。
+    if character is not None:
+        payload["character"] = character
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -241,6 +269,8 @@ def build_bubble_update(
     session_id: str,
     trace_id: str,
     links: list[str] | None = None,
+    ttl_ms: int | None = None,
+    category: str | None = None,
 ) -> dict[str, Any]:
     """
     bubble.update イベントを組み立てて検証する。
@@ -250,9 +280,52 @@ def build_bubble_update(
 
     Args:
         character: キャラクター slug (e.g., "mimi")
-        step:      進捗ステップ ("searching" / "thinking" / "answering" / "done")
+        step:      進捗ステップ。次のいずれかを想定:
+                     - 通常応答: "searching" / "thinking" / "answering" / "done"
+                     - Phase 0.5 (挙手): "handraise" / "denied" / "lapsed" / "cancelled"
+                   (events.py は文字列の中身に介入しない。受信側 V2 が解釈する)
         text:      表示テキスト（キャラクター口調の固定文字列）
+        ttl_ms:    表示後の自動消去ミリ秒数。None なら受信側で next step まで保持。
+                   Phase 0.5 では denied/lapsed=2000ms を想定し、handraise 自体は
+                   None (承認/却下/lapse まで保持) で発行する。
+                   payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
+        category:  V2 HUD 側で表示エリアを分岐させるための種別フィールド。
+                   Phase 0.5-E (= bubble 3 系統分離) で 5 種類に拡張:
+                     - "speech_status":   通常応答のステータス遷移 (thinking/searching/
+                                          answering/done)、bubble_messages.json の固定
+                                          メッセージを表示
+                     - "speech_content":  発話内容 (= chunk text、speaking 中のみ更新)、
+                                          各 chunk 物理再生時に動的更新
+                     - "raisehand":       挙手系 (handraise/denied/lapsed/cancelled)、
+                                          approval/denied/timeout まで独立 lifecycle で
+                                          他カテゴリの影響を受けない
+                     - "speech" (旧):     Phase 0.5-A 8-10 で導入、speech_status/
+                                          speech_content の前身。V2 側で speech_status に
+                                          mapping (後方互換)
+                     - "handraise" (旧):  Phase 0.5-A で導入、raisehand の前身。V2 側で
+                                          raisehand に mapping (後方互換)
+                   None 時は payload に含めない (= 受信側 default で speech_status 解釈)。
+                   step は「進捗状態」、category は「分岐軸」として独立した概念。step 拡張で
+                   将来の bubble 種別が増えても category 固定で受信側ロジックを単純に保てる。
+                   payload 内に追加するため event-envelope-0.1 の schema 変更は不要。
+
+                   【3 系統分離の経緯】
+                   中間実走 4 回目 (= 2026-05-09、logs/runs/run_loop_20260509_190927.log)
+                   で raisehand と speech (thinking) が同 ms 内に publish され、HUD で
+                   raisehand bubble が thinking で上書きされる現象を観察。bubble エリアを
+                   category 別に分離することで、event stream の競合があっても表示は独立に
+                   保たれる設計とする。詳細: Phase 0.5-E 実装 plan 参照。
     """
+    payload: dict[str, Any] = {
+        "character": character,
+        "step": step,
+        "text": text,
+    }
+    # ttl_ms / category はオプション。None 時は payload に含めない (受信側 default 挙動を維持)。
+    if ttl_ms is not None:
+        payload["ttl_ms"] = ttl_ms
+    if category is not None:
+        payload["category"] = category
     event: dict[str, Any] = {
         "ver": "0.1",
         "event_id": _new_uuid(),
@@ -262,14 +335,187 @@ def build_bubble_update(
         "trace_id": trace_id,
         "type": "bubble.update",
         "source": "lab-lounge",
-        "payload": {
-            "character": character,
-            "step": step,
-            "text": text,
-        },
+        "payload": payload,
     }
     if links:
         event["links"] = links
+    validate_event(event)
+    return event
+
+
+def build_dispatcher_queue_update(
+    *,
+    queue: list[dict[str, Any]],
+    max_size: int,
+    ttl_sec: float,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    state: str = "idle",
+) -> dict[str, Any]:
+    """
+    dispatcher.queue.update イベントを組み立てて検証する。
+
+    Block 0 (録音常時化) で導入。Dispatcher の wake_event_queue が変化したとき
+    (add / dequeue / evict) に発行され、HUD のデバッグ dashboard で「現在
+    スタックしている応答」を可視化するためのイベント。
+
+    配信画面には出さない想定（運用デバッグ用途）。Phase 0.5 では同じパターンで
+    ``dispatcher.handraise.update`` を兄弟イベントとして追加できる。
+
+    Args:
+        queue:    queue 内の各 event を表す dict のリスト。各要素は
+                  ``{"character_slug": str, "keyword": str | None,
+                     "transcript": str | None, "age_sec": float}`` を含む想定
+                  （events.py は中身に介入せず、payload にそのまま載せる）
+        max_size: queue の最大保持件数 (Dispatcher.DRAIN_MAX_EVENTS と一致)
+        ttl_sec:  期限切れ閾値秒数 (Dispatcher.DRAIN_MAX_AGE_SEC と一致)
+        state:    Dispatcher の現在状態 ("idle" / "responding" / "handraising")
+    """
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "dispatcher.queue.update",
+        "source": "lab-lounge",
+        "payload": {
+            "queue": queue,
+            "max_size": max_size,
+            "ttl_sec": ttl_sec,
+            "state": state,
+        },
+    }
+    validate_event(event)
+    return event
+
+
+def build_dispatcher_handraise_update(
+    *,
+    handraise_states: list[dict[str, Any]],
+    cooldowns: dict[str, dict[str, Any]],
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+) -> dict[str, Any]:
+    """
+    dispatcher.handraise.update イベントを組み立てて検証する。
+
+    Phase 0.5 (挙手システム) で導入。Dispatcher の挙手中キャラ状態 + 連続却下
+    cooldown 状態が変化したとき (start / approval / denial / lapse) に発行され、
+    HUD のデバッグ dashboard で「現在挙手中のキャラ」「連続却下回数」を可視化する。
+    配信画面には出さない想定 (運用デバッグ用途)。Phase 0.5-B で V2 側 UI が
+    本イベントを購読して可視化する予定。
+
+    `dispatcher.queue.update` (Block 0 で導入) の兄弟イベント。両者は別々の payload
+    を持つが、HUD 側は同じ「dispatcher の内部状態スナップショット」として扱う。
+
+    Args:
+        handraise_states: 挙手中キャラ各々の dict のリスト。各要素は次を含む想定:
+                            {"target_slug": str,
+                             "started_at_age_sec": float,
+                             "phrase": str,
+                             "bg_completed": bool,
+                             "trace_id": str,
+                             "utterance_count_since": int}
+                          (events.py は中身に介入せず、payload にそのまま載せる)
+        cooldowns:        slug → cooldown 状態の dict。各値は次を含む想定:
+                            {"consecutive_denials": int,
+                             "cooldown_until_sec_remaining": float,
+                             "threshold_multiplier": float}
+                          Phase 0.5-A は threshold_multiplier=1.0 固定で発行する。
+    """
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "dispatcher.handraise.update",
+        "source": "lab-lounge",
+        "payload": {
+            "handraise_states": handraise_states,
+            "cooldowns": cooldowns,
+        },
+    }
+    validate_event(event)
+    return event
+
+
+def build_character_status_update(
+    *,
+    character: str,
+    status: str,
+    stream_id: str,
+    session_id: str,
+    trace_id: str,
+    previous_status: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    character.status.update イベントを組み立てて検証する。
+
+    Phase 0.5-B-α で導入。CharacterStatusManager の subscribe callback から発行され、
+    HUD dashboard が「全キャラの現在状態」(Ready/Thinking/ToolCalling/Raisehand/Talking)
+    を可視化するためのイベント。bubble.update (進捗 step) とは概念的に分離され、
+    こちらは「内部状態」を表す (= Ready 状態も明示 publish 可能)。
+
+    Args:
+        character:        対象キャラ slug (mimi/chisame/sakura/octamaid/ruka)
+        status:           遷移後の状態文字列 (CharacterStatus.value:
+                          "ready"/"thinking"/"tool_calling"/"raisehand"/"talking")
+        previous_status:  遷移前の状態 (= デバッグ用、HUD で「どこから来たか」可視化)。
+                          None 時は payload に含めない (後方互換、初期遷移ケース等)。
+        metadata:         status 固有の追加情報。
+                          - Talking 時: {"pose": str, "text": str} を含める想定
+                            (= ルカ要件: HUD で立ち絵 + 発話全文を表示)
+                          - 他 status: 本 phase では None 想定 (将来 Thinking 時の
+                            prompt_summary や Raisehand 時の phrase 等を入れる余地)
+                          None 時は payload に含めない (受信側 default 挙動を維持)。
+        snapshot:         全キャラの状態 dict ({slug: {"status": str, "metadata": dict}})。
+                          HUD 起動時 / 同期ズレ修復時に「全状態を一括反映」する目的。
+                          毎 publish に含めると payload が肥大化するため、通常は None で
+                          差分のみ送る。Phase 0.5-C の観察 2 で「現在状態 snapshot を
+                          文脈に渡す」用途も想定。None 時は payload に含めない。
+
+    payload schema:
+        {
+            "character": str,                     # required
+            "status": str,                        # required, CharacterStatus.value
+            "previous_status": str (optional),
+            "metadata": dict (optional),          # Talking 時の {pose, text} 等
+            "snapshot": dict (optional),          # 全キャラ状態の atomic dict
+        }
+
+    bubble.update の category や ttl_ms 拡張パターンを踏襲し、event-envelope-0.1
+    の schema は変更不要 (payload は open-ended)。
+    """
+    payload: dict[str, Any] = {
+        "character": character,
+        "status": status,
+    }
+    # オプションフィールドは None 時に payload に含めない (= 受信側 default 挙動維持)
+    if previous_status is not None:
+        payload["previous_status"] = previous_status
+    if metadata is not None:
+        payload["metadata"] = metadata
+    if snapshot is not None:
+        payload["snapshot"] = snapshot
+    event: dict[str, Any] = {
+        "ver": "0.1",
+        "event_id": _new_uuid(),
+        "ts": _now_iso(),
+        "stream_id": stream_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "type": "character.status.update",
+        "source": "lab-lounge",
+        "payload": payload,
+    }
     validate_event(event)
     return event
 

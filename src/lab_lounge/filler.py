@@ -45,12 +45,36 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .llm import get_llm_timeout_config
+
+# Phase 0.5-J: google.genai を module top で eager import することで、複数スレッド間の
+# 並列 import (= filler スレッド + 本命 LLM スレッド経由の langchain-google-genai が
+# 同 ms 内で google.genai.types を import) による circular import race condition を
+# 構造的に回避する。
+#
+# 旧設計 (= 関数内 lazy import `import google.genai as genai`) では、セッション内で
+# Gemini を初めて使う瞬間に「partially initialized module 'google.genai.types'」
+# エラーが間欠的に発生 (= 2026-04-11 起票の Notion 課題、2026-05-15 実走で実害確認:
+# logs/runs/run_loop_20260515_121353.log、chisame の callout ターンが丸ごと skip)。
+#
+# eager import により program startup 時 (= 単一スレッド) に 1 回だけ import される
+# ため、その後の並列呼出時には既にキャッシュ済モジュールが返り、race window が消失。
+try:
+    import google.genai as _GOOGLE_GENAI  # noqa: F401  (function 内で参照)
+    from google.genai import types as _GOOGLE_GENAI_TYPES  # noqa: F401  (function 内で参照)
+except ImportError:
+    _GOOGLE_GENAI = None  # type: ignore[assignment]
+    _GOOGLE_GENAI_TYPES = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 _FILLER_PHRASES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_phrases"
 _FILLER_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_cache"
 
-_VALID_SECTIONS = {"opener", "continue", "bridge", "closer"}
+_VALID_SECTIONS = {"opener", "continue", "bridge", "closer", "handraise"}
+# "handraise" は Phase 0.5-A で追加。挙手 (interjection_candidate) 検知時に
+# L2 側で再生される短いキャラ声フレーズ。bubble.update(handraise) の text にも
+# 同じフレーズ実体が使われる (wav 再生とテキスト表示が同期)。
 
 
 def is_filler_enabled() -> bool:
@@ -72,6 +96,8 @@ class FillerPhraseSet:
     continue_: list[FillerPhrase] = field(default_factory=list)
     bridge: list[FillerPhrase] = field(default_factory=list)
     closer: list[FillerPhrase] = field(default_factory=list)
+    handraise: list[FillerPhrase] = field(default_factory=list)
+    # ↑ Phase 0.5-A 追加。挙手機能用の短いフレーズ (wav 兼 SE)。
 
     @property
     def all_phrases(self) -> list[tuple[str, FillerPhrase]]:
@@ -80,13 +106,17 @@ class FillerPhraseSet:
         for cat, lst in [("opener", self.opener),
                          ("continue", self.continue_),
                          ("bridge", self.bridge),
-                         ("closer", self.closer)]:
+                         ("closer", self.closer),
+                         ("handraise", self.handraise)]:
             for p in lst:
                 items.append((cat, p))
         return items
 
     def __len__(self) -> int:
-        return len(self.opener) + len(self.continue_) + len(self.bridge) + len(self.closer)
+        return (
+            len(self.opener) + len(self.continue_) + len(self.bridge)
+            + len(self.closer) + len(self.handraise)
+        )
 
 
 def _parse_emotion(emotion_str: str) -> dict[str, int]:
@@ -154,11 +184,16 @@ def load_filler_phrases(slug: str) -> FillerPhraseSet:
             result.bridge.append(phrase)
         elif current_section == "closer":
             result.closer.append(phrase)
+        elif current_section == "handraise":
+            result.handraise.append(phrase)
 
     total = len(result)
     logger.debug(
-        "フィラーフレーズ読み込み: %s (opener=%d continue=%d closer=%d total=%d)",
-        slug, len(result.opener), len(result.continue_), len(result.closer), total,
+        "フィラーフレーズ読み込み: %s "
+        "(opener=%d continue=%d bridge=%d closer=%d handraise=%d total=%d)",
+        slug,
+        len(result.opener), len(result.continue_), len(result.bridge),
+        len(result.closer), len(result.handraise), total,
     )
     if not result.continue_:
         logger.warning(
@@ -186,11 +221,17 @@ def get_cached_filler_paths(slug: str) -> dict[str, list[Path]]:
     キャッシュ済みフィラー WAV パスをカテゴリ別に返す。
 
     Returns:
-        {"opener": [Path, ...], "continue": [Path, ...], "closer": [Path, ...]}
+        {"opener": [...], "continue": [...], "bridge": [...], "closer": [...],
+         "handraise": [...]}
+
+    NOTE: カテゴリリストは ``_VALID_SECTIONS`` と同期させる。フェーズ 2 で
+    handraise セクションが追加されたが、本関数の cat tuple への反映が漏れて
+    いたため、Phase 0.5-A 実走で挙手 wav が認識されない不具合となっていた。
     """
     cache_dir = _FILLER_CACHE_DIR / slug
     result: dict[str, list[Path]] = {}
-    for cat in ("opener", "continue", "bridge", "closer"):
+    # Phase 0.5-A フェーズ 2 で追加された "handraise" を含む全カテゴリを走査
+    for cat in ("opener", "continue", "bridge", "closer", "handraise"):
         if cache_dir.is_dir():
             result[cat] = sorted(cache_dir.glob(f"{cat}_*.wav"))
         else:
@@ -213,14 +254,20 @@ def ensure_filler_cache(
     from .tts import synthesize
 
     phrase_set = load_filler_phrases(slug)
+    # Phase 0.5-A フェーズ 2 で追加された "handraise" を含む全カテゴリを初期化。
+    # 5 カテゴリのうち 1 つでも欠けると、phrase_set.all_phrases の反復中に
+    # KeyError (counters[cat]) で abort する不具合があった (実走で発見)。
+    _empty: dict[str, list[Path]] = {
+        "opener": [], "continue": [], "bridge": [], "closer": [], "handraise": [],
+    }
     if len(phrase_set) == 0:
         logger.warning("フィラーフレーズが定義されていません: %s", slug)
-        return {"opener": [], "continue": [], "bridge": [], "closer": []}
+        return dict(_empty)
 
     char = get_character(slug)
     if char is None:
         logger.warning("キャラクターが見つかりません: %s", slug)
-        return {"opener": [], "continue": [], "bridge": [], "closer": []}
+        return dict(_empty)
 
     cache_dir = _FILLER_CACHE_DIR / slug
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -230,8 +277,12 @@ def ensure_filler_cache(
         for old_file in cache_dir.glob("*.wav"):
             old_file.unlink()
 
-    result_paths: dict[str, list[Path]] = {"opener": [], "continue": [], "bridge": [], "closer": []}
-    counters: dict[str, int] = {"opener": 0, "continue": 0, "bridge": 0, "closer": 0}
+    result_paths: dict[str, list[Path]] = {
+        "opener": [], "continue": [], "bridge": [], "closer": [], "handraise": [],
+    }
+    counters: dict[str, int] = {
+        "opener": 0, "continue": 0, "bridge": 0, "closer": 0, "handraise": 0,
+    }
 
     for cat, entry in phrase_set.all_phrases:
         idx = counters[cat]
@@ -326,6 +377,59 @@ def select_filler_path(
     return paths[idx], idx
 
 
+def select_filler_phrase(
+    slug: str,
+    category: str = "opener",
+    *,
+    last_index: int = -1,
+) -> tuple[Path | None, FillerPhrase | None, int]:
+    """
+    ``select_filler_path`` の拡張版。Path と元の FillerPhrase の両方を返す。
+
+    Phase 0.5-A の挙手機能で導入。handraise wav 再生時に bubble.update の text
+    として元フレーズを表示する必要があるため、wav パスだけでなく FillerPhrase
+    オブジェクト (text + emotion) も同時に取得できるようにする。
+
+    既存 ``select_filler_path`` の呼出側は変更せず、新規の挙手フローのみ
+    こちらを使う想定。
+
+    Args:
+        slug:        キャラクター slug
+        category:    "opener" / "continue" / "bridge" / "closer" / "handraise"
+        last_index:  直前選択 index (重複回避)
+
+    Returns:
+        (Path or None, FillerPhrase or None, index)
+        wav が見つからない場合は (None, None, -1)。
+        wav はあるが phrase が見つからない場合 (キャッシュとフレーズ定義の
+        ズレ) は (Path, None, index) を返し、呼出側が text="" でフォールバック
+        できるようにする。
+    """
+    paths_by_cat = get_cached_filler_paths(slug)
+    paths = paths_by_cat.get(category, [])
+    if not paths:
+        return None, None, -1
+
+    phrase_set = load_filler_phrases(slug)
+    phrases_by_cat: dict[str, list[FillerPhrase]] = {
+        "opener": phrase_set.opener,
+        "continue": phrase_set.continue_,
+        "bridge": phrase_set.bridge,
+        "closer": phrase_set.closer,
+        "handraise": phrase_set.handraise,
+    }
+    phrases = phrases_by_cat.get(category, [])
+
+    if len(paths) == 1:
+        phrase = phrases[0] if phrases else None
+        return paths[0], phrase, 0
+
+    candidates = [i for i in range(len(paths)) if i != last_index]
+    idx = random.choice(candidates)
+    phrase = phrases[idx] if idx < len(phrases) else None
+    return paths[idx], phrase, idx
+
+
 _FILLER_PROMPTS: dict[str, str] = {
     "mimi": (
         "あなたはミミ・オクタヴィアです。深海貴族のAITuberで、上品で優雅な口調で話します。\n"
@@ -412,10 +516,14 @@ def _call_filler_llm(
     """
     provider = _detect_provider(model)
 
+    # per-request timeout + 自動 retry。filler も raw SDK クライアントを直接生成するため
+    # timeout 無しだとハングし、本応答の前段で固まりうる。scope="router" (短め timeout)。
+    _timeout, _max_retries = get_llm_timeout_config("router")
+
     try:
         if provider == "anthropic":
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(timeout=_timeout, max_retries=_max_retries)
             resp = client.messages.create(
                 model=model,
                 max_tokens=150,
@@ -426,12 +534,20 @@ def _call_filler_llm(
             return resp.content[0].text.strip()
 
         elif provider == "google":
-            import google.genai as genai
-            client = genai.Client()
+            # Phase 0.5-J: module top の eager import を参照 (= 旧 lazy import を削除)。
+            # _GOOGLE_GENAI が None なら package 未インストール、明示的 ImportError を投げる。
+            if _GOOGLE_GENAI is None or _GOOGLE_GENAI_TYPES is None:
+                raise ImportError("google.genai is required for provider=google")
+            # google genai は timeout を http_options にミリ秒で渡す。
+            client = _GOOGLE_GENAI.Client(
+                http_options=_GOOGLE_GENAI_TYPES.HttpOptions(
+                    timeout=int(_timeout * 1000),
+                ),
+            )
             resp = client.models.generate_content(
                 model=model,
                 contents=user_text,
-                config=genai.types.GenerateContentConfig(
+                config=_GOOGLE_GENAI_TYPES.GenerateContentConfig(
                     system_instruction=system_prompt,
                     max_output_tokens=150,
                     temperature=0.9,
@@ -441,7 +557,7 @@ def _call_filler_llm(
 
         else:
             import openai
-            client = openai.OpenAI()
+            client = openai.OpenAI(timeout=_timeout, max_retries=_max_retries)
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -592,9 +708,14 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
             last_bridge_idx = idx
             logger.info("フィラー bridge 再生: [%s] %s", slug, bridge_path.name)
             play_audio_file(str(bridge_path))
-            # bridge 間に間を空ける（立て続けの再生を防止）
+            # bridge 間に間を空ける（立て続けの再生を防止）。
+            # 中間実走 3 回目 (logs/runs/run_loop_20260509_184653.log) で観察された
+            # 「ブリッジフレーズがしつこい」(= 3 秒固定で連続再生されて視聴者が
+            # 単調に感じる) 問題への対処として、4〜8 秒のランダムインターバルに
+            # 変更する。lower=4 で「再生直後の即時連発」を防ぎ、upper=8 で
+            # 「待ち時間が長すぎる空白」も防ぐ範囲。
             if not filler_ready.is_set():
-                filler_ready.wait(timeout=3.0)
+                filler_ready.wait(timeout=random.uniform(4.0, 8.0))
 
     if stop_event.is_set():
         logger.debug("フィラー終了（bridge 後）: %s", slug)
@@ -615,20 +736,79 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
         logger.debug("フィラー終了（continue 後）: %s", slug)
         return
 
-    # Phase 4: 本命到着まで bridge で待機（最大 60 秒）
+    # Phase 4: 本命到着まで bridge filler + LLM continue で待機（最大 60 秒）
+    #
+    # Phase 0.5-D-3 follow-up 2: 「ブリッジフレーズがしつこい」問題への (A)+(D) 対処
+    # 中間実走 3 / 4 回目で観察された「同じ bridge フレーズが 3〜4 秒間隔で繰り返さ
+    # れる機械感」への根本対処。
+    # - (A) bridge filler は最大 2 回まで再生 (= 同じキャッシュ wav の繰り返し感を緩和)
+    # - (D) bridge 2 回後 → 10 秒経過するごとに LLM continue を再生成・再生
+    #   (= 動的フレーズで多様性、LLM コストは Phase 4 全体で最大 ~4 回程度)
+    #
+    # Phase 2 (= LLM 推論待ち中の bridge) は短時間 (1-2 回程度) で済むので 4〜8 秒
+    # ランダム化のみ。Phase 4 (= post-continue 本命待ち、最大 60 秒) は長時間化する
+    # ことが多いので段階制御で「機械的繰り返し感」を構造的に抑制する。
     last_bridge_idx2 = -1
     phase4_deadline = time.monotonic() + 60.0
+    bridge_play_count = 0
+    MAX_BRIDGE_PLAYS = 2  # (A) bridge filler 再生回数の上限
 
     while not stop_event.is_set() and time.monotonic() < phase4_deadline:
-        bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx2)
-        if bridge_path is None:
-            stop_event.wait(timeout=0.5)
+        if bridge_play_count < MAX_BRIDGE_PLAYS:
+            # (A) bridge filler を最大 2 回まで再生
+            bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx2)
+            if bridge_path is None:
+                stop_event.wait(timeout=0.5)
+                continue
+            last_bridge_idx2 = idx
+            # bridge 間のインターバル: 4〜8 秒ランダム (= 上の Phase 2 と同じ範囲)
+            stop_event.wait(timeout=random.uniform(4.0, 8.0))
+            if stop_event.is_set():
+                break
+            logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
+            play_audio_file(str(bridge_path))
+            bridge_play_count += 1
             continue
-        last_bridge_idx2 = idx
-        stop_event.wait(timeout=3.0)
+
+        # (D) bridge 2 回後は 10 秒待ち → LLM continue を動的再生成・再生
+        # WHY: 既存 bridge wav (= キャッシュから 2-3 種類のローテーション) の繰り返しを
+        # 避け、状況に応じた多様な発話で「機械的繰り返し感」を解消する。LLM 呼出は
+        # 10 秒間隔に制限することで Phase 4 内で最大 ~4 回程度に抑える (= コスト制限的)。
+        stop_event.wait(timeout=10.0)
         if stop_event.is_set():
             break
-        logger.info("フィラー bridge 再生 (post-continue): [%s] %s", slug, bridge_path.name)
-        play_audio_file(str(bridge_path))
+
+        char = get_character(slug)
+        additional_filler_text = _generate_filler_text(slug, user_text=user_text)
+        if additional_filler_text and char:
+            from .tts import _parse_voicepeak_json
+            _, _, _, additional_pose = _parse_voicepeak_json(additional_filler_text)
+            logger.info(
+                "フィラー continue (LLM, additional): [%s] %r",
+                slug, additional_filler_text[:60],
+            )
+            try:
+                out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                tts_result = synthesize(
+                    additional_filler_text,
+                    provider=char.tts_provider,
+                    voice=char.tts_voice,
+                    output_dir=str(out_dir),
+                )
+                additional_audio = tts_result.audio_url.replace("file:///", "").replace("file://", "")
+                if additional_pose:
+                    from .obs import set_pose
+                    set_pose(slug, additional_pose)
+                time.sleep(0.3)
+                play_audio_file(additional_audio)
+            except Exception as exc:
+                logger.warning(
+                    "追加 LLM フィラー TTS 失敗 (= 無音待機継続): [%s] %s",
+                    slug, exc,
+                )
+        else:
+            # LLM 失敗 / 空応答時は無音待機継続 (= bridge 連発を避ける)
+            logger.debug("追加 LLM フィラー生成失敗、無音待機継続: %s", slug)
 
     logger.debug("フィラー終了: %s", slug)

@@ -18,12 +18,22 @@ graph.py — LangGraph state graph（Agent 対応）
   Anthropic:  uv sync --extra llm-anthropic
 """
 
+import concurrent.futures
+import contextvars
+import functools
 import logging
 import operator
 import os
+import time
 from typing import Annotated, Any, TypedDict
 
-from .llm import LLMResult, call_llm
+from .character_status import CharacterStatus, CharacterStatusManager
+from .llm import (
+    LLMResult,
+    call_llm,
+    get_llm_max_output_tokens,
+    get_llm_timeout_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +54,11 @@ class LLMGraphState(TypedDict):
 # ─── ノード実装（従来互換） ──────────────────────────────────────
 
 def _llm_node(state: LLMGraphState) -> LLMGraphState:
-    """LLM を呼び出してテキストを生成するノード。"""
+    """LLM を呼び出してテキストを生成するノード。
+
+    旧経路 (= 単一ノードフォールバック)。LLMGraphState は character_slug を持たないため、
+    ログ強化 L-3 の caller_slug は None 渡し (= 旧挙動維持、ログ "?" 表示)。
+    """
     result = call_llm(
         state["text"],
         model=state["model"],
@@ -86,16 +100,50 @@ def _is_tools_enabled() -> bool:
 
 
 def _get_llm_for_agent(provider: str, model: str):
-    """プロバイダーに応じた LangChain Chat モデルを返す。"""
+    """プロバイダーに応じた LangChain Chat モデルを返す。
+
+    WHY (timeout / max_retries): timeout 無しのクライアントは LLM 応答が stall した際に
+    例外を投げず無限ハングし、Agent 全体 (agent.invoke) が固まって配信が停止する
+    (実走 run_loop_20260531_164001 で mimi の step 3 が観測)。per-request timeout +
+    自動 retry を付与することで、stall は APITimeoutError として送出され、run_agent の
+    except がフォールバック (単一ノード) へ流して配信が自力復帰する。値は env で調整可能。
+    """
+    timeout, max_retries = get_llm_timeout_config("agent")
+    # 出力トークン上限 (= 暴走生成の安全弁、None なら上限なし)。reasoning 系モデルが
+    # degenerate loop に入って 1 ステップで巨大出力 (実走で ~128k トークン観測) を出すのを
+    # 構造的に防ぐ。provider で param 名が異なる (openai/anthropic=max_tokens、
+    # google=max_output_tokens) ため分岐ごとに付与する。
+    max_out = get_llm_max_output_tokens()
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=model)
+        # google genai は max_retries=0 を「デフォルト(5 回)」と解釈するため、
+        # 0 を避けて最低 1 を渡す (明示的に有限回へ抑える)。
+        kwargs: dict[str, Any] = {
+            "model": model, "timeout": timeout, "max_retries": max(1, max_retries),
+        }
+        if max_out is not None:
+            kwargs["max_output_tokens"] = max_out
+        return ChatGoogleGenerativeAI(**kwargs)
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model)
+        kwargs = {"model": model, "timeout": timeout, "max_retries": max_retries}
+        if max_out is not None:
+            kwargs["max_tokens"] = max_out
+        return ChatAnthropic(**kwargs)
     else:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model)
+        kwargs = {"model": model, "timeout": timeout, "max_retries": max_retries}
+        if max_out is not None:
+            kwargs["max_tokens"] = max_out
+        # NOTE: ここでは reasoning_effort を付与しない。
+        # gpt-5.5 は「function tools + reasoning_effort」の組合せを /v1/chat/completions で
+        # 拒否する (400 BadRequest、要 /v1/responses。実走 run_loop_20260531_193332 で観測)。
+        # Agent は必ず bind_tools するため、ここで reasoning_effort を付けると毎回 400 →
+        # フォールバック (ツールなし) に落ち、ask_character が一切呼ばれなくなる regression に
+        # なる。reasoning_effort はツールを使わない経路 (llm._call_openai = フォールバック /
+        # 導入セリフ) でのみ適用する。Agent 経路で推論を抑えたい場合は Responses API
+        # (use_responses_api=True) への移行が必要 (別途検討)。
+        return ChatOpenAI(**kwargs)
 
 
 def _is_rag_enabled() -> bool:
@@ -103,29 +151,46 @@ def _is_rag_enabled() -> bool:
     return os.environ.get("L2_ENABLE_RAG", "false").lower() in ("true", "1", "yes")
 
 
-def _load_mcp_tools():
-    """MCP サーバーからツールを LangChain ツールとして読み込む。"""
+def _load_mcp_tools(
+    character_slug: str | None = None,
+    disable_tools: "list[str] | None" = None,
+):
+    """MCP サーバーからツールを LangChain ツールとして読み込む。
+
+    Args:
+        character_slug: 呼出元キャラ slug。ログ強化 L-2 (Phase 0.5-A 後) で追加。
+                        ターン毎に Agent 構築されるため、ログを「どのキャラの Agent
+                        のためのツール登録か」識別できるようにする。
+        disable_tools:  特定ツールを除外するためのリスト (例: ["ask_character"])。
+                        None で全ツール有効 (= キャラ間協働応答が動作)。
+    """
+    disable_set = set(disable_tools or [])
+    # ログ強化 L-2: 3 行に分かれていたツール登録ログを 1 行に集約 (冗長削減)。
+    # 失敗時のみ warning で個別に出す。
+    char_tag = f"[character={character_slug or '?'}]"
     try:
         from langchain_core.tools import tool as lc_tool
 
         tools = []
+        registered: list[str] = []  # ログ用、登録成功したツール名 (1 行集約)
 
         # web_search ツール
-        try:
-            from .mcp_servers.web_search import web_search
+        if "web_search" not in disable_set:
+            try:
+                from .mcp_servers.web_search import web_search
 
-            @lc_tool
-            def web_search_tool(query: str) -> str:
-                """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
-                return web_search(query)
+                @lc_tool
+                def web_search_tool(query: str) -> str:
+                    """インターネットで情報を検索する。最新のニュース、天気、事実確認など、リアルタイムの情報が必要な場合に使用する。"""
+                    return web_search(query)
 
-            tools.append(web_search_tool)
-            logger.info("ツール登録完了: web_search")
-        except Exception as exc:
-            logger.warning("web_search ツール読み込み失敗: %s", exc)
+                tools.append(web_search_tool)
+                registered.append("web_search")
+            except Exception as exc:
+                logger.warning("web_search ツール読み込み失敗 %s: %s", char_tag, exc)
 
         # retrieve_memory ツール (L2_ENABLE_RAG=true のとき)
-        if _is_rag_enabled():
+        if _is_rag_enabled() and "retrieve_memory" not in disable_set:
             try:
                 from .mcp_servers.retrieve_memory import retrieve_memory
 
@@ -135,35 +200,117 @@ def _load_mcp_tools():
                     return retrieve_memory(query)
 
                 tools.append(retrieve_memory_tool)
-                logger.info("ツール登録完了: retrieve_memory (RAG 有効)")
+                registered.append("retrieve_memory(RAG)")
             except Exception as exc:
-                logger.warning("retrieve_memory ツール読み込み失敗: %s", exc)
+                logger.warning("retrieve_memory ツール読み込み失敗 %s: %s", char_tag, exc)
 
-        # ask_character ツール (常に登録)
-        try:
-            from .mcp_servers.ask_character import ask_character
+        # ask_character ツール (基本は常に登録、disable_tools で fallback パス時に無効化)
+        if "ask_character" not in disable_set:
+            try:
+                from .mcp_servers.ask_character import ask_character
 
-            @lc_tool
-            def ask_character_tool(character_slug: str, question: str) -> str:
-                """他のAITuberキャラクターに質問する。自分の専門外の質問や、別の視点が欲しい場合に使用する。character_slug は相手の識別子 (mimi/chisame/sakura/ruka/octamaid)。自分自身には質問しないこと。1 応答で最大 2 回まで。"""
-                return ask_character(character_slug, question)
+                @lc_tool
+                def ask_character_tool(character_slug: str, question: str) -> str:
+                    """他のAITuberキャラクターに質問する。自分の専門外の質問や、別の視点が欲しい場合に使用する。character_slug は相手の識別子 (mimi/chisame/sakura/ruka/octamaid)。自分自身には質問しないこと。1 応答で最大 2 回まで。"""
+                    return ask_character(character_slug, question)
 
-            tools.append(ask_character_tool)
-            logger.info("ツール登録完了: ask_character")
-        except Exception as exc:
-            logger.warning("ask_character ツール読み込み失敗: %s", exc)
+                tools.append(ask_character_tool)
+                registered.append("ask_character")
+            except Exception as exc:
+                logger.warning("ask_character ツール読み込み失敗 %s: %s", char_tag, exc)
 
         if not tools:
-            logger.warning("有効なツールが 0 件。ツールなしで続行。")
+            logger.warning("有効なツールが 0 件 %s。ツールなしで続行。", char_tag)
+        else:
+            disabled_log = (
+                f" (disabled={sorted(disable_set)})" if disable_set else ""
+            )
+            logger.info(
+                "ツール登録完了 %s: %s%s", char_tag, ", ".join(registered), disabled_log,
+            )
 
         return tools
 
     except ImportError as exc:
-        logger.warning("ツール読み込み失敗 (import): %s", exc)
+        logger.warning("ツール読み込み失敗 %s (import): %s", char_tag, exc)
         return []
     except Exception as exc:
-        logger.warning("ツール読み込み失敗: %s。ツールなしで続行。", exc)
+        logger.warning("ツール読み込み失敗 %s: %s。ツールなしで続行。", char_tag, exc)
         return []
+
+
+@functools.lru_cache(maxsize=None)
+def _get_character_response_schema(character_slug: str):
+    """キャラ別の応答 Pydantic スキーマを動的生成して返す (Phase 0.5-A フェーズ 8)。
+
+    create_agent の ``response_format`` に渡すことで、LLM が以下の strict JSON 形式
+    で応答することを強制する::
+
+        {"response": "...", "emotion": {<キャラ別キー>: 0-100, ...},
+         "speed": 50-200, "pose": "..."}
+
+    Markdown コードブロック (```json ... ```) や絵文字、装飾文字 (`**`、`：` 等)
+    の混入を構造的に防ぐ。VOICEPEAK CLI の引数破壊バグ (実走 2026-05-08 で観測)
+    の根本対策。
+
+    voicepeak_emotion_keys が空のキャラ (octamaid 等) は emotion フィールド無し
+    のスキーマを返す。
+
+    @lru_cache でキャッシュしているのは、生成された Pydantic クラスを LangChain
+    側が schema として参照する際に「同一スキーマ ≒ 同一クラス」の同一性を維持
+    するため (毎回新規クラスを生成すると参照同一性が崩れる可能性)。
+
+    Args:
+        character_slug: キャラクター slug (mimi / chisame / sakura / octamaid / ruka 等)
+
+    Returns:
+        Pydantic BaseModel サブクラス (動的生成)
+    """
+    from pydantic import Field, create_model
+    from .characters import get_character
+
+    # 未登録 slug は KeyError を投げる仕様なので try/except で吸収して generic に
+    try:
+        char = get_character(character_slug)
+    except KeyError:
+        char = None
+    if char is None:
+        # 未登録 slug は generic スキーマ (emotion 無し、最小フィールドのみ)
+        return create_model(
+            "GenericResponse",
+            response=(str, Field(..., description="応答テキスト")),
+            speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+            pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+        )
+
+    emotion_keys = char.voicepeak_emotion_keys
+
+    if not emotion_keys:
+        # emotion 不要キャラ (octamaid / ruka 等、voicevox 等の non-emotion TTS)
+        return create_model(
+            f"{character_slug.capitalize()}Response",
+            response=(str, Field(..., description="ユーザーへの応答テキスト")),
+            speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+            pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+        )
+
+    # キャラ別の emotion フィールドを動的構築
+    emotion_fields = {
+        k: (int, Field(default=0, ge=0, le=100, description=f"{k} 強度 (0-100)"))
+        for k in emotion_keys
+    }
+    emotion_schema = create_model(
+        f"{character_slug.capitalize()}Emotion",
+        **emotion_fields,
+    )
+
+    return create_model(
+        f"{character_slug.capitalize()}Response",
+        response=(str, Field(..., description="ユーザーへの応答テキスト")),
+        emotion=(emotion_schema, Field(..., description="感情パラメータ")),
+        speed=(int, Field(default=100, ge=50, le=200, description="発話速度")),
+        pose=(str, Field(default="neutral", description="OBS 立ち絵 pose")),
+    )
 
 
 def _build_agent_graph(
@@ -171,6 +318,7 @@ def _build_agent_graph(
     model: str,
     system_prompt: str | None = None,
     character_slug: str | None = None,
+    disable_tools: "list[str] | None" = None,
 ):
     """
     ツール付き ReAct Agent グラフを構築する。
@@ -180,18 +328,41 @@ def _build_agent_graph(
 
     Sprint Axis D Block 4: Skills 定義ファイルから行動判断基準を読み込み、
     system_prompt と結合して Agent に注入する。
+
+    Phase 0.5-A フェーズ 8: 旧 ``langgraph.prebuilt.create_react_agent`` (deprecated)
+    から ``langchain.agents.create_agent`` (新 API、LangChain v1) に移行。
+    Anthropic Claude 4.x の "assistant message prefill" 制約と衝突して
+    response_format=Pydantic 利用時に 400 エラーが出ていた問題を解消する。
+    新 API は tool-based structured output (ProviderStrategy) を使うため、
+    Markdown コードブロック / 絵文字 / 装飾文字なしの strict JSON が返る
+    (実測でレイテンシも -15% 短縮)。
+
+    Args:
+        provider:        LLM プロバイダ (openai/anthropic/google)
+        model:           モデル名
+        system_prompt:   キャラクター別 system prompt
+        character_slug:  キャラ slug (= ログ識別 + Skills 読込 + response_format)
+        disable_tools:   除外するツール名のリスト (= 案 W'-3 バグ 3 修正、案 A)
     """
     try:
-        from langgraph.prebuilt import create_react_agent
+        from langchain.agents import create_agent
     except ImportError as exc:
         raise ImportError(
-            "langgraph が必要です。"
+            "langchain (v1+) が必要です。"
             " uv sync --extra llm でインストールしてください。"
         ) from exc
 
-    tools = _load_mcp_tools()
+    # ログ強化 L-2: character_slug を渡して、ツール登録ログにキャラ情報を含める
+    # バグ 3 修正: disable_tools を伝播して fallback パスでは ask_character を除外
+    tools = _load_mcp_tools(
+        character_slug=character_slug,
+        disable_tools=disable_tools,
+    )
     if not tools:
-        logger.info("ツールなし。単一ノード構成にフォールバック。")
+        logger.info(
+            "ツールなし [character=%s]。単一ノード構成にフォールバック。",
+            character_slug or "?",
+        )
         return None
 
     # Skills 定義ファイルから行動判断基準を読み込み、system_prompt と結合
@@ -212,15 +383,32 @@ def _build_agent_graph(
         if provider in ("openai", "anthropic")
         else llm
     )
-    agent = create_react_agent(
-        bound_llm,
-        tools,
-        prompt=combined_prompt,
+
+    # Phase 0.5-A フェーズ 8: キャラ別 Pydantic スキーマで構造化出力を強制。
+    # スキーマは voicepeak_emotion_keys から動的生成 (mimi/chisame/sakura で
+    # emotion キーが異なる)。response_format=Pydantic で LLM が必ず JSON
+    # オブジェクトを返すようになり、Markdown コードブロックや絵文字の混入
+    # による VOICEPEAK CLI 引数破壊を構造的に防ぐ。
+    response_schema = (
+        _get_character_response_schema(character_slug) if character_slug else None
     )
+
+    kwargs: dict = {
+        "model": bound_llm,
+        "tools": tools,
+        "system_prompt": combined_prompt,
+    }
+    if response_schema is not None:
+        kwargs["response_format"] = response_schema
+
+    agent = create_agent(**kwargs)
+    # ログ強化 L-2: キャラ識別子を先頭に出して、ターン毎にどのキャラの Agent か判別容易に
     logger.info(
-        "ReAct Agent 構築完了: tools=%d model=%s skills=%s parallel_tool_calls=%s",
-        len(tools), model, bool(skills_text),
+        "Agent 構築完了 (新 API) [character=%s]: tools=%d model=%s skills=%s "
+        "parallel_tool_calls=%s structured_output=%s",
+        character_slug or "?", len(tools), model, bool(skills_text),
         False if provider in ("openai", "anthropic") else "(provider非対応)",
+        response_schema.__name__ if response_schema else "(無効)",
     )
     return agent
 
@@ -260,20 +448,134 @@ class BubbleToolCallbackHandler:
         "ask_character_tool": "ask_character",
     }
 
-    def __init__(self, character_slug: str, common: dict):
+    def __init__(
+        self,
+        character_slug: str,
+        common: dict,
+        status_manager: "CharacterStatusManager | None" = None,
+        model: str = "",
+        provider: str = "",
+    ):
         self._character_slug = character_slug
         self._common = common
+        # 原因究明ログ強化: LLM step エラー時に provider/model も併記するため保持。
+        self._model = model
+        self._provider = provider
+        # Phase 0.5-B-α: ツール呼び出し時に Thinking → ToolCalling、終了時に
+        # ToolCalling → Thinking を反映する。None 時は status 反映スキップ
+        # (= 既存テスト互換、status_manager 未注入時の挙動維持)。
+        self._status_manager = status_manager
+        # Phase 0.5-F-6-f: Agent 内部 LLM step の境界観察用 (= hang 調査ログ強化)。
+        # `on_chat_model_start` / `on_llm_end` で step 開始/完了を INFO 出力し、
+        # tool 呼出後の継続 LLM step がどこで応答停止したかを再発時に追えるようにする。
+        # parallel_tool_calls=False で逐次実行のため、単純な counter + t0 で十分。
+        self._llm_step_count = 0
+        self._llm_step_t0: float | None = None
 
     # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
     def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_chain_end(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_chat_model_start(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_llm_end(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
-    def on_tool_end(self, *args, **kwargs) -> None: pass  # noqa: E704
+
+    def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+        """Agent 内部 LLM step 開始時の境界ログ (Phase 0.5-F-6-f)。
+
+        Agent.invoke 内部で Chat model (ChatOpenAI/ChatAnthropic/ChatGoogleGenerativeAI)
+        を呼ぶたびに発火する。tool 呼出後の継続 step (= tool 結果を統合して次の action を
+        判断する LLM 呼出) もここを通る。hang 時の「どの step で停止したか」を
+        ログから読み取るための強化。
+        """
+        self._llm_step_count += 1
+        # messages は list[list[BaseMessage]] (= prompt 単位の list)。総 message 数を集計
+        try:
+            msg_count = sum(len(m) for m in messages) if messages else 0
+        except Exception:  # noqa: BLE001
+            msg_count = -1
+        logger.info(
+            "Agent LLM step %d 開始 [character=%s] msgs=%d",
+            self._llm_step_count, self._character_slug, msg_count,
+        )
+        self._llm_step_t0 = time.monotonic()
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        """Agent 内部 LLM step 完了時の境界ログ (Phase 0.5-F-6-f)。
+
+        `on_chat_model_start` 後に対応する完了ログ。latency_ms + token usage を出す。
+        hang 時はここまで到達せず、ログ末尾が `Agent LLM step N 開始` で止まる。
+        """
+        latency_ms = (
+            int((time.monotonic() - self._llm_step_t0) * 1000)
+            if self._llm_step_t0 is not None else -1
+        )
+        # token usage 取得 (LangChain LLMResult の llm_output から)
+        usage_info = ""
+        try:
+            llm_output = getattr(response, "llm_output", None) or {}
+            usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            if usage:
+                in_tok = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
+                out_tok = usage.get("output_tokens") or usage.get("completion_tokens", 0)
+                usage_info = f" tokens=in:{in_tok}/out:{out_tok}"
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info(
+            "Agent LLM step %d 完了 [character=%s] latency_ms=%d%s",
+            self._llm_step_count, self._character_slug, latency_ms, usage_info,
+        )
+
+    def on_llm_error(self, error, **kwargs) -> None:
+        """Agent 内部 LLM step エラー時のログ (Phase 0.5-F-6-f / timeout 強化)。
+
+        TimeoutError / APITimeoutError / APIConnectionError 等を再発時に検知できる
+        ようにする。timeout / retry 枯渇の原因究明用に、停止 step・step 開始からの
+        経過秒・provider/model を併記する (= 「どの呼出が何秒で何の例外で落ちたか」)。
+        """
+        elapsed = (
+            f"{time.monotonic() - self._llm_step_t0:.1f}s"
+            if self._llm_step_t0 is not None else "unknown"
+        )
+        logger.warning(
+            "Agent LLM step %d エラー [character=%s provider=%s model=%s] "
+            "(step 開始から %s): %s: %s",
+            self._llm_step_count, self._character_slug,
+            self._provider or "?", self._model or "?", elapsed,
+            type(error).__name__, error,
+        )
+
+    def on_chat_model_error(self, error, **kwargs) -> None:
+        """Chat model エラー時のログ (= on_llm_error と同等、Phase 0.5-F-6-f)。"""
+        self.on_llm_error(error, **kwargs)
+
+    def on_tool_end(self, *args, **kwargs) -> None:
+        """ツール呼び出し終了時の no-op (LangChain CallbackHandler 互換用)。
+
+        【経緯】
+        Phase 0.5-B-α commit 5 では「TOOL_CALLING → THINKING」を反映していたが、
+        LangChain Agent が web_search 完了後に LLM 応答生成で hang する症状を観察
+        (logs/runs/run_loop_20260508_{222342, 224907, 225127}.log)。
+        実走 TAKE 1 (web_search 15936 chars) と TAKE 2 (web_search 2217 chars) の
+        両方でフィラー無限ループが発生し、Phase 0.5-A 末尾 (= 同コードでこの実装が
+        なかった) では同じ web_search サイズで正常応答していたことから、本実装の
+        微妙なタイミング差が Agent の internal state machine に影響していると推定。
+
+        【判断】
+        commit 5 partial revert として on_tool_end を no-op に戻す
+        (= Phase 0.5-A の挙動と同等)。他の状態反映経路 (= on_tool_start で TOOL_CALLING、
+        _generation_node 入口で THINKING) は維持。
+
+        【HUD dashboard への影響】
+        「TOOL_CALLING のまま → 第 1 chunk 投入で TALKING に直接遷移」となり、
+        「Tool 後の Thinking」の中間状態は視覚化されない。ただし TOOL_CALLING 自体が
+        「考え中 / 検索中」相当の表示で十分機能するため実用上は問題なし。
+        """
+        pass
 
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs) -> None:
-        """ツール呼び出し開始時にbubble.updateを発行する。"""
+        """ツール呼び出し開始時にbubble.updateを発行する。
+
+        Phase 0.5-B-α: status_manager に ToolCalling 状態を反映する
+        (= HUD で「ツール呼出中」表示の根拠データ)。
+        """
         from .pipeline import _load_bubble_messages
         from .events import build_bubble_update
         from .bus import publish
@@ -283,6 +585,13 @@ class BubbleToolCallbackHandler:
         if not msg_key:
             return  # 未知のツールは無視 (fail-open)
 
+        # Phase 0.5-B-α: Thinking → ToolCalling 反映 (TOOL_MESSAGE_KEY に登録された
+        # 既知ツールのみ。未知ツールは無視 = bubble.update も skip)。
+        if self._status_manager is not None:
+            self._status_manager.set_status(
+                self._character_slug, CharacterStatus.TOOL_CALLING,
+            )
+
         char_msgs = _load_bubble_messages().get(self._character_slug, {})
         text = char_msgs.get(msg_key, "検索中…")
 
@@ -291,6 +600,7 @@ class BubbleToolCallbackHandler:
                 character=self._character_slug,
                 step="searching",
                 text=text,
+                category="speech_status",  # Phase 0.5-E: ツール呼出中のステータス表示 (= bubble 3 系統分離)
                 **self._common,
             )
             publish(event)
@@ -311,6 +621,8 @@ def run_graph(
     run_metadata: dict | None = None,
     character_slug: str | None = None,
     common: dict | None = None,
+    disable_tools: "list[str] | None" = None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> LLMResult:
     """
     utterance text を受け取り、LLMResult を返す。
@@ -327,6 +639,9 @@ def run_graph(
         run_metadata:    LangGraph config["metadata"] に渡す dict (optional)
         character_slug:  キャラクター slug (Agent モード時の bubble.update 用)
         common:          stream_id/session_id/trace_id dict (Agent モード時の bubble.update 用)
+        disable_tools:   特定ツールを除外するリスト (= 案 W'-3 バグ 3 修正、案 A)。
+                         例: ["ask_character"] で ask_character ツールを Agent に
+                         登録しない。fallback パス専用 (= deadlock 回避)。
 
     Returns:
         LLMResult
@@ -335,20 +650,27 @@ def run_graph(
         ImportError:  langgraph が未インストール
         RuntimeError: Graph が result を返さなかった場合
     """
+    # ログ強化 L-2: キャラ識別子を先頭に出して、どのターンの Graph 実行かパッと分かるように
     logger.info(
-        "Graph 実行開始: model=%s provider=%s tools=%s",
-        model, provider, _is_tools_enabled(),
+        "Graph 実行開始 [character=%s]: model=%s provider=%s tools=%s",
+        character_slug or "?", model, provider, _is_tools_enabled(),
     )
 
     if _is_tools_enabled():
-        agent = _build_agent_graph(provider, model, system_prompt, character_slug=character_slug)
+        agent = _build_agent_graph(
+            provider, model, system_prompt,
+            character_slug=character_slug,
+            disable_tools=disable_tools,
+        )
         if agent is not None:
             return _run_agent(
                 agent, text, model,
+                provider=provider,
                 run_metadata=run_metadata,
                 character_slug=character_slug,
                 common=common,
                 system_prompt=system_prompt,
+                status_manager=status_manager,
             )
 
     # 従来互換: 単一ノード構成
@@ -366,8 +688,101 @@ def run_graph(
     result = final_state["result"]
     if result is None:
         raise RuntimeError("Graph が LLMResult を返しませんでした")
-    logger.info("Graph 実行完了")
+    # ログ強化 L-2: 単一ノードフォールバック経路でもキャラ識別子を出す
+    logger.info("Graph 実行完了 [character=%s]", character_slug or "?")
     return result
+
+
+def _get_agent_invoke_timeout() -> float:
+    """agent.invoke 全体の壁時計上限(秒)を env から取得する。既定 90。
+
+    WHY: per-request timeout (各 LLM 呼出) は HTTP stall を捕捉するが、Agent 内部の
+    デッドロックや非 HTTP 系ハングは捕捉できない。本ガードは agent.invoke 全体に
+    壁時計上限を課し、どんな原因でも必ず制御を返してフォールバック復帰させる最終防壁。
+    既定 90s は reasoning_effort=low で正常ターンが ~30-40s に収まる前提の保険値で、
+    per-request 40s × (1+retries=1) ≈ 80s を上回りつつ、ハング時の dead air を ~90s に抑える。
+    env (L2_AGENT_INVOKE_TIMEOUT_SEC) で調整可能。
+    """
+    return float(os.environ.get("L2_AGENT_INVOKE_TIMEOUT_SEC", "90"))
+
+
+def _invoke_agent_with_timeout(
+    agent,
+    input_data: dict,
+    config: "dict | None",
+    *,
+    timeout_sec: float,
+    character_slug: str | None,
+    provider: str,
+    model: str,
+    handler: "BubbleToolCallbackHandler | None",
+    session_id: str | None,
+):
+    """agent.invoke を別スレッドで実行し、壁時計 timeout で打ち切る (外側ガード)。
+
+    timeout 到達時は組込 ``TimeoutError`` を送出する。呼出元 (_run_agent) の
+    ``except Exception`` がこれを捕捉し、フォールバック (call_llm 単一ノード) に流して
+    配信を自力復帰させる。
+
+    制約 / 設計判断:
+      - Python はスレッドを強制 kill できないため、timeout 後も orphan thread は
+        裏で走り続ける。ただし各 LLM client に per-request timeout があるため、
+        その時間内に必ず自然終了する (= リークは有界)。dispatcher は 1 ターン
+        single-flight なので orphan が積み上がることはない。
+      - orphan の返り値は future 放棄で破棄される。発話 (TTS/再生) は _run_agent の
+        戻り値駆動で下流が行うため、orphan が最終応答を二重発話することはない。
+      - agent.invoke 全体の再実行はしない (ask_character の導入セリフ + target 発話を
+        二重再生してしまうため)。timeout 時は単一ノードへフォールバックのみ。
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    # contextvars を worker thread へ明示的に引き継ぐ (copy_context)。
+    # WHY: ThreadPoolExecutor の worker は呼出元の contextvars を複製しない。これをしないと
+    # agent がツール内で呼ぶ ask_character が参照する contextvar (caller_slug / on_tts_chunk /
+    # common / status_manager 等、ask_character.py:35-72) が worker thread で既定値に戻り、
+    # 導入セリフ生成・協働先 TTS が丸ごとスキップされる (実走 run_loop_20260531_185642 で
+    # caller=空 / on_tts_chunk=None による発話欠落を観測した regression)。
+    # copy_context() は呼出元 (pipeline) スレッドで set 済みの全 contextvar を捕捉する。
+    ctx = contextvars.copy_context()
+    future = executor.submit(ctx.run, agent.invoke, input_data, config or None)
+    try:
+        return future.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        # 原因究明ログ: どの LLM step で、step 開始から何秒経過して止まったか。
+        step = handler._llm_step_count if handler is not None else -1
+        step_elapsed = (
+            f"{time.monotonic() - handler._llm_step_t0:.1f}s"
+            if handler is not None and handler._llm_step_t0 is not None
+            else "unknown"
+        )
+        logger.error(
+            "Agent.invoke が %.0fs を超過 → 中断 [character=%s provider=%s model=%s]: "
+            "最終到達 LLM step=%d (step 開始から %s 経過)。"
+            "単一ノードにフォールバックします。",
+            timeout_sec, character_slug or "?", provider, model, step, step_elapsed,
+        )
+        # orphan が ask_character 実行中だった場合、target の未投入 BG TTS を停止する
+        # (= 中断したターンの協働応答が後から再生されるのを防ぐ)。
+        if session_id:
+            try:
+                from .mcp_servers.ask_character import cancel_bg_tts
+                cancelled = cancel_bg_tts(session_id)
+                if cancelled:
+                    logger.info(
+                        "Agent.invoke timeout: ask_character BG TTS を %d 件キャンセル "
+                        "[session=%s]", cancelled, session_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Agent.invoke timeout: cancel_bg_tts 失敗 [session=%s]: %s",
+                    session_id, exc,
+                )
+        raise TimeoutError(
+            f"agent.invoke が {timeout_sec:.0f}s を超過 "
+            f"(character={character_slug}, last_step={step})"
+        )
+    finally:
+        # orphan thread の終了は待たない (wait=False)。block すると timeout の意味が無い。
+        executor.shutdown(wait=False)
 
 
 def _run_agent(
@@ -375,10 +790,12 @@ def _run_agent(
     text: str,
     model: str,
     *,
+    provider: str = "openai",
     run_metadata: dict | None = None,
     character_slug: str | None = None,
     common: dict | None = None,
     system_prompt: str | None = None,
+    status_manager: "CharacterStatusManager | None" = None,
 ) -> LLMResult:
     """ReAct Agent を実行し、LLMResult に変換する。
 
@@ -386,8 +803,6 @@ def _run_agent(
     - TD-2 context wrapper 削除 (Agent が自分で retrieve_memory ツールを呼ぶため)
     - BubbleToolCallbackHandler でツール呼び出し時に bubble.update を発行
     """
-    import time
-
     t0 = time.monotonic()
 
     # Agent への入力メッセージ (ツール判断は Agent + system_prompt のガイダンスに委ねる)
@@ -398,40 +813,129 @@ def _run_agent(
     if run_metadata:
         config["metadata"] = run_metadata
     # bubble.update コールバック (Agent がツールを呼んだとき HUD に動的表示)
+    # Phase 0.5-B-α: status_manager を Handler に渡し、tool 起動/終了で
+    # Thinking ↔ ToolCalling を反映できるようにする。
+    handler: "BubbleToolCallbackHandler | None" = None
     if character_slug and common:
-        handler = BubbleToolCallbackHandler(character_slug, common)
+        handler = BubbleToolCallbackHandler(
+            character_slug, common, status_manager=status_manager,
+            model=model, provider=provider,
+        )
         config["callbacks"] = [handler]
 
+    # Phase 0.5-F-6-f: Agent.invoke 開始ログ (= hang 調査用)。
+    # 入力 text を全文 (%r) で残す。これにより再発時に
+    # 「LLM に何を渡した結果 hang したか」の証跡が確保される。改行は \n に
+    # エスケープされて 1 行ログ化されるため、長文でも grep / tail で読みやすい。
+    logger.info(
+        "Agent.invoke 開始 [character=%s] text_len=%d text=%r",
+        character_slug or "?", len(text), text,
+    )
+
     try:
-        result = agent.invoke(input_data, config or None)
+        # 外側の壁時計ガードで agent.invoke 全体を包む (= 非 HTTP 系ハングの最終防壁)。
+        # timeout 時は TimeoutError を送出し、下の except がフォールバックへ流す。
+        session_id = common.get("session_id") if common else None
+        result = _invoke_agent_with_timeout(
+            agent, input_data, config,
+            timeout_sec=_get_agent_invoke_timeout(),
+            character_slug=character_slug,
+            provider=provider,
+            model=model,
+            handler=handler,
+            session_id=session_id,
+        )
         latency_ms = int((time.monotonic() - t0) * 1000)
 
-        # Agent の最終メッセージから応答テキストを抽出
-        final_messages = result.get("messages", [])
         response_text = ""
         usage = {}
+        source = "messages"
 
-        if final_messages:
-            # 最後の AI メッセージを探す（ToolMessage をスキップ）
-            for msg in reversed(final_messages):
-                role = getattr(msg, "type", None) or getattr(msg, "role", "")
-                if role in ("ai", "assistant"):
-                    content = getattr(msg, "content", "")
-                    # Gemini はリスト形式で返すことがある
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        response_text = "".join(text_parts)
-                    else:
-                        response_text = str(content)
+        # Phase 0.5-A フェーズ 8: 新 API (langchain.agents.create_agent) で
+        # response_format=Pydantic を有効化した場合、最終応答が
+        # state["structured_response"] に Pydantic インスタンスとして格納される。
+        # これを優先的に取得し、JSON 文字列化して LLMResult.text に格納する。
+        # 後段の _tts_node / _parse_voicepeak_json は llm_text を JSON として読むため、
+        # 既存パイプラインは無変更で互換性を維持できる。
+        structured = result.get("structured_response")
+        if structured is not None:
+            try:
+                # Pydantic v2: model_dump_json で ASCII 非エスケープ JSON
+                if hasattr(structured, "model_dump_json"):
+                    response_text = structured.model_dump_json()
+                elif hasattr(structured, "model_dump"):
+                    import json as _json
+                    response_text = _json.dumps(
+                        structured.model_dump(), ensure_ascii=False,
+                    )
+                elif isinstance(structured, dict):
+                    import json as _json
+                    response_text = _json.dumps(structured, ensure_ascii=False)
+                else:
+                    # dump できない (Pydantic でも dict でもない) → messages フォールバック
+                    raise TypeError(
+                        "structured_response が dump 不可能 (型 ="
+                        f" {type(structured).__name__})"
+                    )
+                source = "structured_response"
+            except Exception as exc:  # noqa: BLE001
+                # Phase 0.5-F-6-f: JSON 変換失敗の調査用に生 content を残す。
+                # 「LLM が想定外フォーマットを返した → parse 失敗」の仮説検証用。
+                # repr で長文も 1 行ログ化、300 文字で trim (= ログ膨張防止)。
+                struct_type = type(structured).__name__
+                struct_repr = repr(structured)
+                if len(struct_repr) > 300:
+                    struct_repr = struct_repr[:300] + f"...(truncated, total={len(repr(structured))} chars)"
+                logger.warning(
+                    "structured_response の JSON 変換失敗 → messages フォールバック: %s "
+                    "(type=%s content=%s)",
+                    exc, struct_type, struct_repr,
+                )
+                structured = None  # フォールバックに進む
+
+        # フォールバック: messages の最後の AI メッセージから応答テキストを抽出
+        # (response_format 未指定 / 構造化出力 fail-open / 旧 API 互換のため)
+        if structured is None:
+            final_messages = result.get("messages", [])
+            if final_messages:
+                # 最後の AI メッセージを探す（ToolMessage をスキップ）
+                for msg in reversed(final_messages):
+                    role = getattr(msg, "type", None) or getattr(msg, "role", "")
+                    if role in ("ai", "assistant"):
+                        content = getattr(msg, "content", "")
+                        # Gemini はリスト形式で返すことがある
+                        if isinstance(content, list):
+                            text_parts = []
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    text_parts.append(part.get("text", ""))
+                                elif isinstance(part, str):
+                                    text_parts.append(part)
+                            response_text = "".join(text_parts)
+                        else:
+                            response_text = str(content)
+                        usage = getattr(msg, "usage_metadata", None) or {}
+                        break
+
+        # usage tokens は messages 内の最後の AIMessage から取得 (structured_response
+        # 取得時でも同じ messages 配列に含まれている)
+        if not usage:
+            for msg in reversed(result.get("messages", [])):
+                if getattr(msg, "type", None) in ("ai", "assistant") or \
+                        getattr(msg, "role", "") in ("ai", "assistant"):
                     usage = getattr(msg, "usage_metadata", None) or {}
                     break
 
-        logger.info("Agent 実行完了: latency_ms=%d text=%s", latency_ms, response_text)
+        # Phase 0.5-F-6-f: text 60 文字省略を廃止、全文を %r で出力。
+        # 「LLM が返した JSON が想定外フォーマット → parse 失敗 → hang」仮説の
+        # 検証用に、応答全文の証跡を残す。改行は %r で \n エスケープされて
+        # 1 行ログ化されるため、長文でも grep / tail で読みやすい。
+        # response_text の長さに関わらず全文を出す (= 数 KB 規模が想定上限)。
+        logger.info(
+            "Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r",
+            character_slug or "?", latency_ms, source, len(response_text),
+            response_text,
+        )
         return LLMResult(
             text=response_text,
             model=model,
@@ -441,13 +945,20 @@ def _run_agent(
             finish_reason="stop",
         )
     except Exception as exc:
-        logger.error("Agent 実行失敗: %s。単一ノードにフォールバック。", exc)
+        logger.error(
+            "Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。",
+            character_slug or "?", exc,
+        )
         # フォールバック: 従来の単一ノード構成 (system_prompt を引き継ぐ)
+        # ログ強化 L-3: caller_slug でログにキャラ識別を残す
+        # provider は元のキャラの provider を使う (旧実装は "openai" 固定で、anthropic/
+        # google キャラが timeout 時に OpenAI へ化けて口調/挙動が変わるバグだった)。
         return call_llm(
             text,
             model=model,
-            provider="openai",
+            provider=provider,
             system_prompt=system_prompt,
+            caller_slug=character_slug,
         )
 
 
@@ -487,6 +998,23 @@ class PipelineGraphState(TypedDict):
     stream_context: str | None
     on_tts_chunk_ready: Any
     on_pose_ready: Any
+    # Phase 0.5-A フェーズ 7: 挙手 BG LLM モードで True にすると、
+    # _generation_node 内の bubble.update("answering") 発行を抑制する。
+    # 通常応答は run_pipeline 経由で生成するときに graph.py 内で answering bubble
+    # を発行するが、挙手の BG 先行生成では「承認時に run_loop が TTS 開始時刻と
+    # 同期して bubble.update("answering") を発行する」設計のため、graph 側では
+    # 抑制する必要がある (= 二重発行防止)。デフォルト False で既存挙動を維持。
+    suppress_bubble_answering: bool
+    # Phase 0.5-A 案 W'-3 + バグ 3 修正 (案 A): 特定の Agent ツールを除外する。
+    # 例: ["ask_character"] で fallback パス時に ask_character ツールを Agent から
+    # 除外し、並行する TTS 再生との deadlock を回避する (logs/runs/run_loop_20260508_181051.log
+    # で観察されたハングの対処)。デフォルト None で全ツール有効 = 既存挙動。
+    disable_tools: "list[str] | None"
+    # Phase 0.5-B-α: 全キャラ状態を一元管理する CharacterStatusManager。
+    # _generation_node が「LLM 推論中 = Thinking」、BubbleToolCallbackHandler が
+    # 「ツール実行中 = ToolCalling」を反映するため、pipeline → graph で透過渡し。
+    # None 時は status 反映スキップ (= 後方互換、テストで未注入時の挙動維持)。
+    status_manager: "CharacterStatusManager | None"
 
     # ノード出力
     character_slug: str
@@ -828,6 +1356,30 @@ def _generation_node(state: PipelineGraphState) -> dict:
     utt_event_id = state["events"][0]["event_id"]
 
     if state["use_real_llm"]:
+        # Phase 0.5-B-α: LLM 推論開始 → Thinking 反映 (HUD 用)。
+        # WHY: graph 内で反映することで run_pipeline (通常応答) と
+        # run_pipeline_llm_only (BG LLM) 両経路を 1 箇所でカバー。run_loop 側に
+        # 分散させると経路ごとに反映漏れが発生しやすい。state.get で None
+        # フォールバック (status_manager 未注入時は no-op、後方互換)。
+        #
+        # Phase 0.5-B-α 修正 (commit 8): BG LLM パス (suppress_bubble_answering=True)
+        # では Thinking 反映をスキップ。挙手 BG 経路では Raisehand 状態を承認まで
+        # 維持して、HUD dashboard で「挙手中」を視覚化するため。実走
+        # logs/runs/run_loop_20260508_231134.log で sakura/mimi が
+        # ready→raisehand→thinking と 0.3 秒以内に Thinking に上書きされ、ダッシュ
+        # ボードを見たときには既に Thinking 表示になっていた症状への対処。
+        # 承認後は run_loop 側で Talking に直接上書き (Raisehand → Ready → Talking)。
+        # 通常応答ターン (suppress_bubble_answering=False) では従来通り Thinking 反映。
+        _gen_status_manager = state.get("status_manager")
+        if (
+            _gen_status_manager is not None
+            and state.get("character_slug")
+            and not state.get("suppress_bubble_answering")
+        ):
+            _gen_status_manager.set_status(
+                state["character_slug"], CharacterStatus.THINKING,
+            )
+
         # Sprint Axis D Block 3: retrieve_memory ツール用のセッションコンテキストをセット
         if _is_rag_enabled():
             from .mcp_servers.retrieve_memory import set_retrieval_context
@@ -841,6 +1393,11 @@ def _generation_node(state: PipelineGraphState) -> dict:
         # 直前に切り替えるためのコールバック。caller の最終応答 pose 切替と
         # 同じ仕組み (= playback worker の _pending_pose 経由) を target にも
         # 適用する。
+        # Phase 0.5-B-β-1 commit 4: status_manager も注入することで、ask_character
+        # 内部で target キャラの THINKING/TALKING/READY を HUD dashboard
+        # (V2 /status) に反映できるようにする。Phase 0.5-B-α では caller のステータス
+        # 反映 (= graph._generation_node / _tts_node) のみ実装されており、target は
+        # 未配線で HUD カードが READY のままだった穴を埋める。
         from .mcp_servers.ask_character import set_ask_character_context
         set_ask_character_context(
             on_tts_chunk=state["on_tts_chunk_ready"],
@@ -848,6 +1405,7 @@ def _generation_node(state: PipelineGraphState) -> dict:
             common=common,
             caller_slug=state["character_slug"],
             on_pose_ready=state.get("on_pose_ready"),
+            status_manager=_gen_status_manager,
         )
 
         _run_meta = build_run_metadata(
@@ -875,6 +1433,12 @@ def _generation_node(state: PipelineGraphState) -> dict:
             run_metadata=_run_meta,
             character_slug=state["character_slug"],
             common=common,
+            # バグ 3 修正 (案 A): fallback パスでは disable_tools=["ask_character"] が
+            # 指定される。state.get で None フォールバック (= 既存挙動互換)。
+            disable_tools=state.get("disable_tools"),
+            # Phase 0.5-B-α: status_manager を Agent / BubbleToolCallbackHandler に
+            # 透過渡し。tool 起動時の Thinking ↔ ToolCalling 反映に使う。
+            status_manager=_gen_status_manager,
         )
         write_llm_response(_llm_result.text)
         llm_text = _llm_result.text
@@ -889,10 +1453,19 @@ def _generation_node(state: PipelineGraphState) -> dict:
         llm_text = f"ダミー応答: {text}"
         llm_meta = {}
 
-    llm = build_llm_final(text=llm_text, seq=1, links=[utt_event_id], **llm_meta, **common)
+    # ログ強化 L-2: payload に character を含めて bus ログ + V2 受信側で識別容易に
+    llm = build_llm_final(
+        text=llm_text, seq=1, links=[utt_event_id],
+        character=state["character_slug"],
+        **llm_meta, **common,
+    )
     publish(llm)
 
-    _publish_bubble("answering", state["character_slug"], common, links=[llm["event_id"]])
+    # Phase 0.5-A フェーズ 7: BG LLM モード (挙手の先行生成) では、承認時に run_loop
+    # が TTS 開始時刻と同期して bubble.update("answering") を発行する。graph 側で
+    # 発行すると二重発行になるので、suppress_bubble_answering=True で抑制する。
+    if not state.get("suppress_bubble_answering", False):
+        _publish_bubble("answering", state["character_slug"], common, links=[llm["event_id"]])
 
     return {
         "llm_text": llm_text,
@@ -913,14 +1486,41 @@ def _tts_node(state: PipelineGraphState) -> dict:
     llm_event_id = state["events"][1]["event_id"]
     character_slug = state["character_slug"]
 
-    # LLM JSON 応答から pose を抽出して OBS 立ち絵を切り替え
+    # LLM JSON 応答から response 本文 + pose を抽出
     # on_pose_ready コールバックがあれば遅延適用 (本命応答の再生開始タイミングで切替)
     # なければ従来通り即時切替 (run_once.py 等の互換性)
-    _, _, _, pose_value = _parse_voicepeak_json(llm_text)
+    response_text, _, _, pose_value = _parse_voicepeak_json(llm_text)
     if state.get("on_pose_ready"):
         state["on_pose_ready"](character_slug, pose_value or "neutral")
     else:
         set_pose(character_slug, pose_value or "neutral")
+
+    # Phase 0.5-B-α (commit 9): TTS 合成開始 → Talking 反映 (HUD 用、ルカ要件)。
+    # WHY: graph 内で full LLM response (= response_text) + 立ち絵 (= pose_value) を
+    # 取得済み。run_loop の chunk 1 投入時点では chunk_text (= 最初の chunk のみ、
+    # 数文程度) しか取れず、HUD dashboard で発話全文を表示するルカ要件を満たせない。
+    # graph._tts_node 内で集約して反映することで、metadata={"pose", "text"} に
+    # full response を含められる。run_loop._on_tts_chunk の Talking 反映は本 commit
+    # で削除し、graph 側に集約 (= 重複 publish 回避)。
+    # WHY suppress_bubble_answering=True (= 挙手 BG パス) では skip: BG パスでは
+    # run_pipeline_llm_only 経由で _tts_node を通らないため理論上ここには来ないが、
+    # 念のため安全側で skip (= 挙手承認応答経路は run_loop の
+    # _spawn_handraise_response_playback で別途 Talking 反映する設計を維持)。
+    status_manager = state.get("status_manager")
+    if (
+        status_manager is not None
+        and character_slug
+        and not state.get("suppress_bubble_answering")
+    ):
+        talking_metadata: dict[str, Any] = {}
+        if pose_value:
+            talking_metadata["pose"] = pose_value
+        if response_text:
+            talking_metadata["text"] = response_text
+        status_manager.set_status(
+            character_slug, CharacterStatus.TALKING,
+            metadata=talking_metadata or None,
+        )
 
     if state["use_real_tts"]:
         # caller の最終応答 TTS を投入する前に、ask_character がバックグラウンド
@@ -953,7 +1553,13 @@ def _tts_node(state: PipelineGraphState) -> dict:
     else:
         tts_meta = dict(speaker=state["tts_speaker"])
 
-    tts = build_tts_done(text=llm_text, seq=2, links=[llm_event_id], **tts_meta, **common)
+    # ログ強化 L-2: payload に character を含めて bus ログ + V2 受信側で識別容易に。
+    # speaker (= voicepeak narrator) は既存フィールド、character (= aibyss slug) は新規。
+    tts = build_tts_done(
+        text=llm_text, seq=2, links=[llm_event_id],
+        character=character_slug,
+        **tts_meta, **common,
+    )
     publish(tts)
 
     # bubble: done は run_loop.py の _playback_worker が最終チャンク再生 + 5 秒後に発行する
@@ -997,3 +1603,5 @@ def run_pipeline_graph(initial_state: PipelineGraphState) -> PipelineGraphState:
     """
     graph = _build_pipeline_graph()
     return graph.invoke(initial_state)
+
+

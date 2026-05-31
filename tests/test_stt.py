@@ -185,3 +185,225 @@ class TestSttLogSanitization:
         assert str(tmp_path) not in all_info
         # ファイル名は含まれてよい
         assert "speech_input.wav" in all_info
+
+
+# ─── TestHallucinationFilter (Phase 0.5-A フェーズ 0) ──────────────
+
+
+class TestHallucinationFilter:
+    """Whisper の hallucination パターン検出ロジック。
+
+    無音 / ノイズ入力で生成される YouTube 字幕由来の定型句を除外する。
+    """
+
+    def test_typical_youtube_phrase_detected(self):
+        """典型的な YouTube 字幕由来フレーズを検出する。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert _is_likely_hallucination("ご視聴ありがとうございました", 2000)
+        assert _is_likely_hallucination("ご視聴ありがとうございます", 1500)
+        assert _is_likely_hallucination("おやすみなさい", 1000)
+        assert _is_likely_hallucination("ご覧いただきありがとうございました。", 2000)
+
+    def test_pattern_with_trailing_punctuation(self):
+        """末尾の句読点を除去して判定する。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert _is_likely_hallucination("ご視聴ありがとうございました。", 2000)
+        assert _is_likely_hallucination("おやすみなさい。", 1000)
+        assert _is_likely_hallucination("また次回!", 1000)
+        assert _is_likely_hallucination("ご視聴ありがとうございました…", 1500)
+
+    def test_pattern_at_end(self):
+        """末尾一致でも検出する (前置きあり)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # 「(無音) → ご視聴ありがとうございました」のような hallucination
+        assert _is_likely_hallucination("...ご視聴ありがとうございました", 2000)
+
+    def test_short_audio_long_text_unmatched(self):
+        """1 秒未満の録音で 10 文字以上の出力は不審。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # 短時間 + 長文 → 不審
+        assert _is_likely_hallucination("これは長い不審なテキスト", 500)
+        # 短時間 + 短文 → 通常 (フィルタしない)
+        assert not _is_likely_hallucination("はい", 500)
+
+    def test_complete_repetition_detected(self):
+        """完全反復 (半分のフレーズが 2 回以上) を検出する。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # "ありがとう" を繰り返す典型的 hallucination
+        assert _is_likely_hallucination(
+            "ありがとうございますありがとうございます", 3000,
+        )
+
+    def test_normal_callout_not_detected(self):
+        """通常の callout は検出されない。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination(
+            "ミミ様、深海って怖い場所だと思いますか?", 4000,
+        )
+        assert not _is_likely_hallucination(
+            "ちさめさん、データ的にはどう見えますか?", 5000,
+        )
+
+    def test_empty_text_not_detected(self):
+        """空文字 / 空白のみは hallucination 扱いしない (フィルタ対象外)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination("", 1000)
+        assert not _is_likely_hallucination("   ", 1000)
+
+    def test_extra_patterns_via_env(self, monkeypatch):
+        """L2_STT_HALLUCINATION_EXTRA_PATTERNS で追加パターンを定義可能。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        monkeypatch.setenv("L2_STT_HALLUCINATION_EXTRA_PATTERNS", "またね,お疲れ様でした")
+
+        assert _is_likely_hallucination("またね", 500)
+        assert _is_likely_hallucination("お疲れ様でした", 1500)
+        # 既存パターンは引き続き機能
+        assert _is_likely_hallucination("ご視聴ありがとうございました", 2000)
+
+    def test_short_phrase_repetition_detected(self):
+        """Phase 0.5-A フェーズ 8: 短句 (3-4 文字) が 3 回以上反復するパターンを検出する。
+
+        既存ルール 3 (半分フレーズの 2 回反復) では検出できない短句反復を
+        ルール 4 (短句 2-8 文字の 3 回以上反復) で補う。
+        """
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # メイドカフェ系反復ハルシネーション (実走 2026-05-07 で観測)
+        assert _is_likely_hallucination(
+            "お嬢様、お嬢様、お嬢様、お嬢様、お嬢様", 3000,
+        )
+        # 区切り無し反復
+        assert _is_likely_hallucination("お嬢様お嬢様お嬢様お嬢様お嬢様", 3000)
+        # 短句 (2 文字) 4 回反復
+        assert _is_likely_hallucination("はいはいはいはい", 2000)
+        # 5 文字 phrase × 3 回
+        assert _is_likely_hallucination("ありがとうありがとうありがとう", 3500)
+
+    def test_short_phrase_2_repeats_not_detected(self):
+        """短句が 2 回しか繰り返されない場合は未検出 (普通の発話)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        # 「そうそう」は 4 文字、len < 6 でルール 4 skip
+        assert not _is_likely_hallucination("そうそう", 1500)
+        # 「ねぇねぇ」も同様 (4 文字、len < 6)
+        assert not _is_likely_hallucination("ねぇねぇ", 1500)
+
+    def test_ojousama_okaeri_pattern_detected(self):
+        """Phase 0.5-A フェーズ 8: 'お嬢様のお帰りの日' が完全/末尾一致パターンとして検出される。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert _is_likely_hallucination("お嬢様のお帰りの日", 5000)
+        # 末尾一致 (句読点付き)
+        assert _is_likely_hallucination("お嬢様のお帰りの日。", 5000)
+        # 「お嬢様のお帰り」も独立パターンとして登録
+        assert _is_likely_hallucination("お嬢様のお帰り", 4000)
+
+    def test_ojousama_alone_not_detected(self):
+        """重要: 'お嬢様' 単独は mimi の alias なのでハルシネーション扱いしない。
+
+        実走時にルカが mimi を「お嬢様」と呼びかけるケースを fail させてはいけない。
+        """
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination("お嬢様", 1500)
+        # 「お嬢様!」「お嬢様。」も末尾句読点除去後 "お嬢様" として検出されない
+        assert not _is_likely_hallucination("お嬢様!", 1500)
+        # 「お嬢様、こちらをご覧ください」も検出されない (普通の文)
+        assert not _is_likely_hallucination("お嬢様、こちらをご覧ください", 4000)
+
+    def test_normal_short_phrases_not_detected(self):
+        """通常の日本語短文は誤検出されない (Phase 0.5-A フェーズ 8 ルール 4 の誤検知防止)。"""
+        from lab_lounge.stt import _is_likely_hallucination
+
+        assert not _is_likely_hallucination("こんにちは", 1500)
+        assert not _is_likely_hallucination("ありがとう", 1500)
+        # callout 系 (短い)
+        assert not _is_likely_hallucination("ミミ様", 1000)
+        assert not _is_likely_hallucination("ちさめさん", 1500)
+        # 普通の発話 (短句反復なし)
+        assert not _is_likely_hallucination("AI 倫理について", 3000)
+        assert not _is_likely_hallucination("最近どうかな", 2000)
+
+    def test_filter_disabled_via_env(self, monkeypatch):
+        """L2_STT_HALLUCINATION_FILTER=false で apply_hallucination_filter は素通し。"""
+        from lab_lounge.stt import _apply_hallucination_filter
+
+        monkeypatch.setenv("L2_STT_HALLUCINATION_FILTER", "false")
+
+        result = STTResult(
+            text="ご視聴ありがとうございました",
+            confidence=None,
+            lang="ja",
+            duration_ms=2000,
+        )
+        out = _apply_hallucination_filter(result)
+        # フィルタ無効 → text は変わらない
+        assert out.text == "ご視聴ありがとうございました"
+
+    def test_filter_replaces_text_when_detected(self, monkeypatch):
+        """フィルタ有効時、hallucination 検出で text が空文字化される。"""
+        from lab_lounge.stt import _apply_hallucination_filter
+
+        monkeypatch.setenv("L2_STT_HALLUCINATION_FILTER", "true")
+
+        result = STTResult(
+            text="ご視聴ありがとうございました",
+            confidence=None,
+            lang="ja",
+            duration_ms=2000,
+        )
+        out = _apply_hallucination_filter(result)
+        # フィルタ有効 + 検出 → text が空文字化
+        assert out.text == ""
+        # 他のフィールドは維持
+        assert out.lang == "ja"
+        assert out.duration_ms == 2000
+
+    def test_filter_preserves_normal_text(self, monkeypatch):
+        """フィルタ有効時、通常テキストは維持される。"""
+        from lab_lounge.stt import _apply_hallucination_filter
+
+        monkeypatch.setenv("L2_STT_HALLUCINATION_FILTER", "true")
+
+        result = STTResult(
+            text="ミミ様、深海について教えてください",
+            confidence=None,
+            lang="ja",
+            duration_ms=4000,
+        )
+        out = _apply_hallucination_filter(result)
+        assert out.text == "ミミ様、深海について教えてください"
+
+    def test_filter_integrated_in_transcribe_audio_file(self, tmp_path, monkeypatch):
+        """transcribe_audio_file 全体で hallucination フィルタが効く。"""
+        monkeypatch.setenv("L2_STT_HALLUCINATION_FILTER", "true")
+
+        dummy = tmp_path / "test.wav"
+        dummy.write_bytes(b"fake")
+
+        # provider が hallucination を返す
+        fake = STTResult(
+            text="ご視聴ありがとうございました",
+            confidence=None,
+            lang="ja",
+            duration_ms=2000,
+        )
+        original_providers = dict(stt_mod._PROVIDERS)
+        try:
+            stt_mod._PROVIDERS["openai"] = _mock_provider(fake)
+            result = transcribe_audio_file(str(dummy), provider="openai", lang="ja")
+        finally:
+            stt_mod._PROVIDERS.clear()
+            stt_mod._PROVIDERS.update(original_providers)
+
+        # transcribe_audio_file の戻り値で text が空文字化されている
+        assert result.text == ""
+        assert result.duration_ms == 2000

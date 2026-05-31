@@ -5,7 +5,10 @@
     "ask_character": "仲間に聞いてみますわね",
     "thinking": "少々お待ちを……",
     "answering": "お話しする準備ができましたわ",
-    "done": ""
+    "done": "",
+    "denied": "承知いたしましたわ",
+    "lapsed": "(遠慮しましたわ)",
+    "cancelled": "(やっぱりよしておきますわ)"
   },
   "chisame": {
     "searching": "過去のデータを参照中です",
@@ -13,7 +16,10 @@
     "ask_character": "他のメンバーの意見も確認します",
     "thinking": "分析しています",
     "answering": "回答をまとめます",
-    "done": ""
+    "done": "",
+    "denied": "了解しました",
+    "lapsed": "(機を改めます)",
+    "cancelled": "(やはり保留します)"
   },
   "sakura": {
     "searching": "ちょっと調べてみますねぇ",
@@ -21,7 +27,10 @@
     "ask_character": "みんなに聞いてみますねぇ",
     "thinking": "んー……考え中ですよぉ",
     "answering": "お待たせしましたぁ",
-    "done": ""
+    "done": "",
+    "denied": "わかりましたぁ",
+    "lapsed": "(遠慮しときますねぇ)",
+    "cancelled": "(やっぱりやめときますぅ)"
   },
   "octamaid": {
     "searching": "データベースを参照中です",
@@ -29,6 +38,9 @@
     "ask_character": "他のメンバーに照会中です",
     "thinking": "処理中です",
     "answering": "回答を準備しました",
-    "done": ""
+    "done": "",
+    "denied": "承知いたしました",
+    "lapsed": "(機を改めます)",
+    "cancelled": "(発言を取り消します)"
   }
 }

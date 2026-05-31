@@ -23,9 +23,11 @@ import logging
 import os
 import platform
 import tempfile
+import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .characters import CharacterConfig, get_all_characters
 from . import stt as _stt
@@ -1043,15 +1045,18 @@ class ContinuousListener:
                     # 「言及」と判定された場合はバッファを保持して次のセグメントを待つ
                     # (跨ぎ発話への対応: 「ミミ様のことなんだけど…聞いていい？」)
                     if _router.is_intent_gate_enabled():
+                        # Phase 0.5-A: check_intent は IntentResult を返す
+                        # ContinuousListener では character_slug 指定モード
+                        # (callout/mention/unknown 判定) のみ使う。
                         intent = _router.check_intent(context, char_slug)
-                        if intent == "mention":
+                        if intent.intent == "mention":
                             logger.info(
                                 "意図ゲート: 言及と判定してスキップ: char=%s (バッファ保持)",
                                 char_slug,
                             )
                             continue  # バッファは保持したまま次のセグメント待ち
                         # "callout" or "unknown" → fall through (fail-open)
-                        logger.info("意図ゲート: %s (char=%s) → 通過", intent, char_slug)
+                        logger.info("意図ゲート: %s (char=%s) → 通過", intent.intent, char_slug)
 
                     self._buffer.clear()
 
@@ -1080,3 +1085,463 @@ class ContinuousListener:
     def cleanup(self) -> None:
         """バッファをクリアする。"""
         self._buffer.clear()
+
+
+# ─── BackgroundContinuousListener ─────────────────────────────────
+#
+# Block 0 (録音常時化) で導入する新クラス。
+# 既存 ContinuousListener が listen_once() で同期ブロッキング動作するのに対し、
+# このクラスはバックグラウンドスレッドで録音 + STT + バッファ蓄積を継続する。
+#
+# 応答パイプライン (LLM + TTS + 再生) 実行中もマイクが OFF にならないため、
+# 応答中の発話を取りこぼさない。検知された wake_event はコールバックで通知し、
+# キュー積み・状態管理は呼出側 (Dispatcher) が担う設計。
+#
+# 設計記録: plans/sparkling-fluttering-penguin.md / Notion 346e38612fe88190a79cd07c0d9c1484
+# ─────────────────────────────────────────────────────────────────
+
+
+class BackgroundContinuousListener:
+    """
+    バックグラウンドスレッドで常時録音 + STT + バッファ蓄積を行うリスナー。
+
+    既存 ``ContinuousListener`` との違い:
+      - listen_once() のような同期ブロッキング呼び出しは持たない
+      - start() で録音スレッドを起動 → コールバックで通知
+      - 応答パイプライン実行中も録音を継続
+      - set_routing_paused() で「バッファ蓄積は続けるが router.route() は
+        スキップ」モードに切替可能
+
+    Phase 0.5 への接続点:
+      - on_segment_added コールバック: 全 segment を check_intent に流す用途
+        (Block 0 では None でも動く)
+      - TranscriptBuffer は内部で保持、buffer property で取得可能
+        (Phase 0.5 で BG LLM タスクに最新 buffer を snapshot 経由で渡す)
+    """
+
+    def __init__(
+        self,
+        *,
+        vad_threshold: float | None = None,
+        device: int | str | None = None,
+        stt_provider: str = "faster-whisper",
+        stt_lang: str = "ja",
+        stt_prompt: str | None = None,
+        tmp_dir: str | None = None,
+        max_record_seconds: float = _DEFAULT_MAX_RECORD_SECONDS,
+        context_window_sec: float | None = None,
+        context_max_chars: int | None = None,
+    ) -> None:
+        """
+        Args:
+            vad_threshold:      RMS 閾値。省略時は L2_SILENCE_THRESHOLD env (default 0.01)
+            device:             録音デバイスのインデックスまたは名前
+            stt_provider:       STT プロバイダ (default "faster-whisper" — ローカル優先)
+            stt_lang:           STT 言語コード
+            stt_prompt:         STT 転写ヒント。省略時はキャラクター名から自動生成
+            tmp_dir:            WAV 一時ファイルの保存先
+            max_record_seconds: 1 発話の最大録音秒数
+            context_window_sec: TranscriptBuffer の保持期間秒数
+            context_max_chars:  TranscriptBuffer の最大文字数
+        """
+        # 循環 import 回避のため遅延 import
+        from .transcript_buffer import TranscriptBuffer
+
+        self._vad_threshold = vad_threshold if vad_threshold is not None else float(
+            os.environ.get("L2_SILENCE_THRESHOLD", "0.01")
+        )
+        self._device = device
+        self._stt_provider = stt_provider
+        self._stt_lang = stt_lang
+        self._stt_prompt = stt_prompt if stt_prompt is not None else _build_character_prompt()
+        self._tmp_dir = tmp_dir
+        self._max_record_seconds = max_record_seconds
+
+        window = context_window_sec if context_window_sec is not None else float(
+            os.environ.get("L2_CONTEXT_WINDOW_SEC", "30")
+        )
+        max_ch = context_max_chars if context_max_chars is not None else int(
+            os.environ.get("L2_CONTEXT_MAX_CHARS", "2000")
+        )
+        # TranscriptBuffer は Block 0 で Lock 化済み。録音スレッドと外部 (run_loop)
+        # の両方からアクセスされるが、Lock で守られている。
+        self._buffer = TranscriptBuffer(window_sec=window, max_chars=max_ch)
+
+        # VAD checker (録音ループで再利用)
+        vad_backend = _get_vad_backend()
+        self._is_speech, self._vad_frame_samples, self._silence_frames = _create_vad_checker(
+            vad_backend, self._vad_threshold
+        )
+
+        # スレッド・状態管理
+        # _stop_event: スレッド終了シグナル。stop() でセットし、録音ループの
+        #              先頭で確認する。
+        # _routing_paused: True のとき router.route() / check_intent をスキップする
+        #                  (応答中はメインスレッドが set_routing_paused(True) を呼ぶ)。
+        #                  ただし録音とバッファ蓄積は継続する。
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._routing_paused = threading.Event()
+
+        # コールバック (start で設定)
+        # Phase 0.5-A フェーズ 6: on_segment_added は (segment, buffer_full_text) の
+        # 2 引数で呼び出される。buffer_full_text を listener 内 Lock のもとで取得して
+        # 渡すことで、Dispatcher 側で再取得した場合の race による微差異を防ぐ。
+        self._on_segment_added: Callable[[Any, str], None] | None = None
+        self._on_wake_detected: Callable[[WakeWordResult], None] | None = None
+
+    @property
+    def buffer(self) -> "Any":
+        """内部の TranscriptBuffer を返す (テスト・デバッグ・Phase 0.5 snapshot 用)。"""
+        return self._buffer
+
+    def start(
+        self,
+        *,
+        on_wake_detected: Callable[[WakeWordResult], None],
+        on_segment_added: Callable[[Any, str], None] | None = None,
+    ) -> None:
+        """
+        バックグラウンド録音スレッドを起動する。
+
+        Args:
+            on_wake_detected:  wake_event 検知時に呼ばれる callback
+                               (Dispatcher.on_wake_detected を渡す想定)
+            on_segment_added:  segment が転写完了 + バッファ追加されるたびに呼ばれる
+                               callback。シグネチャは (segment, buffer_full_text)
+                               の 2 引数。Phase 0.5-A では Dispatcher.on_segment_added
+                               を渡し、check_intent 4 値化判定 (interjection_candidate)
+                               + check_approval (handraising 中) に流す。None の場合
+                               は no-op (Block 0 互換)。
+        """
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("BackgroundContinuousListener は既に起動中")
+
+        self._on_wake_detected = on_wake_detected
+        self._on_segment_added = on_segment_added
+        self._stop_event.clear()
+        self._routing_paused.clear()
+
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="BackgroundContinuousListener",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "BackgroundContinuousListener: started (provider=%s, threshold=%.4f)",
+            self._stt_provider, self._vad_threshold,
+        )
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        """
+        バックグラウンド録音スレッドを停止する。
+
+        ``_stop_event`` をセットして録音ループに脱出させ、thread.join() で完了を待つ。
+        sd.InputStream は ``with`` スコープを抜けることで閉じる。
+
+        Args:
+            timeout: thread.join のタイムアウト秒数 (default 5 秒)
+        """
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning(
+                "BackgroundContinuousListener: thread.join がタイムアウト (%.1fs)",
+                timeout,
+            )
+        self._thread = None
+        logger.info("BackgroundContinuousListener: stopped")
+
+    def set_routing_paused(self, paused: bool) -> None:
+        """
+        router.route() / 意図ゲートをスキップするモードを切替える。
+
+        - paused=True: 応答パイプライン実行中。録音とバッファ蓄積は継続するが、
+          wake_event 通知は発生しない (segment は ``on_segment_added`` のみで
+          通知される)。
+        - paused=False: アイドル状態。通常通り wake_event を検知して通知する。
+        """
+        if paused:
+            self._routing_paused.set()
+        else:
+            self._routing_paused.clear()
+        logger.debug("BackgroundContinuousListener: routing_paused=%s", paused)
+
+    def cleanup(self) -> None:
+        """リソース解放 (stop と同等 + バッファクリア)。"""
+        self.stop()
+        self._buffer.clear()
+
+    # ─── 内部実装 ─────────────────────────────────────────────
+
+    def _run_loop(self) -> None:
+        """
+        バックグラウンドスレッドのメインループ。
+
+        ``sd.InputStream`` を 1 度だけ開いてから、stop_event が立つまで
+        録音 + STT + バッファ蓄積 + (条件に応じて) wake 判定を繰り返す。
+
+        例外時はログを出して終了する (主機能を止めないよう broad catch)。
+        """
+        try:
+            import sounddevice as sd
+            import numpy as np
+            import soundfile as sf
+        except ImportError as exc:
+            logger.error(
+                "BackgroundContinuousListener: 必須パッケージが import できません: %s。"
+                " uv sync --extra mic を実行してください。",
+                exc,
+            )
+            return
+
+        try:
+            with sd.InputStream(
+                samplerate=_DEFAULT_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=self._vad_frame_samples,
+                device=self._device,
+            ) as stream:
+                logger.info(
+                    "BackgroundContinuousListener: InputStream opened (samplerate=%d, blocksize=%d)",
+                    _DEFAULT_SAMPLE_RATE, self._vad_frame_samples,
+                )
+                while not self._stop_event.is_set():
+                    segment = self._record_one_segment_bg(stream, np_module=np, sf_module=sf)
+                    if segment is None:
+                        # タイムアウト or 空録音 or stop_event
+                        continue
+
+                    self._buffer.add(segment)
+                    logger.info(
+                        "BG buffer 蓄積: %r (segments=%d chars=%d)",
+                        segment.text,
+                        len(self._buffer),
+                        self._buffer.total_chars,
+                    )
+
+                    # Phase 0.5-A フェーズ 6: on_segment_added は (segment, buffer_full_text)
+                    # の 2 引数で呼ぶ。buffer.full_text() を listener 内 Lock のもとで
+                    # 取得することで、後で Dispatcher が別タイミングで再取得した際の
+                    # 微差異を防ぐ。
+                    # 挙手判定 (interjection_candidate) は Dispatcher 側で行うため、
+                    # ここでは check_intent を呼ばない (役割分担)。一方 _evaluate_wake は
+                    # 既存の callout/mention/unknown 判定 (= wake 経路) として残しており、
+                    # 両者は独立した責務 (前者: 挙手、後者: wake) で重複呼出は発生しない。
+                    #
+                    # Phase 0.5-A 案 W'-2: callback 戻り値が True の場合 (= dispatcher が
+                    # 本 segment を挙手系で消費した = granted/denied/lapse/新規 candidate)、
+                    # 同一 segment が _evaluate_wake で wake_event_queue に二重投入される
+                    # のを防ぐため wake 判定を skip する。実走で観察された 3 重発火
+                    # (BG LLM + fallback + wake_event) のうち wake_event 経路を停止させる
+                    # 経路。詳細は dispatcher.on_segment_added の Returns docstring 参照。
+                    processed_by_handraise = False
+                    if self._on_segment_added is not None:
+                        try:
+                            # bool() で念のため型ガード (戻り値が None/falsy で fail-open)
+                            processed_by_handraise = bool(
+                                self._on_segment_added(segment, self._buffer.full_text())
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("on_segment_added callback failed: %s", exc)
+                            # WHY (fail-open): callback 例外時は processed_by_handraise を
+                            # False のまま続行する。dispatcher 側のバグが wake 経路を完全
+                            # 停止させる事故を防ぐ安全弁 (= 観察の前に通常応答が止まる方が
+                            # 配信品質上ダメージが大きい)。
+
+                    if processed_by_handraise:
+                        # ログ強化 L-4: dispatcher 側で詳細ログが出ているのでここは
+                        # segment.text の冒頭のみ。grep で「3 重発火が消えた」の確認用。
+                        logger.info(
+                            "BG: on_segment_added が挙手系で消費 → wake 判定スキップ"
+                            " (segment=%r)",
+                            segment.text[:40],
+                        )
+                        # WHY (バグ 2 修正、実走 logs/runs/run_loop_20260508_180741.log
+                        # で発覚): 挙手系で消費した segment は buffer からも除去する。
+                        # クリアしないと、次の発話 (例: Whisper ハルシネーション
+                        # 「お嬢様のお祭りをお祭りします」) で buffer に残った承認発話
+                        # 「ちさめさん、どうぞ」が name_hint='chisame' として router に
+                        # 拾われ、wake_event_queue に投入されて多重発火する症状が発生
+                        # した (= 旧 W'-2 の不完全さ)。
+                        #
+                        # 新規挙手 (interjection_candidate 確定) のケースでも buffer を
+                        # クリアする。続発話の文脈を BG LLM の入力に反映させたい場合は
+                        # Phase 0.5-B 観察 2 (snapshot hybrid) で transcript_snapshot を
+                        # 段階的に更新する設計で対応する (= バグ 2 のスコープ外)。
+                        self._buffer.clear()
+                        continue
+
+                    # 応答中は wake 判定をスキップ (バッファ蓄積のみ継続)
+                    if self._routing_paused.is_set():
+                        logger.debug("BG: routing paused, skip wake routing")
+                        continue
+
+                    self._evaluate_wake(segment)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "BackgroundContinuousListener._run_loop で例外: %s",
+                exc, exc_info=True,
+            )
+        finally:
+            logger.info("BackgroundContinuousListener: run_loop ended")
+
+    def _evaluate_wake(self, segment) -> None:
+        """
+        バッファ全文に router.route() を適用し、必要なら wake コールバックを発火する。
+
+        既存 ``ContinuousListener.listen_once`` 内の判定ロジックと同等の挙動を保つ。
+        意図ゲート Phase 2 (mention 判定) も同様に適用する。
+        """
+        # バッファ全文でキャラクター判定
+        decision = _router.route(self._buffer.full_text())
+        if decision.reason == "default":
+            logger.info("BG 名前ゲート: キャラクター名未検出。蓄積のみ: %r", segment.text)
+            return
+
+        char_slug = decision.speaker
+        context = self._buffer.extract_context()
+
+        # LLM 意図ゲート (Phase 2): mention と判定されたらバッファ保持 + スキップ
+        if _router.is_intent_gate_enabled():
+            # Phase 0.5-A: check_intent は IntentResult を返す
+            # BackgroundContinuousListener では character_slug 指定モード
+            # (callout/mention/unknown 判定) のみ使う。
+            # interjection_candidate モードは Dispatcher.on_segment_added が呼ぶ。
+            intent = _router.check_intent(context, char_slug)
+            if intent.intent == "mention":
+                logger.info(
+                    "BG 意図ゲート: 言及と判定してスキップ: char=%s (バッファ保持)",
+                    char_slug,
+                )
+                return
+            logger.info("BG 意図ゲート: %s (char=%s) → 通過", intent.intent, char_slug)
+
+        # 通過したらバッファクリア (応答後の重複検知を防ぐ)
+        self._buffer.clear()
+
+        # キャラクター設定から wake_word を取得
+        from .characters import get_all_characters as _get_chars
+        chars = {c.slug: c for c in _get_chars()}
+        char = chars.get(char_slug)
+        keyword = (char.wake_word if char and char.wake_word else None) or char_slug
+
+        result = WakeWordResult(
+            keyword=keyword,
+            character_slug=char_slug,
+            keyword_index=0,
+            transcript=context,
+        )
+
+        logger.info(
+            "BG wake 検知: %s (context=%d chars)",
+            char_slug, len(context),
+        )
+
+        if self._on_wake_detected is not None:
+            try:
+                self._on_wake_detected(result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_wake_detected callback failed: %s", exc)
+
+    def _record_one_segment_bg(self, stream, *, np_module, sf_module):
+        """
+        バックグラウンドループ用の 1 セグメント録音 + STT。
+
+        ``ContinuousListener._record_one_segment`` と同等のロジックだが、
+        ``stop_event`` でループから即時脱出できるよう拡張してある。
+        """
+        from .transcript_buffer import TranscriptSegment
+        import time as _time
+
+        np = np_module
+        sf = sf_module
+        sample_rate = _DEFAULT_SAMPLE_RATE
+        is_speech = self._is_speech
+        frame_samples = self._vad_frame_samples
+        max_record_frames = int(self._max_record_seconds * sample_rate / frame_samples)
+
+        onset_count = 0
+        silence_count = 0
+        recording: list = []
+        recording_started = False
+        onset_buffer: deque = deque(maxlen=_DEFAULT_VAD_HOLD_FRAMES)
+
+        while not self._stop_event.is_set():
+            pcm, overflowed = stream.read(frame_samples)
+            if overflowed:
+                logger.debug("オーディオバッファオーバーフロー (BG)")
+
+            mono = pcm[:, 0]
+            speech = is_speech(mono)
+
+            if not recording_started:
+                onset_buffer.append(mono.copy())
+
+                if speech:
+                    onset_count += 1
+                else:
+                    onset_count = 0
+
+                if onset_count >= _DEFAULT_VAD_HOLD_FRAMES:
+                    recording_started = True
+                    silence_count = 0
+                    recording = list(onset_buffer)
+                    logger.info("発話開始検知 (BG)")
+            else:
+                recording.append(mono.copy())
+
+                if not speech:
+                    silence_count += 1
+                else:
+                    silence_count = 0
+
+                if (
+                    silence_count >= self._silence_frames
+                    or len(recording) >= max_record_frames
+                ):
+                    logger.info(
+                        "発話終了検知 (BG, frames=%d silence=%d)",
+                        len(recording), silence_count,
+                    )
+                    break
+
+        if self._stop_event.is_set() or not recording:
+            return None
+
+        # WAV 書き出し → STT → 削除
+        audio_data = np.concatenate(recording)
+        tmp_file = tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            dir=self._tmp_dir,
+            delete=False,
+        )
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        try:
+            sf.write(tmp_path, audio_data, sample_rate, subtype="PCM_16")
+
+            stt_result = _stt.transcribe_audio_file(
+                tmp_path,
+                provider=self._stt_provider,
+                lang=self._stt_lang,
+                prompt=self._stt_prompt or None,
+            )
+            transcript = stt_result.text.strip()
+            duration_ms = stt_result.duration_ms
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        if not transcript:
+            logger.debug("空の転写結果 (BG)。スキップします。")
+            return None
+
+        return TranscriptSegment(
+            text=transcript,
+            timestamp=_time.monotonic(),
+            duration_ms=duration_ms,
+        )

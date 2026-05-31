@@ -18,10 +18,87 @@ llm.py — LLM アダプタ
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# ─── LLM クライアントの timeout / retry 設定 ───────────────────────
+
+def get_llm_timeout_config(scope: str = "agent") -> tuple[float, int]:
+    """LLM クライアントの per-request timeout(秒) と max_retries を env から取得する。
+
+    WHY: timeout 無しの LLM クライアントは応答 stall 時に例外を投げず無限ハングし、
+    配信フリーズの原因になる (実走 run_loop_20260531_164001 で観測)。全 LLM 呼出経路
+    (agent / fallback / router / filler) で生成時に per-request timeout + 自動 retry を
+    一元的な既定値で適用するためのヘルパー。値は env で配信中に調整できる。
+
+    Args:
+        scope: "agent"  = 本応答 Agent / フォールバック (大きい応答。既定 timeout 40s)
+               "router" = ルーター / 意図判定 / filler (max_tokens 小。既定 timeout 20s。
+                          dispatcher 判定経路なので短めにして早期復帰させる)
+
+    Returns:
+        (timeout_sec, max_retries) のタプル。
+
+    注意 (google genai): google の SDK は max_retries=0 を「デフォルト(5 回)」と解釈する
+    ため、google クライアントへ渡す際は 0 を避ける (呼出側で +1 等の補正を行う)。
+    """
+    if scope == "router":
+        timeout = float(os.environ.get("L2_ROUTER_LLM_TIMEOUT_SEC", "20"))
+    else:
+        timeout = float(os.environ.get("L2_LLM_TIMEOUT_SEC", "40"))
+    max_retries = int(os.environ.get("L2_LLM_MAX_RETRIES", "1"))
+    return timeout, max_retries
+
+
+def get_llm_reasoning_effort() -> str | None:
+    """OpenAI reasoning 系モデル (gpt-5 系) の reasoning_effort を env から取得する。
+
+    WHY: gpt-5 系は既定で推論を厚く行い、Agent モード (tools + 構造化出力) の継続ステップで
+    推論が過大化する。これが出力暴走 (実走 20260531 16:40、~128k トークン) や応答ストール
+    (実走 19:08、60s × 3) を引き起こした。キャラ対話は persona/Skills が応答を駆動するため
+    深い推論は不要なので、reasoning_effort を下げて推論時間そのものを抑える
+    (max_tokens は出力量しか抑えないため、推論時間ストールには効かない。本設定が補完する)。
+
+    対象は OpenAI provider のみ (anthropic/google は別機構)。現状 OpenAI 側は gpt-5 系
+    (gpt-5.5 / gpt-5.4-mini / gpt-5.4-nano) のみで、いずれも reasoning_effort に対応する。
+
+    Returns:
+        L2_LLM_REASONING_EFFORT の値 (既定 "low")。空文字 = 設定しない (None、モデル既定に従う)。
+        有効値: "minimal" / "low" / "medium" / "high" / "none" (モデル依存)。万一モデルが
+        本パラメータを拒否する場合は env に空文字を設定して無効化できる。
+    """
+    value = os.environ.get("L2_LLM_REASONING_EFFORT", "low").strip()
+    return value or None
+
+
+def get_llm_max_output_tokens() -> int | None:
+    """LLM の 1 リクエストあたり出力トークン上限を env から取得する。
+
+    WHY: 出力上限が無いと、reasoning 系モデル (gpt-5.5 等) が degenerate loop に入った際に
+    1 リクエストで 10 万トークン超を生成し、(1) 数分間フリーズに見え、(2) 巨額課金を招く
+    (実走 run_loop_20260531_164001 で mimi step3 が ~128k トークン出力を観測)。出力に
+    天井を設けることで、どんな原因のループでも 1 ステップの被害を有界化する (安全弁)。
+
+    Returns:
+        L2_LLM_MAX_OUTPUT_TOKENS の整数値 (既定 4096)。"0" / 空文字 / 負値は None
+        (= 上限なし、opt-out) を返す。
+
+    注意: 正常な可視出力は ~250-400 トークン程度 (= 既定 4096 は十分な余裕)。上限超過時は
+    finish_reason=length で打ち切られ、構造化出力の JSON が壊れて呼出元のフォールバックに
+    流れる。極端に長い応答を出したい用途では env で引き上げる。
+    """
+    raw = os.environ.get("L2_LLM_MAX_OUTPUT_TOKENS", "4096").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 # ─── 戻り値型 ─────────────────────────────────────────────────────
@@ -71,6 +148,20 @@ def _call_openai(
         ) from exc
 
     t0 = time.monotonic()
+    # per-request timeout + 自動 retry を既定適用 (caller が明示指定した場合はそれを優先)。
+    # WHY: timeout 無しだと応答 stall 時に無限ハングし配信が固まる (graph.py の
+    # フォールバック先でもあるため、ここが固まると復帰経路ごと止まる)。
+    _timeout, _max_retries = get_llm_timeout_config("agent")
+    kwargs.setdefault("timeout", _timeout)
+    kwargs.setdefault("max_retries", _max_retries)
+    # 出力トークン上限 (= 暴走生成の安全弁)。None なら付与しない (上限なし)。
+    _max_out = get_llm_max_output_tokens()
+    if _max_out is not None:
+        kwargs.setdefault("max_tokens", _max_out)
+    # reasoning_effort (= 推論時間の抑制、gpt-5 系のみ)。フォールバックも遅延/ストールを避ける。
+    _effort = get_llm_reasoning_effort()
+    if _effort is not None:
+        kwargs.setdefault("reasoning_effort", _effort)
     llm = ChatOpenAI(model=model, **kwargs)
 
     # SystemMessage の組み立て: system_prompt + RAG context を結合
@@ -130,6 +221,15 @@ def _call_google(
         ) from exc
 
     t0 = time.monotonic()
+    # per-request timeout + 自動 retry を既定適用 (caller の明示指定を優先)。
+    # google genai は max_retries=0 を「デフォルト(5 回)」と解釈するため 0 を避ける。
+    _timeout, _max_retries = get_llm_timeout_config("agent")
+    kwargs.setdefault("timeout", _timeout)
+    kwargs.setdefault("max_retries", max(1, _max_retries))
+    # 出力トークン上限。google は param 名が max_output_tokens (openai/anthropic と異なる)。
+    _max_out = get_llm_max_output_tokens()
+    if _max_out is not None:
+        kwargs.setdefault("max_output_tokens", _max_out)
     llm = ChatGoogleGenerativeAI(model=model, **kwargs)
 
     parts: list[str] = []
@@ -202,6 +302,14 @@ def _call_anthropic(
         ) from exc
 
     t0 = time.monotonic()
+    # per-request timeout + 自動 retry を既定適用 (caller が明示指定した場合はそれを優先)。
+    _timeout, _max_retries = get_llm_timeout_config("agent")
+    kwargs.setdefault("timeout", _timeout)
+    kwargs.setdefault("max_retries", _max_retries)
+    # 出力トークン上限 (= 暴走生成の安全弁)。None なら付与しない。
+    _max_out = get_llm_max_output_tokens()
+    if _max_out is not None:
+        kwargs.setdefault("max_tokens", _max_out)
     llm = ChatAnthropic(model=model, **kwargs)
 
     parts: list[str] = []
@@ -253,6 +361,7 @@ def call_llm(
     provider: str = "openai",
     context: str | None = None,
     system_prompt: str | None = None,
+    caller_slug: str | None = None,
     **kwargs,
 ) -> LLMResult:
     """
@@ -264,6 +373,11 @@ def call_llm(
         provider:      LLM プロバイダ（現在 "openai" のみ対応）
         context:       RAG で取得した参照テキスト（省略時は non-RAG 動作）
         system_prompt: キャラクター別システムプロンプト（省略時は従来動作）
+        caller_slug:   応答を生成するキャラ slug。ログ強化 L-3 (Phase 0.5-A 後) で
+                       追加。本セッション/ターン内で複数キャラの LLM 呼出が並列に
+                       走るときに「どのキャラの呼出か」をログで識別できるよう
+                       にする (e.g., 通常応答中の ask_character や挙手 BG LLM)。
+                       None なら "?" 表示 (= 旧経路 / フォールバック)。
         **kwargs:      プロバイダ固有のオプション（temperature 等）
 
     Returns:
@@ -280,21 +394,24 @@ def call_llm(
             f"未対応の provider: {provider!r}。対応プロバイダ: {supported}"
         )
 
+    char_tag = f"[character={caller_slug or '?'}]"
     logger.info(
-        "LLM 呼び出し開始: provider=%s model=%s rag=%s",
-        provider, model, context is not None,
+        "LLM 呼び出し開始 %s: provider=%s model=%s rag=%s",
+        char_tag, provider, model, context is not None,
     )
     if context is not None:
         kwargs["context"] = context
     if system_prompt is not None:
         kwargs["system_prompt"] = system_prompt
     result: LLMResult = fn(text, model=model, **kwargs)
+    # ログ強化 L-3: text 全文出力をやめ、長さ + 冒頭 60 文字 preview に変更。
+    # 全文は llm.final payload に残るため、ログ調査時の手掛かりは preview で十分。
+    text_preview = result.text[:60].replace("\n", " ")
+    text_suffix = "..." if len(result.text) > 60 else ""
     logger.info(
-        "LLM 呼び出し完了: latency_ms=%d input_tokens=%d output_tokens=%d finish_reason=%s text=%s",
-        result.latency_ms,
-        result.input_tokens,
-        result.output_tokens,
-        result.finish_reason,
-        result.text,
+        "LLM 呼び出し完了 %s: latency_ms=%d input_tokens=%d output_tokens=%d "
+        "finish_reason=%s text_len=%d text=%r%s",
+        char_tag, result.latency_ms, result.input_tokens, result.output_tokens,
+        result.finish_reason, len(result.text), text_preview, text_suffix,
     )
     return result
