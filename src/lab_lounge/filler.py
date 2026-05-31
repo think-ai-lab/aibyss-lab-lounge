@@ -623,6 +623,26 @@ def _generate_filler_text(slug: str, *, user_text: str = "") -> str | None:
     return None
 
 
+def _select_waiting_filler(
+    slug: str, last_index: int,
+) -> "tuple[Path | None, int, str]":
+    """待機中 (opener 後〜本応答準備完了まで) に再生するフィラー音声を選ぶ。
+
+    bridge を優先し、bridge 音声が無い (未生成の) キャラは continue で代替する。
+    WHY: bridge 音声が未生成のキャラ (例 mimi/chisame/sakura、実走 run_loop_20260531_212346 で
+    観測) でも「無音で待つ」状態を避け、continue フィラーで間を埋める (キャッシュ取りこぼし耐性)。
+    bridge/continue どちらにも音声が無ければ (None, -1, "") を返す (呼出側は短時間 wait)。
+
+    Returns:
+        (path_or_None, index, category)。category は実際に選ばれた "bridge" / "continue"。
+    """
+    for category in ("bridge", "continue"):
+        path, idx = select_filler_path(slug, category, last_index=last_index)
+        if path is not None:
+            return path, idx, category
+    return None, -1, ""
+
+
 def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = "") -> None:
     """
     ハイブリッドフィラー再生（並行 LLM+TTS）。
@@ -701,12 +721,13 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
     if not filler_ready.is_set():
         last_bridge_idx = -1
         while not filler_ready.is_set() and not stop_event.is_set():
-            bridge_path, idx = select_filler_path(slug, "bridge", last_index=last_bridge_idx)
+            # bridge 優先、未生成なら continue で代替 (無音待ちを防ぐ)。
+            bridge_path, idx, category = _select_waiting_filler(slug, last_bridge_idx)
             if bridge_path is None:
                 filler_ready.wait(timeout=0.5)
                 continue
             last_bridge_idx = idx
-            logger.info("フィラー bridge 再生: [%s] %s", slug, bridge_path.name)
+            logger.info("フィラー %s 再生 (待機): [%s] %s", category, slug, bridge_path.name)
             play_audio_file(str(bridge_path))
             # bridge 間に間を空ける（立て続けの再生を防止）。
             # 中間実走 3 回目 (logs/runs/run_loop_20260509_184653.log) で観察された

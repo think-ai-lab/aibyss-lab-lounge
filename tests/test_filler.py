@@ -14,6 +14,7 @@ from lab_lounge.filler import (
     FillerPhraseSet,
     _generate_filler_text,
     _parse_emotion,
+    _select_waiting_filler,
     get_cached_filler_paths,
     get_filler_duration_ms,
     is_filler_enabled,
@@ -179,6 +180,46 @@ class TestSelectFillerPath:
             for _ in range(100):
                 _, idx = select_filler_path("test_slug", "continue", last_index=1)
                 assert idx != 1
+
+
+# ─── TestSelectWaitingFiller ──────────────────────────────────────
+
+class TestSelectWaitingFiller:
+    """待機中フィラー選択: bridge 優先、未生成なら continue で代替 (無音化防止)。"""
+
+    def test_prefers_bridge_when_present(self, tmp_path):
+        cache_dir = tmp_path / "x"
+        cache_dir.mkdir()
+        (cache_dir / "bridge_00.wav").touch()
+        (cache_dir / "continue_00.wav").touch()
+        with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
+            path, _idx, category = _select_waiting_filler("x", -1)
+        assert category == "bridge"
+        assert path is not None and path.name.startswith("bridge_")
+
+    def test_falls_back_to_continue_when_bridge_missing(self, tmp_path):
+        """bridge 音声が無いキャラ (mimi/chisame/sakura の実状況) は continue で代替する。
+
+        実走 run_loop_20260531_212346 で観測した「bridge 音声欠落 → 待機中無音」への対処の回帰防止。
+        """
+        cache_dir = tmp_path / "x"
+        cache_dir.mkdir()
+        for i in range(3):
+            (cache_dir / f"continue_{i:02d}.wav").touch()  # bridge 無し、continue のみ
+        with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
+            path, _idx, category = _select_waiting_filler("x", -1)
+        assert category == "continue"
+        assert path is not None and path.name.startswith("continue_")
+
+    def test_none_when_both_missing(self, tmp_path):
+        cache_dir = tmp_path / "x"
+        cache_dir.mkdir()
+        (cache_dir / "opener_00.wav").touch()  # opener のみ (bridge も continue も無し)
+        with patch("lab_lounge.filler._FILLER_CACHE_DIR", tmp_path):
+            path, idx, category = _select_waiting_filler("x", -1)
+        assert path is None
+        assert idx == -1
+        assert category == ""
 
 
 # ─── TestGetFillerDurationMs ──────────────────────────────────────
