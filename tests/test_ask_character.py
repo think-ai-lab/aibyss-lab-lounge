@@ -141,6 +141,36 @@ class TestAskCharacterImpl:
         assert "データによると問題ありません" in result
         assert "ちさめ" in result or "chisame" in result.lower()
 
+    def test_strips_raw_json_from_collab_result(self):
+        """協働先が生の構造化 JSON を返しても、caller へのツール結果は response 本文のみ。
+
+        ```json フェンスや別スキーマの emotion キーを含めない。caller (gpt-5.5 等 reasoning
+        系) が別スキーマ JSON を入力に受け取って推論暴走する事象 (実走 20260531、~128k
+        トークン出力 → 数分フリーズ + 巨額課金) の回帰防止。
+        """
+        set_ask_character_context(
+            caller_slug="mimi",
+            common={"stream_id": "s1", "session_id": "ss1", "trace_id": "t1"},
+        )
+
+        raw_json = (
+            "```json\n{\n"
+            '"emotion": {"bosoboso": 0, "doyaru": 20, "honwaka": 10},\n'
+            '"speed": 150, "pose": "special_overdrive",\n'
+            '"response": "ええ、ミミ。私たちは紛れもなくAIです。"\n'
+            "}\n```"
+        )
+        with patch("lab_lounge.mcp_servers.ask_character._run_collaboration_agent",
+                    return_value=raw_json):
+            result = _ask_character_impl("chisame", "AIですか？")
+
+        # クリーンな response 本文が含まれる
+        assert "ええ、ミミ。私たちは紛れもなくAIです。" in result
+        # 生 JSON の痕跡 (フェンス / 別スキーマ emotion キー / pose) を含まない
+        assert "```json" not in result
+        assert "bosoboso" not in result
+        assert "special_overdrive" not in result
+
     def test_tts_called_when_enabled(self, monkeypatch):
         """L2_USE_REAL_TTS=true のとき TTS 合成が呼ばれること（導入 + 本応答の 2 回）。
 

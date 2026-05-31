@@ -828,23 +828,58 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
     # 直前 target を更新 (次回 ask_character 呼出し時の導入セリフ生成で参照される)
     _record_target(session_id, target_char.display_name)
 
-    # Agent への戻り値: 応答元と再生済みであることを明確に伝える
+    # Agent への戻り値: 応答元と再生済みであることを明確に伝える。
+    # response_text は生の構造化 JSON のことがあるため、クリーンな発話文に整形して渡す
+    # (= caller の暴走生成を防ぐ。_format_collab_result_for_caller の docstring 参照)。
     caller_name = caller_char.display_name if caller_char else "あなた"
+    return _format_collab_result_for_caller(
+        target_char.display_name, caller_name, response_text,
+    )
+
+
+def _format_collab_result_for_caller(
+    target_display: str,
+    caller_name: str,
+    response_text: str,
+) -> str:
+    """ask_character の協働応答を caller(Agent) へ返すツール結果文字列を組み立てる。
+
+    WHY (生 JSON を渡さない): 協働先 Agent の生出力は構造化 JSON
+    (```json{"emotion":{...}, "response":"..."}```) のことが多い。これをそのまま
+    ツール結果として caller に渡すと、caller (特に gpt-5.5 等 reasoning 系) が
+    「自分とは別スキーマの構造化 JSON」を入力に受け取り、推論が膨張・暴走する
+    (実走 run_loop_20260531_164001 で mimi step3 が ~128k トークン出力 → 数分フリーズ +
+    巨額課金。対照: 同じ生 JSON を claude-sonnet は正常処理)。そこで _parse_voicepeak_json
+    で response 本文のみ抽出し、クリーンな発話文を渡す。TTS / HUD 経路と同じ抽出器を再利用
+    し、非 JSON・エラー文字列はそのまま返るため後方互換 (octamaid SAY 形式・プレーン文も安全)。
+
+    Args:
+        target_display: 協働先キャラの表示名 (例 "波心ちさめ")
+        caller_name:    呼出元キャラの表示名 (例 "ミミ・オクタヴィア")
+        response_text:  協働先 Agent の生出力 (構造化 JSON or プレーン文)
+
+    Returns:
+        caller の Agent に渡すツール結果文字列 (クリーンな発話文 + 振る舞い指示)。
+    """
+    from ..tts import _parse_voicepeak_json
+
+    say_text, _, _, _ = _parse_voicepeak_json(response_text)
+    clean = say_text or response_text  # 抽出が空振りしたら元テキストにフォールバック
     return (
-        f"【{target_char.display_name}からの応答】\n"
-        f"{response_text}\n\n"
+        f"【{target_display}からの応答】\n"
+        f"{clean}\n\n"
         f"【重要な指示】\n"
-        f"- 上記は{target_char.display_name}が話した内容です（ルカからの応答ではありません）。\n"
-        f"- この応答はすでに{target_char.display_name}の声で視聴者に直接再生されています。\n"
+        f"- 上記は{target_display}が話した内容です（ルカからの応答ではありません）。\n"
+        f"- この応答はすでに{target_display}の声で視聴者に直接再生されています。\n"
         f"- 逐語的な要約や繰り返しは不要です。「聞いてまいりました」「こう言っていました」"
         f"「○○さんによると」のような第三者報告調も不要です。\n"
-        f"- まず{target_char.display_name}の発言に直接リアクション（同意・補足・関連付け・異論など）を返してください。\n"
+        f"- まず{target_display}の発言に直接リアクション（同意・補足・関連付け・異論など）を返してください。\n"
         f"  例: 「そうですわね、構造としてはまさにその通り」"
-        f"「{target_char.display_name}の言う『◯◯』、まさに核心ですわね」のような直接的な呼応。\n"
+        f"「{target_display}の言う『◯◯』、まさに核心ですわね」のような直接的な呼応。\n"
         f"- そのリアクションを起点に、{caller_name}として自分の視点・感想・次の展開を述べてください。\n"
         f"- 振った相手の発言を無視して独白的に締めることは避けてください"
         f"（視聴者には『振った意味がない』と映ります）。\n"
-        f"- {target_char.display_name}がすでに話し終えた前提で、自然に会話を続けてください。"
+        f"- {target_display}がすでに話し終えた前提で、自然に会話を続けてください。"
     )
 
 
