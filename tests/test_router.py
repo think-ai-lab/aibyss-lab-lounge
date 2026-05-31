@@ -85,6 +85,44 @@ class TestRouteDefault:
         assert result.reason == "name_hint"
 
 
+class TestRukaExcludedFromRouting:
+    """配信者本人 (ruka) はルーティング/ウェイク対象から除外される (誤トリガー防止)。
+
+    ルカが自己紹介等で自分の名前「ルカ」を口にしても、AI がウェイク/呼びかけと誤認して
+    応答しないことを保証する (実走で観測した誤トリガーの回帰防止)。
+    """
+
+    def test_ruka_alias_does_not_trigger(self):
+        """「ルカ」(ruka の alias) を含む発話で ruka にルーティングされない。"""
+        result = route("今日はルカが司会を務めます")
+        assert result.speaker != "ruka"
+        # 他キャラ名が無いのでデフォルト (= 名前ゲートが「未検出」として無視する)
+        assert result.reason == "default"
+
+    def test_ruka_display_name_does_not_trigger(self):
+        """display_name「坂東ルカ」を含む発話でも ruka にルーティングされない。"""
+        result = route("私の名前は坂東ルカです、よろしく")
+        assert result.speaker != "ruka"
+        assert result.reason == "default"
+
+    def test_ruka_name_hint_does_not_match(self):
+        """name_hint='ruka' でも ruka にはマッチせず、デフォルトに落ちる。"""
+        result = route("こんにちは", name_hint="ruka")
+        assert result.speaker != "ruka"
+
+    def test_other_character_still_matches_alongside_ruka_mention(self):
+        """「ルカ」と他キャラ名が同居する発話では、他キャラは正しくマッチする。"""
+        result = route("ミミ様、ルカだけど元気？")
+        assert result.speaker == "mimi"
+        assert result.reason == "text_match"
+
+    def test_octamaid_still_routable(self):
+        """octamaid はルーティング対象 (interjection 除外とは別。回帰防止)。"""
+        result = route("オクタメイド、次の手順は？")
+        assert result.speaker == "octamaid"
+        assert result.reason == "text_match"
+
+
 class TestFindAllMatches:
     """_find_all_matches のユニットテスト。"""
 

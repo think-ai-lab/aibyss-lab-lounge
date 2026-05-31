@@ -288,6 +288,15 @@ def _route_by_llm(
     return None
 
 
+# ルーティング/ウェイク対象から除外する slug。
+# ruka は配信者本人 (坂東ルカ) のキャラクター。発話者 = ルカ自身なので、ルカが自己紹介等で
+# 自分の名前「ルカ」を口にした際に AI がそれをウェイク/呼びかけと誤認して応答するのは不適切
+# (実走で誤トリガーを観測)。名前マッチの対象から外し、ルカの名前では wake しないようにする。
+# ※ interjection の _HANDRAISE_EXCLUDED_SLUGS とは別物 (あちらは octamaid も除外するが、
+#   octamaid は「オクタメイド」と呼べば応答すべき正規のルーティング対象なのでここでは除外しない)。
+_ROUTING_EXCLUDED_SLUGS: frozenset[str] = frozenset({"ruka"})
+
+
 def route(
     text: str,
     *,
@@ -305,7 +314,11 @@ def route(
     Returns:
         RoutingDecision (speaker slug + reason)
     """
-    characters = get_all_characters()
+    # 配信者本人 (ruka) はルーティング/ウェイク対象から除外する (誤トリガー防止)。
+    characters = [
+        c for c in get_all_characters()
+        if c.slug not in _ROUTING_EXCLUDED_SLUGS
+    ]
 
     # ログ強化 L-3: ルーティング系ログに発話 text preview を含めて「どの発話に対する
     # 判定か」を識別容易にする (= 連続するルーティング呼出を log で trace しやすく)

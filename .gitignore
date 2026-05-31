@@ -215,6 +215,8 @@ sherpa-models/
 
 # audio files
 data/audio/*.wav
+# filler_cache はキャラクターの合成音声 (VOICEPEAK/VOICEVOX)。リポジトリには含めず、
+# 各自 `uv run python scripts/generate_filler_cache.py` で再生成する (data/filler_phrases/*.txt から)。
 data/filler_cache/**/*.wav
 output.wav
 
