@@ -18,6 +18,8 @@ graph.py — LangGraph state graph（Agent 対応）
   Anthropic:  uv sync --extra llm-anthropic
 """
 
+import concurrent.futures
+import contextvars
 import functools
 import logging
 import operator
@@ -26,7 +28,12 @@ import time
 from typing import Annotated, Any, TypedDict
 
 from .character_status import CharacterStatus, CharacterStatusManager
-from .llm import LLMResult, call_llm
+from .llm import (
+    LLMResult,
+    call_llm,
+    get_llm_max_output_tokens,
+    get_llm_timeout_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,16 +100,50 @@ def _is_tools_enabled() -> bool:
 
 
 def _get_llm_for_agent(provider: str, model: str):
-    """プロバイダーに応じた LangChain Chat モデルを返す。"""
+    """プロバイダーに応じた LangChain Chat モデルを返す。
+
+    WHY (timeout / max_retries): timeout 無しのクライアントは LLM 応答が stall した際に
+    例外を投げず無限ハングし、Agent 全体 (agent.invoke) が固まって配信が停止する
+    (実走 run_loop_20260531_164001 で mimi の step 3 が観測)。per-request timeout +
+    自動 retry を付与することで、stall は APITimeoutError として送出され、run_agent の
+    except がフォールバック (単一ノード) へ流して配信が自力復帰する。値は env で調整可能。
+    """
+    timeout, max_retries = get_llm_timeout_config("agent")
+    # 出力トークン上限 (= 暴走生成の安全弁、None なら上限なし)。reasoning 系モデルが
+    # degenerate loop に入って 1 ステップで巨大出力 (実走で ~128k トークン観測) を出すのを
+    # 構造的に防ぐ。provider で param 名が異なる (openai/anthropic=max_tokens、
+    # google=max_output_tokens) ため分岐ごとに付与する。
+    max_out = get_llm_max_output_tokens()
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=model)
+        # google genai は max_retries=0 を「デフォルト(5 回)」と解釈するため、
+        # 0 を避けて最低 1 を渡す (明示的に有限回へ抑える)。
+        kwargs: dict[str, Any] = {
+            "model": model, "timeout": timeout, "max_retries": max(1, max_retries),
+        }
+        if max_out is not None:
+            kwargs["max_output_tokens"] = max_out
+        return ChatGoogleGenerativeAI(**kwargs)
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model)
+        kwargs = {"model": model, "timeout": timeout, "max_retries": max_retries}
+        if max_out is not None:
+            kwargs["max_tokens"] = max_out
+        return ChatAnthropic(**kwargs)
     else:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model)
+        kwargs = {"model": model, "timeout": timeout, "max_retries": max_retries}
+        if max_out is not None:
+            kwargs["max_tokens"] = max_out
+        # NOTE: ここでは reasoning_effort を付与しない。
+        # gpt-5.5 は「function tools + reasoning_effort」の組合せを /v1/chat/completions で
+        # 拒否する (400 BadRequest、要 /v1/responses。実走 run_loop_20260531_193332 で観測)。
+        # Agent は必ず bind_tools するため、ここで reasoning_effort を付けると毎回 400 →
+        # フォールバック (ツールなし) に落ち、ask_character が一切呼ばれなくなる regression に
+        # なる。reasoning_effort はツールを使わない経路 (llm._call_openai = フォールバック /
+        # 導入セリフ) でのみ適用する。Agent 経路で推論を抑えたい場合は Responses API
+        # (use_responses_api=True) への移行が必要 (別途検討)。
+        return ChatOpenAI(**kwargs)
 
 
 def _is_rag_enabled() -> bool:
@@ -412,9 +453,14 @@ class BubbleToolCallbackHandler:
         character_slug: str,
         common: dict,
         status_manager: "CharacterStatusManager | None" = None,
+        model: str = "",
+        provider: str = "",
     ):
         self._character_slug = character_slug
         self._common = common
+        # 原因究明ログ強化: LLM step エラー時に provider/model も併記するため保持。
+        self._model = model
+        self._provider = provider
         # Phase 0.5-B-α: ツール呼び出し時に Thinking → ToolCalling、終了時に
         # ToolCalling → Thinking を反映する。None 時は status 反映スキップ
         # (= 既存テスト互換、status_manager 未注入時の挙動維持)。
@@ -478,13 +524,21 @@ class BubbleToolCallbackHandler:
         )
 
     def on_llm_error(self, error, **kwargs) -> None:
-        """Agent 内部 LLM step エラー時のログ (Phase 0.5-F-6-f)。
+        """Agent 内部 LLM step エラー時のログ (Phase 0.5-F-6-f / timeout 強化)。
 
-        TimeoutError / APIConnectionError 等を再発時に検知できるようにする。
+        TimeoutError / APITimeoutError / APIConnectionError 等を再発時に検知できる
+        ようにする。timeout / retry 枯渇の原因究明用に、停止 step・step 開始からの
+        経過秒・provider/model を併記する (= 「どの呼出が何秒で何の例外で落ちたか」)。
         """
+        elapsed = (
+            f"{time.monotonic() - self._llm_step_t0:.1f}s"
+            if self._llm_step_t0 is not None else "unknown"
+        )
         logger.warning(
-            "Agent LLM step %d エラー [character=%s]: %s: %s",
+            "Agent LLM step %d エラー [character=%s provider=%s model=%s] "
+            "(step 開始から %s): %s: %s",
             self._llm_step_count, self._character_slug,
+            self._provider or "?", self._model or "?", elapsed,
             type(error).__name__, error,
         )
 
@@ -611,6 +665,7 @@ def run_graph(
         if agent is not None:
             return _run_agent(
                 agent, text, model,
+                provider=provider,
                 run_metadata=run_metadata,
                 character_slug=character_slug,
                 common=common,
@@ -638,11 +693,104 @@ def run_graph(
     return result
 
 
+def _get_agent_invoke_timeout() -> float:
+    """agent.invoke 全体の壁時計上限(秒)を env から取得する。既定 90。
+
+    WHY: per-request timeout (各 LLM 呼出) は HTTP stall を捕捉するが、Agent 内部の
+    デッドロックや非 HTTP 系ハングは捕捉できない。本ガードは agent.invoke 全体に
+    壁時計上限を課し、どんな原因でも必ず制御を返してフォールバック復帰させる最終防壁。
+    既定 90s は reasoning_effort=low で正常ターンが ~30-40s に収まる前提の保険値で、
+    per-request 40s × (1+retries=1) ≈ 80s を上回りつつ、ハング時の dead air を ~90s に抑える。
+    env (L2_AGENT_INVOKE_TIMEOUT_SEC) で調整可能。
+    """
+    return float(os.environ.get("L2_AGENT_INVOKE_TIMEOUT_SEC", "90"))
+
+
+def _invoke_agent_with_timeout(
+    agent,
+    input_data: dict,
+    config: "dict | None",
+    *,
+    timeout_sec: float,
+    character_slug: str | None,
+    provider: str,
+    model: str,
+    handler: "BubbleToolCallbackHandler | None",
+    session_id: str | None,
+):
+    """agent.invoke を別スレッドで実行し、壁時計 timeout で打ち切る (外側ガード)。
+
+    timeout 到達時は組込 ``TimeoutError`` を送出する。呼出元 (_run_agent) の
+    ``except Exception`` がこれを捕捉し、フォールバック (call_llm 単一ノード) に流して
+    配信を自力復帰させる。
+
+    制約 / 設計判断:
+      - Python はスレッドを強制 kill できないため、timeout 後も orphan thread は
+        裏で走り続ける。ただし各 LLM client に per-request timeout があるため、
+        その時間内に必ず自然終了する (= リークは有界)。dispatcher は 1 ターン
+        single-flight なので orphan が積み上がることはない。
+      - orphan の返り値は future 放棄で破棄される。発話 (TTS/再生) は _run_agent の
+        戻り値駆動で下流が行うため、orphan が最終応答を二重発話することはない。
+      - agent.invoke 全体の再実行はしない (ask_character の導入セリフ + target 発話を
+        二重再生してしまうため)。timeout 時は単一ノードへフォールバックのみ。
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    # contextvars を worker thread へ明示的に引き継ぐ (copy_context)。
+    # WHY: ThreadPoolExecutor の worker は呼出元の contextvars を複製しない。これをしないと
+    # agent がツール内で呼ぶ ask_character が参照する contextvar (caller_slug / on_tts_chunk /
+    # common / status_manager 等、ask_character.py:35-72) が worker thread で既定値に戻り、
+    # 導入セリフ生成・協働先 TTS が丸ごとスキップされる (実走 run_loop_20260531_185642 で
+    # caller=空 / on_tts_chunk=None による発話欠落を観測した regression)。
+    # copy_context() は呼出元 (pipeline) スレッドで set 済みの全 contextvar を捕捉する。
+    ctx = contextvars.copy_context()
+    future = executor.submit(ctx.run, agent.invoke, input_data, config or None)
+    try:
+        return future.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        # 原因究明ログ: どの LLM step で、step 開始から何秒経過して止まったか。
+        step = handler._llm_step_count if handler is not None else -1
+        step_elapsed = (
+            f"{time.monotonic() - handler._llm_step_t0:.1f}s"
+            if handler is not None and handler._llm_step_t0 is not None
+            else "unknown"
+        )
+        logger.error(
+            "Agent.invoke が %.0fs を超過 → 中断 [character=%s provider=%s model=%s]: "
+            "最終到達 LLM step=%d (step 開始から %s 経過)。"
+            "単一ノードにフォールバックします。",
+            timeout_sec, character_slug or "?", provider, model, step, step_elapsed,
+        )
+        # orphan が ask_character 実行中だった場合、target の未投入 BG TTS を停止する
+        # (= 中断したターンの協働応答が後から再生されるのを防ぐ)。
+        if session_id:
+            try:
+                from .mcp_servers.ask_character import cancel_bg_tts
+                cancelled = cancel_bg_tts(session_id)
+                if cancelled:
+                    logger.info(
+                        "Agent.invoke timeout: ask_character BG TTS を %d 件キャンセル "
+                        "[session=%s]", cancelled, session_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Agent.invoke timeout: cancel_bg_tts 失敗 [session=%s]: %s",
+                    session_id, exc,
+                )
+        raise TimeoutError(
+            f"agent.invoke が {timeout_sec:.0f}s を超過 "
+            f"(character={character_slug}, last_step={step})"
+        )
+    finally:
+        # orphan thread の終了は待たない (wait=False)。block すると timeout の意味が無い。
+        executor.shutdown(wait=False)
+
+
 def _run_agent(
     agent,
     text: str,
     model: str,
     *,
+    provider: str = "openai",
     run_metadata: dict | None = None,
     character_slug: str | None = None,
     common: dict | None = None,
@@ -667,9 +815,11 @@ def _run_agent(
     # bubble.update コールバック (Agent がツールを呼んだとき HUD に動的表示)
     # Phase 0.5-B-α: status_manager を Handler に渡し、tool 起動/終了で
     # Thinking ↔ ToolCalling を反映できるようにする。
+    handler: "BubbleToolCallbackHandler | None" = None
     if character_slug and common:
         handler = BubbleToolCallbackHandler(
             character_slug, common, status_manager=status_manager,
+            model=model, provider=provider,
         )
         config["callbacks"] = [handler]
 
@@ -683,7 +833,18 @@ def _run_agent(
     )
 
     try:
-        result = agent.invoke(input_data, config or None)
+        # 外側の壁時計ガードで agent.invoke 全体を包む (= 非 HTTP 系ハングの最終防壁)。
+        # timeout 時は TimeoutError を送出し、下の except がフォールバックへ流す。
+        session_id = common.get("session_id") if common else None
+        result = _invoke_agent_with_timeout(
+            agent, input_data, config,
+            timeout_sec=_get_agent_invoke_timeout(),
+            character_slug=character_slug,
+            provider=provider,
+            model=model,
+            handler=handler,
+            session_id=session_id,
+        )
         latency_ms = int((time.monotonic() - t0) * 1000)
 
         response_text = ""
@@ -790,10 +951,12 @@ def _run_agent(
         )
         # フォールバック: 従来の単一ノード構成 (system_prompt を引き継ぐ)
         # ログ強化 L-3: caller_slug でログにキャラ識別を残す
+        # provider は元のキャラの provider を使う (旧実装は "openai" 固定で、anthropic/
+        # google キャラが timeout 時に OpenAI へ化けて口調/挙動が変わるバグだった)。
         return call_llm(
             text,
             model=model,
-            provider="openai",
+            provider=provider,
             system_prompt=system_prompt,
             caller_slug=character_slug,
         )

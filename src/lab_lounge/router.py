@@ -25,6 +25,7 @@ from .characters import (
     get_all_characters,
     get_default_character,
 )
+from .llm import get_llm_timeout_config
 
 # Phase 0.5-J: filler.py と同じく google.genai を module top で eager import する。
 # router.py の _call_router_llm でも google branch があり、filler との並列実行で
@@ -171,10 +172,15 @@ def _call_router_llm(
         {"role": "user", "content": user_text},
     ]
 
+    # per-request timeout + 自動 retry。判定経路 (dispatcher) なので scope="router"
+    # (短め timeout) を使い、stall 時に早期復帰させる。timeout 無しだと判定 LLM の
+    # ハングが dispatcher を固め、配信全体が停止する (実走 20260522 で観測した 529 も同経路)。
+    _timeout, _max_retries = get_llm_timeout_config("router")
+
     try:
         if provider == "anthropic":
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(timeout=_timeout, max_retries=_max_retries)
             resp = client.messages.create(
                 model=model,
                 max_tokens=20,
@@ -188,7 +194,12 @@ def _call_router_llm(
             # Phase 0.5-J: module top の eager import を参照 (= 旧 lazy import を削除)。
             if _GOOGLE_GENAI is None or _GOOGLE_GENAI_TYPES is None:
                 raise ImportError("google.genai is required for provider=google")
-            client = _GOOGLE_GENAI.Client()
+            # google genai は timeout を http_options にミリ秒で渡す。
+            client = _GOOGLE_GENAI.Client(
+                http_options=_GOOGLE_GENAI_TYPES.HttpOptions(
+                    timeout=int(_timeout * 1000),
+                ),
+            )
             resp = client.models.generate_content(
                 model=model,
                 contents=user_text,
@@ -202,7 +213,7 @@ def _call_router_llm(
 
         else:
             import openai
-            client = openai.OpenAI()
+            client = openai.OpenAI(timeout=_timeout, max_retries=_max_retries)
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,

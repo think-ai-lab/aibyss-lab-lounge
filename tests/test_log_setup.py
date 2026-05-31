@@ -198,12 +198,23 @@ class TestSensitiveLoggerSuppression:
         assert logging.getLogger("httpx").level == logging.WARNING
         assert logging.getLogger("httpcore").level == logging.WARNING
 
-    def test_llm_provider_loggers_set_to_warning(self, tmp_path, monkeypatch):
-        """OpenAI / Anthropic / Google GenAI の logger が WARNING 以上に抑制される。"""
+    def test_llm_retry_loggers_set_to_info(self, tmp_path, monkeypatch):
+        """OpenAI / Anthropic の _base_client は retry 行を出すため INFO に解放される。
+
+        timeout / overloaded で自動 retry が起きた原因を追えるようにするための変更。
+        retry 行は URL パスのみ (API キー非含有) のため INFO 解放は安全。
+        L2_LLM_DEBUG_HTTP 未設定時は INFO。
+        """
+        monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
+        monkeypatch.delenv("L2_LLM_DEBUG_HTTP", raising=False)
+        setup_logging(session_name="test_llm")
+        assert logging.getLogger("openai._base_client").level == logging.INFO
+        assert logging.getLogger("anthropic._base_client").level == logging.INFO
+
+    def test_google_genai_loggers_stay_warning(self, tmp_path, monkeypatch):
+        """Google GenAI の logger は引き続き WARNING に抑制される (機密情報配慮)。"""
         monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
         setup_logging(session_name="test_llm")
-        assert logging.getLogger("openai._base_client").level == logging.WARNING
-        assert logging.getLogger("anthropic._base_client").level == logging.WARNING
         assert logging.getLogger("google_genai.models").level == logging.WARNING
         assert logging.getLogger("google.genai").level == logging.WARNING
 

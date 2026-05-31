@@ -45,6 +45,8 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .llm import get_llm_timeout_config
+
 # Phase 0.5-J: google.genai を module top で eager import することで、複数スレッド間の
 # 並列 import (= filler スレッド + 本命 LLM スレッド経由の langchain-google-genai が
 # 同 ms 内で google.genai.types を import) による circular import race condition を
@@ -514,10 +516,14 @@ def _call_filler_llm(
     """
     provider = _detect_provider(model)
 
+    # per-request timeout + 自動 retry。filler も raw SDK クライアントを直接生成するため
+    # timeout 無しだとハングし、本応答の前段で固まりうる。scope="router" (短め timeout)。
+    _timeout, _max_retries = get_llm_timeout_config("router")
+
     try:
         if provider == "anthropic":
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(timeout=_timeout, max_retries=_max_retries)
             resp = client.messages.create(
                 model=model,
                 max_tokens=150,
@@ -532,7 +538,12 @@ def _call_filler_llm(
             # _GOOGLE_GENAI が None なら package 未インストール、明示的 ImportError を投げる。
             if _GOOGLE_GENAI is None or _GOOGLE_GENAI_TYPES is None:
                 raise ImportError("google.genai is required for provider=google")
-            client = _GOOGLE_GENAI.Client()
+            # google genai は timeout を http_options にミリ秒で渡す。
+            client = _GOOGLE_GENAI.Client(
+                http_options=_GOOGLE_GENAI_TYPES.HttpOptions(
+                    timeout=int(_timeout * 1000),
+                ),
+            )
             resp = client.models.generate_content(
                 model=model,
                 contents=user_text,
@@ -546,7 +557,7 @@ def _call_filler_llm(
 
         else:
             import openai
-            client = openai.OpenAI()
+            client = openai.OpenAI(timeout=_timeout, max_retries=_max_retries)
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
