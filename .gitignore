@@ -227,3 +227,20 @@ output.wav
 # 構造を伝えるテンプレ current.example.md のみ commit 対象 (下の例外指定で残す)。
 data/stream_context/*.md
 !data/stream_context/current.example.md
+
+# benchmark results
+# tests/bench_ttft.py の計測生データ。再計測で再生成できるローカル作業ファイルのため
+# リポジトリには含めない。
+bench_ttft_results.csv
+
+# ─── キャラクター資産（Think-AI Lab. 予約資産・ライセンス対象外）────────────────────
+# 実キャラの人格プロンプト・詳細設定はコードの Apache-2.0 とは別に全権利を留保するため
+# 追跡しない（実体はローカルに残し、ローダーは samples/ にフォールバックする）。
+# 構造を学べる中立サンプルは samples/ に Apache-2.0 で同梱。詳細は CHARACTERS.md 参照。
+src/lab_lounge/system_prompts/*
+!src/lab_lounge/system_prompts/samples/
+!src/lab_lounge/system_prompts/samples/**
+# character_detail はコード未使用の予約レイヤ。プレースホルダのみ追跡。
+src/lab_lounge/character_detail/*
+!src/lab_lounge/character_detail/.gitkeep
+!src/lab_lounge/character_detail/README.md
