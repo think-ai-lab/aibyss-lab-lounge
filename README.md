@@ -397,7 +397,9 @@ aibyss-lab-lounge/
 ## ライセンス
 
 - 本リポジトリのコードは [Apache License 2.0](./LICENSE) の下で公開しています。
-- Think-AI Lab. のキャラクター（名称・人格設定・詳細設定・プロンプト・画像・音声設定）は
-  ライセンスの対象外で、すべての権利を留保します。詳細は [CHARACTERS.md](./CHARACTERS.md) を参照してください。
-- `src/lab_lounge/system_prompts/samples/` のサンプルキャラクターは Apache-2.0 です。
+- `src/lab_lounge/system_prompts/samples/` のサンプルキャラクターも Apache-2.0 です。
   自由に改変してご利用ください。
+- 上記を除く Think-AI Lab. のキャラクター資産（`system_prompts` / `character_detail` の実プロンプト・
+  詳細設定、および名称・人格設定・画像・音声設定）は、参考情報としてリポジトリ内に公開しますが、
+  すべての権利を留保します（再利用のライセンスは付与しません）。詳細は [CHARACTERS.md](./CHARACTERS.md) と
+  各ディレクトリの LICENSE を参照してください。
