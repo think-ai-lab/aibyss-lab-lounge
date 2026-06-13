@@ -62,45 +62,59 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         display_name="ミミ・オクタヴィア",
         nickname="ミミ",
         wake_word="ミミ様",
-        tts_provider="voicepeak",
-        tts_voice="Asumi Ririse",
+        # TTS: irodori VoiceDesign（確定版）。サイドカー起動が前提
+        #   （aibyss.ps1 start -Irodori）。VOICEPEAK に戻すには
+        #   tts_provider="voicepeak" / tts_voice="Asumi Ririse"。
+        #   tts_voice は reference_voices/voices.json の voices.<key>（例 "mimi"）。
+        tts_provider="irodori_vd",
+        tts_voice="mimi",
         system_prompt_file="system_mimi.txt",
         llm_provider="openai",
         llm_model="gpt-5.5",
         filler_model="gpt-5.4-mini",
         porcupine_model="mimi-sama_ja_windows_v4_0_0.ppn",
         aliases=["ミミ", "お嬢様"],
-        voicepeak_emotion_keys=("happy", "fun", "angry", "sad", "sulky"),
+        # irodori pose-only 化に伴い emotion 軸オフ（pose + speed で表現）。VOICEPEAK に
+        # 戻す場合は ("happy","fun","angry","sad","sulky") を復元 + プロンプトの emotion 復元。
+        voicepeak_emotion_keys=(),
     ),
     "chisame": CharacterConfig(
         slug="chisame",
         display_name="波心ちさめ",
         nickname="ちさめ",
         wake_word="ちさめさん",
-        tts_provider="voicepeak",
-        tts_voice="Miyamai Moca",
+        # TTS: irodori VoiceDesign（確定版）。VOICEPEAK に戻すには
+        #   tts_provider="voicepeak" / tts_voice="Miyamai Moca"。
+        tts_provider="irodori_vd",
+        tts_voice="chisame",
         system_prompt_file="system_chisame.txt",
         llm_provider="google",
         llm_model="gemini-3.1-pro-preview",
         filler_model="gemini-3.1-flash-lite",
         porcupine_model="chisame-san_ja_windows_v3_0_0.ppn",
         aliases=["ちさめ"],
-        voicepeak_emotion_keys=("bosoboso", "doyaru", "honwaka", "angry", "teary"),
+        # irodori pose-only 化に伴い emotion 軸オフ。VOICEPEAK に戻す場合は
+        # ("bosoboso","doyaru","honwaka","angry","teary") を復元 + プロンプトの emotion 復元。
+        voicepeak_emotion_keys=(),
     ),
     "sakura": CharacterConfig(
         slug="sakura",
         display_name="八重笠さくら",
         nickname="さくら",
         wake_word="さくらさん",
-        tts_provider="voicepeak",
-        tts_voice="Haruno Sora",
+        # TTS: irodori VoiceDesign（確定版）。VOICEPEAK に戻すには
+        #   tts_provider="voicepeak" / tts_voice="Haruno Sora"。
+        tts_provider="irodori_vd",
+        tts_voice="sakura",
         system_prompt_file="system_sakura.txt",
         llm_provider="anthropic",
         llm_model="claude-sonnet-4-6",
         filler_model="claude-haiku-4-5",
         porcupine_model="sakura-san_ja_windows_v3_0_0.ppn",
         aliases=["さくら", "桜さん", "桜"],
-        voicepeak_emotion_keys=("happy", "sad", "angry", "whisper", "cool"),
+        # irodori pose-only 化に伴い emotion 軸オフ。VOICEPEAK に戻す場合は
+        # ("happy","sad","angry","whisper","cool") を復元 + プロンプトの emotion 復元。
+        voicepeak_emotion_keys=(),
     ),
     "octamaid": CharacterConfig(
         slug="octamaid",
@@ -123,6 +137,24 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         system_prompt_file="system_ruka.txt",
         porcupine_model=None,
         aliases=["ルカ"],
+    ),
+    "aruka": CharacterConfig(
+        slug="aruka",
+        display_name="アルカ",
+        nickname="アルカ",
+        # 暫定 wake word。.ppn 未整備のため Porcupine 検知は porcupine_model=None で当面オフ
+        # （ルーティングは name/aliases のテキスト一致で可能）。
+        wake_word="アルカさん",
+        # TTS: irodori VoiceDesign（確定版、AI ホスト）。VOICEVOX に戻すなら
+        #   tts_provider="voicevox" / tts_voice=<冥鳴ひまりの style id>。
+        tts_provider="irodori_vd",
+        tts_voice="aruka",
+        system_prompt_file="system_aruka.txt",
+        porcupine_model=None,
+        aliases=["アルカ", "Aルカ", "アルカさん"],
+        # アルカは emotion パラメータを持たない（LLM 出力は {speed, pose, response}）。
+        # 感情は pose + speed + 文体で表現。空タプル = フィラーは emotion JSON を生成しない。
+        voicepeak_emotion_keys=(),
     ),
 }
 

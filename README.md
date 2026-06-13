@@ -111,6 +111,12 @@ uv sync --extra llm --extra llm-google --extra llm-anthropic `
 > **TTS の VOICEPEAK / VOICEVOX について**: VOICEPEAK は別途インストールし PATH を通すか
 > `L2_TTS_VOICEPEAK_PATH` で指定する。VOICEVOX は Engine をローカル起動する
 > （`docker run -p 50021:50021 voicevox/voicevox_engine:latest`）。
+>
+> **irodori-TTS（ニューラル音声クローン / VoiceDesign）について**: torch + CUDA を使うため
+> 別プロセスの HTTP サイドカーとして動かす（[`sidecar/README.md`](sidecar/README.md)）。起動は
+> `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` か `scripts/run_irodori_sidecar.ps1`。
+> provider は `irodori_vd`（VoiceDesign）。確定版は self-ref アンカー + caption + seed + sway24。
+> どのキャラがどの provider を使うかは `characters.py` で定義する（確定版は ミミ/ちさめ/さくら/アルカ）。
 
 ### 環境変数
 
@@ -129,7 +135,9 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | `L2_LLM_PROVIDER` / `L2_LLM_MODEL` | `openai` / `gpt-5.4` | 既定プロバイダ・モデル（**フォールバック**。キャラ別の指定が `characters.py` にあればそちらが優先） |
 | `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` | *(real mode 時)* | 各 LLM プロバイダの API キー |
 | `L2_USE_REAL_TTS` | `false` | `true` で real TTS を呼ぶ |
-| `L2_TTS_PROVIDER` | `voicevox` | TTS プロバイダ（`edge_tts` / `voicevox` / `voicepeak`） |
+| `L2_TTS_PROVIDER` | `voicevox` | 既定 TTS プロバイダ（`edge_tts` / `voicevox` / `voicepeak` / `irodori_vd`）。キャラ単位は `characters.py` で定義 |
+| `L2_TTS_IRODORI_URL` | `http://127.0.0.1:50080` | irodori サイドカーの URL（[`sidecar/`](sidecar/README.md)） |
+| `L2_IRODORI_VOICES_JSON` / `L2_IRODORI_READINGS_JSON` | `reference_voices/voices.json` / `…/readings.json` | irodori 設定の正典 / 読み辞書（読みが欠損でも動作） |
 | `L2_USE_REAL_STT` | `false` | `true` で real STT を呼ぶ |
 | `L2_STT_PROVIDER` | `faster-whisper` | STT プロバイダ（`openai` / `faster-whisper` / `sherpa-onnx`） |
 | `L2_DEFAULT_SPEAKER` | `octamaid` | 既定キャラ slug（wake hint / 文字列一致なし時） |
@@ -152,14 +160,51 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 
 | slug | 表示名 | ウェイクワード | LLM | TTS（ボイス） |
 |------|--------|--------------|-----|--------------|
-| `mimi` | ミミ・オクタヴィア | ミミ様 | OpenAI `gpt-5.5` | VOICEPEAK（Asumi Ririse） |
-| `chisame` | 波心ちさめ | ちさめさん | Google `gemini-3.1-pro-preview` | VOICEPEAK（Miyamai Moca） |
-| `sakura` | 八重笠さくら | さくらさん | Anthropic `claude-sonnet-4-6` | VOICEPEAK（Haruno Sora） |
+| `mimi` | ミミ・オクタヴィア | ミミ様 | OpenAI `gpt-5.5` | irodori VoiceDesign（mimi） |
+| `chisame` | 波心ちさめ | ちさめさん | Google `gemini-3.1-pro-preview` | irodori VoiceDesign（chisame） |
+| `sakura` | 八重笠さくら | さくらさん | Anthropic `claude-sonnet-4-6` | irodori VoiceDesign（sakura） |
 | `octamaid` | オクタメイド | オクタメイド | 既定（OpenAI） | VOICEVOX（89 / Voidoll） |
 | `ruka` | 坂東ルカ | *(なし)* | 既定（OpenAI） | VOICEPEAK（Frimomen） |
+| `aruka` | アルカ（AIホスト） | アルカさん | 既定（OpenAI） | irodori VoiceDesign（aruka） |
+
+VOICEPEAK に戻すには `characters.py` の該当キャラの `tts_provider="voicepeak"` ＋ `tts_voice`（Asumi Ririse / Miyamai Moca / Haruno Sora）を編集する。
 
 各キャラのシステムプロンプトは `src/lab_lounge/system_prompts/` に配置。
-VOICEPEAK キャラは emotion キー（happy/fun/angry/sad/sulky 等）を持ち、フィラーや感情表現に使う。
+irodori_vd キャラ（ミミ/ちさめ/さくら/アルカ）は **pose-only**：LLM 出力は `{speed, pose, response}` で、
+pose → 本文末の正規絵文字 + caption 末尾サフィックス、speed → duration_scale に変換される
+（声質は self-ref アンカー + caption + seed で固定。emotion は使わない）。
+設定の正典は `reference_voices/voices.json`（`L2_IRODORI_VOICES_JSON`）でデータ駆動。
+将来 VOICEPEAK を採用するキャラは `voicepeak_emotion_keys` を持ち emotion を出力する（機構は温存）。
+
+### 読み辞書（readings）
+
+irodori はエンジン側に読み上げ辞書 / g2p を**持たない**ため、英単語・略語・固有名詞を誤読する
+（例: `JSON`→ジュウソン、`波心`→なみごころ）。そこで L2 が **「喋るテキスト」にだけ** 読み置換を
+適用する（**HUD/字幕は元のまま** — 画面は「RAG」、音声は「ラグ」）。VOICEPEAK/VOICEVOX の
+エンジン内辞書に相当する機能を L2 側で一元化したもの。
+
+- **辞書本体**: `reference_voices/readings.json`（`L2_IRODORI_READINGS_JSON`）。voices.json と同居。
+  - `global`: 表層 → カタカナ読み（全キャラ共通）。`characters.<slug>` で個別上書き可。
+  - 置換は **longest-match-first**（`Think-AI Lab` を `Lab` より先に）。
+  - **欠損しても動く**（補正なしで素通り）→ 削除すればロールバック。
+- **編集**: `readings.json` の `global` に `"表層": "カタカナ読み"` を足すだけ。L2 再起動で反映。
+- **文脈依存の多音字は対象外**（`方`=かた/ほう、`十分`=じゅうぶん/じっぷん 等）。素朴な置換では
+  一方の読みを強制して他方を壊すため `_excluded_review` に隔離し**適用しない**（irodori に任せる）。
+- **アクセント**: irodori はアクセント制御の入力を持たない（モデルが自動決定）。実測では
+  通常文のアクセントは妥当（最小対 箸/橋 を区別）。`.vdc2` の accent は `_accent_meta` として
+  inert 保持（VOICEPEAK 復帰 / 将来の対応モデル用）。
+- **VOICEPEAK 辞書からの生成**: VOICEPEAK でエクスポートした `.vdc2`（JSON）から初期辞書を作れる:
+  ```powershell
+  uv run python scripts/import_vdc2_readings.py --vdc2 <export>.vdc2 --out reference_voices/readings.json
+  ```
+
+> **小数点を含む数字**: irodori は小数点 `.` を読めない（`GPT-5.5` / `Gemini Pro 3.1` 等が誤読）。
+> 喋るテキストの小数を自動正規化する（`5.5`→「ごてんご」、`3.14`→「さんてんいちよん」。
+> 整数部は数字のまま・小数点は「てん」・小数部は桁読み）。HUD は `5.5` のまま、辞書編集は不要（常時自動）。
+
+> **短文の末尾幻聴**: irodori は短文の尺を過剰予測し、余尺を「それっぽい発話」で埋めることがある
+> （「○○ですわ」のような語尾の反復）。L2 は短文（既定 ≤12 字）に **manual duration** を与えて
+> 尺予測器をバイパスし抑制する。`L2_TTS_IRODORI_SHORT_CHARS` / `_SEC_PER_CHAR` / `_MIN_SEC` で調整可。
 
 ---
 

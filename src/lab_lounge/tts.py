@@ -1006,13 +1006,483 @@ def _call_voicepeak(
     )
 
 
+# ─── irodori-TTS adapter (VoiceDesign / HTTP サイドカー経由) ──────────
+#
+# irodori-tts は torch + CUDA を要する重い ML スタックのため L2 本体には取り込まず、
+# 別プロセスの HTTP サイドカー (sidecar/irodori_server.py) として起動する。ここは
+# その stdlib HTTP クライアント (VOICEVOX adapter と同じく urllib のみで実装し、
+# L2 に新規依存を増やさない)。
+#
+# provider "irodori_vd": VoiceDesign。声は固定 (self-ref アンカー + caption + seed)。
+# 表現は pose (→ 本文末の正規絵文字 + caption 末尾サフィックス) と speed (→ ds) のみ。
+# irodori は emotion 強度入力を持たないため emotion dict は使わない (pose-only)。
+#
+# キャラ別設定 (caption / アンカー / seed / cfg / pose_map) は voices.json を
+# データ駆動で実行時ロードする (単一の真実源)。正典:
+# T:\irodori-tts\reference_voices\voices.json (L2_IRODORI_VOICES_JSON で上書き可)。
+# サイドカーは generic な合成エンドポイントに保つ (他ツールからも再利用可)。
+
+
+def _voices_json_path() -> Path:
+    """irodori 確定設定の正典 voices.json のパス (L2_IRODORI_VOICES_JSON で上書き可)。"""
+    return Path(
+        os.environ.get(
+            "L2_IRODORI_VOICES_JSON",
+            r"T:\irodori-tts\reference_voices\voices.json",
+        )
+    )
+
+
+# voices.json は解決済みパスごとにキャッシュ (テストで別 fixture を指しても汚染しない)。
+# 実行中に voices.json を編集した場合は L2 再起動で反映される (= .env と同様の扱い)。
+_voices_cache: dict[str, dict] = {}
+
+
+def _load_voices(path: Path | None = None) -> dict:
+    """voices.json を読み込んで返す (パスでキャッシュ)。
+
+    Returns:
+        raw dict ({"common": {...}, "voices": {slug: {caption, ref_wav, seed, pose_map, ...}}})。
+        ref_wav の絶対パス化は _resolve_irodori_voice 側で行う。
+
+    Raises:
+        FileNotFoundError: voices.json が存在しない (irodori_vd には必須)
+    """
+    import json as _json
+
+    p = (path or _voices_json_path()).resolve()
+    key = str(p)
+    cached = _voices_cache.get(key)
+    if cached is not None:
+        return cached
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"irodori voices.json が見つかりません: {p}。"
+            f" L2_IRODORI_VOICES_JSON で reference_voices/voices.json を指定してください。"
+        )
+    data = _json.loads(p.read_text(encoding="utf-8"))
+    _voices_cache[key] = data
+    return data
+
+
+def _readings_path() -> Path:
+    """irodori 読み辞書 readings.json のパス (L2_IRODORI_READINGS_JSON で上書き可)。"""
+    return Path(
+        os.environ.get(
+            "L2_IRODORI_READINGS_JSON",
+            r"T:\irodori-tts\reference_voices\readings.json",
+        )
+    )
+
+
+# readings.json も解決済みパスごとにキャッシュ (voices と同型)。実行中の編集は L2 再起動で反映。
+_readings_cache: dict[str, dict] = {}
+
+
+def _load_readings(path: Path | None = None) -> dict:
+    """読み辞書 readings.json を読み込んで返す (パスでキャッシュ)。
+
+    voices.json と違い **欠損は致命ではない**: 辞書が無くても irodori は動く
+    (読みが補正されないだけ) ので、ファイルが無ければ空 dict を返して passthrough する。
+
+    Returns:
+        {"global": {surface: reading}, "characters": {voice: {surface: reading}}, ...}
+        または欠損時 {}。
+    """
+    import json as _json
+
+    p = (path or _readings_path()).resolve()
+    key = str(p)
+    cached = _readings_cache.get(key)
+    if cached is not None:
+        return cached
+    if not p.is_file():
+        # 辞書なしでも動く (no-op)。ログだけ残して空をキャッシュ (毎回 stat しない)。
+        logger.info("irodori readings.json が無いため読み辞書なしで動作します: %s", p)
+        _readings_cache[key] = {}
+        return {}
+    data = _json.loads(p.read_text(encoding="utf-8"))
+    _readings_cache[key] = data
+    return data
+
+
+def _apply_readings(text: str, voice: str) -> str:
+    """喋るテキストに読み辞書を適用して返す (表層 → カタカナ読み)。
+
+    irodori はエンジン側の読み辞書を持たず、英単語・略語・固有名詞を誤読する
+    (実測: JSON→ジュウソン, Claude→キーエカ, 波心→なみごころ 等)。そこで
+    **サイドカーへ送るテキストにだけ** 読み置換を適用する (HUD/字幕は元のまま保つ)。
+
+    マージ規則:
+      - readings["global"] を土台に readings["characters"][voice] (あれば) で上書き
+        (キャラ別が優先)。
+
+    置換規則 (longest-match-first):
+      - 表層を長い順に並べた単一の正規表現で **1 パス置換** する。同じ位置では
+        最長の表層が選ばれる ("Think-AI Lab" を "Lab" より優先)。単一パスなので
+        置換後の読み (カタカナ) が再マッチして二重置換される事故も起きない。
+      - re.escape で "A.I.byss" 等の記号を literal 化する。
+      - _excluded_review (文脈依存の多音字) / _accent_meta は適用しない (loader が無視)。
+      - 辞書が空 (ファイル欠損含む) なら text をそのまま返す (no-op)。
+
+    注: 表層が 140 字チャンク境界を跨ぐ稀ケースは未対応 (実害ほぼなし)。
+    """
+    readings = _load_readings()
+    if not readings:
+        return text
+    merged = dict(readings.get("global", {}))
+    merged.update(readings.get("characters", {}).get(voice, {}))
+    surfaces = [s for s in merged if s]  # 空文字 surface はパターンを壊すので除外
+    if not surfaces:
+        return text
+    import re as _re
+
+    # 長い表層を先の alternative に置く → 同位置で最長一致が選ばれる (longest-match-first)。
+    pattern = _re.compile("|".join(_re.escape(s) for s in sorted(surfaces, key=len, reverse=True)))
+    return pattern.sub(lambda m: merged[m.group(0)], text)
+
+
+# 小数部を 1 桁ずつ読ませるためのカナ表 (3.14 → さんてん「いちよん」。「じゅうよん」にしない)。
+_DECIMAL_DIGIT_KANA = {
+    "0": "ゼロ", "1": "いち", "2": "に", "3": "さん", "4": "よん",
+    "5": "ご", "6": "ろく", "7": "なな", "8": "はち", "9": "きゅう",
+}
+
+
+def _normalize_decimals(text: str) -> str:
+    """小数 (数字.数字) を irodori が読める形に正規化する ("5.5" → "5てんご")。
+
+    irodori は g2p を持たず小数点 "." を読めない (実機確認: GPT-5.5 / Gemini Pro 3.1 等の
+    小数が誤読される)。そこで喋るテキストの小数を:
+      - 整数部 … 数字のまま (irodori は整数を読める: 12 → じゅうに)
+      - 小数点 … 「てん」 (実測 probe7: "5てん5" は小数点として発声される)
+      - 小数部 … 数字を 1 桁ずつカナ化 (小数は桁読み: 3.14 → さんてんいちよん。
+                 "14" を「じゅうよん」と読ませない)
+    に正規化する。数字に挟まれない "." (A.I.byss / 文末 等) は対象外。読み辞書と同じく
+    **喋るテキストにだけ** 適用し、HUD/字幕には元の "5.5" を残す (呼出側で元 chunk を渡す)。
+    """
+    import re as _re
+
+    def _repl(m) -> str:
+        int_part, frac = m.group(1), m.group(2)
+        return int_part + "てん" + "".join(_DECIMAL_DIGIT_KANA[d] for d in frac)
+
+    return _re.sub(r"(\d+)\.(\d+)", _repl, text)
+
+
+def _irodori_url() -> str:
+    """サイドカーの /synthesize URL を返す (L2_TTS_IRODORI_URL で base 上書き可)。"""
+    base = os.environ.get("L2_TTS_IRODORI_URL", "http://127.0.0.1:50080").rstrip("/")
+    return f"{base}/synthesize"
+
+
+def _speed_to_duration_scale(speed: int | None) -> float:
+    """VOICEPEAK 互換の speed (既定 100) を irodori の duration_scale に変換する。
+
+    duration_scale = max(0.85, 100/speed)。speed が大きい (速い) ほど短く (=<1)、
+    小さいほど長く (=>1)。**0.85 を下限にクランプする**: ds<~0.7 は拡散が内容を詰め込めず
+    後半が崩壊する (PoC ASR 実証: ds0.645 sim0.83 → ds0.85 sim0.98)。早口は ds≈0.85+caption。
+    speed 未指定 / 不正は 1.0 (等倍)。
+    """
+    if not speed or speed <= 0:
+        return 1.0
+    return round(max(0.85, 100.0 / float(speed)), 3)
+
+
+# 短文の末尾幻聴 (= 尺の過剰予測) 抑制パラメータ。すべて env で上書き可。
+# WHY: irodori の duration predictor は短文の尺を過剰予測し (~3.4s floor)、余尺を
+# 「それっぽい発話」(語尾の癖の反復) で埋める = 末尾幻聴。duration_scale では取り戻せない
+# (実測 probe3: ds0.85 でも どうも/橋 は幻聴)。そこで短文だけ manual duration
+# (SamplingRequest.seconds) で predictor をバイパスし、文字数ベースで尺を直接与える
+# (実測 probe4: len×0.27s で どうも/橋 も完全クリーン、内容欠落なし)。
+# 漢字密集の極短文は char 数が実モーラを過小評価し早口になりうるが、内容は保持され
+# 幻聴の garble よりはるかに軽微 (ルカ判断で char ベース採用)。rate/閾値は実走で微調整。
+_IRODORI_SHORT_CHARS = int(os.environ.get("L2_TTS_IRODORI_SHORT_CHARS", "12"))
+_IRODORI_SEC_PER_CHAR = float(os.environ.get("L2_TTS_IRODORI_SEC_PER_CHAR", "0.26"))
+_IRODORI_MIN_SEC = float(os.environ.get("L2_TTS_IRODORI_MIN_SEC", "0.6"))
+
+
+def _short_text_seconds(spoken_text: str) -> float | None:
+    """短文なら manual duration 秒、そうでなければ None (predictor 任せ) を返す。
+
+    irodori は短文の尺を過剰予測して末尾を幻聴で埋める。閾値 (_IRODORI_SHORT_CHARS、
+    既定 12 字) 以下のテキストは len×_IRODORI_SEC_PER_CHAR 秒 (下限 _IRODORI_MIN_SEC)
+    の手動尺を返し、サイドカー側で predictor をバイパスさせる。閾値超は None
+    (predictor は長文では尺が妥当なので任せる)。
+
+    注: 文字数ベースの粗い見積もり。漢字密集の極短文は実モーラを過小評価しうるが、
+    早口化 (内容保持) は幻聴 garble より軽微。env で rate/閾値を調整可能。
+    """
+    n = len(spoken_text.strip())
+    if n == 0 or n > _IRODORI_SHORT_CHARS:
+        return None
+    return round(max(_IRODORI_MIN_SEC, n * _IRODORI_SEC_PER_CHAR), 2)
+
+
+def _resolve_irodori_voice(voice: str) -> dict:
+    """voice キーを voices.json から解決する (ref_wav は絶対パス化)。
+
+    Returns:
+        {"ref_wav": <abs path|None>, "caption": str, "seed": int|None,
+         "cfg_scale_speaker": float, "num_steps": int, "t_schedule_mode": str}
+
+    Raises:
+        ValueError:          voices.json に未登録の voice
+        FileNotFoundError:   voices.json が存在しない
+    """
+    data = _load_voices()
+    voices = data.get("voices", {})
+    entry = voices.get(voice)
+    if entry is None:
+        raise ValueError(
+            f"irodori voice {voice!r} が voices.json にありません。登録済み: {sorted(voices)}"
+        )
+    common = data.get("common", {})
+    realtime = common.get("realtime", {})
+    ref_wav = None
+    ref_wav_file = entry.get("ref_wav")
+    if ref_wav_file:
+        # ref_wav は voices.json のあるディレクトリ基準で解決する。
+        ref_wav = str(_voices_json_path().resolve().parent / ref_wav_file)
+    return {
+        "ref_wav": ref_wav,
+        "caption": entry.get("caption", ""),
+        "seed": entry.get("seed"),
+        "cfg_scale_speaker": float(common.get("cfg_scale_speaker", 5.0)),
+        "num_steps": int(realtime.get("num_steps", 24)),
+        "t_schedule_mode": str(realtime.get("t_schedule_mode", "sway")),
+    }
+
+
+def _irodori_control(voice: str, pose: str | None) -> tuple[str, str]:
+    """キャラの pose を (本文末絵文字, caption サフィックス) に変換する (pose-only)。
+
+    voices.json の pose_map[voice][pose] を引く。未対応 pose は ("", "") = neutral 扱い。
+    emoji は ALLOWED_ANNOTATION_EMOJIS のみ (voices.json 側で担保)。
+
+    irodori は声が固定で emotion 強度入力を持たないため、表現は pose と speed のみ
+    (emotion dict は使わない)。
+    """
+    if not pose:
+        return "", ""
+    try:
+        voices = _load_voices().get("voices", {})
+    except FileNotFoundError:
+        return "", ""
+    pose_map = voices.get(voice, {}).get("pose_map", {})
+    ctrl = pose_map.get(pose)
+    if not ctrl:
+        return "", ""
+    return ctrl.get("emoji", ""), ctrl.get("caption_suffix", "")
+
+
+def _generate_irodori_single_file(
+    chunk_text: str,
+    *,
+    caption: str,
+    ref_wav: str | None,
+    duration_scale: float,
+    num_steps: int,
+    t_schedule_mode: str,
+    cfg_scale_speaker: float,
+    seed: int | None,
+    filepath: Path,
+    url: str,
+    seconds: float | None = None,
+) -> tuple[int, int]:
+    """1 チャンク分を irodori サイドカー (VoiceDesign) に合成依頼し WAV を保存する。
+
+    サイドカーは PCM16 WAV を返すので、VOICEVOX 経路と同様に stdlib `wave` で
+    duration / sample_rate を読む。
+
+    Args:
+        seconds: 手動 duration (秒)。指定すると irodori の duration predictor を
+            バイパスして尺を直接決める (短文の末尾幻聴抑制用)。None なら predictor。
+
+    Returns:
+        (duration_ms, sample_rate)
+    """
+    import io
+    import json as _json
+    import urllib.error
+    import urllib.request
+    import wave
+
+    payload: dict = {
+        "mode": "vd",
+        "text": chunk_text,
+        "caption": caption,
+        "duration_scale": duration_scale,
+        "num_steps": num_steps,
+        "t_schedule_mode": t_schedule_mode,
+        "cfg_scale_speaker": cfg_scale_speaker,
+    }
+    if ref_wav:
+        payload["ref_wav"] = ref_wav
+    if seed is not None:
+        payload["seed"] = seed
+    if seconds is not None:
+        # 手動 duration: 短文の尺過剰予測 (末尾幻聴) を回避する。predictor をバイパス。
+        payload["seconds"] = seconds
+
+    timeout = float(os.environ.get("L2_TTS_IRODORI_TIMEOUT_SEC", "120"))
+    body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            wav_bytes = resp.read()
+    except urllib.error.HTTPError as exc:
+        # サイドカーが返した JSON エラーメッセージを拾って例外に載せる
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"irodori サイドカー HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"irodori サイドカーに接続できません ({url}): {exc.reason}。"
+            f" run_irodori_sidecar.ps1 で起動済みか確認してください。"
+        ) from exc
+
+    with wave.open(io.BytesIO(wav_bytes)) as wf:
+        duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)
+        sample_rate = wf.getframerate()
+
+    filepath.write_bytes(wav_bytes)
+    logger.info(
+        "irodori WAV 保存: %s (%d bytes, %d ms)", filepath.name, len(wav_bytes), duration_ms
+    )
+    return duration_ms, sample_rate
+
+
+def _call_irodori(
+    text: str,
+    *,
+    voice: str,
+    output_dir: str,
+    speaker: str = "",
+    speed: int | None = None,
+    on_chunk_ready=None,
+    **kwargs,
+) -> TTSResult:
+    """irodori-TTS サイドカー (VoiceDesign) 経由で音声合成する (pose-only)。
+
+    VOICEPEAK / VOICEVOX と同じく:
+      - JSON 応答 (_parse_voicepeak_json) から say_text / speed / pose を抽出
+        (emotion は irodori では未使用)
+      - 140 字でチャンク分割し、各チャンクを個別合成 + on_chunk_ready 通知
+      - 結合 WAV は作らず chunk_audio_urls で全チャンクを返す
+
+    pose-only モデル (PoC 確定):
+      - voice → voices.json (caption / self-ref アンカー / seed / cfg / num_steps / schedule)
+      - pose → 本文末の正規絵文字 + caption 末尾サフィックス
+      - speed → duration_scale = max(0.85, 100/speed)
+
+    Args:
+        voice:  irodori voice キー (voices.json の voices.<key>、例 "mimi")
+    """
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON 応答から本文 / speed / pose を分離 (emotion は irodori では未使用)。
+    say_text, _json_emotion, json_speed, json_pose = _parse_voicepeak_json(text)
+    effective_speed = json_speed if json_speed is not None else speed
+    duration_scale = _speed_to_duration_scale(effective_speed)
+
+    entry = _resolve_irodori_voice(voice)
+    base_caption = entry["caption"]
+    ref_wav = entry["ref_wav"]
+    cfg_scale_speaker = entry["cfg_scale_speaker"]
+
+    url = _irodori_url()
+    # num_steps / schedule は voices.json (common.realtime) 由来。env で上書き可。
+    num_steps = int(os.environ.get("L2_TTS_IRODORI_NUM_STEPS", str(entry["num_steps"])))
+    t_schedule_mode = os.environ.get("L2_TTS_IRODORI_SCHEDULE", entry["t_schedule_mode"])
+    # seed はキャラ毎固定 (voices.json)。env L2_TTS_IRODORI_SEED があれば全キャラ上書き。
+    seed_env = os.environ.get("L2_TTS_IRODORI_SEED", "")
+    seed = int(seed_env) if seed_env.strip() else entry["seed"]
+
+    # pose → emoji (本文末) + caption サフィックス (pose-only。emotion は使わない)。
+    # ターン単位で 1 回作り全チャンクに適用する。
+    emoji, suffix = _irodori_control(voice, json_pose)
+    caption_for_request = f"{base_caption}{suffix}" if suffix else base_caption
+
+    chunks = _split_text_for_voicepeak(say_text)
+    logger.info(
+        "irodori チャンク分割: speaker=%s %d 個 (元 %d 文字) ds=%.3f pose=%s emoji=%r",
+        speaker or "(unknown)", len(chunks), len(say_text), duration_scale,
+        json_pose, emoji,
+    )
+
+    chunk_paths: list[Path] = []
+    chunk_durations: list[int] = []
+    sample_rate = 48000
+
+    for i, chunk_text in enumerate(chunks):
+        # 喋るテキストにだけ読み補正を適用 (HUD は元 chunk_text のまま)。
+        # 読み辞書 → 小数正規化 → 末尾に pose 絵文字、の順で request_text を組む。
+        spoken_text = _apply_readings(chunk_text, voice)
+        spoken_text = _normalize_decimals(spoken_text)  # "5.5" → "5てんご"
+        request_text = f"{spoken_text}{emoji}" if emoji else spoken_text
+        # 短文は manual duration で predictor をバイパス (末尾幻聴抑制)。尺の基準は
+        # 実際に喋る語 (spoken_text) で測る (pose 絵文字は注釈なので除外)。
+        seconds = _short_text_seconds(spoken_text)
+        filepath = out_dir / f"{uuid.uuid4()}.wav"
+        dur, sr = _generate_irodori_single_file(
+            request_text,
+            caption=caption_for_request,
+            ref_wav=ref_wav,
+            duration_scale=duration_scale,
+            num_steps=num_steps,
+            t_schedule_mode=t_schedule_mode,
+            cfg_scale_speaker=cfg_scale_speaker,
+            seed=seed,
+            filepath=filepath,
+            url=url,
+            seconds=seconds,
+        )
+        chunk_paths.append(filepath)
+        chunk_durations.append(dur)
+        sample_rate = sr
+        if on_chunk_ready:
+            # chunk_text は元テキスト (絵文字なし) を渡す: HUD/ログ表示を綺麗に保つ。
+            on_chunk_ready(filepath.as_uri(), chunk_text, i == len(chunks) - 1, speaker)
+
+    audio_url = chunk_paths[0].as_uri() if chunk_paths else ""
+    total_duration = sum(chunk_durations)
+
+    return TTSResult(
+        audio_url=audio_url,
+        duration_ms=total_duration,
+        voice=voice,
+        format="wav",
+        sample_rate=sample_rate,
+        speaker=speaker or f"irodori-{voice}",
+        chunk_audio_urls=[p.as_uri() for p in chunk_paths],
+    )
+
+
 # ─── プロバイダ登録テーブル ─────────────────────────────────────────
 
 _PROVIDERS: dict = {
     "edge_tts": _call_edge_tts,
     "voicevox": _call_voicevox,
     "voicepeak": _call_voicepeak,
+    "irodori_vd": _call_irodori,
 }
+
+
+# emotion を JSON ({response, emotion}) で受け取る provider。
+# VOICEPEAK のみ (irodori_vd は pose-only で emotion を使わない)。将来 VOICEPEAK 採用
+# キャラがいる場合に、フィラー生成時の emotion JSON 包装判定に使う (filler.py が参照)。
+_EMOTION_JSON_PROVIDERS = frozenset({"voicepeak"})
+
+
+def provider_uses_emotion_json(provider: str) -> bool:
+    """provider が emotion を JSON 経由で受け取るか (= フィラーで JSON 包装すべきか) を返す。"""
+    return provider in _EMOTION_JSON_PROVIDERS
 
 
 # ─── 公開 API ────────────────────────────────────────────────────

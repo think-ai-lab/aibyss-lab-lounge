@@ -564,6 +564,11 @@ _HANDRAISE_EXCLUDED_SLUGS: frozenset[str] = frozenset({
     # キャラクター。AI が「ルカとして自発介入する」のは設計上不自然 (配信者の意思を
     # AI が代弁する形になり、自律エージェント感の趣旨に反する)。
     "ruka",
+    # AI ホスト (司会・整理・接続役)。mimi/chisame/sakura が領域パネリストとして挙手する
+    # のに対し、アルカは「発話と発話のあいだを整える」進行役であり、領域トピックへの挙手
+    # 競争には乗らない (= ルカと同じくホスト側。介入は司会機能 = 小テーマ進行 / 要約 /
+    # ハンドオフ経由で行う)。
+    "aruka",
 })
 
 
@@ -577,6 +582,7 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     除外スラグ:
       - octamaid: 補助員ボット (Notion §C1 確定)
       - ruka:     配信者本人 (Phase 0.5-A フェーズ 8 実走で確定)
+      - aruka:    AI ホスト (司会・整理役。領域パネリストではないので挙手しない)
 
     Phase 0.5-A フェーズ 8: 各キャラの担当エリア (skills/characters/<slug>.md の
     `**担当エリア**:` 行) をプロンプトに含めて、LLM の判定精度を改善した。
@@ -584,7 +590,7 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     問題への対応。
     """
     characters = get_all_characters()
-    # 挙手対象から除外: octamaid (補助員) + ruka (配信者本人)。詳細は
+    # 挙手対象から除外: octamaid (補助員) + ruka (配信者本人) + aruka (AI ホスト)。詳細は
     # ``_HANDRAISE_EXCLUDED_SLUGS`` の docstring を参照。
     candidate_chars = [
         c for c in characters if c.slug not in _HANDRAISE_EXCLUDED_SLUGS

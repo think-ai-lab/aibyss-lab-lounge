@@ -563,15 +563,23 @@ class TestGenerateFillerText:
 class TestBuildFillerPrompt:
     """_build_filler_prompt のテスト。"""
 
-    def test_voicepeak_character_includes_emotion_keys(self):
-        """mimi (voicepeak) のプロンプトに emotion キーと JSON 指示が含まれる。"""
+    def test_emotion_character_includes_emotion_and_pose(self, monkeypatch):
+        """voicepeak_emotion_keys を持つキャラの filler は emotion + pose の JSON 指示を含む
+        (将来の VOICEPEAK 採用キャラ用に機構を温存)。"""
+        from lab_lounge import characters
+        from lab_lounge.characters import CharacterConfig
+        fake = CharacterConfig(
+            slug="vptest", display_name="VP", wake_word=None,
+            tts_provider="voicepeak", tts_voice="X", system_prompt_file="system_mimi.txt",
+            voicepeak_emotion_keys=("happy", "fun", "sulky"),
+        )
+        monkeypatch.setattr(characters, "get_character", lambda s: fake)
         from lab_lounge.filler import _build_filler_prompt
-        prompt = _build_filler_prompt("mimi")
+        prompt = _build_filler_prompt("vptest")
         assert "JSON" in prompt
-        assert '"happy"' in prompt
-        assert '"fun"' in prompt
-        assert '"sulky"' in prompt
-        assert "テキストのみ出力" not in prompt  # 旧指示が除去されている
+        assert '"happy"' in prompt and '"fun"' in prompt and '"sulky"' in prompt
+        assert '"pose"' in prompt and "neutral" in prompt
+        assert "テキストのみ出力" not in prompt
 
     def test_voicevox_character_skips_json(self):
         """octamaid (voicevox) は JSON 形式指示なし、プレーンテキストプロンプトのまま。"""
@@ -580,14 +588,12 @@ class TestBuildFillerPrompt:
         assert '"emotion"' not in prompt  # emotion JSON 指示が無い
         assert "テキストのみ出力" in prompt  # 旧指示が残っている
 
-    def test_voicepeak_character_includes_pose(self):
-        """mimi (voicepeak) のプロンプトに pose 指示が含まれる。"""
+    def test_pose_only_character_is_plain_text(self):
+        """irodori 化した mimi (emotion 軸オフ) はプレーンテキスト filler (emotion JSON なし)。"""
         from lab_lounge.filler import _build_filler_prompt
         prompt = _build_filler_prompt("mimi")
-        assert '"pose"' in prompt
-        assert "neutral" in prompt
-        assert "happy" in prompt
-        assert "fun" in prompt
+        assert '"emotion"' not in prompt
+        assert "テキストのみ出力" in prompt
 
 
 # ─── TestHandraiseSection (Phase 0.5-A フェーズ 2) ─────────────────
