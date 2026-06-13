@@ -6,11 +6,18 @@ import pytest
 
 from lab_lounge.characters import (
     CHARACTER_REGISTRY,
+    _PROMPTS_DIR,
     get_all_characters,
     get_character,
     get_default_character,
     load_system_prompt,
 )
+
+
+def _real_prompt_exists(filename: str) -> bool:
+    """実キャラ system prompt がローカルに在るか (公開リポでは untrack されるため
+    fresh clone では不在。本文 assert はその場合スキップする)。"""
+    return (_PROMPTS_DIR / filename).is_file()
 
 
 class TestGetCharacter:
@@ -68,18 +75,27 @@ class TestGetAllCharacters:
 
 
 class TestLoadSystemPrompt:
+    @pytest.mark.skipif(
+        not _real_prompt_exists("system_octamaid.txt"),
+        reason="実キャラ prompt はローカル限定 (公開リポでは untrack 済み)",
+    )
     def test_load_existing_prompt(self):
         config = get_character("octamaid")
         prompt = load_system_prompt(config)
         assert "オクタメイド" in prompt
         assert len(prompt) > 100
 
+    @pytest.mark.skipif(
+        not _real_prompt_exists("system_mimi.txt"),
+        reason="実キャラ prompt はローカル限定 (公開リポでは untrack 済み)",
+    )
     def test_load_mimi_prompt(self):
         config = get_character("mimi")
         prompt = load_system_prompt(config)
         assert "ミミ・オクタヴィア" in prompt
 
     def test_missing_prompt_raises(self):
+        # 実キャラもサンプルも無い場合のみ FileNotFoundError (サンプルも不在に設定)
         from lab_lounge.characters import CharacterConfig
         fake = CharacterConfig(
             slug="fake",
@@ -88,6 +104,33 @@ class TestLoadSystemPrompt:
             tts_provider="voicevox",
             tts_voice="0",
             system_prompt_file="nonexistent.txt",
+            sample_fallback="nonexistent_sample.md",
         )
         with pytest.raises(FileNotFoundError):
             load_system_prompt(fake)
+
+    def test_falls_back_to_sample_when_real_absent(self):
+        """実キャラ prompt 不在 → samples/<sample_fallback> が返る (fresh clone での起動可能性)。"""
+        from lab_lounge.characters import CharacterConfig
+        cfg = CharacterConfig(
+            slug="x",
+            display_name="X",
+            wake_word=None,
+            tts_provider="voicevox",
+            tts_voice="0",
+            system_prompt_file="definitely_absent_real_prompt.txt",
+            sample_fallback="sample_logic.md",
+        )
+        prompt = load_system_prompt(cfg)
+        assert "サンプルキャラクター" in prompt
+        assert len(prompt) > 100
+
+    def test_bundled_samples_exist_with_json_contract(self):
+        """同梱サンプル2体が存在し、応答 JSON 契約 (response/speed/pose) を持つ
+        (公開リポでの起動を保証する不変条件)。"""
+        for name in ("sample_logic.md", "sample_empath.md"):
+            p = _PROMPTS_DIR / "samples" / name
+            assert p.is_file(), f"サンプル {name} が無い"
+            text = p.read_text(encoding="utf-8")
+            assert '"response"' in text and '"speed"' in text and '"pose"' in text
+            assert "ask_character" in text  # 委譲バイアスの実演

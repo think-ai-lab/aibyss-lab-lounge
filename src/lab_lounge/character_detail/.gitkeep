@@ -1,0 +1,2 @@
+# character_detail/ を git に残すためのプレースホルダ。
+# 実キャラの詳細設定ファイルは予約資産のため .gitignore で追跡対象外。詳細は README.md 参照。

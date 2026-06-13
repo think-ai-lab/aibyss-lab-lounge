@@ -52,6 +52,11 @@ class CharacterConfig:
     # フィラー LLM プロンプトに含めて JSON 出力を誘導する。
     # 空タプル = emotion 非対応 (voicevox 等) → フィラーはプレーンテキスト生成。
     voicepeak_emotion_keys: tuple[str, ...] = ()
+    # 実キャラ system prompt がローカルに無い場合 (= 公開リポを fresh clone し
+    # 予約資産が未配置の状態) に代替で読む samples/ 内のサンプル prompt 名。
+    # 実ファイルがあれば常にそちらが優先される (このフォールバックは構造を保ったまま
+    # 起動可能にするためのもの。詳細は CHARACTERS.md)。
+    sample_fallback: str = "sample_logic.md"
 
 
 # ─── キャラクター定義 ────────────────────────────────────────────────
@@ -69,6 +74,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         tts_provider="irodori_vd",
         tts_voice="mimi",
         system_prompt_file="system_mimi.txt",
+        sample_fallback="sample_empath.md",  # fresh clone 時の代替サンプル (感情寄り)
         llm_provider="openai",
         llm_model="gpt-5.5",
         filler_model="gpt-5.4-mini",
@@ -107,6 +113,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         tts_provider="irodori_vd",
         tts_voice="sakura",
         system_prompt_file="system_sakura.txt",
+        sample_fallback="sample_empath.md",  # fresh clone 時の代替サンプル (感情寄り)
         llm_provider="anthropic",
         llm_model="claude-sonnet-4-6",
         filler_model="claude-haiku-4-5",
@@ -135,6 +142,7 @@ CHARACTER_REGISTRY: dict[str, CharacterConfig] = {
         tts_provider="voicepeak",
         tts_voice="Frimomen",  # 暫定
         system_prompt_file="system_ruka.txt",
+        sample_fallback="sample_empath.md",  # fresh clone 時の代替サンプル (感情寄り)
         porcupine_model=None,
         aliases=["ルカ"],
     ),
@@ -202,18 +210,32 @@ def load_system_prompt(config: CharacterConfig) -> str:
     """
     キャラクターのシステムプロンプトをファイルから読み込む。
 
+    実キャラのプロンプトがローカルにあればそれを読む (従来通り・完全に同一挙動)。
+    無い場合 (= 公開リポを fresh clone し、予約資産である実キャラ人格が未配置の状態) は
+    samples/<sample_fallback> にフォールバックし、構造を保ったまま起動できるようにする。
+    samples/ が「追加キャラ」としてレジストリに混入することはない (フォールバック専用)。
+
     Args:
         config: 対象キャラクターの設定
 
     Returns:
-        プロンプトテキスト
+        プロンプトテキスト (実キャラ、無ければサンプル)
 
     Raises:
-        FileNotFoundError: プロンプトファイルが見つからない
+        FileNotFoundError: 実キャラ・サンプルのどちらも見つからない
     """
     path = _PROMPTS_DIR / config.system_prompt_file
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"システムプロンプトが見つかりません: {path}"
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    # 実キャラ prompt 不在 → サンプルにフォールバック (公開リポでの起動可能性を保つ)。
+    sample_path = _PROMPTS_DIR / "samples" / config.sample_fallback
+    if sample_path.is_file():
+        logger.warning(
+            "実キャラ system prompt が見つかりません (%s)。サンプル %s で代替起動します"
+            " (実キャラ人格は予約資産のため公開リポには含まれません。詳細は CHARACTERS.md)。",
+            config.system_prompt_file, config.sample_fallback,
         )
-    return path.read_text(encoding="utf-8")
+        return sample_path.read_text(encoding="utf-8")
+    raise FileNotFoundError(
+        f"システムプロンプトが見つかりません: {path} (サンプル {sample_path} も不在)"
+    )
