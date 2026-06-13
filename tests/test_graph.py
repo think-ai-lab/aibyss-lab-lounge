@@ -534,6 +534,43 @@ class TestComposeSystemPrompt:
         from lab_lounge.graph import _compose_system_prompt
         assert _compose_system_prompt(None, None) is None
 
+    def test_now_none_keeps_legacy_behavior(self):
+        """now=None (既定) なら現在日時を足さない (後方互換)。"""
+        from lab_lounge.graph import _compose_system_prompt
+        assert _compose_system_prompt("キャラ素体", None, now=None) == "キャラ素体"
+        assert _compose_system_prompt(None, None, now=None) is None
+
+    def test_now_injects_current_datetime_block(self):
+        """now 指定で "## 現在日時" + 和暦日付が末尾に重なる (鮮度判断の基準)。"""
+        from datetime import datetime
+        from lab_lounge.graph import _compose_system_prompt
+        result = _compose_system_prompt("キャラ素体", None, now=datetime(2026, 6, 9))
+        assert "## 現在日時" in result
+        assert "2026年6月9日" in result
+        assert "鮮度" in result
+        assert result.startswith("キャラ素体")  # 素体が先、日時は後
+
+    def test_now_layer_order_after_stream_context(self):
+        """順序: キャラ素体 → 本日の配信 → 現在日時。"""
+        from datetime import datetime
+        from lab_lounge.graph import _compose_system_prompt
+        result = _compose_system_prompt("素体", "配信内容", now=datetime(2026, 1, 5))
+        assert (
+            result.index("素体")
+            < result.index("## 本日の配信")
+            < result.index("## 現在日時")
+        )
+        assert "2026年1月5日" in result
+
+    def test_now_only_returns_datetime_block(self):
+        """素体も配信文脈も無く now だけある場合は現在日時ブロックを返す。"""
+        from datetime import datetime
+        from lab_lounge.graph import _compose_system_prompt
+        result = _compose_system_prompt(None, None, now=datetime(2026, 12, 31))
+        assert result is not None
+        assert result.startswith("## 現在日時")
+        assert "2026年12月31日" in result
+
 
 class TestRoutingNodeStreamContextMerge:
     """routing ノードが state["stream_context"] を system_prompt にマージする検証。"""
@@ -603,8 +640,15 @@ class TestRoutingNodeStreamContextMerge:
         merged = result["system_prompt"]
         assert merged is not None
         assert "オクタメイド" in merged
-        # 配信文脈見出しが入っていないこと (= キャラ素体のみ)
+        # 配信文脈見出しが入っていないこと (= キャラ素体 + 現在日時のみ)
         assert "## 本日の配信" not in merged
+
+    def test_routing_injects_current_datetime(self, mock_publish):
+        """routing 後の system_prompt に現在日時ブロックが入る (検索時の鮮度判断の基準)。"""
+        from lab_lounge.graph import _routing_node
+        state = self._make_state(stream_context=None)
+        result = _routing_node(state)
+        assert "## 現在日時" in result["system_prompt"]
 
 
 # ═══════════════════════════════════════════════════════════════════
