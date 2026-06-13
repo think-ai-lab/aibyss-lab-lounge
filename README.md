@@ -436,3 +436,13 @@ aibyss-lab-lounge/
 - `POST /events` に直接送信しない（G-2）。正規経路は Redis Streams (XADD) のみ。
 - `seq` を全体ソートキーに使わない（G-3）。全体順序は C2 の `stream_idx` による。
 - フォールバック優先: C2 検索が遅い/失敗しても検索なしで結論を返す（ライブ耐性）。
+
+---
+
+## ライセンス
+
+- 本リポジトリのコードは [Apache License 2.0](./LICENSE) の下で公開しています。
+- Think-AI Lab. のキャラクター（名称・人格設定・詳細設定・プロンプト・画像・音声設定）は
+  ライセンスの対象外で、すべての権利を留保します。詳細は [CHARACTERS.md](./CHARACTERS.md) を参照してください。
+- `src/lab_lounge/system_prompts/samples/` のサンプルキャラクターは Apache-2.0 です。
+  自由に改変してご利用ください。
