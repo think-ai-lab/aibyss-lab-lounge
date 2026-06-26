@@ -48,7 +48,7 @@ irodori_server.py — Irodori-TTS サイドカー HTTP サーバ
     $env:HF_HOME = "T:\\irodori-tts\\hf-cache"
     uv run --directory "T:\\irodori-tts\\Irodori-TTS" --no-sync `
       python <repo>/aibyss-lab-lounge/sidecar/irodori_server.py `
-      --port 50080 --models vd
+      --port 18080 --models vd
 
   irodori_tts パッケージは L2_IRODORI_REPO (既定 T:\\irodori-tts\\Irodori-TTS) を
   sys.path に追加して import する。weights は HF_HOME (= hf-cache) からロードされる。
@@ -57,6 +57,7 @@ irodori_server.py — Irodori-TTS サイドカー HTTP サーバ
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import logging
@@ -165,23 +166,19 @@ def _load_runtimes(modes: list[str]) -> dict:
     return runtimes
 
 
-def _wav_bytes_from_result(result) -> tuple[bytes, int]:
-    """
-    SamplingResult.audio (torch.Tensor) を PCM16 WAV バイト列に変換する。
+def _wav_bytes_from_tensor(audio, sample_rate: int) -> bytes:
+    """1 発話分の audio テンソル (channels, samples) を PCM16 WAV バイト列へ変換する。
 
     【なぜ PCM16 か】
       L2 側 (_call_irodori) は VOICEVOX 経路と同じく stdlib の `wave` モジュールで
       WAV ヘッダから duration / sample_rate を読む。`wave` は float WAV を扱えない
       ため、PCM16 で返して L2 のコードパスを VOICEVOX と揃える。再生側
       (audio_io.play_audio_file) は soundfile で読むので PCM16 で問題ない。
-
-    Returns:
-        (wav_bytes, sample_rate)
     """
     import soundfile as sf
     import torch
 
-    audio_cpu = result.audio.detach().to(device="cpu", dtype=torch.float32)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
     # audio shape は (channels, samples)。通常モノラル (1, N)。
     if audio_cpu.ndim == 2 and audio_cpu.shape[0] == 1:
         audio_np = audio_cpu.squeeze(0).numpy()         # (N,)
@@ -190,10 +187,40 @@ def _wav_bytes_from_result(result) -> tuple[bytes, int]:
     else:
         audio_np = audio_cpu.numpy()
 
-    sample_rate = int(result.sample_rate)
     buf = io.BytesIO()
-    sf.write(buf, audio_np, sample_rate, format="WAV", subtype="PCM_16")
-    return buf.getvalue(), sample_rate
+    sf.write(buf, audio_np, int(sample_rate), format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _wav_bytes_from_result(result) -> tuple[bytes, int]:
+    """SamplingResult.audio を PCM16 WAV バイト列へ（_wav_bytes_from_tensor 経由・単発/バッチ共用）。"""
+    sample_rate = int(result.sample_rate)
+    return _wav_bytes_from_tensor(result.audio, sample_rate), sample_rate
+
+
+def _build_sampling_request(req: dict):
+    """リクエスト dict → SamplingRequest（vd）。単発 /synthesize とバッチ /synthesize_batch で
+    共用し、payload→SamplingRequest の解釈が両経路でズレないようにする。"""
+    from irodori_tts.inference_runtime import SamplingRequest
+
+    caption = req.get("caption")
+    if not caption or not str(caption).strip():
+        raise ValueError("vd モードは caption が必須です")
+    ref_wav = req.get("ref_wav")
+    seed = req.get("seed", None)
+    seconds = req.get("seconds", None)
+    return SamplingRequest(
+        text=str(req["text"]),
+        caption=str(caption),
+        ref_wav=str(ref_wav) if ref_wav else None,
+        no_ref=(not ref_wav),
+        duration_scale=float(req.get("duration_scale", 1.0)),
+        num_steps=int(req.get("num_steps", 24)),
+        t_schedule_mode=str(req.get("t_schedule_mode", "sway")),
+        cfg_scale_speaker=float(req.get("cfg_scale_speaker", 5.0)),
+        seed=None if seed is None else int(seed),
+        seconds=None if seconds is None else float(seconds),
+    )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -224,20 +251,27 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": f"unknown path: {self.path}"})
 
-    # ── POST /synthesize ────────────────────────────────────
+    # ── POST /synthesize（単発）/ /synthesize_batch（同質バッチ）────────────
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/synthesize":
+        path = self.path.rstrip("/")
+        if path not in ("/synthesize", "/synthesize_batch"):
             self._send_json(404, {"error": f"unknown path: {self.path}"})
             return
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length > 0 else b""
-            req = json.loads(raw.decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             self._send_json(400, {"error": f"invalid JSON body: {exc}"})
             return
 
+        if path == "/synthesize":
+            self._handle_single(payload)
+        else:
+            self._handle_batch(payload)
+
+    def _handle_single(self, req: dict) -> None:
         mode = str(req.get("mode", "")).strip().lower()
         runtime = self.server.runtimes.get(mode)
         if runtime is None:
@@ -270,6 +304,43 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(wav_bytes)
 
+    def _handle_batch(self, payload: dict) -> None:
+        mode = str(payload.get("mode", "")).strip().lower()
+        runtime = self.server.runtimes.get(mode)
+        if runtime is None:
+            self._send_json(
+                400,
+                {"error": f"unknown/unloaded mode: {mode!r}. loaded: {sorted(self.server.runtimes)}"},
+            )
+            return
+
+        reqs = payload.get("requests")
+        if not isinstance(reqs, list) or not reqs:
+            self._send_json(400, {"error": "requests must be a non-empty list"})
+            return
+        for i, r in enumerate(reqs):
+            text = r.get("text") if isinstance(r, dict) else None
+            if not text or not str(text).strip():
+                self._send_json(400, {"error": f"requests[{i}].text is required and must be non-empty"})
+                return
+
+        try:
+            wavs, sample_rate, synth_sec = self.server.synthesize_batch(mode, reqs)
+        except Exception as exc:  # noqa: BLE001 — どんな失敗も 500 で返し配信を止めない
+            logger.exception("バッチ合成失敗 (mode=%s, n=%d)", mode, len(reqs))
+            self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+
+        total = sum(len(w) for w in wavs)
+        logger.info(
+            "synth_batch ok: mode=%s n=%d wav=%d bytes synth=%.3fs (%.3fs/item)",
+            mode, len(reqs), total, synth_sec, synth_sec / max(1, len(reqs)),
+        )
+        self._send_json(200, {
+            "sample_rate": sample_rate,
+            "wavs": [base64.b64encode(w).decode("ascii") for w in wavs],
+        })
+
 
 class _IrodoriServer(ThreadingHTTPServer):
     """runtimes を保持する ThreadingHTTPServer。
@@ -296,41 +367,35 @@ class _IrodoriServer(ThreadingHTTPServer):
             するが、確定版では台詞跨ぎドリフト防止のため必ず送る。
           - t_schedule_mode=sway / num_steps=24 / cfg_scale_speaker=5.0 / seed=キャラ毎固定
         """
-        from irodori_tts.inference_runtime import SamplingRequest
-
         runtime = self.runtimes[mode]
-        caption = req.get("caption")
-        if not caption or not str(caption).strip():
-            raise ValueError("vd モードは caption が必須です")
-        ref_wav = req.get("ref_wav")
-        seed = req.get("seed", None)
-        # seconds: 手動 duration (秒)。指定時は irodori の duration predictor を
-        # バイパスして尺を直接決める (L2 側で短文の末尾幻聴抑制に使う)。None なら predictor。
-        seconds = req.get("seconds", None)
-        sampling = SamplingRequest(
-            text=str(req["text"]),
-            caption=str(caption),
-            ref_wav=str(ref_wav) if ref_wav else None,
-            no_ref=(not ref_wav),
-            duration_scale=float(req.get("duration_scale", 1.0)),
-            num_steps=int(req.get("num_steps", 24)),
-            t_schedule_mode=str(req.get("t_schedule_mode", "sway")),
-            cfg_scale_speaker=float(req.get("cfg_scale_speaker", 5.0)),
-            seed=None if seed is None else int(seed),
-            seconds=None if seconds is None else float(seconds),
-        )
-
+        sampling = _build_sampling_request(req)
         t0 = time.perf_counter()
         result = runtime.synthesize(sampling, log_fn=None)
         synth_sec = time.perf_counter() - t0
         wav_bytes, sample_rate = _wav_bytes_from_result(result)
         return wav_bytes, sample_rate, synth_sec
 
+    def synthesize_batch(self, mode: str, reqs: list[dict]) -> tuple[list[bytes], int, float]:
+        """同質ボイスの N リクエストを 1 forward でバッチ合成し (wavs, sample_rate, synth_sec) を返す。
+
+        声の同一性 (caption/ref/seed 等) が全 req で一致している前提 (呼出側=MaC client が
+        ボイス単位でグループ化して送る)。合成本体は sidecar/batch.py。upstream irodori_tts は無改変。
+        """
+        import batch as _batch
+
+        runtime = self.runtimes[mode]
+        samplings = [_build_sampling_request(r) for r in reqs]
+        t0 = time.perf_counter()
+        audios, sample_rate = _batch.synthesize_batch(runtime, samplings)
+        synth_sec = time.perf_counter() - t0
+        wavs = [_wav_bytes_from_tensor(a, sample_rate) for a in audios]
+        return wavs, sample_rate, synth_sec
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Irodori-TTS sidecar HTTP server")
     parser.add_argument("--host", default="127.0.0.1", help="bind host (既定 127.0.0.1 = localhost のみ)")
-    parser.add_argument("--port", type=int, default=50080, help="bind port (既定 50080)")
+    parser.add_argument("--port", type=int, default=18080, help="bind port (既定 18080)")
     parser.add_argument(
         "--models",
         default="vd",
