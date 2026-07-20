@@ -330,7 +330,7 @@ class TestGenerateIrodoriSingleFile:
         dur, sr = tts_mod._generate_irodori_single_file(
             "こんにちは", caption="やわらかい声。", ref_wav="R:/a.wav",
             duration_scale=0.9, num_steps=24, t_schedule_mode="sway",
-            cfg_scale_speaker=5.0, seed=3, filepath=out, url="http://127.0.0.1:50080/synthesize",
+            cfg_scale_speaker=5.0, seed=3, filepath=out, url="http://127.0.0.1:18080/synthesize",
         )
         assert sr == 48000 and dur == 1000 and out.is_file()
         body = json.loads(captured["body"].decode("utf-8"))
@@ -352,7 +352,7 @@ class TestGenerateIrodoriSingleFile:
             tts_mod._generate_irodori_single_file(
                 "x", caption="c", ref_wav="r.wav", duration_scale=1.0, num_steps=24,
                 t_schedule_mode="sway", cfg_scale_speaker=5.0, seed=None,
-                filepath=tmp_path / "e.wav", url="http://127.0.0.1:50080/synthesize",
+                filepath=tmp_path / "e.wav", url="http://127.0.0.1:18080/synthesize",
             )
 
     def test_connection_error_becomes_runtime_error(self, tmp_path, monkeypatch):
@@ -365,7 +365,7 @@ class TestGenerateIrodoriSingleFile:
             tts_mod._generate_irodori_single_file(
                 "x", caption="c", ref_wav="r.wav", duration_scale=1.0, num_steps=24,
                 t_schedule_mode="sway", cfg_scale_speaker=5.0, seed=None,
-                filepath=tmp_path / "e.wav", url="http://127.0.0.1:50080/synthesize",
+                filepath=tmp_path / "e.wav", url="http://127.0.0.1:18080/synthesize",
             )
 
 
@@ -525,15 +525,28 @@ class TestCallIrodoriReadingsAndSeconds:
         )
         assert cap_gen.calls[0]["seconds"] is None
 
-    def test_seconds_measured_on_spoken_text_not_emoji(self, tmp_path, cap_gen, monkeypatch):
+    def test_emoji_pose_uses_predictor_not_manual(self, tmp_path, cap_gen, monkeypatch):
+        """pose 絵文字 (笑い声等の発声) が付く場合は manual duration を使わず predictor に
+        任せる (spoken_text 基準の短い尺だと絵文字の発声が途中で切れるため。probe23)。"""
         monkeypatch.setattr(tts_mod, "_IRODORI_SHORT_CHARS", 12)
         monkeypatch.setattr(tts_mod, "_IRODORI_SEC_PER_CHAR", 0.26)
         monkeypatch.setattr(tts_mod, "_IRODORI_MIN_SEC", 0.6)
         text = '{"response": "うふふ", "pose": "happy"}'  # 末尾に 🤭 が付く
         tts_mod._call_irodori(text, voice="mimi", output_dir=str(tmp_path))
         sent = cap_gen.calls[0]
-        assert sent["text"].endswith("🤭")
-        assert sent["seconds"] == 0.78  # "うふふ" = 3 字 × 0.26 (絵文字は尺基準に含めない)
+        assert sent["text"].endswith("🤭")    # 絵文字は付く
+        assert sent["seconds"] is None        # が、尺は predictor に任せる (笑いを切らない)
+
+    def test_short_text_no_emoji_still_manual(self, tmp_path, cap_gen, monkeypatch):
+        """絵文字なしの短文は従来どおり manual duration (末尾幻聴抑制) を維持。"""
+        monkeypatch.setattr(tts_mod, "_IRODORI_SHORT_CHARS", 12)
+        monkeypatch.setattr(tts_mod, "_IRODORI_SEC_PER_CHAR", 0.26)
+        monkeypatch.setattr(tts_mod, "_IRODORI_MIN_SEC", 0.6)
+        text = '{"response": "うふふ", "pose": "neutral"}'  # neutral = 絵文字なし
+        tts_mod._call_irodori(text, voice="mimi", output_dir=str(tmp_path))
+        sent = cap_gen.calls[0]
+        assert sent["text"] == "うふふ"          # 絵文字なし
+        assert sent["seconds"] == 0.78           # 3 字 × 0.26 (manual 維持)
 
     def test_decimal_normalized_in_request_not_hud(self, tmp_path, cap_gen):
         captured_hud = []

@@ -136,7 +136,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` | *(real mode 時)* | 各 LLM プロバイダの API キー |
 | `L2_USE_REAL_TTS` | `false` | `true` で real TTS を呼ぶ |
 | `L2_TTS_PROVIDER` | `voicevox` | 既定 TTS プロバイダ（`edge_tts` / `voicevox` / `voicepeak` / `irodori_vd`）。キャラ単位は `characters.py` で定義 |
-| `L2_TTS_IRODORI_URL` | `http://127.0.0.1:50080` | irodori サイドカーの URL（[`sidecar/`](sidecar/README.md)） |
+| `L2_TTS_IRODORI_URL` | `http://127.0.0.1:18080` | irodori サイドカーの URL（[`sidecar/`](sidecar/README.md)） |
 | `L2_IRODORI_VOICES_JSON` / `L2_IRODORI_READINGS_JSON` | `reference_voices/voices.json` / `…/readings.json` | irodori 設定の正典 / 読み辞書（読みが欠損でも動作） |
 | `L2_USE_REAL_STT` | `false` | `true` で real STT を呼ぶ |
 | `L2_STT_PROVIDER` | `faster-whisper` | STT プロバイダ（`openai` / `faster-whisper` / `sherpa-onnx`） |

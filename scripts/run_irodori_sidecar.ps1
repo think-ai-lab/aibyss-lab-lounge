@@ -12,7 +12,7 @@
 #   - GPU (CUDA) が利用可能
 #
 # 【使い方】
-#   .\scripts\run_irodori_sidecar.ps1                       # vd を 50080 で起動
+#   .\scripts\run_irodori_sidecar.ps1                       # vd を 18080 で起動
 #   .\scripts\run_irodori_sidecar.ps1 -Port 50081 -Models vd
 #
 # 【環境変数による上書き (任意)】
@@ -23,7 +23,7 @@
 # ──────────────────────────────────────────────────────────────
 
 param(
-    [int]$Port = 50080,
+    [int]$Port = 18080,
     [string]$Models = "vd"
 )
 

@@ -35,7 +35,7 @@ irodori は `torch` + CUDA + git 依存（`dacvae` / `silentcipher`）の重い�
 
 ```powershell
 # aibyss-lab-lounge
-.\scripts\run_irodori_sidecar.ps1                      # vd を 50080 で起動
+.\scripts\run_irodori_sidecar.ps1                      # vd を 18080 で起動
 ```
 
 モデルロードに数十秒かかります。「起動完了」ログが出れば準備完了です。
@@ -78,7 +78,7 @@ irodori は `torch` + CUDA + git 依存（`dacvae` / `silentcipher`）の重い�
 
 ```powershell
 # 動作確認の例
-curl -X POST http://127.0.0.1:50080/synthesize `
+curl -X POST http://127.0.0.1:18080/synthesize `
   -H "Content-Type: application/json" `
   -d '{"mode":"vd","text":"テストです。","caption":"気品のある若い女性の声。落ち着いて優雅に。","duration_scale":1.0}' `
   --output test.wav
@@ -91,6 +91,6 @@ curl -X POST http://127.0.0.1:50080/synthesize `
 | 起動時 `CUDA ... is False` | GPU/ドライバ未認識。`nvidia-smi` を確認。irodori を `--extra cu128` で sync したか |
 | `irodori_tts` が import できない | `L2_IRODORI_REPO` が irodori リポを指しているか確認 |
 | weights を毎回 DL しようとする | `HF_HOME` が `hf-cache` を指しているか確認 |
-| L2 から繋がらない | `L2_TTS_IRODORI_URL`（既定 `http://127.0.0.1:50080`）とポートが一致しているか |
+| L2 から繋がらない | `L2_TTS_IRODORI_URL`（既定 `http://127.0.0.1:18080`）とポートが一致しているか |
 
 設定の全体像は L2 の `.env.example` の irodori セクションを参照してください。

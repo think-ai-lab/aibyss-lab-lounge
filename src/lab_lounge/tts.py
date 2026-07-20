@@ -1172,7 +1172,7 @@ def _normalize_decimals(text: str) -> str:
 
 def _irodori_url() -> str:
     """サイドカーの /synthesize URL を返す (L2_TTS_IRODORI_URL で base 上書き可)。"""
-    base = os.environ.get("L2_TTS_IRODORI_URL", "http://127.0.0.1:50080").rstrip("/")
+    base = os.environ.get("L2_TTS_IRODORI_URL", "http://127.0.0.1:18080").rstrip("/")
     return f"{base}/synthesize"
 
 
@@ -1426,9 +1426,11 @@ def _call_irodori(
         spoken_text = _apply_readings(chunk_text, voice)
         spoken_text = _normalize_decimals(spoken_text)  # "5.5" → "5てんご"
         request_text = f"{spoken_text}{emoji}" if emoji else spoken_text
-        # 短文は manual duration で predictor をバイパス (末尾幻聴抑制)。尺の基準は
-        # 実際に喋る語 (spoken_text) で測る (pose 絵文字は注釈なので除外)。
-        seconds = _short_text_seconds(spoken_text)
+        # 短文は manual duration で predictor をバイパス (末尾幻聴抑制)。ただし pose 絵文字が
+        # 付く場合は predictor に任せる (seconds=None): 絵文字は笑い声等の発声を生むため、
+        # spoken_text 基準の短い尺だとその発声が途中で切れる (実測 probe23: 笑いが詰まる)。
+        # 絵文字付きは予測器が発声分も含めて尺を取り、笑いが完走する (過剰予測=幻聴も出ない)。
+        seconds = None if emoji else _short_text_seconds(spoken_text)
         filepath = out_dir / f"{uuid.uuid4()}.wav"
         dur, sr = _generate_irodori_single_file(
             request_text,
