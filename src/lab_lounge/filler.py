@@ -294,8 +294,10 @@ def ensure_filler_cache(
             result_paths[cat].append(target)
             continue
 
-        # emotion 付きの場合は JSON 形式でテキストを渡す
-        if entry.emotion and char.tts_provider == "voicepeak":
+        # emotion 付きの場合は JSON 形式でテキストを渡す。
+        # VOICEPEAK / irodori (clone/vd) は _parse_voicepeak_json 経由で emotion を解釈する。
+        from .tts import provider_uses_emotion_json
+        if entry.emotion and provider_uses_emotion_json(char.tts_provider):
             tts_text = json.dumps(
                 {"response": entry.text, "emotion": entry.emotion},
                 ensure_ascii=False,

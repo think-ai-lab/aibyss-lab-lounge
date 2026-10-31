@@ -1037,24 +1037,34 @@ class PipelineGraphState(TypedDict):
 # キャラ素体 → 本日の配信 → 参照情報 という3層の同心円構造を作る。
 # 順序の意味: 普遍 (キャラ人格) → 当日の前提 → 今ターンの動的情報。
 _STREAM_CONTEXT_HEADING = "## 本日の配信"
+_CURRENT_DATETIME_HEADING = "## 現在日時"
+
+
+def _format_jp_date(now) -> str:
+    """datetime を「YYYY年M月D日」表記にする (鮮度判断の基準として LLM に渡す)。"""
+    return f"{now.year}年{now.month}月{now.day}日"
 
 
 def _compose_system_prompt(
     character_prompt: str | None,
     stream_context: str | None,
+    now=None,
 ) -> str | None:
     """
-    キャラクター素体プロンプトに配信文脈を重ねた拡張 system_prompt を返す。
+    キャラクター素体プロンプトに配信文脈 + 現在日時を重ねた拡張 system_prompt を返す。
 
     Args:
         character_prompt: load_system_prompt() の戻り値 (キャラ素体)。
         stream_context:   stream_context.load_stream_context() の戻り値。
                           None / 空文字列なら結合せずキャラ素体をそのまま返す。
+        now:              現在日時 (datetime)。指定すると "## 現在日時" ブロックを末尾に
+                          重ね、LLM に「今」を伝える (情報の鮮度判断の基準)。**None なら
+                          従来どおり日時を足さない** (後方互換: 既存呼出/テストを壊さない)。
 
     Returns:
-        結合済みプロンプト。両方 None なら None。
+        結合済みプロンプト。全て None / 空なら None。
 
-    結合フォーマット:
+    結合フォーマット (now 指定時):
         <キャラ素体>
 
         ---
@@ -1063,24 +1073,45 @@ def _compose_system_prompt(
 
         <stream_context>
 
+        ---
+
+        ## 現在日時
+
+        現在は YYYY年M月D日 です。…
+
     【WHY: 順序】
-        キャラ素体 (上位・不変) → 配信文脈 (中位・配信単位) という
-        同心円構造を作る。LLM の attention 順序効果を踏まえると、
-        安定した情報を上に置くと一貫した応答になりやすい。
-        後段 llm.py で "## 参照情報" (RAG, ターン単位) が末尾に追加されるため、
-        最終的に「不変 → 配信単位 → ターン単位」の3層になる。
+        キャラ素体 (上位・不変) → 配信文脈 (中位・配信単位) → 現在日時 (配信単位) という
+        同心円構造を作る。LLM の attention 順序効果を踏まえると、安定した情報を上に置くと
+        一貫した応答になりやすい。後段 llm.py で "## 参照情報" (RAG, ターン単位) が末尾に
+        追加されるため、最終的に「不変 → 配信単位 → ターン単位」の層になる。
+
+    【WHY: 現在日時を入れる】
+        irodori 等のキャラは検索 (web_search) をするが、現在日付を知らないと学習カットオフの
+        記憶を最新と思い込み、鮮度の低い情報を答えてしまう (実走で観測)。"今" を明示して
+        research Skill の鮮度ガードレールが機能する前提を与える。
     """
+    # 素体 + 配信文脈 (従来ロジック)
     if not stream_context:
-        return character_prompt
-    if not character_prompt:
-        # キャラ素体が無い (FileNotFoundError 等) ケース。
-        # 配信文脈だけでも LLM の前提に効かせるため、見出し付きで返す。
-        return f"{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
-    return (
-        f"{character_prompt}"
-        f"\n\n---\n\n"
-        f"{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
+        composed = character_prompt
+    elif not character_prompt:
+        # キャラ素体が無い (FileNotFoundError 等) ケースも配信文脈は見出し付きで効かせる。
+        composed = f"{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
+    else:
+        composed = (
+            f"{character_prompt}\n\n---\n\n{_STREAM_CONTEXT_HEADING}\n\n{stream_context}"
+        )
+
+    # 現在日時ブロック (now 指定時のみ。鮮度判断の基準を LLM に与える)
+    if now is None:
+        return composed
+    date_block = (
+        f"{_CURRENT_DATETIME_HEADING}\n\n"
+        f"現在は{_format_jp_date(now)}です。"
+        f"情報の鮮度 (特に検索時) はこの日付を基準に判断してください。"
     )
+    if not composed:
+        return date_block
+    return f"{composed}\n\n---\n\n{date_block}"
 
 
 def _routing_node(state: PipelineGraphState) -> dict:
@@ -1106,11 +1137,12 @@ def _routing_node(state: PipelineGraphState) -> dict:
         )
         character_prompt = None
 
-    # 配信文脈 (run_loop 起動時にロードされ state に乗っている) を重ねる。
+    # 配信文脈 (run_loop 起動時にロードされ state に乗っている) + 現在日時を重ねる。
     # 配信文脈なし or キャラ素体読み込み失敗時も _compose_system_prompt が
-    # 適切に処理する (後方互換)。
+    # 適切に処理する (後方互換)。now で「今」を渡し、検索時の鮮度判断の基準を与える。
+    from datetime import datetime as _datetime
     system_prompt = _compose_system_prompt(
-        character_prompt, state.get("stream_context")
+        character_prompt, state.get("stream_context"), now=_datetime.now()
     )
 
     updates: dict = {

@@ -309,36 +309,30 @@ class TestGetCharacterResponseSchema:
     返すようにする。VOICEPEAK CLI の引数破壊バグの根本対策。
     """
 
-    def test_mimi_schema_has_5_emotion_keys(self):
-        """mimi のスキーマは 5 つの emotion キー (happy/fun/angry/sad/sulky)。"""
+    def test_irodori_characters_schema_pose_only(self):
+        """irodori 化したキャラ (mimi/chisame/sakura) は emotion 軸オフ → pose-only スキーマ。"""
         from lab_lounge.graph import _get_character_response_schema
-        schema = _get_character_response_schema("mimi")
-        assert schema.__name__ == "MimiResponse"
-        assert set(schema.model_fields.keys()) == {"response", "emotion", "speed", "pose"}
-        emotion_schema = schema.model_fields["emotion"].annotation
-        assert set(emotion_schema.model_fields.keys()) == {
-            "happy", "fun", "angry", "sad", "sulky",
-        }
+        for slug, cls in (("mimi", "MimiResponse"), ("chisame", "ChisameResponse"),
+                          ("sakura", "SakuraResponse")):
+            schema = _get_character_response_schema(slug)
+            assert schema.__name__ == cls
+            assert set(schema.model_fields.keys()) == {"response", "speed", "pose"}
+            assert "emotion" not in schema.model_fields
 
-    def test_chisame_schema_has_chisame_emotion_keys(self):
-        """chisame のスキーマは bosoboso/doyaru/honwaka/angry/teary。"""
+    def test_emotion_character_schema_has_emotion_field(self, monkeypatch):
+        """voicepeak_emotion_keys を持つキャラは emotion フィールド付きスキーマ (機構は温存)。"""
+        from lab_lounge import characters
+        from lab_lounge.characters import CharacterConfig
         from lab_lounge.graph import _get_character_response_schema
-        schema = _get_character_response_schema("chisame")
-        assert schema.__name__ == "ChisameResponse"
-        emotion_schema = schema.model_fields["emotion"].annotation
-        assert set(emotion_schema.model_fields.keys()) == {
-            "bosoboso", "doyaru", "honwaka", "angry", "teary",
-        }
-
-    def test_sakura_schema_has_sakura_emotion_keys(self):
-        """sakura のスキーマは happy/sad/angry/whisper/cool。"""
-        from lab_lounge.graph import _get_character_response_schema
-        schema = _get_character_response_schema("sakura")
-        assert schema.__name__ == "SakuraResponse"
-        emotion_schema = schema.model_fields["emotion"].annotation
-        assert set(emotion_schema.model_fields.keys()) == {
-            "happy", "sad", "angry", "whisper", "cool",
-        }
+        fake = CharacterConfig(
+            slug="vptest", display_name="VP", wake_word=None,
+            tts_provider="voicepeak", tts_voice="X", system_prompt_file="system_mimi.txt",
+            voicepeak_emotion_keys=("happy", "angry"),
+        )
+        monkeypatch.setattr(characters, "get_character", lambda s: fake)
+        schema = _get_character_response_schema("vptest")
+        assert "emotion" in schema.model_fields
+        assert set(schema.model_fields["emotion"].annotation.model_fields.keys()) == {"happy", "angry"}
 
     def test_octamaid_schema_has_no_emotion(self):
         """octamaid (voicepeak_emotion_keys 空) は emotion フィールド無し。"""
@@ -409,7 +403,6 @@ class TestRunAgentStructuredResponse:
         Schema = _get_character_response_schema("mimi")
         structured_instance = Schema(
             response="わたくしの見解ですわ",
-            emotion={"happy": 50, "fun": 0, "angry": 0, "sad": 0, "sulky": 0},
             speed=100,
             pose="happy",
         )
@@ -430,7 +423,7 @@ class TestRunAgentStructuredResponse:
         # text が JSON 文字列化されている
         assert "わたくしの見解ですわ" in result.text
         assert '"response":' in result.text
-        assert '"emotion":' in result.text
+        assert '"pose":' in result.text
         # token usage は messages から取得
         assert result.input_tokens == 100
         assert result.output_tokens == 50
