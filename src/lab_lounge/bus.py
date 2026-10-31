@@ -25,7 +25,9 @@ _LOG_TEXT_PREVIEW_CHARS = 30
 
 
 def _redis_url() -> str:
-    return os.environ.get("REDIS_URL", "redis://localhost:6379")
+    # WHY: Windows の localhost は ::1 を先に試すので、IPv4 だけで待ち受ける Redis だと
+    #      接続ごとに約 2 秒失う。loopback の IPv4 を直接指す。
+    return os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
 
 
 def _stream_key() -> str:

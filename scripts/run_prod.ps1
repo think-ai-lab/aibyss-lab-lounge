@@ -10,7 +10,7 @@
 #
 # 前提:
 #   - Redis が起動中 (aibyss-workspace で docker compose up -d redis)
-#   - VOICEVOX が起動中 (port 50021)
+#   - VOICEVOX が起動中 (port 15021)
 #   - 本番 C2 が稼働中 (port 8100, c2.db)
 #       → aibyss-coral-chronicle/scripts/run_prod.ps1
 #   - 本番 V2 が稼働中 (推奨、配信時に必須)
@@ -135,7 +135,9 @@ if ($env:REDIS_STREAM_KEY -eq "aibyss:events-dev") {
     Write-Warning "REDIS_STREAM_KEY が dev ストリーム 'aibyss:events-dev' を指しています。prod モードでは 'aibyss:events' が期待値です。"
     $ViolationFound = $true
 }
-if ($env:L2_C2_URL -eq "http://localhost:8101") {
+# WHY: URL の完全一致だと、ホスト名を 127.0.0.1 へ変えただけで無言で効かなくなる。
+#      dev と prod を分けているのはポートなので、ポートで判定する。
+if ($env:L2_C2_URL -match ':8101/?$') {
     Write-Warning "L2_C2_URL が dev C2 ポート 8101 を指しています。prod モードでは 8100 が期待値です。"
     $ViolationFound = $true
 }

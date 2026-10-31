@@ -17,8 +17,9 @@ tts.py — TTS アダプタ
     uv add --optional tts "edge-tts>=6.1"
     duration 計算に mutagen を使う（任意）: uv add --optional tts "mutagen>=1.47"
   voicevox:
-    stdlib のみ (urllib)。VOICEVOX Engine が http://localhost:50021 で起動している必要がある。
-    docker run -p 50021:50021 voicevox/voicevox_engine:latest
+    stdlib のみ (urllib)。VOICEVOX Engine が http://127.0.0.1:15021 で起動している必要がある。
+    docker run -d --name aibyss-voicevox -p 127.0.0.1:15021:50021 voicevox/voicevox_engine:cpu-0.26.0
+    (ホスト側を 15021 にするのは、既定の 50021 が Windows の永続除外レンジに入り bind できないため)
 
 【audio_url の形式】
   ローカルファイルは pathlib.Path.as_uri() で file:///... 形式に変換する。
@@ -185,7 +186,7 @@ def _call_voicevox(
     voice には VOICEVOX のスピーカー ID（整数文字列）を渡す。
       例: "3" → ずんだもん
     VOICEVOX Engine のベース URL は環境変数 L2_TTS_VOICEVOX_URL で変更できる
-    (デフォルト: http://localhost:50021)
+    (デフォルト: http://127.0.0.1:15021)
 
     VOICEPEAK と同じ `_split_text_for_voicepeak` で 140 字分割し、チャンクごとに生成する。
     VOICEVOX 自体に文字数制限はないが、配信演出 (OBS セリフテロップ / ストリーミング再生) を
@@ -199,7 +200,7 @@ def _call_voicevox(
         on_chunk_ready:  チャンク生成完了時コールバック
             (audio_url: str, chunk_text: str, is_last: bool, speaker: str) -> None
     """
-    voicevox_url = os.environ.get("L2_TTS_VOICEVOX_URL", "http://localhost:50021")
+    voicevox_url = os.environ.get("L2_TTS_VOICEVOX_URL", "http://127.0.0.1:15021")
     try:
         speaker_id = int(voice)
     except ValueError as exc:

@@ -25,8 +25,8 @@
 # 【分離の保証】
 #   このスクリプトで起動した L2 は:
 #     - aibyss:events-dev のみに XADD (本番ストリームには一切書き込まない)
-#     - 主 C2 = http://localhost:8101 (dev、書き込み先)
-#     - 副 C2 = http://localhost:8100 (prod、read-only 参照)
+#     - 主 C2 = http://127.0.0.1:8101 (dev、書き込み先)
+#     - 副 C2 = http://127.0.0.1:8100 (prod、read-only 参照)
 #   よって発話データは本番 c2.db に混入せず、かつ過去の本番履歴も参照できる。
 # ──────────────────────────────────────────────────────────────
 
@@ -158,7 +158,9 @@ if ($env:REDIS_STREAM_KEY -eq "aibyss:events") {
     Write-Warning "REDIS_STREAM_KEY が本番ストリーム 'aibyss:events' を指しています。dev 発話が本番 C2 に届いてしまいます。"
     $ViolationFound = $true
 }
-if ($env:L2_C2_URL -eq "http://localhost:8100") {
+# WHY: URL の完全一致だと、ホスト名を 127.0.0.1 へ変えただけで無言で効かなくなる。
+#      dev と prod を分けているのはポートなので、ポートで判定する。
+if ($env:L2_C2_URL -match ':8100/?$') {
     Write-Warning "L2_C2_URL が本番ポート 8100 を指しています。dev 発話の読み取りで本番 DB を参照する設定になっています。"
     $ViolationFound = $true
 }

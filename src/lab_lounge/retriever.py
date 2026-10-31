@@ -215,7 +215,7 @@ class C2Retriever(Retriever):
     ) -> None:
         """
         Args:
-            base_url:   C2 のベース URL (例: "http://localhost:8100")
+            base_url:   C2 のベース URL (例: "http://127.0.0.1:8100")
             top_k:      retrieve() のデフォルト取得件数
             timeout_s:  HTTP リクエストのタイムアウト秒数
             exclude_event_ids: 検索結果から除外する event_id のリスト。
@@ -319,7 +319,7 @@ class RecentC2Retriever(Retriever):
     ) -> None:
         """
         Args:
-            base_url:   C2 のベース URL (例: "http://localhost:8100")
+            base_url:   C2 のベース URL (例: "http://127.0.0.1:8100")
             stream_id:  対象ストリーム ID。None の場合は全ストリーム横断 (global scope)。
             top_k:      retrieve() のデフォルト取得件数
             timeout_s:  HTTP リクエストのタイムアウト秒数

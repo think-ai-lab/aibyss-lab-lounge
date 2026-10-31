@@ -6,7 +6,7 @@ samples/test_greeting.wav として保存する。
 
 【使い方】
   # VOICEVOX Engine を起動してから（別ターミナル）:
-  # docker run -p 50021:50021 voicevox/voicevox_engine:latest
+  # docker run -d --name aibyss-voicevox -p 127.0.0.1:15021:50021 voicevox/voicevox_engine:cpu-0.26.0
 
   uv run python scripts/generate_smoke_wav.py
 
@@ -37,7 +37,7 @@ from pathlib import Path
 DEFAULT_TEXT = "こんにちは、私はAITuberのヴォイドルです。よろしくお願いします。"
 DEFAULT_SPEAKER = 89  # Voidoll
 DEFAULT_OUTPUT = Path(__file__).parent.parent / "samples" / "test_greeting.wav"
-DEFAULT_VOICEVOX_URL = "http://localhost:50021"
+DEFAULT_VOICEVOX_URL = "http://127.0.0.1:15021"
 
 
 def generate_wav(
@@ -136,7 +136,7 @@ def main() -> None:
         print(f"❌ VOICEVOX Engine に接続できません: {exc}", file=sys.stderr)
         print(
             "   VOICEVOX Engine を起動してから再実行してください:\n"
-            "   docker run -p 50021:50021 voicevox/voicevox_engine:latest",
+            "   docker run -d --name aibyss-voicevox -p 127.0.0.1:15021:50021 voicevox/voicevox_engine:cpu-0.26.0",
             file=sys.stderr,
         )
         sys.exit(1)

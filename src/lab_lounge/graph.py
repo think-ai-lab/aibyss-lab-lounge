@@ -1211,7 +1211,7 @@ def _build_retriever_from_env(
 
     関連 env:
         L2_USE_C2_RETRIEVER        — C2Retriever を Composite に組み込むか (default: false)
-        L2_C2_URL                  — 主 C2 のベース URL (default: http://localhost:8100)
+        L2_C2_URL                  — 主 C2 のベース URL (default: http://127.0.0.1:8100)
         L2_C2_URL_READONLY         — 副 C2 のベース URL (dev プロファイル用、空なら無効)
         L2_C2_RETRIEVER_TOP_K      — C2Retriever 単独の取得件数 (default: 3)
         L2_C2_RETRIEVER_BUDGET_MS  — C2 HTTP タイムアウト ms (default: 600)
@@ -1230,7 +1230,9 @@ def _build_retriever_from_env(
         return LocalRetriever(kb_path)
 
     from .retriever import C2Retriever, CompositeRetriever, RecentC2Retriever
-    c2_url = os.environ.get("L2_C2_URL", "http://localhost:8100")
+    # WHY: C2 は IPv4 の loopback だけで待ち受ける。localhost だと ::1 を先に試して約 2 秒失い、
+    #      600 ms の RAG 予算を超えて検索なしに落ちる。
+    c2_url = os.environ.get("L2_C2_URL", "http://127.0.0.1:8100")
     c2_url_readonly = os.environ.get("L2_C2_URL_READONLY", "").strip()
     c2_top_k = int(os.environ.get("L2_C2_RETRIEVER_TOP_K", "3"))
     c2_budget_s = float(os.environ.get("L2_C2_RETRIEVER_BUDGET_MS", "600")) / 1000

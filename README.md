@@ -110,7 +110,8 @@ uv sync --extra llm --extra llm-google --extra llm-anthropic `
 
 > **TTS の VOICEPEAK / VOICEVOX について**: VOICEPEAK は別途インストールし PATH を通すか
 > `L2_TTS_VOICEPEAK_PATH` で指定する。VOICEVOX は Engine をローカル起動する
-> （`docker run -p 50021:50021 voicevox/voicevox_engine:latest`）。
+> （`docker run -d --name aibyss-voicevox -p 127.0.0.1:15021:50021 voicevox/voicevox_engine:cpu-0.26.0`）。
+> ホスト側を 15021 にするのは、既定の 50021 が Windows の永続除外レンジに入り bind できないため。
 >
 > **irodori-TTS（ニューラル音声クローン / VoiceDesign）について**: torch + CUDA を使うため
 > 別プロセスの HTTP サイドカーとして動かす（[`sidecar/README.md`](sidecar/README.md)）。起動は
@@ -128,7 +129,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 
 | 変数 | 既定値 | 説明 |
 |------|--------|------|
-| `REDIS_URL` | `redis://localhost:6379` | Redis 接続 URL |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis 接続 URL |
 | `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー |
 | `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマ絶対パス（省略で兄弟 workspace を探索） |
 | `L2_USE_REAL_LLM` | `false` | `true` で real LLM を呼ぶ（ダミー応答を無効化） |
@@ -144,7 +145,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | `L2_USE_LLM_ROUTER` / `L2_LLM_ROUTER_MODEL` | `true` / `claude-haiku-4-5` | LLM によるキャラ・ルーティング |
 | `L2_USE_INTENT_GATE` / `L2_INTENT_GATE_MODEL` | `true` / `claude-haiku-4-5` | 挙手・承認の意図判定（軽量分類 LLM） |
 | `L2_ENABLE_RAG` / `L2_USE_C2_RETRIEVER` | `false` / `false` | seed corpus RAG / C2 会話メモリ RAG |
-| `L2_C2_URL` | `http://localhost:8100` | C2 のベース URL（RAG 参照先） |
+| `L2_C2_URL` | `http://127.0.0.1:8100` | C2 のベース URL（RAG 参照先） |
 | `L2_USE_HANDRAISE` | `true` | 挙手制自発介入の有効化（`bg-continuous` 上で動作） |
 | `L2_ENABLE_TOOLS` | `false` | MCP ツール（Agent モード）の有効化 |
 | `L2_VAD_BACKEND` / `L2_VAD_AGGRESSIVENESS` | `webrtc` / `3` | VAD バックエンドと感度 |
@@ -286,7 +287,7 @@ uv run python -m lab_lounge.run_loop --no-play
 | `-WakeBackend` | `continuous` | run_loop の `--wake-backend` に渡す（上記 6 種から選択） |
 | `-MaxTurns` | `3` | 暴走防止のターン上限。`0` 以下なら `--max-turns` を渡さず **無制限** にする |
 
-**分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://localhost:8101`（dev・書き込み先）、副 C2 = `http://localhost:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。
+**分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://127.0.0.1:8101`（dev・書き込み先）、副 C2 = `http://127.0.0.1:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。
 
 **前提**:
 - Redis 起動済み（`aibyss-workspace` で `docker compose up -d`）

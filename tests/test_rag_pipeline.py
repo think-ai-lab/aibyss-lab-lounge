@@ -269,7 +269,7 @@ class TestRAGPipelineWithC2Retriever:
         from lab_lounge.retriever import CompositeRetriever
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
         monkeypatch.setenv("L2_C2_RETRIEVER_TOP_K", "3")
         monkeypatch.setenv("L2_USE_C2_RECENT", "false")  # 本テストは C2Retriever のみを検証
 
@@ -311,7 +311,7 @@ class TestRAGPipelineWithC2Retriever:
         from lab_lounge.graph import _build_retriever_from_env
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
             retriever = _build_retriever_from_env(fake_index)
@@ -334,7 +334,7 @@ class TestRAGPipelineWithC2Retriever:
             assert not d.source.startswith("c2:")
 
     def test_c2_url_default_value(self, monkeypatch, fake_index):
-        """L2_C2_URL 未設定時のデフォルト値 http://localhost:8100 が使われる。"""
+        """L2_C2_URL 未設定時のデフォルト値 http://127.0.0.1:8100 が使われる。"""
         from lab_lounge.graph import _build_retriever_from_env
         from lab_lounge.retriever import C2Retriever
 
@@ -347,7 +347,7 @@ class TestRAGPipelineWithC2Retriever:
         # 2 つ目の retriever が C2Retriever で base_url がデフォルト
         c2_retriever = retriever._retrievers[1]
         assert isinstance(c2_retriever, C2Retriever)
-        assert c2_retriever._base_url == "http://localhost:8100"
+        assert c2_retriever._base_url == "http://127.0.0.1:8100"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -378,7 +378,7 @@ class TestC2RetrieverReadonlyProfile:
         from lab_lounge.retriever import C2Retriever, LocalRetriever
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
         monkeypatch.delenv("L2_C2_URL_READONLY", raising=False)
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
@@ -388,7 +388,7 @@ class TestC2RetrieverReadonlyProfile:
         assert len(retriever._retrievers) == 2
         assert isinstance(retriever._retrievers[0], LocalRetriever)
         assert isinstance(retriever._retrievers[1], C2Retriever)
-        assert retriever._retrievers[1]._base_url == "http://localhost:8100"
+        assert retriever._retrievers[1]._base_url == "http://127.0.0.1:8100"
 
     def test_readonly_url_set_adds_second_c2(self, monkeypatch, fake_index):
         """L2_C2_URL_READONLY 設定 → C2Retriever を 2 つ (primary + readonly) 追加 (3 retrievers)。"""
@@ -396,8 +396,8 @@ class TestC2RetrieverReadonlyProfile:
         from lab_lounge.retriever import C2Retriever, LocalRetriever
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8101")           # dev C2
-        monkeypatch.setenv("L2_C2_URL_READONLY", "http://localhost:8100")  # prod C2
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8101")           # dev C2
+        monkeypatch.setenv("L2_C2_URL_READONLY", "http://127.0.0.1:8100")  # prod C2
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
             retriever = _build_retriever_from_env(fake_index)
@@ -406,16 +406,16 @@ class TestC2RetrieverReadonlyProfile:
         assert len(retriever._retrievers) == 3
         assert isinstance(retriever._retrievers[0], LocalRetriever)
         assert isinstance(retriever._retrievers[1], C2Retriever)
-        assert retriever._retrievers[1]._base_url == "http://localhost:8101"
+        assert retriever._retrievers[1]._base_url == "http://127.0.0.1:8101"
         assert isinstance(retriever._retrievers[2], C2Retriever)
-        assert retriever._retrievers[2]._base_url == "http://localhost:8100"
+        assert retriever._retrievers[2]._base_url == "http://127.0.0.1:8100"
 
     def test_readonly_url_empty_string_ignored(self, monkeypatch, fake_index):
         """L2_C2_URL_READONLY='' (空文字列) は未設定扱い。"""
         from lab_lounge.graph import _build_retriever_from_env
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
         monkeypatch.setenv("L2_C2_URL_READONLY", "")
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
@@ -429,7 +429,7 @@ class TestC2RetrieverReadonlyProfile:
         from lab_lounge.graph import _build_retriever_from_env
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
         monkeypatch.setenv("L2_C2_URL_READONLY", "   ")
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
@@ -457,7 +457,7 @@ class TestRAGPipelineWithRecentRetriever:
         )
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8100")
         monkeypatch.delenv("L2_USE_C2_RECENT", raising=False)  # default=true
         monkeypatch.delenv("L2_C2_RECENT_SCOPE", raising=False)  # default=global
         monkeypatch.delenv("L2_C2_URL_READONLY", raising=False)
@@ -591,8 +591,8 @@ class TestRAGPipelineWithRecentRetriever:
         )
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8101")
-        monkeypatch.setenv("L2_C2_URL_READONLY", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8101")
+        monkeypatch.setenv("L2_C2_URL_READONLY", "http://127.0.0.1:8100")
         monkeypatch.delenv("L2_USE_C2_RECENT", raising=False)
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
@@ -607,7 +607,7 @@ class TestRAGPipelineWithRecentRetriever:
             r for r in retriever._retrievers if isinstance(r, RecentC2Retriever)
         ]
         assert len(recent_retrievers) == 1
-        assert recent_retrievers[0]._base_url == "http://localhost:8101"
+        assert recent_retrievers[0]._base_url == "http://127.0.0.1:8101"
 
     def test_exclude_event_ids_propagates_to_all_c2_retrievers(
         self, monkeypatch, fake_index
@@ -617,8 +617,8 @@ class TestRAGPipelineWithRecentRetriever:
         from lab_lounge.retriever import C2Retriever, RecentC2Retriever
 
         monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
-        monkeypatch.setenv("L2_C2_URL", "http://localhost:8101")
-        monkeypatch.setenv("L2_C2_URL_READONLY", "http://localhost:8100")
+        monkeypatch.setenv("L2_C2_URL", "http://127.0.0.1:8101")
+        monkeypatch.setenv("L2_C2_URL_READONLY", "http://127.0.0.1:8100")
         monkeypatch.delenv("L2_USE_C2_RECENT", raising=False)
 
         with patch("lab_lounge.retriever._embed", return_value=[1.0, 0.0]):
