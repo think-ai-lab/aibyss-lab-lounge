@@ -15,8 +15,8 @@ from lab_lounge.characters import (
 
 
 def _real_prompt_exists(filename: str) -> bool:
-    """実キャラ system prompt がローカルに在るか (公開リポでは untrack されるため
-    fresh clone では不在。本文 assert はその場合スキップする)。"""
+    """実キャラ system prompt が在るか (キャラ資産を削除した fork などでは不在。
+    本文 assert はその場合スキップする)。"""
     return (_PROMPTS_DIR / filename).is_file()
 
 
@@ -77,7 +77,7 @@ class TestGetAllCharacters:
 class TestLoadSystemPrompt:
     @pytest.mark.skipif(
         not _real_prompt_exists("system_octamaid.txt"),
-        reason="実キャラ prompt はローカル限定 (公開リポでは untrack 済み)",
+        reason="実キャラ prompt が無い環境 (キャラ資産を削除した fork 等)",
     )
     def test_load_existing_prompt(self):
         config = get_character("octamaid")
@@ -87,7 +87,7 @@ class TestLoadSystemPrompt:
 
     @pytest.mark.skipif(
         not _real_prompt_exists("system_mimi.txt"),
-        reason="実キャラ prompt はローカル限定 (公開リポでは untrack 済み)",
+        reason="実キャラ prompt が無い環境 (キャラ資産を削除した fork 等)",
     )
     def test_load_mimi_prompt(self):
         config = get_character("mimi")
@@ -110,7 +110,7 @@ class TestLoadSystemPrompt:
             load_system_prompt(fake)
 
     def test_falls_back_to_sample_when_real_absent(self):
-        """実キャラ prompt 不在 → samples/<sample_fallback> が返る (fresh clone での起動可能性)。"""
+        """実キャラ prompt 不在 → samples/<sample_fallback> が返る (キャラ資産を除いた環境での起動可能性)。"""
         from lab_lounge.characters import CharacterConfig
         cfg = CharacterConfig(
             slug="x",
@@ -127,7 +127,7 @@ class TestLoadSystemPrompt:
 
     def test_bundled_samples_exist_with_json_contract(self):
         """同梱サンプル2体が存在し、応答 JSON 契約 (response/speed/pose) を持つ
-        (公開リポでの起動を保証する不変条件)。"""
+        (キャラ資産を除いた環境での起動を保証する不変条件)。"""
         for name in ("sample_logic.md", "sample_empath.md"):
             p = _PROMPTS_DIR / "samples" / name
             assert p.is_file(), f"サンプル {name} が無い"
