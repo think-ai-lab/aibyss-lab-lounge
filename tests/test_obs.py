@@ -53,7 +53,7 @@ class TestInitObs:
         self, monkeypatch, caplog,
     ):
         """接続成功ログに host / port / password が含まれない (配信中の漏洩防止)。"""
-        monkeypatch.setenv("L2_OBS_WS_URL", "ws://192.168.11.101:4455")
+        monkeypatch.setenv("L2_OBS_WS_URL", "ws://192.0.2.101:4455")
         monkeypatch.setenv("L2_OBS_WS_PASSWORD", "secretpass123")
 
         mock_obsws = MagicMock()
@@ -65,7 +65,7 @@ class TestInitObs:
 
         all_messages = " ".join(r.getMessage() for r in caplog.records)
         # 機密情報がログに出ない
-        assert "192.168.11.101" not in all_messages
+        assert "192.0.2.101" not in all_messages
         assert "4455" not in all_messages
         assert "secretpass123" not in all_messages
         # 環境変数名のみが含まれる
@@ -75,13 +75,13 @@ class TestInitObs:
         self, monkeypatch, caplog,
     ):
         """接続失敗ログに host / port / password / 例外詳細が含まれない。"""
-        monkeypatch.setenv("L2_OBS_WS_URL", "ws://192.168.11.101:4455")
+        monkeypatch.setenv("L2_OBS_WS_URL", "ws://192.0.2.101:4455")
         monkeypatch.setenv("L2_OBS_WS_PASSWORD", "secretpass123")
 
         mock_obsws = MagicMock()
         # 例外メッセージに host/port が含まれる典型ケース
         mock_obsws.ReqClient.side_effect = ConnectionRefusedError(
-            "Connection refused: 192.168.11.101:4455 (auth=secretpass123)"
+            "Connection refused: 192.0.2.101:4455 (auth=secretpass123)"
         )
 
         with patch.dict(sys.modules, {"obsws_python": mock_obsws}):
@@ -89,7 +89,7 @@ class TestInitObs:
                 obs_mod.init_obs()
 
         all_messages = " ".join(r.getMessage() for r in caplog.records)
-        assert "192.168.11.101" not in all_messages
+        assert "192.0.2.101" not in all_messages
         assert "secretpass123" not in all_messages
         # 例外クラス名のみが残る
         assert "ConnectionRefusedError" in all_messages
