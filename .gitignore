@@ -135,8 +135,11 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+# 鍵の入った派生ファイル (.env.local, .env.bak など) を誤って commit しないよう、雛形以外はすべて外す。
 .env
-.env.dev
+.env.*
+!.env.example
+!.env.dev.example
 .envrc
 .venv
 env/
@@ -227,6 +230,14 @@ output.wav
 # 構造を伝えるテンプレ current.example.md のみ commit 対象 (下の例外指定で残す)。
 data/stream_context/*.md
 !data/stream_context/current.example.md
+
+# 実発話を含むローカルデータ
+# 判定ログ、リプレイセット、計測結果は配信外の発話を含みうるので、公開リポジトリへ入れない。
+logs/decisions/
+data/replay/
+data/probe/
+# 一時作業ディレクトリ
+.tmp/
 
 # benchmark results
 # tests/bench_ttft.py の計測生データ。再計測で再生成できるローカル作業ファイルのため
