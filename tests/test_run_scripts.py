@@ -508,6 +508,38 @@ class TestStartup:
                 assert text not in output, output
         assert "192.0.2" not in output  # 起動の出力は貼られることがあるので、OBS の PC のアドレスを出さない
 
+    @pytest.mark.parametrize("script,expected", [
+        ("run_dev.ps1", ["[HOST]:8101", "[HOST]:8100"]),
+        ("run_prod.ps1", ["[HOST]:8100"]),
+    ])
+    def test_header_does_not_print_a_non_loopback_url(self, scene, script, expected):
+        """起動の出力は貼られることがある。/health の行と同じく host を伏せ、URL の資格情報も出さない。
+        ポートは残すので、dev と prod の分離は読める。"""
+        scene.dotenv["L2_C2_URL"] = "http://user:zqxPASSWORD@192.0.2.1:8100"
+        scene.dotenv_dev["L2_C2_URL"] = "http://user:zqxPASSWORD@192.0.2.1:8101"
+        scene.dotenv_dev["L2_C2_URL_READONLY"] = "http://user:zqxPASSWORD@192.0.2.2:8100"
+
+        done = scene.run(script, "-SkipHealthCheck")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert "192.0.2" not in output
+        assert "zqx" not in output
+        for endpoint in expected:
+            assert endpoint in output
+
+    def test_header_shows_a_loopback_url_as_host_and_port(self, scene):
+        """loopback は調査の手がかりなので残す。空の副 C2 は URL の形の不正としない。"""
+        scene.dotenv_dev["L2_C2_URL"] = "http://127.0.0.1:8101/"
+        scene.dotenv_dev["L2_C2_URL_READONLY"] = ""
+
+        done = scene.run("run_dev.ps1", "-SkipHealthCheck")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert re.search(r"L2_C2_URL \(primary\)\s+= 127\.0\.0\.1:8101\n", output), output
+        assert re.search(r"L2_C2_URL_READONLY\s+= \n", output), output
+
     def test_dotenv_that_sets_an_endpoint_reaches_preflight_which_refuses_it(self, scene):
         """.env の指定は黙って消さない。読む前に外すので残り、preflight が終了コード 2 で止める。"""
         scene.dotenv["ANTHROPIC_BASE_URL"] = _INHERITED_VALUE

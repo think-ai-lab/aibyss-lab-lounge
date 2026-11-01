@@ -66,7 +66,8 @@ Import-DotEnvFile -Path $EnvFile -Override
 Write-Host ""
 Write-Host "[lab-lounge/prod] 起動設定 (最終値):" -ForegroundColor Cyan
 Write-Host "  REDIS_STREAM_KEY      = $env:REDIS_STREAM_KEY"
-Write-Host "  L2_C2_URL             = $env:L2_C2_URL"
+# WHY: 起動の出力は貼られることがあるので、/health の行と同じく host を伏せる (理由は Format-ServiceEndpoint)。
+Write-Host "  L2_C2_URL             = $(if ($env:L2_C2_URL) { Format-ServiceEndpoint $env:L2_C2_URL })"
 Write-Host "  L2_USE_REAL_LLM       = $env:L2_USE_REAL_LLM"
 Write-Host "  L2_USE_REAL_TTS       = $env:L2_USE_REAL_TTS"
 Write-Host "  L2_USE_REAL_STT       = $env:L2_USE_REAL_STT"

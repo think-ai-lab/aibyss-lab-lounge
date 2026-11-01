@@ -90,8 +90,10 @@ Write-Host ""
 Write-Host "[lab-lounge/dev] 分離確認 (最終値):" -ForegroundColor Cyan
 Write-Host "  REDIS_STREAM_KEY      = $env:REDIS_STREAM_KEY"
 Write-Host "  L2_USE_C2_RETRIEVER   = $env:L2_USE_C2_RETRIEVER"
-Write-Host "  L2_C2_URL (primary)   = $env:L2_C2_URL"
-Write-Host "  L2_C2_URL_READONLY    = $env:L2_C2_URL_READONLY"
+# WHY: 起動の出力は貼られることがあるので、/health の行と同じく host を伏せる (理由は Format-ServiceEndpoint)。
+#      ポートは残るので、dev と prod の分離の確認には足りる。
+Write-Host "  L2_C2_URL (primary)   = $(if ($env:L2_C2_URL) { Format-ServiceEndpoint $env:L2_C2_URL })"
+Write-Host "  L2_C2_URL_READONLY    = $(if ($env:L2_C2_URL_READONLY) { Format-ServiceEndpoint $env:L2_C2_URL_READONLY })"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
 Write-KeyStatus -Name "OPENAI_API_KEY" -Required
