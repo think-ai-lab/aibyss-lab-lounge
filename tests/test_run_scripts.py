@@ -13,11 +13,13 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from dotenv import dotenv_values
 
 from lab_lounge import bus, preflight
 
@@ -86,16 +88,23 @@ class FakeService:
         self.status = 200
         # None はテストが応答を決めていない印。Scene が流すスクリプトに合う正常な応答で埋める。
         self.body: bytes | None = None
+        self.delay = 0.0
         self.paths: list[str] = []
         service = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - http.server の規約
-                service.paths.append(self.path)
-                self.send_response(service.status)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(service.body)
+                # WHY: self.path は先頭の // を / へ縮めるので、URL の末尾の / の扱いを確かめられない。送られた行から読む。
+                service.paths.append(self.raw_requestline.split()[1].decode("ascii"))
+                time.sleep(service.delay)
+                try:
+                    self.send_response(service.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(service.body)
+                except OSError:
+                    pass  # 待たせる場面では、相手が先に切っている
+
 
             def log_message(self, *_args) -> None:
                 """テストの出力へアクセスログを混ぜない。"""
@@ -129,6 +138,7 @@ class Scene:
         self.env: dict[str, str] = {}
         self.dotenv: dict[str, str] = {
             "OPENAI_API_KEY": _KEY_VALUE,
+            "LANGSMITH_API_KEY": _KEY_VALUE,
             "L2_ENABLE_TOOLS": "true",
             "L2_ENABLE_RAG": "true",
             "L2_USE_C2_RETRIEVER": "true",
@@ -165,6 +175,8 @@ class Scene:
 
     def _prepare(self, script: str) -> None:
         """今の値で .env と .env.dev を書き、テストが決めていない応答を正常なものにする。"""
+        # 消すと既定の URL の実サービスへ繋がるので、どの場面にも必ず置く。
+        assert {"L2_C2_URL", "L2_V2_URL"} <= set(self.dotenv)
         for name, values in ((".env", self.dotenv), (".env.dev", self.dotenv_dev)):
             (self.root / name).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
         stream = _stream_of(script)
@@ -231,6 +243,19 @@ class Scene:
         return any(module in call for call in self.uv_calls)
 
 
+def _run_common_probe(tmp_path: Path, lines: list[str]) -> str:
+    """run_common.ps1 を読み込んで lines を流し、標準出力を返す。関数の表を 1 つのプロセスでまとめて確かめるため。"""
+    probe = tmp_path / "probe.ps1"
+    head = ["[Console]::OutputEncoding = [System.Text.Encoding]::UTF8", f". '{_SCRIPTS / 'run_common.ps1'}'"]
+    probe.write_text("\n".join([*head, *lines]), encoding="utf-8-sig")
+    done = subprocess.run(
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
 @pytest.fixture
 def scene(tmp_path):
     """既定で正常に動く場面を返す。テストは偽サーバの応答や .env の値を変えてから run を呼ぶ。"""
@@ -265,6 +290,8 @@ class TestStartup:
         assert not [line for line in scene.uv_lines if line.startswith("LEFT ")]
         # キーは set / unset だけ。先頭の数文字も出さない。
         assert re.search(r"OPENAI_API_KEY\s+= set", output)
+        if script == "run_prod.ps1":
+            assert re.search(r"LANGSMITH_API_KEY\s+= set", output)
         assert "zqx" not in output
         # V2 の接続数が読めること。OBS の PC が繋がっていないことを、起動時に見つけるため。
         assert "total=8 loopback=0 lan=8" in output
@@ -542,12 +569,24 @@ class TestStartup:
         assert re.search(r"L2_C2_URL \(primary\)\s+= 127\.0\.0\.1:8101\n", output), output
         assert re.search(r"L2_C2_URL_READONLY\s+= \n", output), output
 
-    def test_dotenv_that_sets_an_endpoint_reaches_preflight_which_refuses_it(self, scene):
+    def test_v2_without_the_client_counts_still_starts(self, scene):
+        """接続数は知らせるための値なので、読めなくても起動を止めない。"""
+        scene.v2.answer(200, {"status": "ok", "stream": "aibyss:events"})
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert _TOTAL_NOTICE not in output
+        assert _LAN_NOTICE not in output
+
+    @pytest.mark.parametrize("script", _RUN_SCRIPTS)
+    def test_dotenv_that_sets_an_endpoint_reaches_preflight_which_refuses_it(self, scene, script):
         """.env の指定は黙って消さない。読む前に外すので残り、preflight が終了コード 2 で止める。"""
         scene.dotenv["ANTHROPIC_BASE_URL"] = _INHERITED_VALUE
         scene.preflight_exit = preflight.EXIT_REFUSED
 
-        done = scene.run("run_prod.ps1")
+        done = scene.run(script)
 
         assert done.returncode == 1, done.stdout + done.stderr
         assert "LEFT ANTHROPIC_BASE_URL" in scene.uv_lines
@@ -591,6 +630,54 @@ class TestStartup:
         output = done.stdout + done.stderr
         assert done.returncode == 1, output
         assert "'aibyss:events-dev' を読んでいます" in output
+
+    @pytest.mark.parametrize("script,name,leftover", [
+        ("run_prod.ps1", "REDIS_STREAM_KEY", "aibyss:events-dev"),
+        ("run_dev.ps1", "REDIS_STREAM_KEY", "aibyss:events"),  # .env.dev が勝つ
+        ("run_dev.ps1", "L2_V2_URL", "http://127.0.0.1:6"),  # .env が勝つ。閉じたポート
+    ])
+    def test_files_win_over_what_the_last_run_left_in_the_shell(self, scene, script, name, leftover):
+        """同じシェルで dev と prod を続けて流しても、前の実行の値で別の相手へ繋がらない。"""
+        scene.env = {name: leftover}
+
+        done = scene.run(script)
+
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert scene.called("lab_lounge.run_loop")
+        assert scene.v2.paths == ["/health"]
+
+    def test_trailing_slash_of_the_url_does_not_double_the_slash(self, scene):
+        """V2 や C2 の経路に // は合わないので、末尾の / だけで嘘の赤になる。"""
+        scene.dotenv["L2_C2_URL"] = f"{scene.c2.url}/"
+        scene.dotenv["L2_V2_URL"] = f"{scene.v2.url}/"
+
+        done = scene.run("run_prod.ps1")
+
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert scene.c2.paths == ["/health"]
+        assert scene.v2.paths == ["/health"]
+
+    def test_proxy_left_in_the_shell_is_not_used_for_the_check(self, scene):
+        """手元のサービスの確認がプロキシへ向かうと、止まったプロキシで嘘の赤になる。"""
+        with socket.create_server(("127.0.0.1", 0)) as unused:
+            scene.env = {"HTTP_PROXY": f"http://127.0.0.1:{unused.getsockname()[1]}"}
+
+        done = scene.run("run_prod.ps1")
+
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert scene.c2.paths == ["/health"]
+        assert scene.v2.paths == ["/health"]
+
+    def test_service_that_hangs_stops_the_start_instead_of_hanging_it(self, scene):
+        """/health が固まったサービスで、起動の確認まで固まらない。6 秒は確認の上限の 3 秒より長く待たせる値。"""
+        scene.v2.delay = 6.0
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert "接続できません" in output
+        assert not scene.called("lab_lounge.run_loop")
 
     @pytest.mark.skipif(_WINDOWS_POWERSHELL is None, reason="Windows PowerShell がない環境")
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
@@ -637,15 +724,8 @@ class TestStartup:
             """環境変数を設定する PowerShell の文を返す。None は未設定。"""
             return f"$env:{name} = $null" if value is None else f"$env:{name} = '{value}'"
 
-        lines = [f". '{_SCRIPTS / 'run_common.ps1'}'"]
-        lines += [";".join(assignment(*item) for item in row.items()) + "; [int](Test-C2RetrieverEnabled)" for row in table]
-        probe = tmp_path / "probe.ps1"
-        probe.write_text("\n".join(lines), encoding="utf-8-sig")
-        done = subprocess.run(
-            [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(probe)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
-        )
-        assert done.returncode == 0, done.stderr
+        lines = [";".join(assignment(*item) for item in row.items()) + "; [int](Test-C2RetrieverEnabled)" for row in table]
+        stdout = _run_common_probe(tmp_path, lines)
 
         expected = []
         for row in table:
@@ -655,7 +735,60 @@ class TestStartup:
                     if value is not None:
                         os.environ[name] = value
                 expected.append("1" if preflight._c2_retriever_enabled() else "0")
-        assert done.stdout.split() == expected
+        assert stdout.split() == expected
+
+    def test_endpoint_shows_only_a_loopback_host_and_the_port(self, tmp_path):
+        """起動の出力は貼られることがある。loopback だけを調査の手がかりとして残し、資格情報とパスは出さない。"""
+        table = {
+            "http://127.0.0.1:8101": "127.0.0.1:8101",
+            "http://127.0.0.1:8101/": "127.0.0.1:8101",
+            "http://localhost:3200": "localhost:3200",
+            "http://[::1]:3200": "[::1]:3200",
+            "http://user:zqx@127.0.0.1:8101": "127.0.0.1:8101",
+            "http://192.0.2.1:8100": "[HOST]:8100",
+            "http://user:zqx@192.0.2.1:8100/path": "[HOST]:8100",
+            "http://box.example": "[HOST]:80",
+            "not a url": "(URL の形が不正)",
+        }
+        stdout = _run_common_probe(tmp_path, [f"Format-ServiceEndpoint '{url}'" for url in table])
+        assert stdout.splitlines() == list(table.values())
+
+    def test_dotenv_reader_reads_like_python_dotenv(self, tmp_path):
+        """スクリプトと run_loop で値の読み方が違うと、起動の確認と本番で別の相手を見る。本物の dotenv_values と比べる。
+
+        ダブルクォートの中のエスケープは揃わない（preflight の env/quoting が知らせる）ので、表に入れない。
+        """
+        rows = [
+            "{}=value",
+            "{} = value",
+            "{}=   value   ",
+            '{}="value"',
+            "{}='value'",
+            "export {}=value",
+            "{}=value # comment",
+            "{}=value\t# comment after a tab",
+            '{}="value # not a comment"',
+            '{}="value" # comment after the quote',
+            "{}=value#literal",
+            "{}=two words",
+            "{}=",
+            "# {}=commented out",
+            "   # {}=indented comment",
+            "{}=http://127.0.0.1:8100/",
+            "{}=a=b",
+            "{}=値",
+        ]
+        names = [f"L2_PROBE_{index:02}" for index in range(len(rows))]
+        env_file = tmp_path / ".env.probe"
+        env_file.write_text("\n".join(row.format(name) for row, name in zip(rows, names, strict=True)) + "\n", encoding="utf-8")
+
+        reads = [f"[Console]::Out.WriteLine('{name}=' + $env:{name})" for name in names]
+        stdout = _run_common_probe(tmp_path, [f"Import-DotEnvFile -Path '{env_file}' -Override", *reads])
+
+        # 空の値と行なしの区別は pwsh の版で変わる（古い版は空の値で変数を消す）ので、どちらも空として比べる。
+        read_by_the_script = dict(line.split("=", 1) for line in stdout.splitlines())
+        read_by_dotenv = dotenv_values(env_file)
+        assert read_by_the_script == {name: read_by_dotenv.get(name) or "" for name in names}
 
 
 class TestScriptText:
@@ -693,9 +826,13 @@ class TestScriptText:
     def test_preflight_gets_the_profile_of_the_script(self, script):
         assert f"--static --profile {_profile_of(script)}\n" in self._read(script)
 
-    def test_default_v2_url_is_the_documented_one(self):
-        """偽サーバの場面では .env で上書きするので、既定はここで確かめる。実物の V2 には繋がない。"""
-        assert '"http://127.0.0.1:3200"' in self._read("run_common.ps1")
+    def test_default_urls_are_the_documented_ones(self):
+        """偽サーバの場面では .env で上書きするので、既定はここで確かめる。実物の C2 と V2 には繋がない。"""
+        common = self._read("run_common.ps1")
+        assert '"http://127.0.0.1:3200"' in common
+        assert '"http://127.0.0.1:8100"' in common
+        # C2 の既定は本番の読み方と同じ。
+        assert 'os.environ.get("L2_C2_URL", "http://127.0.0.1:8100")' in (_REPO_ROOT / "src" / "lab_lounge" / "graph.py").read_text(encoding="utf-8")
 
     def test_prod_start_batch_file_has_the_same_shape_as_dev(self):
         """Stream Deck から押すボタンの入口。cmd は UTF-8 の日本語を読み違えることがあるので ASCII に限る。"""
