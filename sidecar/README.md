@@ -17,9 +17,11 @@ irodori は `torch` + CUDA + git 依存（`dacvae` / `silentcipher`）の重い�
 
 ## 前提
 
-- `irodori-tts` が `T:\irodori-tts\Irodori-TTS` に clone ＋ `uv sync --extra cu128`（CUDA バックエンド）済み
-- weights が `HF_HOME`（既定 `T:\irodori-tts\hf-cache`）に DL 済み
+- `run_irodori_sidecar.ps1` は PowerShell 7（`pwsh`）で動かす（Windows PowerShell 5.1 は BOM のない UTF-8 を ANSI として読むので、日本語の Windows では構文エラーで止まる）
+- `irodori-tts` を clone して `uv sync --extra cu128`（CUDA バックエンド）する。既定の場所は作者の環境の `T:\irodori-tts\Irodori-TTS` なので、別の場所なら `L2_IRODORI_REPO` で指す
+- weights を `HF_HOME` に取得する。スクリプトは `L2_IRODORI_HF_HOME`（既定 `T:\irodori-tts\hf-cache`）を `HF_HOME` へ入れるので、別の場所なら `L2_IRODORI_HF_HOME` で指す
   （`Irodori-TTS-500M-v3` / `Irodori-TTS-600M-v3-VoiceDesign` / DACVAE codec / tokenizer / silentcipher）
+  `run_irodori_sidecar.ps1` は取得済みの weights だけを使う（`HF_HUB_OFFLINE=1`。上流の更新を無言で取り込むと調整済みの声が変わるため）。初回や更新するときは `-AllowDownload` を付ける
 - CUDA GPU が利用可能
 
 ## 起動
@@ -55,7 +57,7 @@ irodori は `torch` + CUDA + git 依存（`dacvae` / `silentcipher`）の重い�
   "mode": "vd",
   "text": "ごきげんよう、アビスメイトの皆さま。🤭",
   "caption": "理知的で聡明な、気品のある若い女性の声。…（＋感情サフィックス）",
-  "ref_wav": "T:\\irodori-tts\\reference_voices\\mimi_ref.wav",
+  "ref_wav": "<reference_voices の絶対パス>\\mimi_ref.wav",
   "duration_scale": 1.0,
   "num_steps": 24,
   "t_schedule_mode": "sway",
@@ -90,7 +92,7 @@ curl -X POST http://127.0.0.1:18080/synthesize `
 |------|------------|
 | 起動時 `CUDA ... is False` | GPU/ドライバ未認識。`nvidia-smi` を確認。irodori を `--extra cu128` で sync したか |
 | `irodori_tts` が import できない | `L2_IRODORI_REPO` が irodori リポを指しているか確認 |
-| weights を毎回 DL しようとする | `HF_HOME` が `hf-cache` を指しているか確認 |
+| 起動時に weights が見つからない（`LocalEntryNotFoundError` など） | まず起動時に表示される `HF_HOME` が取得済みのキャッシュを指しているか確かめる（違えば `L2_IRODORI_HF_HOME` で指す）。未取得なら `run_irodori_sidecar.ps1 -AllowDownload` で取得する |
 | L2 から繋がらない | `L2_TTS_IRODORI_URL`（既定 `http://127.0.0.1:18080`）とポートが一致しているか |
 
 設定の全体像は L2 の `.env.example` の irodori セクションを参照してください。

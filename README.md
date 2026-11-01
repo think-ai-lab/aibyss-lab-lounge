@@ -115,7 +115,7 @@ uv sync --extra llm --extra llm-google --extra llm-anthropic `
 >
 > **irodori-TTS（ニューラル音声クローン / VoiceDesign）について**: torch + CUDA を使うため
 > 別プロセスの HTTP サイドカーとして動かす（[`sidecar/README.md`](sidecar/README.md)）。起動は
-> `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` か `scripts/run_irodori_sidecar.ps1`。
+> `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` か `scripts/run_irodori_sidecar.ps1`（weights が未取得なら初回だけ `-AllowDownload` を付けて後者を流す）。
 > provider は `irodori_vd`（VoiceDesign）。確定版は self-ref アンカー + caption + seed + sway24。
 > どのキャラがどの provider を使うかは `characters.py` で定義する（確定版は ミミ/ちさめ/さくら/アルカ）。
 
