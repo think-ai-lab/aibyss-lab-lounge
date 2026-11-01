@@ -763,6 +763,19 @@ class TestStartup:
         assert re.search(r"L2_C2_URL_READONLY\s+= \n", output), output
         assert "zqx" not in output
 
+    def test_prod_without_a_stream_line_after_dev_in_the_same_shell_goes_to_the_default(self, scene):
+        """.env に行がないなら、新しいシェルと同じく既定の本番へ向く。dev の値が残ると、正しい設定なのに拒否で止まる。"""
+        scene.set_stream_lines(None, "aibyss:events-dev")
+        scene.env = {"REDIS_STREAM_KEY": "aibyss:events-dev"}
+        scene.watch = ["REDIS_STREAM_KEY"]
+
+        done = scene.run("run_prod.ps1", colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert "<Gray>[lab-lounge/prod] .env.dev だけにある変数を外しました: REDIS_STREAM_KEY" in output
+        assert [line for line in scene.uv_lines if line.startswith("LEFT ")] == []
+
     def test_prod_keeps_the_names_env_also_sets(self, scene):
         """.env にもある名前は、.env の値で動く。外すのは .env.dev だけにある名前。"""
         scene.dotenv["L2_C2_URL_READONLY"] = "http://127.0.0.1:8102"
@@ -939,19 +952,20 @@ class TestStartup:
 
         stdout = _run_common_probe(tmp_path, [f"Get-DotEnvName -Path '{env_file}'", f"Get-DotEnvName -Path '{tmp_path / 'missing'}'"])
 
-        assert stdout.split() == ["L2_PROBE_NAME"]
+        assert stdout.splitlines() == ["L2_PROBE_NAME"]
 
     def test_only_the_names_that_env_lacks_are_removed(self, tmp_path):
         """コメントの行は .env にない名前として外す。大文字と小文字の違いは同じ名前として残す（Windows の環境変数は区別しない）。
 
-        名前はファイルから来るので、* でほかの変数を巻き込まない。.env.dev がなければ何も外さない。
+        名前はファイルから来るので、* でほかの変数を巻き込まず、名前のない行で Env: ドライブそのものを指さない。
+        .env.dev がなければ何も外さない。
         """
         env_file = tmp_path / ".env"
         dev_file = tmp_path / ".env.dev"
         env_file.write_text("L2_PROBE_BOTH=1\n# L2_PROBE_COMMENTED=1\nexport L2_PROBE_EXPORTED=1\nl2_probe_lower=1\n", encoding="utf-8")
         dev_file.write_text(
             "L2_PROBE_BOTH=2\nL2_PROBE_COMMENTED=2\nL2_PROBE_EXPORTED=2\nL2_PROBE_LOWER=2\n"
-            "L2_PROBE_DEV=zqx\nL2_PROBE_DEV=zqx\nL2_PROBE_UNSET=2\nL2_PROBE_*=2\n",
+            "L2_PROBE_DEV=zqx\nL2_PROBE_DEV=zqx\nL2_PROBE_UNSET=2\nL2_PROBE_*=2\n=2\n",
             encoding="utf-8",
         )
         in_shell = ["L2_PROBE_BOTH", "L2_PROBE_COMMENTED", "L2_PROBE_EXPORTED", "L2_PROBE_LOWER", "L2_PROBE_DEV", "L2_PROBE_OTHER"]
