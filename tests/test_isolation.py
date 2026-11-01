@@ -117,7 +117,9 @@ class TestLocalData:
 
     @staticmethod
     def _outside_repo(path: str | Path) -> bool:
-        return _REPO_ROOT not in Path(path).resolve().parents
+        """path がリポジトリの中（リポジトリ自身を含む）でなければ True を返す。"""
+        resolved = Path(path).resolve()
+        return resolved != _REPO_ROOT and _REPO_ROOT not in resolved.parents
 
     def test_working_directory_is_outside_the_repo(self):
         """./data/audio や ./logs の既定と、作業ディレクトリの .env を読むライブラリのため。"""
