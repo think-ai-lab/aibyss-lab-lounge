@@ -2258,6 +2258,7 @@ class TestStaticKeepsGoing:
         ("_check_endpoints", "url"),
         ("_check_stream", "stream"),
         ("_check_run_script_refusals", "run-script"),
+        ("_check_loopback_proxy", "env/proxy"),
         ("_check_event_schema", "schema"),
         ("_check_stream_context", "stream_context"),
         ("_check_obs", "obs"),
@@ -3732,6 +3733,51 @@ class TestEnvFileQuoting:
         assert code == preflight.EXIT_FAILED
         assert "[WARN ] env/quoting: L2_IRODORI_VOICES_JSON" in out
         assert "[FAIL ] tts-config/mimi:" in out
+
+
+class TestLoopbackProxy:
+    """C2 と TTS への接続が環境のプロキシを通る設定を知らせる。run スクリプトの /health は -NoProxy なので、そちらでは見えない。"""
+
+    # 出力に現れないことを確かめる印。
+    _PROXY = "http://zqx-proxy.invalid:8080"
+
+    @pytest.fixture(autouse=True)
+    def _no_inherited_no_proxy(self, monkeypatch):
+        """流すシェルの NO_PROXY で結果が変わらないようにする。"""
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+    def test_warns_without_showing_the_proxy(self, monkeypatch):
+        monkeypatch.setenv("HTTP_PROXY", self._PROXY)
+        report = preflight.Report()
+        preflight._check_loopback_proxy(report)
+        check = _status(report, "env/proxy")
+        assert check.status == "WARN"
+        assert "zqx" not in check.detail
+
+    @pytest.mark.parametrize("no_proxy", ["127.0.0.1", "localhost,127.0.0.1", "*"])
+    def test_no_proxy_quiets_it(self, monkeypatch, no_proxy):
+        monkeypatch.setenv("HTTP_PROXY", self._PROXY)
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+        report = preflight.Report()
+        preflight._check_loopback_proxy(report)
+        assert report.checks == []
+
+    def test_no_row_without_a_proxy(self):
+        # Windows は環境変数がないとレジストリの設定を読むので、手元の設定で結果が変わらないように差し替える。
+        with patch("urllib.request.getproxies", return_value={}):
+            report = preflight.Report()
+            preflight._check_loopback_proxy(report)
+        assert report.checks == []
+
+    def test_static_shows_the_row(self, isolated, monkeypatch, capsys):
+        """--static は run スクリプトが毎回流すので、ここに出れば起動のたびに見える。"""
+        monkeypatch.setenv("HTTP_PROXY", self._PROXY)
+        (isolated / ".env").write_text("REDIS_STREAM_KEY=aibyss:events-dev\n", encoding="utf-8")
+        preflight.main(["--static", "--profile", "dev", "--characters", "mimi"], repo_root=isolated)
+        out = capsys.readouterr().out
+        assert "[WARN ] env/proxy:" in out
+        assert "zqx" not in out
 
 
 class TestRunScriptRefusals:

@@ -1486,6 +1486,17 @@ def _check_run_script_refusals(report: Report, profile: str, repo_root: Path) ->
         report.add("run-script/L2_C2_URL", "WARN", "prod で dev のポート 8101 を指しています。run_prod.ps1 は起動を拒否します")
 
 
+def _check_loopback_proxy(report: Report) -> None:
+    """手元のサービスへの接続がプロキシを通る設定を知らせる。プロキシの URL は表示しない。
+
+    WHY: 本番の C2Retriever (httpx) と TTS (urllib) は環境のプロキシを読むので、NO_PROXY がないと 127.0.0.1 への
+         接続もプロキシへ向かう。run スクリプトの /health の確認はプロキシを通らないので、起動の確認は緑のまま
+         本番だけが繋がらないことがある。--static は run スクリプトが毎回流すので、ここで見えるようにする。
+    """
+    if urllib.request.getproxies().get("http") and not urllib.request.proxy_bypass("127.0.0.1"):
+        report.add("env/proxy", "WARN", "プロキシの設定があり、NO_PROXY に 127.0.0.1 がありません。C2 と TTS への接続がプロキシを通ります")
+
+
 def _check_event_schema(report: Report) -> None:
     """イベントのスキーマを、本番と同じ関数で解決できるかを確かめる。
 
@@ -1653,6 +1664,7 @@ def run_static(
     run("url", _check_endpoints, characters)
     run("stream", _check_stream, profile)
     run("run-script", _check_run_script_refusals, profile, repo_root)
+    run("env/proxy", _check_loopback_proxy)
     run("schema", _check_event_schema)
     run("stream_context", _check_stream_context, repo_root)
     report.add("flag/LANGSMITH", "INFO", _tracing_state())
