@@ -6,6 +6,7 @@ conftest の隔離が黙って外れると、以後のテストが手元の .env
 """
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -27,6 +28,39 @@ _SERVICE_PORTS = [6, 3200, 4455, 6379, 8100, 8101, 15021, 18080, 50021]
 
 class TestEnvironment:
     """lab_lounge の import より前に整えた環境が、テストの間も保たれていること。"""
+
+    def test_environment_is_ready_when_conftest_is_imported(self):
+        """テストファイルの import は fixture より先に走り、その時点で load_dotenv やログの作成が動く。
+
+        fixture だけで整えていても、ここまでのテストは緑になる。別プロセスで conftest だけを読んで確かめる。
+        """
+        code = textwrap.dedent("""
+            import json, os, sys
+            sys.path.insert(0, sys.argv[1])
+            import conftest
+            print(json.dumps({name: os.environ.get(name) for name in (
+                "PYTHON_DOTENV_DISABLED", "REDIS_URL", "REDIS_STREAM_KEY", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "L2_USE_REAL_LLM",
+            )} | {"log_dir_is_temporary": conftest._SESSION_DIR.name in os.environ["L2_LOG_DIR"]}))
+        """)
+        env = {
+            **os.environ, "OPENAI_API_KEY": "x", "ANTHROPIC_BASE_URL": "http://192.0.2.1", "L2_USE_REAL_LLM": "true",
+            "REDIS_URL": "redis://192.0.2.1:6379", "REDIS_STREAM_KEY": "aibyss:events",
+        }
+        del env["PYTHON_DOTENV_DISABLED"]
+        done = subprocess.run(
+            [sys.executable, "-c", code, str(_REPO_ROOT / "tests")],
+            capture_output=True, text=True, encoding="utf-8", timeout=60, check=False, env=env,
+        )
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {
+            "PYTHON_DOTENV_DISABLED": "1",
+            "REDIS_URL": "redis://127.0.0.1:6",
+            "REDIS_STREAM_KEY": "aibyss:events-test",
+            "OPENAI_API_KEY": None,
+            "ANTHROPIC_BASE_URL": None,
+            "L2_USE_REAL_LLM": None,
+            "log_dir_is_temporary": True,
+        }
 
     def test_dotenv_loading_is_disabled(self, tmp_path):
         """明示したパスでも読まないこと。run_loop などの load_dotenv() が手元の .env を環境へ入れないように。"""
