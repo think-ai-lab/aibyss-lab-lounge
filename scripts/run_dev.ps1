@@ -11,8 +11,6 @@
 #
 # 前提:
 #   - Redis が起動中 (docker compose up -d redis)
-#   - 本番 C2 が稼働中 (port 8100, c2.db)
-#     → aibyss-coral-chronicle/scripts/run_prod.ps1
 #   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)
 #     → aibyss-coral-chronicle/scripts/run_dev.ps1
 #   - V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
@@ -23,6 +21,12 @@
 #   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。
 #   C2 は記憶の検索に使う設定のときだけ確かめる。失敗があれば赤く出して exit 1 で止まる。
 #   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
+#
+# 【本番 C2 (副 C2) について】
+#   本番 C2 (port 8100, c2.db) は過去の本番履歴を読むための副 C2 で、止まっていても起動できる。
+#   止まっている間は、検索のたびに副 C2 の分が予算 (L2_C2_RETRIEVER_BUDGET_MS、既定 600 ms) で
+#   打ち切りになり、本番の履歴なしで続く (WARN が出る)。
+#   本番 C2 を動かさない期間は、.env.dev の L2_C2_URL_READONLY を空にすれば待たずに済む。
 #
 # 使い方: PowerShell から実行
 #   .\scripts\run_dev.ps1

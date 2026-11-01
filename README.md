@@ -300,8 +300,8 @@ uv run python -m lab_lounge.run_loop --no-play
 
 **前提**:
 - Redis 起動済み（`aibyss-workspace` で `docker compose up -d`）
-- 本番 C2（port 8100 / `c2.db`）と開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`）の両方が稼働（`aibyss-coral-chronicle/scripts/run_prod.ps1` と `run_dev.ps1`）
-- V2（port 3200、`aibyss-nautilus-v2/scripts/run_dev.ps1`。別の URL なら `L2_V2_URL` で指す）が稼働
+- 開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`、`aibyss-coral-chronicle/scripts/run_dev.ps1`）と V2（port 3200、`aibyss-nautilus-v2/scripts/run_dev.ps1`。別の URL なら `L2_V2_URL` で指す）が稼働
+- 本番 C2（port 8100 / `c2.db`）は過去の本番履歴を読むための副 C2 で、止まっていても起動できる。止まっている間は、検索のたびに副 C2 の分が `L2_C2_RETRIEVER_BUDGET_MS`（既定 600 ms）で打ち切りになり、本番の履歴なしで続く（`preflight --paid` の `c2/readonly` と `memory` は WARN）。本番 C2 を動かさない期間は `.env.dev` の `L2_C2_URL_READONLY` を空にすれば待たずに済む
 - `.env.dev` を作成済み（`cp .env.dev.example .env.dev`）
 
 ### 4. `preflight` — 配信前の点検
