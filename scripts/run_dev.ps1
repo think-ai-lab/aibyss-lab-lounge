@@ -77,13 +77,7 @@ Write-Host "  L2_C2_URL_READONLY    = $env:L2_C2_URL_READONLY"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
 
-# OPENAI_API_KEY が読み込まれているか簡易確認 (値そのものは表示しない)
-if ($env:OPENAI_API_KEY) {
-    $keyPreview = $env:OPENAI_API_KEY.Substring(0, [Math]::Min(7, $env:OPENAI_API_KEY.Length))
-    Write-Host "  OPENAI_API_KEY        = $keyPreview... (length=$($env:OPENAI_API_KEY.Length))"
-} else {
-    Write-Host "  OPENAI_API_KEY        = (未設定)" -ForegroundColor Yellow
-}
+Write-KeyStatus -Name "OPENAI_API_KEY" -Required
 Write-Host ""
 
 # ── 分離違反の安全チェック ──

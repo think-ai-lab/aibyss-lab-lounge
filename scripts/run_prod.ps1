@@ -63,17 +63,8 @@ Write-Host "  LANGSMITH_PROJECT     = $env:LANGSMITH_PROJECT"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
 
-# OPENAI_API_KEY が読み込まれているか簡易確認 (値そのものは表示しない)
-if ($env:OPENAI_API_KEY) {
-    $keyPreview = $env:OPENAI_API_KEY.Substring(0, [Math]::Min(7, $env:OPENAI_API_KEY.Length))
-    Write-Host "  OPENAI_API_KEY        = $keyPreview... (length=$($env:OPENAI_API_KEY.Length))"
-} else {
-    Write-Host "  OPENAI_API_KEY        = (未設定)" -ForegroundColor Yellow
-}
-if ($env:LANGSMITH_API_KEY) {
-    $keyPreview = $env:LANGSMITH_API_KEY.Substring(0, [Math]::Min(10, $env:LANGSMITH_API_KEY.Length))
-    Write-Host "  LANGSMITH_API_KEY     = $keyPreview... (length=$($env:LANGSMITH_API_KEY.Length))"
-}
+Write-KeyStatus -Name "OPENAI_API_KEY" -Required
+Write-KeyStatus -Name "LANGSMITH_API_KEY"
 Write-Host ""
 
 # ── 安全チェック (prod モードに不適切な設定を検知) ──

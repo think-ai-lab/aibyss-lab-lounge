@@ -78,3 +78,27 @@ function Import-DotEnvFile {
         }
     }
 }
+
+function Write-KeyStatus {
+    <#
+    .SYNOPSIS
+        秘匿値の有無だけを set / unset で表示する。
+    .DESCRIPTION
+        WHY: 起動の出力は配信中のコンソールや記録に貼られることがある。先頭の数文字でも、公開すればキーの手がかりになる。
+    .PARAMETER Name
+        環境変数の名前
+    .PARAMETER Required
+        unset のときに黄色で目立たせる
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [switch]$Required
+    )
+    $isSet = [bool][Environment]::GetEnvironmentVariable($Name, "Process")
+    $line = "  {0,-21} = {1}" -f $Name, $(if ($isSet) { "set" } else { "unset" })
+    if ($Required -and -not $isSet) {
+        Write-Host $line -ForegroundColor Yellow
+    } else {
+        Write-Host $line
+    }
+}
