@@ -398,6 +398,25 @@ class TestRunPipelineWithLangSmith:
     """
 
     @pytest.fixture()
+    def tracing_on(self, monkeypatch):
+        """トレーサを本当に動かし、送信先だけを偽物にする。
+
+        WHY: langsmith は環境変数の読み取りをキャッシュするので、LANGSMITH_TRACING=true を立てるだけだと、
+             前のテストの順序によってトレーサが動かなかったり、動いて LangSmith へ POST したりする。
+             tracing_context は環境変数より優先されるので、順序によらず同じ経路を通る。
+
+        Returns:
+            トレーサが送信に使う偽の Client
+        """
+        from langsmith import Client
+        from langsmith.run_helpers import tracing_context
+
+        monkeypatch.setenv("LANGSMITH_TRACING", "true")
+        client = MagicMock(spec=Client)
+        with tracing_context(enabled=True, client=client):
+            yield client
+
+    @pytest.fixture()
     def mock_real_llm(self, monkeypatch):
         monkeypatch.setenv("L2_USE_REAL_LLM", "true")
         monkeypatch.setenv("L2_LLM_PROVIDER", "openai")
@@ -438,12 +457,12 @@ class TestRunPipelineWithLangSmith:
         assert meta["aibyss.source"] == "aibyss-lab-lounge"
 
     def test_langsmith_tracing_on_does_not_change_events(
-        self, mock_real_llm, mock_publish, fake_llm_result, monkeypatch
+        self, mock_real_llm, mock_publish, fake_llm_result, tracing_on
     ):
         """LANGSMITH_TRACING=true でも発行されるイベントは変わらない"""
-        monkeypatch.setenv("LANGSMITH_TRACING", "true")
         with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result):
             result = run_pipeline("テスト", **COMMON)
+        tracing_on.create_run.assert_called()  # トレーサが本当に動いたうえで
         assert len(result.events) == 3
         types = [ev["type"] for ev in result.events]
         assert types == ["utterance.final", "llm.final", "tts.done"]
@@ -458,15 +477,15 @@ class TestRunPipelineWithLangSmith:
         assert "run_metadata" in mock_graph.call_args.kwargs
 
     def test_audio_file_path_with_tracing_on(
-        self, mock_real_llm, mock_publish, fake_llm_result, monkeypatch
+        self, mock_real_llm, mock_publish, fake_llm_result, tracing_on
     ):
         """utterance_meta (audio-file 想定) + LANGSMITH_TRACING=true の組み合わせ"""
-        monkeypatch.setenv("LANGSMITH_TRACING", "true")
         utterance_meta = {"lang": "ja", "confidence": 0.9, "duration_ms": 3049}
         with patch("lab_lounge.graph.run_graph", return_value=fake_llm_result) as mock_graph:
             result = run_pipeline(
                 "音声テスト", utterance_meta=utterance_meta, **COMMON
             )
+        tracing_on.create_run.assert_called()  # トレーサが本当に動いたうえで
         # イベントが正しく生成される
         assert len(result.events) == 3
         assert result.events[0]["payload"]["confidence"] == 0.9
