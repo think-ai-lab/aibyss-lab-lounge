@@ -6,7 +6,6 @@ pvporcupine をモックして、キャラクターマッピングとエラー�
 
 import logging
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -26,19 +25,30 @@ from lab_lounge.wake_word import (
 
 
 class TestFindKeywordPaths:
-    def test_finds_existing_models(self):
-        """porcupine ディレクトリに .ppn ファイルがあればリストに含まれる。"""
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        """全キャラの .ppn を空ファイルで置いたディレクトリを返す。
+
+        WHY: 実物の porcupine/ は git に入らない。置いてある人だけ流れるテストにすると、
+             新しい clone では skip になり、同じテストの結果が手元と食い違う。
+             _find_keyword_paths はファイルの有無しか見ないので、空ファイルで足りる。
+        """
         from lab_lounge.characters import get_all_characters
 
-        model_dir = Path(__file__).resolve().parents[1] / "porcupine"
-        if not model_dir.is_dir():
-            pytest.skip("porcupine ディレクトリが見つかりません")
+        for character in get_all_characters():
+            if character.porcupine_model:
+                (tmp_path / character.porcupine_model).touch()
+        return tmp_path
+
+    def test_finds_existing_models(self, model_dir):
+        """porcupine ディレクトリに .ppn ファイルがあればリストに含まれる。"""
+        from lab_lounge.characters import get_all_characters
 
         chars = get_all_characters()
         entries = _find_keyword_paths(chars, model_dir)
         slugs = [c.slug for c, _ in entries]
 
-        # 少なくとも octamaid は存在するはず
+        assert slugs == [c.slug for c in chars if c.porcupine_model]
         assert "octamaid" in slugs
 
     def test_skips_missing_models(self, tmp_path):
@@ -49,13 +59,9 @@ class TestFindKeywordPaths:
         entries = _find_keyword_paths(chars, tmp_path)
         assert len(entries) == 0
 
-    def test_ruka_has_no_model(self):
+    def test_ruka_has_no_model(self, model_dir):
         """ruka は porcupine_model=None なので常にスキップ。"""
         from lab_lounge.characters import get_all_characters
-
-        model_dir = Path(__file__).resolve().parents[1] / "porcupine"
-        if not model_dir.is_dir():
-            pytest.skip("porcupine ディレクトリが見つかりません")
 
         chars = get_all_characters()
         entries = _find_keyword_paths(chars, model_dir)
