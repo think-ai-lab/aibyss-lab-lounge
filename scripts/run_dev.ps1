@@ -50,6 +50,9 @@ if (-not (Test-Path $EnvFile)) {
     exit 1
 }
 
+# ── 継承した LLM の接続先を外す (.env を読む前に。理由は Remove-InheritedLlmVar を参照) ──
+Remove-InheritedLlmVar -Tag "lab-lounge/dev"
+
 # ── 1. .env を base として読み込み (強制上書き) ──
 # 【重要】-Override を指定する理由:
 # セッション横断で PowerShell の環境変数が残り続けるため、過去の実行で

@@ -45,6 +45,9 @@ if (-not (Test-Path $EnvFile)) {
     exit 1
 }
 
+# ── 継承した LLM の接続先を外す (.env を読む前に。理由は Remove-InheritedLlmVar を参照) ──
+Remove-InheritedLlmVar -Tag "lab-lounge/prod"
+
 # ── .env を読み込み (強制上書き) ──
 # 【重要】-Override を指定する理由は run_dev.ps1 と同じ。
 # セッション横断の env 残留を防ぎ、ファイルを source of truth とする。

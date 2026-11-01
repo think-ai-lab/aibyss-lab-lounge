@@ -4,6 +4,17 @@
 # 両方のスクリプトから dot-source して使う。単体で流しても関数を定義するだけで何も起きない。
 # ──────────────────────────────────────────────────────────────
 
+# 親プロセスから継承すると LLM の向き先や認証を変えてしまう環境変数。
+# lab_lounge.preflight の INHERITED_LLM_VARS と同じ一覧にする (tests/test_run_scripts.py で突き合わせる)。
+$script:InheritedLlmVars = @(
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "GOOGLE_GEMINI_BASE_URL"
+)
+
 function Import-DotEnvFile {
     <#
     .SYNOPSIS
@@ -76,6 +87,27 @@ function Import-DotEnvFile {
         if ($Override -or -not [Environment]::GetEnvironmentVariable($key, "Process")) {
             [Environment]::SetEnvironmentVariable($key, $value, "Process")
         }
+    }
+}
+
+function Remove-InheritedLlmVar {
+    <#
+    .SYNOPSIS
+        親プロセスから継承した LLM の接続先と認証を環境から外し、外した名前を表示する (値は出さない)。
+    .DESCRIPTION
+        WHY: Claude Code などのツールから起動すると、ツール自身の接続先を引き継ぐ。preflight は自分の中でだけ
+             外すので、同じシェルから起動する run_loop には残り、点検が緑でも本番は別の相手へ繋がる。
+        .env を読む前に呼ぶこと。.env がこれらを指定しているときは残り、preflight が終了コード 2 で止める。
+    .PARAMETER Tag
+        表示の先頭に付ける名前
+    #>
+    param([Parameter(Mandatory)][string]$Tag)
+    $removed = @($script:InheritedLlmVars | Where-Object { Test-Path "Env:$_" })
+    foreach ($name in $removed) {
+        Remove-Item "Env:$name"
+    }
+    if ($removed) {
+        Write-Host "[$Tag] 継承した変数を外しました: $($removed -join ', ')" -ForegroundColor Yellow
     }
 }
 
