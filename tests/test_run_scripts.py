@@ -285,6 +285,18 @@ class TestStartup:
         assert "reason=consumer_stale" in output
         assert "JSON でない応答" in output
 
+    @pytest.mark.parametrize("body", ["", "[]", "{}", '{"detail":"x"}', '{"status":"degraded"}', '{"status":"UP"}', '{"status":"OK"}'])
+    def test_200_outside_the_contract_stops_the_start(self, scene, body):
+        """C2 と V2 の 200 は status が ok か disabled だけ。JSON でも形が違えば、ポートにいるのは別のサービス。"""
+        scene.v2.answer(200, body)
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert "status が ok でも disabled でもなく、別のサービスかもしれません" in output
+        assert not scene.called("lab_lounge.run_loop")
+
     def test_closed_port_stops_the_start(self, scene):
         """サービスが起動していない。"""
         with socket.create_server(("127.0.0.1", 0)) as unused:

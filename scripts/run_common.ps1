@@ -194,7 +194,7 @@ function Get-ServiceHealth {
     .PARAMETER BaseUrl
         サービスのベース URL
     .OUTPUTS
-        Ok (200 で JSON が返った), Detail (失敗の理由), Body (JSON の中身。読めなければ $null) を持つオブジェクト
+        Ok (200 で status が ok か disabled), Detail (失敗の理由), Body (JSON の中身。読めなければ $null) を持つオブジェクト
     #>
     param([Parameter(Mandatory)][string]$BaseUrl)
     # 進捗バーの表示で起動の出力が崩れないようにする。この関数の中だけで効く。
@@ -213,7 +213,12 @@ function Get-ServiceHealth {
         return [pscustomobject]@{ Ok = $false; Detail = "HTTP $($response.StatusCode)。JSON でない応答で、別のサービスかもしれません"; Body = $null }
     }
     if ($response.StatusCode -eq 200) {
-        return [pscustomobject]@{ Ok = $true; Detail = ""; Body = $body }
+        # WHY: C2 と V2 の 200 は status が ok か disabled だけ。空の本文や形の違う JSON まで緑にすると、
+        #      ポートにいる別のサービスを見逃して、無音のまま配信に入る。
+        if ($body.status -cin @("ok", "disabled")) {
+            return [pscustomobject]@{ Ok = $true; Detail = ""; Body = $body }
+        }
+        return [pscustomobject]@{ Ok = $false; Detail = "HTTP 200。status が ok でも disabled でもなく、別のサービスかもしれません"; Body = $body }
     }
     # 503 の本文にある理由を添える。C2 は reason、V2 は redis と consumer を返す。
     $parts = @("HTTP $($response.StatusCode)")
