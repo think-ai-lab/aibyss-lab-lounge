@@ -222,6 +222,8 @@ data/audio/*.wav
 # 各自 `uv run python scripts/generate_filler_cache.py` で再生成する (data/filler_phrases/*.txt から)。
 data/filler_cache/**/*.wav
 output.wav
+# smoke-real-e2e.ps1 が生成するサンプル
+samples/smoke_test.wav
 
 # stream context
 # 配信文脈は個人メモ・配信外で得た情報を含みうるため、実ファイルは丸ごと git 外。
