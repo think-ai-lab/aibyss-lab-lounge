@@ -256,6 +256,40 @@ function Write-ServiceHealthLine {
     }
 }
 
+function Get-ServiceProblem {
+    <#
+    .SYNOPSIS
+        /health の結果から、L2 の発話を受け取れない理由を返す。
+    .DESCRIPTION
+        WHY: V2 のポートは dev と prod で同じなので、別のモードの V2 が残っていても 200 を返す。200 だけを見ると、
+             本番の字幕と bubble が出ないのに緑のまま配信に入る。そこで、読んでいるストリームも publish 先と比べる。
+             status が ok なのに stream がないのは、stream を返す前の古いプロセスで、どこを読んでいるかを確かめられない。
+             disabled はバスを読んでいないので比べない (Write-ServiceHealthLine が黄色で知らせる)。
+             未設定の REDIS_STREAM_KEY は、bus._stream_key と同じく本番の aibyss:events と読む。
+    .PARAMETER Health
+        Get-ServiceHealth の戻り値
+    .OUTPUTS
+        [string] 理由。問題がなければ空文字列
+    #>
+    param([Parameter(Mandatory)]$Health)
+    if (-not $Health.Ok) {
+        return $Health.Detail
+    }
+    if ($Health.Body.status -ceq "disabled") {
+        return ""
+    }
+    $stream = $Health.Body.stream
+    if ($null -eq $stream) {
+        return "/health が stream を返しません。古いプロセスなので、止めて起動し直してください"
+    }
+    $expected = $env:REDIS_STREAM_KEY ?? "aibyss:events"
+    # WHY: Redis のキーは大文字と小文字を区別するので、-cne で比べる。
+    if ($stream -cne $expected) {
+        return "'$stream' を読んでいます (L2 の publish 先は '$expected')。別のモードで動いているので、止めて起動し直してください"
+    }
+    return ""
+}
+
 function Test-ServicesHealthy {
     <#
     .SYNOPSIS
@@ -266,7 +300,7 @@ function Test-ServicesHealthy {
     .PARAMETER Tag
         表示の先頭に付ける名前
     .OUTPUTS
-        [bool] すべて 200 なら $true
+        [bool] 問題がなければ $true
     #>
     param([Parameter(Mandatory)][string]$Tag)
     $problems = [System.Collections.Generic.List[string]]::new()
@@ -275,10 +309,11 @@ function Test-ServicesHealthy {
         $c2Url = if ($env:L2_C2_URL) { $env:L2_C2_URL } else { "http://127.0.0.1:8100" }
         $label = "C2 $(Format-ServiceEndpoint $c2Url)"
         $c2 = Get-ServiceHealth -BaseUrl $c2Url
-        if ($c2.Ok) {
-            Write-ServiceHealthLine -Tag $Tag -Label $label -Status $c2.Body.status
+        $problem = Get-ServiceProblem -Health $c2
+        if ($problem) {
+            $problems.Add("$label`: $problem")
         } else {
-            $problems.Add("$label`: $($c2.Detail)")
+            Write-ServiceHealthLine -Tag $Tag -Label $label -Status $c2.Body.status
         }
     } else {
         Write-Host "[$Tag] C2: 確認を省略 (L2_ENABLE_TOOLS / L2_ENABLE_RAG / L2_USE_C2_RETRIEVER のどれかが無効で、検索に使わない)" -ForegroundColor Gray
@@ -287,7 +322,10 @@ function Test-ServicesHealthy {
     $v2Url = if ($env:L2_V2_URL) { $env:L2_V2_URL } else { "http://127.0.0.1:3200" }
     $label = "V2 $(Format-ServiceEndpoint $v2Url)"
     $v2 = Get-ServiceHealth -BaseUrl $v2Url
-    if ($v2.Ok) {
+    $problem = Get-ServiceProblem -Health $v2
+    if ($problem) {
+        $problems.Add("$label`: $problem")
+    } else {
         $clients = $v2.Body.ws_clients
         $extra = if ($null -ne $clients) { "ws_clients total=$($clients.total) loopback=$($clients.loopback) lan=$($clients.lan)" } else { "" }
         Write-ServiceHealthLine -Tag $Tag -Label $label -Status $v2.Body.status -Extra $extra
@@ -295,8 +333,6 @@ function Test-ServicesHealthy {
             # OBS を後から起動することもあるので、止めずに知らせる。
             Write-Host "[$Tag] HUD に繋がっている画面がありません。OBS を使うなら bubble のソースが読み込まれているかを確かめてください (別の PC なら README の「OBS を別の PC で動かす」)" -ForegroundColor Yellow
         }
-    } else {
-        $problems.Add("$label`: $($v2.Detail)")
     }
 
     if ($problems.Count -eq 0) {
@@ -306,6 +342,6 @@ function Test-ServicesHealthy {
     foreach ($problem in $problems) {
         Write-Host "  - $problem" -ForegroundColor Red
     }
-    Write-Host "  起動してから流し直してください。C2 や V2 を置かない構成なら -SkipHealthCheck を付けて起動できます。" -ForegroundColor Red
+    Write-Host "  直してから流し直してください。C2 や V2 を置かない構成なら -SkipHealthCheck を付けて起動できます。" -ForegroundColor Red
     return $false
 }

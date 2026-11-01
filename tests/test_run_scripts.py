@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from lab_lounge import preflight
+from lab_lounge import bus, preflight
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO_ROOT / "scripts"
@@ -54,12 +54,23 @@ exit "$UV_STUB_RUN_EXIT"
 """
 
 
+def _stream_of(script: str) -> str:
+    """スクリプトの publish 先を返す。.env.example と .env.dev.example の値と同じ。"""
+    return "aibyss:events-dev" if script == "run_dev.ps1" else "aibyss:events"
+
+
+def _v2_ok(stream: str, *, total: int = 8, loopback: int = 0, lan: int = 8) -> dict:
+    """正常な V2 の /health の本文を返す。"""
+    return {"status": "ok", "stream": stream, "ws_clients": {"total": total, "loopback": loopback, "lan": lan}}
+
+
 class FakeService:
     """GET /health だけに答える偽サーバ。"""
 
     def __init__(self) -> None:
         self.status = 200
-        self.body: bytes = b'{"status":"ok"}'
+        # None はテストが応答を決めていない印。Scene が流すスクリプトに合う正常な応答で埋める。
+        self.body: bytes | None = None
         self.paths: list[str] = []
         service = self
 
@@ -98,7 +109,6 @@ class Scene:
         self.root = root
         self.c2 = FakeService()
         self.v2 = FakeService()
-        self.v2.answer(200, {"status": "ok", "ws_clients": {"total": 8, "loopback": 0, "lan": 8}})
         self.preflight_exit = 0
         self.run_exit = 0
         self.env: dict[str, str] = {}
@@ -138,10 +148,15 @@ class Scene:
             if value is not None:
                 values["REDIS_STREAM_KEY"] = value
 
-    def _write_env_files(self) -> None:
-        """今の値で .env と .env.dev を書く。"""
+    def _prepare(self, script: str) -> None:
+        """今の値で .env と .env.dev を書き、テストが決めていない応答を正常なものにする。"""
         for name, values in ((".env", self.dotenv), (".env.dev", self.dotenv_dev)):
             (self.root / name).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
+        stream = _stream_of(script)
+        if self.c2.body is None:
+            self.c2.answer(200, {"status": "ok", "stream": stream, "last_read_age_sec": 0.1})
+        if self.v2.body is None:
+            self.v2.answer(200, _v2_ok(stream))
 
     def _child_env(self) -> dict[str, str]:
         """子の環境を返す。
@@ -163,7 +178,7 @@ class Scene:
 
     def run(self, script: str, *args: str) -> subprocess.CompletedProcess:
         """スクリプトを流す。日本語の出力を読むため、出力の文字コードを UTF-8 へ揃えて -Command で呼ぶ。"""
-        self._write_env_files()
+        self._prepare(script)
         command = (
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
             f"& '{self.root / 'scripts' / script}' {' '.join(args)}; exit $LASTEXITCODE"
@@ -176,7 +191,7 @@ class Scene:
 
     def run_as_file(self, script: str, *args: str) -> subprocess.CompletedProcess:
         """l2-start-*.bat と同じ -File で流す。プロセスの終了コードを確かめるため。"""
-        self._write_env_files()
+        self._prepare(script)
         return subprocess.run(
             [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(self.root / "scripts" / script), *args],
             capture_output=True, timeout=120, check=False, env=self._child_env(), cwd=self.root,
@@ -242,7 +257,7 @@ class TestStartup:
         """preflight の非 0 は $ErrorActionPreference では止まらない。$LASTEXITCODE を見ていること。"""
         scene.preflight_exit = 1
         scene.v2.answer(503, {
-            "status": "degraded", "redis": {"sub": False, "pub": True}, "consumer": "stopped",
+            "status": "degraded", "stream": _stream_of(script), "redis": {"sub": False, "pub": True}, "consumer": "stopped",
             "ws_clients": {"total": 0, "loopback": 0, "lan": 0},
         })
 
@@ -274,7 +289,7 @@ class TestStartup:
 
     def test_unhealthy_c2_reason_and_foreign_service_on_the_v2_port(self, scene):
         """listen していても 503 なら止まること。JSON でない 200 は別のサービスがポートにいる印。"""
-        scene.c2.answer(503, {"status": "degraded", "reason": "consumer_stale", "last_read_age_sec": 42.0})
+        scene.c2.answer(503, {"status": "degraded", "stream": "aibyss:events-dev", "reason": "consumer_stale", "last_read_age_sec": 42.0})
         scene.v2.answer(200, "<html>another service</html>")
 
         done = scene.run("run_dev.ps1")
@@ -297,6 +312,73 @@ class TestStartup:
         assert "status が ok でも disabled でもなく、別のサービスかもしれません" in output
         assert not scene.called("lab_lounge.run_loop")
 
+    @pytest.mark.parametrize("script,other", [
+        ("run_prod.ps1", "aibyss:events-dev"),
+        ("run_dev.ps1", "aibyss:events"),
+        ("run_prod.ps1", "AIBYSS:EVENTS"),  # Redis のキーは大文字と小文字を区別する
+    ])
+    def test_v2_reading_another_stream_stops_the_start(self, scene, script, other):
+        """V2 のポートは dev と prod で同じ。残った別のモードの V2 は 200 を返すが、発話は届かず HUD は無音になる。"""
+        scene.v2.answer(200, _v2_ok(other))
+
+        done = scene.run(script)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert f"'{other}' を読んでいます" in output
+        assert f"'{_stream_of(script)}'" in output
+        assert not scene.called("lab_lounge.run_loop")
+        assert "lan=8" not in output  # 止まる V2 を緑の行で出さない
+
+    @pytest.mark.parametrize("script,other", [("run_prod.ps1", "aibyss:events-dev"), ("run_dev.ps1", "aibyss:events")])
+    def test_c2_in_use_reading_another_stream_stops_the_start(self, scene, script, other):
+        """検索に使う C2 が別のストリームを読むと、今の発話を覚えていない相手から思い出すことになる。"""
+        scene.c2.answer(200, {"status": "ok", "stream": other, "last_read_age_sec": 0.1})
+
+        done = scene.run(script)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert re.search(rf"C2 127\.0\.0\.1:\d+: '{other}' を読んでいます", output)
+        assert not scene.called("lab_lounge.run_loop")
+
+    @pytest.mark.parametrize("service,body", [
+        ("c2", {"status": "ok", "last_read_age_sec": 0.1}),
+        ("v2", {"status": "ok", "ws_clients": {"total": 8, "loopback": 0, "lan": 8}}),
+    ])
+    def test_ok_without_the_stream_is_an_old_process_and_stops_the_start(self, scene, service, body):
+        """stream を足す前のプロセスは、どこを読んでいるかを確かめられない。緑にせず、起動し直す案内を出す。"""
+        getattr(scene, service).answer(200, body)
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert "古いプロセス" in output
+        assert not scene.called("lab_lounge.run_loop")
+
+    def test_disabled_is_not_compared_because_it_reads_no_stream(self, scene):
+        """disabled はバスを読んでいないので、比べる相手がない。今までどおり知らせるだけで続ける。"""
+        scene.c2.answer(200, {"status": "disabled", "stream": "aibyss:events-dev"})
+        scene.v2.answer(200, {"status": "disabled", "stream": "aibyss:events-dev", "ws_clients": {"total": 8, "loopback": 0, "lan": 8}})
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert "REDIS_URL が空なので" in output
+        assert scene.called("lab_lounge.run_loop")
+
+    def test_custom_stream_name_is_compared_as_it_is(self, scene):
+        """既定の 2 つと違う名前でも、L2 と同じなら嘘の赤にしない。"""
+        scene.dotenv_dev["REDIS_STREAM_KEY"] = "lab:custom"
+        scene.c2.answer(200, {"status": "ok", "stream": "lab:custom"})
+        scene.v2.answer(200, _v2_ok("lab:custom"))
+
+        done = scene.run("run_dev.ps1")
+
+        assert done.returncode == 0, done.stdout + done.stderr
+
     def test_closed_port_stops_the_start(self, scene):
         """サービスが起動していない。"""
         with socket.create_server(("127.0.0.1", 0)) as unused:
@@ -310,7 +392,7 @@ class TestStartup:
         """検索に使わない C2 で起動を止めない。あわせて、起動はするが知らせるべき状態を確かめる。"""
         scene.dotenv["L2_ENABLE_RAG"] = "false"
         del scene.dotenv["OPENAI_API_KEY"]
-        scene.v2.answer(200, {"status": "disabled", "ws_clients": {"total": 0, "loopback": 0, "lan": 0}})
+        scene.v2.answer(200, {"status": "disabled", "stream": "aibyss:events", "ws_clients": {"total": 0, "loopback": 0, "lan": 0}})
 
         done = scene.run("run_prod.ps1")
 
@@ -358,6 +440,19 @@ class TestStartup:
         done = scene.run("run_prod.ps1")
         assert done.returncode == 0, done.stdout + done.stderr
         assert scene.called("lab_lounge.run_loop")
+
+    def test_prod_without_a_stream_line_is_compared_with_the_default_of_the_bus(self, scene, monkeypatch):
+        """未設定の実効値は aibyss:events。比べないと、行のない prod が dev の V2 を見逃す。"""
+        monkeypatch.delenv("REDIS_STREAM_KEY")
+        assert bus._stream_key() == "aibyss:events"  # 比べる相手の既定が変わったら、スクリプトも変える
+        scene.set_stream_lines(None, None)
+        scene.v2.answer(200, _v2_ok("aibyss:events-dev"))
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert "'aibyss:events-dev' を読んでいます" in output
 
     @pytest.mark.parametrize("script,args,max_turns", [
         ("run_dev.ps1", ["-MaxTurns", "0"], None),
