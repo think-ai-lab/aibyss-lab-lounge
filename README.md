@@ -398,7 +398,7 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 - `flag/<設定名>` や `url/<設定名>` の値が読めない: 今の設定で本番が読むものは FAIL、読まないものは WARN（値は表示しない）。`flag/L2_VOICEPEAK_*` のように配信に出ないキャラだけが使うものは `[FAIL*]`
 - `env/quoting` が WARN: ダブルクォートの中の `\r` や `\v` が制御文字に変わっている。`python-dotenv` と `run_*.ps1` で読み方が違うので、パスは引用符を外して書く
 - `run-script/*` が WARN: `run_dev.ps1` / `run_prod.ps1` が起動を拒否する組（dev で `.env.dev` がない、dev で `L2_C2_URL` が `:8100`、prod で `:8101`）
-- `env/proxy` が WARN: `HTTP_PROXY` があり、`NO_PROXY` に `127.0.0.1` がない。C2 の検索と TTS の接続がプロキシを通る。`run_dev.ps1` / `run_prod.ps1` の `/health` の確認はプロキシを通らないので、確認だけが緑で本番が繋がらないことがある。`NO_PROXY=127.0.0.1` を足す
+- `env/proxy` が WARN: `HTTP_PROXY` か `ALL_PROXY` があり、`NO_PROXY` に `127.0.0.1` がない。`HTTP_PROXY` なら C2 の検索と TTS の接続がプロキシを通る。`ALL_PROXY` だけなら C2 の検索の接続だけが通る（TTS の `urllib` は `ALL_PROXY` を読まない）。`run_dev.ps1` / `run_prod.ps1` の `/health` の確認はプロキシを通らないので、確認だけが緑で本番が繋がらないことがある。`NO_PROXY=127.0.0.1` を足す
 - `obs` が WARN で「立ち絵（`<slug>_neutral`）がありません」: グループがあっても、中のソース名が `<slug>_<pose>` でないと立ち絵は切り替わらない。接続の失敗の理由は `logs/preflight/` に残る
 - `schema` が FAIL: Event Envelope のスキーマが見つからない。`aibyss-workspace` を兄弟に clone するか、`AIBYSS_SCHEMA_PATH` でスキーマのファイルを指す。本番はダミー起動でも全ターンが落ちる
 - `persona/<slug>` が FAIL: 人格のファイルが空か UTF-8 以外。空なら人格なしで応答し、UTF-8 以外ならそのキャラのターンがすべて落ちる

@@ -3742,23 +3742,40 @@ class TestLoopbackProxy:
     _PROXY = "http://zqx-proxy.invalid:8080"
 
     @pytest.fixture(autouse=True)
-    def _no_inherited_no_proxy(self, monkeypatch):
-        """流すシェルの NO_PROXY で結果が変わらないようにする。"""
-        monkeypatch.delenv("NO_PROXY", raising=False)
-        monkeypatch.delenv("no_proxy", raising=False)
+    def _no_inherited_proxy(self, monkeypatch):
+        """流すシェルのプロキシと NO_PROXY で結果が変わらないようにする。"""
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
 
-    def test_warns_without_showing_the_proxy(self, monkeypatch):
-        monkeypatch.setenv("HTTP_PROXY", self._PROXY)
+    @pytest.mark.parametrize("names,reach", [
+        (["HTTP_PROXY"], "C2 と TTS への接続が"),
+        # httpx (C2Retriever) は ALL_PROXY を読むが、urllib (TTS) は読まない。TTS まで疑わせない。
+        (["ALL_PROXY"], "C2 への接続だけが"),
+        (["all_proxy"], "C2 への接続だけが"),
+        (["HTTP_PROXY", "ALL_PROXY"], "C2 と TTS への接続が"),
+    ])
+    def test_warns_without_showing_the_proxy(self, monkeypatch, names, reach):
+        for name in names:
+            monkeypatch.setenv(name, self._PROXY)
         report = preflight.Report()
         preflight._check_loopback_proxy(report)
         check = _status(report, "env/proxy")
         assert check.status == "WARN"
+        assert reach in check.detail
         assert "zqx" not in check.detail
 
+    @pytest.mark.parametrize("proxy_name", ["HTTP_PROXY", "ALL_PROXY"])
     @pytest.mark.parametrize("no_proxy", ["127.0.0.1", "localhost,127.0.0.1", "*"])
-    def test_no_proxy_quiets_it(self, monkeypatch, no_proxy):
-        monkeypatch.setenv("HTTP_PROXY", self._PROXY)
+    def test_no_proxy_quiets_it(self, monkeypatch, no_proxy, proxy_name):
+        monkeypatch.setenv(proxy_name, self._PROXY)
         monkeypatch.setenv("NO_PROXY", no_proxy)
+        report = preflight.Report()
+        preflight._check_loopback_proxy(report)
+        assert report.checks == []
+
+    def test_https_proxy_alone_stays_quiet(self, monkeypatch):
+        """C2 と TTS は手元の http なので、https だけのプロキシは通らない。"""
+        monkeypatch.setenv("HTTPS_PROXY", self._PROXY)
         report = preflight.Report()
         preflight._check_loopback_proxy(report)
         assert report.checks == []
@@ -3782,6 +3799,7 @@ class TestLoopbackProxy:
     def test_readme_tells_what_to_do(self):
         row = next(line for line in _readme_section().splitlines() if "`env/proxy`" in line)
         assert "NO_PROXY" in row
+        assert "ALL_PROXY" in row
 
 
 class TestRunScriptRefusals:

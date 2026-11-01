@@ -1492,9 +1492,15 @@ def _check_loopback_proxy(report: Report) -> None:
     WHY: 本番の C2Retriever (httpx) と TTS (urllib) は環境のプロキシを読むので、NO_PROXY がないと 127.0.0.1 への
          接続もプロキシへ向かう。run スクリプトの /health の確認はプロキシを通らないので、起動の確認は緑のまま
          本番だけが繋がらないことがある。--static は run スクリプトが毎回流すので、ここで見えるようにする。
+         ALL_PROXY は httpx だけが読み、urllib は読まない。TTS まで疑わせないように、文面を分ける。
     """
-    if urllib.request.getproxies().get("http") and not urllib.request.proxy_bypass("127.0.0.1"):
+    proxies = urllib.request.getproxies()
+    if not (proxies.get("http") or proxies.get("all")) or urllib.request.proxy_bypass("127.0.0.1"):
+        return
+    if proxies.get("http"):
         report.add("env/proxy", "WARN", "プロキシの設定があり、NO_PROXY に 127.0.0.1 がありません。C2 と TTS への接続がプロキシを通ります")
+    else:
+        report.add("env/proxy", "WARN", "ALL_PROXY の設定があり、NO_PROXY に 127.0.0.1 がありません。C2 への接続だけがプロキシを通ります (TTS の urllib は ALL_PROXY を読みません)")
 
 
 def _check_event_schema(report: Report) -> None:
