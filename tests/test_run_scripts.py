@@ -31,7 +31,7 @@ needs_pwsh = pytest.mark.skipif(_PWSH is None, reason="pwsh がない環境")
 
 # 値が出力に現れないことを確かめる印。先頭だけ出ても見つかるように、頭に短い印を置く。
 _KEY_VALUE = "zqxKEYVALUE-not-a-real-key"
-_INHERITED_VALUE = "http://198.51.100.1:9/zqxINHERITED"
+_INHERITED_VALUE = "http://192.0.2.1:9/zqxINHERITED"
 
 # 偽の uv。引数と、外れているはずの変数の残りを記録して、preflight と run_loop で別の終了コードを返す。
 _INHERITED_NAMES = " ".join(preflight.INHERITED_LLM_VARS)
@@ -132,6 +132,7 @@ class Scene:
         self.v2.close()
 
     def _write_env_files(self) -> None:
+        """今の値で .env と .env.dev を書く。"""
         for name, values in ((".env", self.dotenv), (".env.dev", self.dotenv_dev)):
             (self.root / name).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
 
@@ -188,12 +189,14 @@ class Scene:
 
 @pytest.fixture
 def scene(tmp_path):
+    """既定で正常に動く場面を返す。テストは偽サーバの応答や .env の値を変えてから run を呼ぶ。"""
     made = Scene(tmp_path)
     yield made
     made.close()
 
 
 def _profile_of(script: str) -> str:
+    """スクリプトが preflight へ渡すはずのプロファイルを返す。"""
     return "dev" if script == "run_dev.ps1" else "prod"
 
 
@@ -340,6 +343,7 @@ class TestStartup:
         ]
 
         def assignment(name: str, value: str | None) -> str:
+            """環境変数を設定する PowerShell の文を返す。None は未設定。"""
             return f"$env:{name} = $null" if value is None else f"$env:{name} = '{value}'"
 
         lines = [f". '{_SCRIPTS / 'run_common.ps1'}'"]
@@ -368,6 +372,7 @@ class TestScriptText:
 
     @staticmethod
     def _read(name: str) -> str:
+        """scripts/ のファイルの本文を返す。"""
         return (_SCRIPTS / name).read_text(encoding="utf-8")
 
     def test_inherited_list_is_the_same_as_preflight(self):
@@ -397,7 +402,7 @@ class TestScriptText:
         assert '"http://127.0.0.1:3200"' in self._read("run_common.ps1")
 
     def test_prod_start_batch_file_has_the_same_shape_as_dev(self):
-        """Stream Deck から押すボタンの入口。cmd は UTF-8 の日本語で壊れるので ASCII に限る。"""
+        """Stream Deck から押すボタンの入口。cmd は UTF-8 の日本語を読み違えることがあるので ASCII に限る。"""
         raw = (_SCRIPTS / "l2-start-prod.bat").read_bytes()
         assert raw.decode("ascii")
         assert raw.count(b"\n") == raw.count(b"\r\n")
@@ -412,9 +417,11 @@ class TestReadme:
 
     @staticmethod
     def _readme() -> str:
+        """README の本文を返す。"""
         return (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     def _obs_section(self) -> str:
+        """OBS を別の PC で動かす手順の節を返す。"""
         return self._readme().split("### OBS を別の PC で動かす")[1].split("\n---\n")[0]
 
     def test_startup_checks_are_described_where_the_script_is_explained(self):

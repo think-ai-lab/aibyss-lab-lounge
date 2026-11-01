@@ -9,7 +9,7 @@ conftest.py — テストを実環境から切り離す共通設定
 環境の変更をファイルの先頭で行う理由:
   run_loop / run_once / emitter は import の瞬間に load_dotenv() を呼び、run_loop はログファイルも作る。
   テストファイルの import は fixture より先に走るので、fixture では間に合わない。
-  このファイルが lab_lounge より先に読まれることは pytest が保証する。
+  このファイルがテストファイルより先に読まれることは pytest が保証する。
 
 ほかに、次のものもここで用意する:
   - AIBYSS_SCHEMA_PATH を兄弟の aibyss-workspace から解決し、validator のキャッシュをテストごとに捨てる

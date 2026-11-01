@@ -277,6 +277,7 @@ uv run python -m lab_lounge.run_loop --no-play
 .\scripts\run_dev.ps1                              # 既定: -WakeBackend continuous -MaxTurns 3
 .\scripts\run_dev.ps1 -MaxTurns 0                  # 無制限（Ctrl+C で停止、prod と同仕様）
 .\scripts\run_dev.ps1 -WakeBackend bg-continuous -MaxTurns 5
+.\scripts\run_dev.ps1 -SkipHealthCheck             # C2 も V2 も置かない構成
 ```
 
 実行の流れ:
@@ -486,7 +487,7 @@ echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
 - **別のマイク/スピーカーを使う**: `uv run python -c "import sounddevice; print(sounddevice.query_devices())"` で番号を確認し `--device N` または `L2_AUDIO_DEVICE` を指定。
 - **VOICEPEAK が並列実行エラー/クラッシュ**: 1 プロセス制限のためフィラーと本応答が衝突しうる。`L2_VOICEPEAK_RETRY_WAIT_SEC` / `L2_VOICEPEAK_MAX_RETRIES`（既定 1.0s × 8 回）で自動リトライ。
 - **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
-- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`aibyss-workspace` の `aibyss status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
+- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`aibyss-workspace/scripts/aibyss.ps1 status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
 
 ### OBS を別の PC で動かす
 
