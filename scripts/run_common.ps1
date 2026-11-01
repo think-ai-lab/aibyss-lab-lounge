@@ -293,7 +293,7 @@ function Get-ServiceProblem {
 function Test-ServicesHealthy {
     <#
     .SYNOPSIS
-        C2 (使う設定のときだけ) と V2 の /health を確かめ、問題があれば赤く一覧を出す。
+        C2 と V2 の /health を確かめ、問題があれば赤く一覧を出す。検索に使わない設定の C2 は止めずに黄色で知らせる。
     .DESCRIPTION
         WHY: ポートが開いているだけでは分からない。C2 も V2 も Redis の consumer が止まっても listen を続けるので、
              歴史書が記録せず OBS の HUD も動かないまま配信に入り、無音で初めて気づくことになる。
@@ -305,18 +305,20 @@ function Test-ServicesHealthy {
     param([Parameter(Mandatory)][string]$Tag)
     $problems = [System.Collections.Generic.List[string]]::new()
 
-    if (Test-C2RetrieverEnabled) {
-        $c2Url = if ($env:L2_C2_URL) { $env:L2_C2_URL } else { "http://127.0.0.1:8100" }
-        $label = "C2 $(Format-ServiceEndpoint $c2Url)"
-        $c2 = Get-ServiceHealth -BaseUrl $c2Url
-        $problem = Get-ServiceProblem -Health $c2
-        if ($problem) {
-            $problems.Add("$label`: $problem")
-        } else {
-            Write-ServiceHealthLine -Tag $Tag -Label $label -Status $c2.Body.status
-        }
+    $c2Url = if ($env:L2_C2_URL) { $env:L2_C2_URL } else { "http://127.0.0.1:8100" }
+    $label = "C2 $(Format-ServiceEndpoint $c2Url)"
+    $c2 = Get-ServiceHealth -BaseUrl $c2Url
+    $problem = Get-ServiceProblem -Health $c2
+    if (-not $problem) {
+        Write-ServiceHealthLine -Tag $Tag -Label $label -Status $c2.Body.status
+    } elseif (Test-C2RetrieverEnabled) {
+        $problems.Add("$label`: $problem")
     } else {
-        Write-Host "[$Tag] C2: 確認を省略 (L2_ENABLE_TOOLS / L2_ENABLE_RAG / L2_USE_C2_RETRIEVER のどれかが無効で、検索に使わない)" -ForegroundColor Gray
+        # WHY: C2 は検索のフラグと無関係に consumer で全発話を記録するので、検索に使わない設定でも確かめる。
+        #      ただし止めない。L2 と V2 だけで動かす構成があり、発話は Redis に残るので C2 を戻せば追いつく。
+        #      stream を返さない古いプロセスは記録しているかもしれないので、言い切らない。
+        $effect = if ($c2.Ok -and $null -eq $c2.Body.stream) { "歴史書が記録しているかを確かめられません" } else { "歴史書が記録していません" }
+        Write-Host "[$Tag] $label`: $problem。検索に使わない設定なので止めませんが、$effect。発話は Redis に残り、C2 を戻せば追いつきます" -ForegroundColor Yellow
     }
 
     $v2Url = if ($env:L2_V2_URL) { $env:L2_V2_URL } else { "http://127.0.0.1:3200" }

@@ -54,6 +54,14 @@ exit "$UV_STUB_RUN_EXIT"
 """
 
 
+# WHY: Write-Host の色はパイプへ流すと失われる。止めるか知らせるかの違いは色で伝えているので、同じ名前の関数を先に
+#      定義して行の先頭へ写す（PowerShell は同じ名前のコマンドレットより関数を先に探す）。
+_SHOW_COLORS = (
+    "function global:Write-Host { param([Parameter(Position = 0)]$Object, $ForegroundColor) "
+    '[Console]::Out.WriteLine("<$ForegroundColor>$Object") }; '
+)
+
+
 def _stream_of(script: str) -> str:
     """スクリプトの publish 先を返す。.env.example と .env.dev.example の値と同じ。"""
     return "aibyss:events-dev" if script == "run_dev.ps1" else "aibyss:events"
@@ -176,11 +184,15 @@ class Scene:
             **self.env,
         }
 
-    def run(self, script: str, *args: str) -> subprocess.CompletedProcess:
-        """スクリプトを流す。日本語の出力を読むため、出力の文字コードを UTF-8 へ揃えて -Command で呼ぶ。"""
+    def run(self, script: str, *args: str, colors: bool = False) -> subprocess.CompletedProcess:
+        """スクリプトを流す。日本語の出力を読むため、出力の文字コードを UTF-8 へ揃えて -Command で呼ぶ。
+
+        colors を真にすると、Write-Host の行の先頭に色を <Yellow> の形で付ける。
+        """
         self._prepare(script)
         command = (
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            f"{_SHOW_COLORS if colors else ''}"
             f"& '{self.root / 'scripts' / script}' {' '.join(args)}; exit $LASTEXITCODE"
         )
         return subprocess.run(
@@ -388,8 +400,62 @@ class TestStartup:
         assert "接続できません" in done.stdout + done.stderr
         assert not scene.called("lab_lounge.run_loop")
 
-    def test_c2_that_the_settings_do_not_use_is_not_checked(self, scene):
-        """検索に使わない C2 で起動を止めない。あわせて、起動はするが知らせるべき状態を確かめる。"""
+    @pytest.mark.parametrize("status,body,reason,effect", [
+        (503, {"status": "degraded", "stream": "aibyss:events", "reason": "consumer_stopped", "last_read_age_sec": None},
+         "HTTP 503 reason=consumer_stopped", "歴史書が記録していません"),
+        (200, {"status": "ok", "stream": "aibyss:events-dev", "last_read_age_sec": 0.1},
+         "'aibyss:events-dev' を読んでいます", "歴史書が記録していません"),
+        (200, "{}", "別のサービスかもしれません", "歴史書が記録していません"),
+        # 古いプロセスは記録しているかもしれないので、言い切らない。
+        (200, {"status": "ok", "last_read_age_sec": 0.1}, "古いプロセス", "歴史書が記録しているかを確かめられません"),
+    ])
+    def test_c2_that_search_does_not_use_is_reported_in_yellow_and_does_not_stop(self, scene, status, body, reason, effect):
+        """C2 は検索のフラグと無関係に全発話を記録する。止めないのは、発話が Redis に残り、C2 を戻せば追いつくから。"""
+        scene.dotenv["L2_ENABLE_RAG"] = "false"
+        scene.c2.answer(status, body)
+
+        done = scene.run("run_prod.ps1", colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert scene.called("lab_lounge.run_loop")
+        assert re.search(
+            rf"<Yellow>\[lab-lounge/prod\] C2 127\.0\.0\.1:\d+: .*{re.escape(reason)}.*"
+            rf"検索に使わない設定なので止めませんが、{effect}。発話は Redis に残り、C2 を戻せば追いつきます",
+            output,
+        ), output
+        assert "前提サービスの確認に失敗しました" not in output
+
+    @pytest.mark.parametrize("script", _RUN_SCRIPTS)
+    def test_setup_with_only_l2_and_v2_starts_without_a_false_red(self, scene, script):
+        """C2 を置かない構成。接続できなくても、検索に使わないなら止めない。V2 の確認まで省く -SkipHealthCheck は要らない。"""
+        scene.dotenv["L2_ENABLE_TOOLS"] = "false"
+        with socket.create_server(("127.0.0.1", 0)) as unused:
+            url = f"http://127.0.0.1:{unused.getsockname()[1]}"
+        scene.dotenv["L2_C2_URL"] = url
+        scene.dotenv_dev["L2_C2_URL"] = url
+
+        done = scene.run(script, colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert re.search(r"<Yellow>\[lab-lounge/\w+\] C2 127\.0\.0\.1:\d+: 接続できません。検索に使わない設定なので止めませんが", output), output
+        assert scene.v2.paths == ["/health"]
+
+    def test_c2_that_search_uses_stops_in_red_when_it_does_not_record(self, scene):
+        """検索に使う設定では今までどおり止める。今の発話を思い出せないまま配信に入らないように。"""
+        scene.c2.answer(503, {"status": "degraded", "stream": "aibyss:events", "reason": "consumer_stopped", "last_read_age_sec": None})
+
+        done = scene.run("run_prod.ps1", colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert re.search(r"<Red>  - C2 127\.0\.0\.1:\d+: HTTP 503 reason=consumer_stopped", output), output
+        assert "検索に使わない設定" not in output
+        assert not scene.called("lab_lounge.run_loop")
+
+    def test_c2_that_search_does_not_use_is_read_and_other_states_are_reported(self, scene):
+        """正常な C2 は通常の行で出す。あわせて、起動はするが知らせるべき状態を確かめる。"""
         scene.dotenv["L2_ENABLE_RAG"] = "false"
         del scene.dotenv["OPENAI_API_KEY"]
         scene.v2.answer(200, {"status": "disabled", "stream": "aibyss:events", "ws_clients": {"total": 0, "loopback": 0, "lan": 0}})
@@ -398,8 +464,10 @@ class TestStartup:
 
         output = done.stdout + done.stderr
         assert done.returncode == 0, output
-        assert scene.c2.paths == []
+        assert scene.c2.paths == ["/health"]
         assert scene.v2.paths == ["/health"]
+        assert re.search(r"C2 127\.0\.0\.1:\d+: ok", output)
+        assert "検索に使わない設定" not in output
         assert re.search(r"OPENAI_API_KEY\s+= unset", output)
         assert "disabled" in output
         assert "HUD に繋がっている画面がありません" in output
