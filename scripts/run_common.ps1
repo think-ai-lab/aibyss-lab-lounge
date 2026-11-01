@@ -42,8 +42,9 @@ function Import-DotEnvFile {
         [string]$Path,
         [switch]$Override
     )
-    if (-not (Test-Path $Path)) { return }
-    foreach ($rawLine in Get-Content $Path) {
+    # WHY: -LiteralPath は、clone 先のパスの [ ] をワイルドカードと読ませないため。読むと、ファイルがあるのに「ない」扱いになる。
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    foreach ($rawLine in Get-Content -LiteralPath $Path) {
         $line = $rawLine.Trim()
         if (-not $line -or $line.StartsWith("#")) { continue }
         if ($line.StartsWith("export ")) {

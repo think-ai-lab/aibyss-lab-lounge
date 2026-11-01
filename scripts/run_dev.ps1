@@ -65,10 +65,11 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "run_common.ps1")
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $RepoRoot
+# WHY: -LiteralPath は、clone 先のパスの [ ] をワイルドカードと読ませないため (読むと場所が見つからず止まる)。
+Set-Location -LiteralPath $RepoRoot
 
 $EnvFile = Join-Path $RepoRoot ".env.dev"
-if (-not (Test-Path $EnvFile)) {
+if (-not (Test-Path -LiteralPath $EnvFile)) {
     Write-Error ".env.dev が見つかりません。先に 'cp .env.dev.example .env.dev' を実行してください。"
     exit 1
 }
@@ -83,7 +84,7 @@ Remove-InheritedLlmVar -Tag "lab-lounge/dev"
 # 再利用されてしまう事故を防ぐ。ファイルが常に source of truth となる。
 # シェルレベルで一時上書きしたい場合は run_dev.ps1 実行後に設定する。
 $BaseEnvFile = Join-Path $RepoRoot ".env"
-if (Test-Path $BaseEnvFile) {
+if (Test-Path -LiteralPath $BaseEnvFile) {
     Write-Host "[lab-lounge/dev] .env を base として読み込み (API キー等を継承)..." -ForegroundColor Gray
     Import-DotEnvFile -Path $BaseEnvFile -Override
 } else {

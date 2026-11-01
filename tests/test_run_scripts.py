@@ -306,6 +306,16 @@ def scene(tmp_path):
     made.close()
 
 
+@pytest.fixture
+def scene_under_brackets(tmp_path):
+    """パスに [ ] を含む場所へ置いた場面を返す。使い方は scene と同じ。"""
+    root = tmp_path / "brack[et]"
+    root.mkdir()
+    made = Scene(root)
+    yield made
+    made.close()
+
+
 def _profile_of(script: str) -> str:
     """スクリプトが preflight へ渡すはずのプロファイルを返す。"""
     return "dev" if script == "run_dev.ps1" else "prod"
@@ -767,6 +777,30 @@ class TestStartup:
         assert "LEFT L2_C2_URL_READONLY" in scene.uv_lines
         assert ".env.dev だけにある変数" not in output
         assert re.search(r"L2_C2_URL_READONLY\s+= 127\.0\.0\.1:8102\n", output), output
+
+    @pytest.mark.parametrize("script", _RUN_SCRIPTS)
+    @pytest.mark.parametrize("how", ["run", "run_as_file"])
+    def test_repo_under_a_path_with_brackets_reaches_run_loop(self, scene_under_brackets, script, how):
+        """[ ] はワイルドカードの文字なので、-LiteralPath でないと clone 先の名前だけで起動できない。
+
+        .env を読めない退行でも実サービスへ繋がらないように、偽サーバの URL をシェルにも置く。
+        OPENAI_API_KEY は .env にしかないので、これが残れば .env を読めている。L2_PROBE_DEV_ONLY は .env.dev にしかないので、
+        dev では残り（.env.dev を読めている）、prod では外れる（名前を読めている）。
+        """
+        scene = scene_under_brackets
+        scene.dotenv_dev["L2_PROBE_DEV_ONLY"] = "1"
+        scene.env = {"L2_C2_URL": scene.c2.url, "L2_V2_URL": scene.v2.url, "L2_PROBE_DEV_ONLY": "1"}
+        scene.watch = ["OPENAI_API_KEY", "L2_PROBE_DEV_ONLY"]
+
+        done = getattr(scene, how)(script)
+
+        assert done.returncode == 0, (done.stdout, done.stderr)
+        assert scene.called("lab_lounge.preflight")
+        assert scene.called("lab_lounge.run_loop")
+        assert scene.c2.paths == ["/health"]
+        assert scene.v2.paths == ["/health"]
+        left = {line.removeprefix("LEFT ") for line in scene.uv_lines if line.startswith("LEFT ")}
+        assert left == ({"OPENAI_API_KEY", "L2_PROBE_DEV_ONLY"} if script == "run_dev.ps1" else {"OPENAI_API_KEY"})
 
     def test_trailing_slash_of_the_url_does_not_double_the_slash(self, scene):
         """V2 や C2 の経路に // は合わないので、末尾の / だけで嘘の赤になる。"""

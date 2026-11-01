@@ -55,10 +55,11 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "run_common.ps1")
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $RepoRoot
+# WHY: -LiteralPath は、clone 先のパスの [ ] をワイルドカードと読ませないため (読むと場所が見つからず止まる)。
+Set-Location -LiteralPath $RepoRoot
 
 $EnvFile = Join-Path $RepoRoot ".env"
-if (-not (Test-Path $EnvFile)) {
+if (-not (Test-Path -LiteralPath $EnvFile)) {
     Write-Error ".env が見つかりません。先に 'cp .env.example .env' を実行してください。"
     exit 1
 }
