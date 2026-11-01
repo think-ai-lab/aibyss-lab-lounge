@@ -255,16 +255,17 @@ def run_in_work_dir():
 
 
 @pytest.fixture(autouse=True)
-def isolate_environment(monkeypatch):
+def isolate_environment():
     """テストごとに環境を決まった状態へ戻す。
 
     前のテストが os.environ を直接変えていても、順序で結果が変わらないようにする。
     real mode が必要なテストは、それぞれの fixture で明示的に setenv する。
+
+    WHY: monkeypatch を通さないのは、テストの後で前の値へ戻す仕組みが、書き残しまで元へ戻してしまうため。
     """
     for name in _scrubbed_names():
-        monkeypatch.delenv(name)
-    for name, value in _isolated_values().items():
-        monkeypatch.setenv(name, value)
+        del os.environ[name]
+    os.environ.update(_isolated_values())
 
 
 @pytest.fixture(autouse=True)
