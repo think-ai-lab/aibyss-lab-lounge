@@ -94,6 +94,32 @@ function Import-DotEnvFile {
     }
 }
 
+function Get-DotEnvName {
+    <#
+    .SYNOPSIS
+        .env 形式のファイルにある変数の名前だけを返す。値は取り出さない。
+    .DESCRIPTION
+        行の読み方は Import-DotEnvFile と同じ (tests/test_run_scripts.py で python-dotenv と突き合わせる)。
+    .PARAMETER Path
+        読むファイル。なければ何も返さない
+    .OUTPUTS
+        [string] 名前。ファイルに書かれた順
+    #>
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    foreach ($rawLine in Get-Content -LiteralPath $Path) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith("#")) { continue }
+        if ($line.StartsWith("export ")) {
+            $line = $line.Substring(7).Trim()
+        }
+        $eqIdx = $line.IndexOf("=")
+        if ($eqIdx -lt 0) { continue }
+        $name = $line.Substring(0, $eqIdx).Trim()
+        if ($name) { $name }
+    }
+}
+
 function Remove-InheritedLlmVar {
     <#
     .SYNOPSIS
@@ -112,6 +138,41 @@ function Remove-InheritedLlmVar {
     }
     if ($removed) {
         Write-Host "[$Tag] 継承した変数を外しました: $($removed -join ', ')" -ForegroundColor Yellow
+    }
+}
+
+function Remove-DevOnlyEnvVar {
+    <#
+    .SYNOPSIS
+        .env.dev にあって .env にない名前を環境から外し、外した名前を灰色で表示する (値は取り出さず、出さない)。
+    .DESCRIPTION
+        WHY: Import-DotEnvFile の -Override は、ファイルにある名前しか上書きしない。同じシェルで run_dev.ps1 の後に
+             run_prod.ps1 を流すと、.env.dev だけにある L2_C2_URL_READONLY や L2_ENABLE_RAG が本番の run_loop へ渡り、
+             .env.example が本番では厳禁とする副 C2 を読むことになる。
+        run_prod.ps1 が .env を読む前に呼ぶこと。シェルで同じ名前を手で立てていても外れるので、外した名前を表示する。
+    .PARAMETER Tag
+        表示の先頭に付ける名前
+    .PARAMETER EnvFile
+        本番の設定のファイル (.env)
+    .PARAMETER DevEnvFile
+        dev の設定のファイル (.env.dev)。なければ何も外さない
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Tag,
+        [Parameter(Mandatory)][string]$EnvFile,
+        [Parameter(Mandatory)][string]$DevEnvFile
+    )
+    $inEnvFile = @(Get-DotEnvName -Path $EnvFile)
+    # WHY: 名前はファイルから来るので、* がワイルドカードとして他の変数を巻き込まないように -LiteralPath で扱う。
+    #      -notin は大文字と小文字を区別しない。Windows の環境変数も区別しないので揃う。
+    $removed = foreach ($name in Get-DotEnvName -Path $DevEnvFile) {
+        if ($name -notin $inEnvFile -and (Test-Path -LiteralPath "Env:$name")) {
+            Remove-Item -LiteralPath "Env:$name"
+            $name
+        }
+    }
+    if ($removed) {
+        Write-Host "[$Tag] .env.dev だけにある変数を外しました: $($removed -join ', ')" -ForegroundColor Gray
     }
 }
 

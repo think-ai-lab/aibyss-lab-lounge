@@ -3,13 +3,14 @@
 # Lab Lounge — prod プロファイル run_loop 起動スクリプト
 # ──────────────────────────────────────────────────────────────
 # 本番運用 / 実配信用の run_loop を起動する。
-# .env のみ読み込み (.env.dev は触らない)。
+# 値は .env だけを読む (.env.dev は値を読まず、名前だけを見る)。
 #
 # 【env 読み込み】
 #   .env (本番設定: REDIS_STREAM_KEY=aibyss:events / L2_C2_URL=:8100 等)
 #   → .env > プロセス環境変数 の優先度 (ファイルが常に勝つ)
 #   REDIS_STREAM_KEY は未設定なら既定の aibyss:events へ向くので通す。aibyss:events-dev と空の値は拒否する。
 #   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
+#   .env.dev にあって .env にない名前も、読み込みの前に外す (同じシェルで流した run_dev.ps1 の残りを本番へ渡さない)。
 #
 # 前提:
 #   - PowerShell 7.5 以上 (pwsh)。共通処理が ?? などの PowerShell 7 の構文を使い、REDIS_STREAM_KEY= の検査には空の値の
@@ -38,7 +39,7 @@
 #   .\scripts\run_prod.ps1 -SkipHealthCheck    # C2 も V2 も置かない構成
 #
 # 【dev/prod の違い】
-#   prod は .env のみ読み込み aibyss:events ストリームに発話を publish する。
+#   prod は .env の値だけを読み込み aibyss:events ストリームに発話を publish する。
 #   c2.db (本番履歴) に記録される点が dev (c2-dev.db) との最大の差。
 # ──────────────────────────────────────────────────────────────
 
@@ -65,6 +66,9 @@ if (-not (Test-Path $EnvFile)) {
 # ── 継承した LLM の接続先を外す (.env を読む前に。理由は Remove-InheritedLlmVar を参照) ──
 Remove-InheritedLlmVar -Tag "lab-lounge/prod"
 
+# ── 同じシェルで流した run_dev.ps1 の残りを外す (.env を読む前に。理由は Remove-DevOnlyEnvVar を参照) ──
+Remove-DevOnlyEnvVar -Tag "lab-lounge/prod" -EnvFile $EnvFile -DevEnvFile (Join-Path $RepoRoot ".env.dev")
+
 # ── .env を読み込み (強制上書き) ──
 # 【重要】-Override を指定する理由は run_dev.ps1 と同じ。
 # セッション横断の env 残留を防ぎ、ファイルを source of truth とする。
@@ -76,6 +80,7 @@ Write-Host "[lab-lounge/prod] 起動設定 (最終値):" -ForegroundColor Cyan
 Write-Host "  REDIS_STREAM_KEY      = $env:REDIS_STREAM_KEY"
 # WHY: 起動の出力は貼られることがあるので、/health の行と同じく host を伏せる (理由は Format-ServiceEndpoint)。
 Write-Host "  L2_C2_URL             = $(if ($env:L2_C2_URL) { Format-ServiceEndpoint $env:L2_C2_URL })"
+Write-Host "  L2_C2_URL_READONLY    = $(if ($env:L2_C2_URL_READONLY) { Format-ServiceEndpoint $env:L2_C2_URL_READONLY })"
 Write-Host "  L2_USE_REAL_LLM       = $env:L2_USE_REAL_LLM"
 Write-Host "  L2_USE_REAL_TTS       = $env:L2_USE_REAL_TTS"
 Write-Host "  L2_USE_REAL_STT       = $env:L2_USE_REAL_STT"

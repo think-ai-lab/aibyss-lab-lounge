@@ -38,16 +38,17 @@ _KEY_VALUE = "zqxKEYVALUE-not-a-real-key"
 _INHERITED_VALUE = "http://192.0.2.1:9/zqxINHERITED"
 
 # 偽の uv。引数と、外れているはずの変数の残りを記録して、preflight と run_loop で別の終了コードを返す。
+# 継承した LLM の変数のほかに見張る名前は、場面ごとに UV_STUB_WATCH で渡す（Scene.watch）。
 _INHERITED_NAMES = " ".join(preflight.INHERITED_LLM_VARS)
 _UV_CMD = f"""@echo off
 >>"%UV_STUB_LOG%" echo ARGS %*
-for %%N in ({_INHERITED_NAMES}) do if defined %%N >>"%UV_STUB_LOG%" echo LEFT %%N
+for %%N in ({_INHERITED_NAMES} %UV_STUB_WATCH%) do if defined %%N >>"%UV_STUB_LOG%" echo LEFT %%N
 echo %* | findstr /c:"lab_lounge.preflight" >nul && exit /b %UV_STUB_PREFLIGHT_EXIT%
 exit /b %UV_STUB_RUN_EXIT%
 """
 _UV_SH = f"""#!/bin/sh
 echo "ARGS $*" >> "$UV_STUB_LOG"
-for name in {_INHERITED_NAMES}; do
+for name in {_INHERITED_NAMES} $UV_STUB_WATCH; do
     eval "value=\\${{$name+x}}"
     [ -n "$value" ] && echo "LEFT $name" >> "$UV_STUB_LOG"
 done
@@ -140,6 +141,8 @@ class Scene:
         self.preflight_exit = 0
         self.run_exit = 0
         self.env: dict[str, str] = {}
+        # 偽の uv が LEFT の行で残りを知らせる名前。継承した LLM の変数は常に見張る。
+        self.watch: list[str] = []
         self.dotenv: dict[str, str] = {
             "OPENAI_API_KEY": _KEY_VALUE,
             "LANGSMITH_API_KEY": _KEY_VALUE,
@@ -204,6 +207,7 @@ class Scene:
             "UV_STUB_LOG": str(self._log),
             "UV_STUB_PREFLIGHT_EXIT": str(self.preflight_exit),
             "UV_STUB_RUN_EXIT": str(self.run_exit),
+            "UV_STUB_WATCH": " ".join(self.watch),
             **self.env,
         }
 
@@ -258,6 +262,37 @@ def _run_common_probe(tmp_path: Path, lines: list[str]) -> str:
     )
     assert done.returncode == 0, done.stderr
     return done.stdout
+
+
+# run_loop の python-dotenv と読み方を比べる .env の行。{} に変数の名前が入る。
+_DOTENV_ROWS = [
+    "{}=value",
+    "{} = value",
+    "{}=   value   ",
+    '{}="value"',
+    "{}='value'",
+    "export {}=value",
+    "{}=value # comment",
+    "{}=value\t# comment after a tab",
+    '{}="value # not a comment"',
+    '{}="value" # comment after the quote',
+    "{}=value#literal",
+    "{}=two words",
+    "{}=",
+    "# {}=commented out",
+    "   # {}=indented comment",
+    "{}=http://127.0.0.1:8100/",
+    "{}=a=b",
+    "{}=値",
+]
+
+
+def _write_dotenv_rows(tmp_path: Path) -> tuple[list[str], Path]:
+    """_DOTENV_ROWS を 1 つのファイルへ書き、行ごとの変数の名前とファイルのパスを返す。"""
+    names = [f"L2_PROBE_{index:02}" for index in range(len(_DOTENV_ROWS))]
+    env_file = tmp_path / ".env.probe"
+    env_file.write_text("\n".join(row.format(name) for row, name in zip(_DOTENV_ROWS, names, strict=True)) + "\n", encoding="utf-8")
+    return names, env_file
 
 
 @pytest.fixture
@@ -552,12 +587,13 @@ class TestStartup:
 
     @pytest.mark.parametrize("script,expected", [
         ("run_dev.ps1", ["[HOST]:8101", "[HOST]:8100"]),
-        ("run_prod.ps1", ["[HOST]:8100"]),
+        ("run_prod.ps1", ["[HOST]:8100", "[HOST]:8102"]),
     ])
     def test_header_does_not_print_a_non_loopback_url(self, scene, script, expected):
         """起動の出力は貼られることがある。/health の行と同じく host を伏せ、URL の資格情報も出さない。
         ポートは残すので、dev と prod の分離は読める。"""
         scene.dotenv["L2_C2_URL"] = "http://user:zqxPASSWORD@192.0.2.1:8100"
+        scene.dotenv["L2_C2_URL_READONLY"] = "http://user:zqxPASSWORD@192.0.2.3:8102"
         scene.dotenv_dev["L2_C2_URL"] = "http://user:zqxPASSWORD@192.0.2.1:8101"
         scene.dotenv_dev["L2_C2_URL_READONLY"] = "http://user:zqxPASSWORD@192.0.2.2:8100"
 
@@ -658,6 +694,42 @@ class TestStartup:
         assert done.returncode == 0, done.stdout + done.stderr
         assert scene.called("lab_lounge.run_loop")
         assert scene.v2.paths == ["/health"]
+
+    def test_prod_removes_what_only_env_dev_set_in_the_same_shell(self, scene):
+        """-Override は .env にある名前しか上書きしない。run_dev.ps1 の後に同じシェルで流すと、.env.dev だけの値が本番へ渡る。
+
+        .env.example が本番では厳禁とする副 C2 を読むことになる。外した名前は知らせ、値は出さない。
+        """
+        leftovers = {"L2_C2_URL_READONLY": "http://127.0.0.1:8100/zqx", "L2_ENABLE_RAG": "true"}
+        del scene.dotenv["L2_ENABLE_RAG"]
+        scene.dotenv_dev.update(leftovers)
+        scene.env = leftovers
+        scene.watch = list(leftovers)
+
+        done = scene.run("run_prod.ps1", colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert scene.called("lab_lounge.run_loop")
+        assert [line for line in scene.uv_lines if line.startswith("LEFT ")] == []
+        assert "<Gray>[lab-lounge/prod] .env.dev だけにある変数を外しました: L2_C2_URL_READONLY, L2_ENABLE_RAG" in output
+        assert re.search(r"L2_C2_URL_READONLY\s+= \n", output), output
+        assert "zqx" not in output
+
+    def test_prod_keeps_the_names_env_also_sets(self, scene):
+        """.env にもある名前は、.env の値で動く。外すのは .env.dev だけにある名前。"""
+        scene.dotenv["L2_C2_URL_READONLY"] = "http://127.0.0.1:8102"
+        scene.dotenv_dev["L2_C2_URL_READONLY"] = "http://127.0.0.1:8100"
+        scene.env = {"L2_C2_URL_READONLY": "http://127.0.0.1:8100"}
+        scene.watch = ["L2_C2_URL_READONLY"]
+
+        done = scene.run("run_prod.ps1")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert "LEFT L2_C2_URL_READONLY" in scene.uv_lines
+        assert ".env.dev だけにある変数" not in output
+        assert re.search(r"L2_C2_URL_READONLY\s+= 127\.0\.0\.1:8102\n", output), output
 
     def test_trailing_slash_of_the_url_does_not_double_the_slash(self, scene):
         """V2 や C2 の経路に // は合わないので、末尾の / だけで嘘の赤になる。"""
@@ -771,29 +843,7 @@ class TestStartup:
 
         ダブルクォートの中のエスケープは揃わない（preflight の env/quoting が知らせる）ので、表に入れない。
         """
-        rows = [
-            "{}=value",
-            "{} = value",
-            "{}=   value   ",
-            '{}="value"',
-            "{}='value'",
-            "export {}=value",
-            "{}=value # comment",
-            "{}=value\t# comment after a tab",
-            '{}="value # not a comment"',
-            '{}="value" # comment after the quote',
-            "{}=value#literal",
-            "{}=two words",
-            "{}=",
-            "# {}=commented out",
-            "   # {}=indented comment",
-            "{}=http://127.0.0.1:8100/",
-            "{}=a=b",
-            "{}=値",
-        ]
-        names = [f"L2_PROBE_{index:02}" for index in range(len(rows))]
-        env_file = tmp_path / ".env.probe"
-        env_file.write_text("\n".join(row.format(name) for row, name in zip(rows, names, strict=True)) + "\n", encoding="utf-8")
+        names, env_file = _write_dotenv_rows(tmp_path)
 
         reads = [f"[Console]::Out.WriteLine('{name}=' + $env:{name})" for name in names]
         stdout = _run_common_probe(tmp_path, [f"Import-DotEnvFile -Path '{env_file}' -Override", *reads])
@@ -802,6 +852,50 @@ class TestStartup:
         read_by_the_script = dict(line.split("=", 1) for line in stdout.splitlines())
         read_by_dotenv = dotenv_values(env_file)
         assert read_by_the_script == {name: read_by_dotenv.get(name) or "" for name in names}
+
+    def test_name_reader_finds_what_the_dotenv_reader_sets(self, tmp_path):
+        """外す名前の読み方が読み込みとずれると、.env にある名前を外したり、残りを見逃したりする。本物の dotenv_values と比べる。"""
+        _names, env_file = _write_dotenv_rows(tmp_path)
+
+        stdout = _run_common_probe(tmp_path, [f"Get-DotEnvName -Path '{env_file}'"])
+
+        assert stdout.split() == list(dotenv_values(env_file))
+
+    def test_name_reader_skips_lines_without_a_name_and_a_missing_file(self, tmp_path):
+        """名前のない行まで返すと、環境から外すときに例外で止まる。"""
+        env_file = tmp_path / ".env.probe"
+        env_file.write_text("=value\nNO_EQUALS\n\n# COMMENT=1\nL2_PROBE_NAME=1\n", encoding="utf-8")
+
+        stdout = _run_common_probe(tmp_path, [f"Get-DotEnvName -Path '{env_file}'", f"Get-DotEnvName -Path '{tmp_path / 'missing'}'"])
+
+        assert stdout.split() == ["L2_PROBE_NAME"]
+
+    def test_only_the_names_that_env_lacks_are_removed(self, tmp_path):
+        """コメントの行は .env にない名前として外す。大文字と小文字の違いは同じ名前として残す（Windows の環境変数は区別しない）。
+
+        名前はファイルから来るので、* でほかの変数を巻き込まない。.env.dev がなければ何も外さない。
+        """
+        env_file = tmp_path / ".env"
+        dev_file = tmp_path / ".env.dev"
+        env_file.write_text("L2_PROBE_BOTH=1\n# L2_PROBE_COMMENTED=1\nexport L2_PROBE_EXPORTED=1\nl2_probe_lower=1\n", encoding="utf-8")
+        dev_file.write_text(
+            "L2_PROBE_BOTH=2\nL2_PROBE_COMMENTED=2\nL2_PROBE_EXPORTED=2\nL2_PROBE_LOWER=2\n"
+            "L2_PROBE_DEV=zqx\nL2_PROBE_DEV=zqx\nL2_PROBE_UNSET=2\nL2_PROBE_*=2\n",
+            encoding="utf-8",
+        )
+        in_shell = ["L2_PROBE_BOTH", "L2_PROBE_COMMENTED", "L2_PROBE_EXPORTED", "L2_PROBE_LOWER", "L2_PROBE_DEV", "L2_PROBE_OTHER"]
+
+        stdout = _run_common_probe(tmp_path, [
+            *[f"$env:{name} = 'left'" for name in in_shell],
+            f"Remove-DevOnlyEnvVar -Tag 'probe' -EnvFile '{env_file}' -DevEnvFile '{tmp_path / 'missing'}'",
+            f"Remove-DevOnlyEnvVar -Tag 'probe' -EnvFile '{env_file}' -DevEnvFile '{dev_file}'",
+            "[Console]::Out.WriteLine('REMAINS ' + ((Get-ChildItem Env:L2_PROBE_*).Name -join ' '))",
+        ])
+
+        lines = stdout.splitlines()
+        assert lines[0] == "[probe] .env.dev だけにある変数を外しました: L2_PROBE_COMMENTED, L2_PROBE_DEV"
+        assert set(lines[1].removeprefix("REMAINS ").split()) == {"L2_PROBE_BOTH", "L2_PROBE_EXPORTED", "L2_PROBE_LOWER", "L2_PROBE_OTHER"}
+        assert len(lines) == 2
 
 
 class TestScriptText:
@@ -892,6 +986,7 @@ class TestReadme:
             "`reason=append_failing` だけは別",  # 書けなかった発話は追いつかない
             "`lan` が 0",  # OBS が別の PC のときの判定
             "`[HOST]`",  # 見出しの URL を伏せる
+            "`.env.dev` にあって `.env` にない名前",  # 同じシェルの run_dev.ps1 の残りを prod で外す
         ):
             assert word in section, word
         assert "記憶の検索に使わない C2 では止めない" not in section  # 読まなかったころの説明
