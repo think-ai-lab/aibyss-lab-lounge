@@ -539,15 +539,22 @@ V2 の HUD を `V2_HUD_HOST` で LAN へ出し、別の PC の OBS のブラウ�
 ## テスト
 
 ```bash
-uv run pytest -q
-uv run pytest -v     # 詳細表示
+uv run --frozen --all-extras pytest -q
+uv run --frozen --all-extras pytest -v     # 詳細表示
 ```
 
 主なテスト領域: イベント/スキーマ (`test_events`)・パイプライン (`test_3stage_pipeline`, `test_pipeline`)・
 ルーティング (`test_router`)・挙手 (`test_dispatcher`, `test_character_status*`)・グラフ/Agent (`test_graph`, `test_graph_agent`)・
 Retriever/RAG (`test_retriever`, `test_rag_pipeline`)・STT/TTS (`test_stt`, `test_tts`, `test_voicepeak_tts`, `test_sherpa_streaming`)・
 ウェイクワード/VAD (`test_wake_word`, `test_speech_activated`)・MCP ツール (`test_ask_character`, `test_web_search`, `test_retrieve_memory`)・
-OBS (`test_obs`)・フィラー (`test_filler`)・配信文脈 (`test_stream_context`)。LLM/STT/TTS 等の外部呼び出しはすべて mock。
+OBS (`test_obs`)・フィラー (`test_filler`)・配信文脈 (`test_stream_context`)・配信前の点検 (`test_preflight`)・起動スクリプト (`test_run_scripts`、`pwsh` がなければ skip)。LLM/STT/TTS 等の外部呼び出しはすべて mock。
+
+**テストは手元の環境に触れない**（`tests/conftest.py`、隔離そのものは `test_isolation` で確かめる）。サービスが起動中でも、`.env` に本物のキーがあっても、新しい clone と同じ結果になる。
+
+- `.env` を読まない（`PYTHON_DOTENV_DISABLED=1`）。API キー、LLM や LangSmith の接続先、`L2_*`、プロキシの変数は環境から外す
+- Redis は閉じたポート（`redis://127.0.0.1:6`）を指し、ストリームは `aibyss:events-test`。本番の `aibyss:events` へは書かない
+- loopback の外への接続は遮断し、試みたテストを失敗にする（本番のコードが例外を握りつぶしても赤くなる）。loopback でも、実サービスのいる範囲のポートは閉じたポートと同じ扱いにする
+- ログ、作業ディレクトリ、配信文脈、`voices.json`、`readings.json`、フィラーのキャッシュと音声は、テストのプロセスの一時ディレクトリへ向ける
 
 ---
 

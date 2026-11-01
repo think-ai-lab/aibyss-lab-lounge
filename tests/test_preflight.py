@@ -8562,6 +8562,8 @@ class TestPublicFiles:
     @pytest.mark.parametrize("rel", [
         "README.md", "sidecar/README.md", "scripts/run_irodori_sidecar.ps1", "src/lab_lounge/preflight.py",
         ".env.example", ".env.dev.example",
+        "scripts/run_dev.ps1", "scripts/run_prod.ps1", "scripts/run_common.ps1", "scripts/l2-start-prod.bat",
+        "tests/conftest.py", "tests/test_isolation.py", "tests/test_run_scripts.py",
     ])
     def test_no_local_details(self, rel):
         text = _read_public(rel)
@@ -8574,7 +8576,11 @@ class TestPublicFiles:
         text = _read_public("tests/test_preflight.py")
         assert not re.search(r"\b[A-Z]:[\\/]+repos[\\/]+aibyss|notion\.(?:so|site)|[\w.+-]+@(?:gmail|outlook|yahoo)\.", text)
 
-    @pytest.mark.parametrize("rel", ["README.md", "sidecar/README.md", "src/lab_lounge/preflight.py", "tests/test_preflight.py"])
+    @pytest.mark.parametrize("rel", [
+        "README.md", "sidecar/README.md", "src/lab_lounge/preflight.py", "tests/test_preflight.py",
+        "scripts/run_dev.ps1", "scripts/run_prod.ps1", "scripts/run_common.ps1", "scripts/l2-start-prod.bat",
+        "tests/conftest.py", "tests/test_isolation.py", "tests/test_run_scripts.py",
+    ])
     def test_no_private_plan_names(self, rel):
         """非公開の計画の番号と内部の呼び名は、第三者が辿れない。"""
         text = _read_public(rel)

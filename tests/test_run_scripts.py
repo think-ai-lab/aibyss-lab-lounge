@@ -443,3 +443,9 @@ class TestReadme:
         addresses = set(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", section))
         assert addresses
         assert {address for address in addresses if not address.startswith(("192.0.2.", "127.0.0.1"))} == set()
+
+    def test_test_command_uses_the_locked_environment(self):
+        """素の uv run は dev の extra を入れないので、新しい clone では pytest が見つからない。"""
+        section = self._readme().split("## テスト")[1].split("## ディレクトリ構成")[0]
+        assert "uv run --frozen --all-extras pytest" in section
+        assert "uv run pytest" not in section
