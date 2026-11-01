@@ -70,6 +70,10 @@ _SHOW_COLORS = (
 _TOTAL_NOTICE = "HUD に繋がっている画面がありません"
 _LAN_NOTICE = "別の PC の OBS が HUD に繋がっていません"
 
+# 検索に使わない C2 の黄色の知らせの結び。止まっていた間の発話は読み直せるが、書けなかった発話は読み直されない。
+_C2_CATCHES_UP = "発話は Redis に残り、C2 を戻せば追いつきます"
+_C2_DOES_NOT_CATCH_UP = "C2 は書けなかった発話を ack するので、DB を直しても自動では追いつきません。発話は Redis のストリームには残ります"
+
 
 def _stream_of(script: str) -> str:
     """スクリプトの publish 先を返す。.env.example と .env.dev.example の値と同じ。"""
@@ -434,17 +438,24 @@ class TestStartup:
         assert "接続できません" in done.stdout + done.stderr
         assert not scene.called("lab_lounge.run_loop")
 
-    @pytest.mark.parametrize("status,body,reason,effect", [
+    @pytest.mark.parametrize("status,body,reason,effect,catches_up", [
         (503, {"status": "degraded", "stream": "aibyss:events", "reason": "consumer_stopped", "last_read_age_sec": None},
-         "HTTP 503 reason=consumer_stopped", "歴史書が記録していません"),
+         "HTTP 503 reason=consumer_stopped", "歴史書が記録していません", True),
         (200, {"status": "ok", "stream": "aibyss:events-dev", "last_read_age_sec": 0.1},
-         "'aibyss:events-dev' を読んでいます", "歴史書が記録していません"),
-        (200, "{}", "別のサービスかもしれません", "歴史書が記録していません"),
+         "'aibyss:events-dev' を読んでいます", "歴史書が記録していません", True),
+        (200, "{}", "別のサービスかもしれません", "歴史書が記録していません", True),
         # 古いプロセスは記録しているかもしれないので、言い切らない。
-        (200, {"status": "ok", "last_read_age_sec": 0.1}, "古いプロセス", "歴史書が記録しているかを確かめられません"),
+        (200, {"status": "ok", "last_read_age_sec": 0.1}, "古いプロセス", "歴史書が記録しているかを確かめられません", True),
+        # C2 は書けなかった発話を ack するので、この理由だけは「追いつきます」が嘘になる。
+        (503, {"status": "degraded", "stream": "aibyss:events", "reason": "append_failing", "last_read_age_sec": 0.842},
+         "HTTP 503 reason=append_failing", "歴史書が記録していません", False),
     ])
-    def test_c2_that_search_does_not_use_is_reported_in_yellow_and_does_not_stop(self, scene, status, body, reason, effect):
-        """C2 は検索のフラグと無関係に全発話を記録する。止めないのは、発話が Redis に残り、C2 を戻せば追いつくから。"""
+    def test_c2_that_search_does_not_use_is_reported_in_yellow_and_does_not_stop(self, scene, status, body, reason, effect, catches_up):
+        """C2 は検索のフラグと無関係に全発話を記録する。止めないのは、発話が Redis に残り、C2 を戻せば追いつくから。
+
+        append_failing は追いつかないが、それでも止めない。原因を直しても次の発話が届くまで 503 が残るので、
+        赤で止めると L2 を起動できなくなる。
+        """
         scene.dotenv["L2_ENABLE_RAG"] = "false"
         scene.c2.answer(status, body)
 
@@ -453,11 +464,13 @@ class TestStartup:
         output = done.stdout + done.stderr
         assert done.returncode == 0, output
         assert scene.called("lab_lounge.run_loop")
+        recovery = _C2_CATCHES_UP if catches_up else _C2_DOES_NOT_CATCH_UP
         assert re.search(
             rf"<Yellow>\[lab-lounge/prod\] C2 127\.0\.0\.1:\d+: .*{re.escape(reason)}.*"
-            rf"検索に使わない設定なので止めませんが、{effect}。発話は Redis に残り、C2 を戻せば追いつきます",
+            rf"検索に使わない設定なので止めませんが、{effect}。{recovery}",
             output,
         ), output
+        assert ("追いつきます" in output) == catches_up, output
         assert "前提サービスの確認に失敗しました" not in output
 
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
@@ -876,11 +889,25 @@ class TestReadme:
             "`stream`",  # 読んでいるストリームの照合
             "古いプロセス",  # stream を返さない V2 と C2
             "検索に使わない設定",  # C2 は常に読み、止めずに黄色で知らせる
+            "`reason=append_failing` だけは別",  # 書けなかった発話は追いつかない
             "`lan` が 0",  # OBS が別の PC のときの判定
             "`[HOST]`",  # 見出しの URL を伏せる
         ):
             assert word in section, word
         assert "記憶の検索に使わない C2 では止めない" not in section  # 読まなかったころの説明
+
+    def test_stream_row_does_not_promise_a_stop_for_a_c2_out_of_search(self):
+        """検索に使わない C2 は黄色で続行する。止まると読んだ利用者が、黄色の行を見逃さないように。"""
+        row = next(line for line in self._readme().splitlines() if line.startswith("| `REDIS_STREAM_KEY`"))
+        assert "検索に使う C2" in row
+        assert "検索に使わない C2 は黄色" in row
+
+    def test_troubleshooting_tells_the_way_out_of_append_failing(self):
+        """Redis を調べても原因にたどり着かない 503。原因を直しても 503 が残るので、再起動まで書く。"""
+        row = next(line for line in self._readme().splitlines() if "が起動前の確認で止まる**" in line)
+        assert "`reason=append_failing`" in row
+        assert "DB に書けていない" in row
+        assert "C2 を再起動" in row
 
     def test_prerequisites_state_how_the_old_powershell_stops(self):
         """前提の節は、スクリプトの #Requires と同じことを言う。"""

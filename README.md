@@ -133,7 +133,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | 変数 | 既定値 | 説明 |
 |------|--------|------|
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis 接続 URL |
-| `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー（`run_dev.ps1` は未設定と空を拒否し、`run_prod.ps1` は空を拒否する。C2 と V2 が読むストリームと違えば、起動前の確認で止まる） |
+| `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー（`run_dev.ps1` は未設定と空を拒否し、`run_prod.ps1` は空を拒否する。起動前の確認では、V2 と、検索に使う C2 のストリームと違えば止まる（検索に使わない C2 は黄色で知らせて続行）） |
 | `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマ絶対パス（省略で兄弟 workspace を探索） |
 | `L2_USE_REAL_LLM` | `false` | `true` で real LLM を呼ぶ（ダミー応答を無効化） |
 | `L2_LLM_PROVIDER` / `L2_LLM_MODEL` | `openai` / `gpt-5.4` | 既定プロバイダ・モデル（**フォールバック**。キャラ別の指定が `characters.py` にあればそちらが優先） |
@@ -288,7 +288,7 @@ uv run python -m lab_lounge.run_loop --no-play
 4. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、未設定、空のどれか、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（`bus` は未設定を本番と読むので、行を書き忘れただけで dev 発話が本番 C2 に混入する。空の値は C2 にも HUD にも届かない）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
 5. **起動前の確認** — `preflight --static --profile dev` を流し、C2 と V2 の `GET /health` を確かめる。失敗はまとめて赤く出し、`exit 1` で止まる。
    - **読んでいるストリームの照合**: `/health` の `stream` を実効の `REDIS_STREAM_KEY`（未設定は `aibyss:events`）と比べ、違えば止まる。V2 のポートは dev と prod で同じなので、別のモードの V2 が残っていても 200 を返し、確認が緑のまま字幕と bubble が出なくなるため。`status` が `ok` なのに `stream` がないのは古いプロセスなので、これも止まる。`disabled` はバスを読んでいないので比べず、黄色で知らせて続ける。
-   - **C2**: 検索の設定によらず読む（C2 は検索のフラグと無関係に全発話を記録するので）。`L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効（記憶の検索に使う）なら、問題があれば赤で止まる。検索に使わない設定なら、接続できない、503、`stream` が違うときも止めず、黄色で知らせる（発話は Redis に残り、C2 を戻せば追いつく）。L2 と V2 だけの構成もこの形で起動できる。
+   - **C2**: 検索の設定によらず読む（C2 は検索のフラグと無関係に全発話を記録するので）。`L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効（記憶の検索に使う）なら、問題があれば赤で止まる。検索に使わない設定なら、接続できない、503、`stream` が違うときも止めず、黄色で知らせる（発話は Redis に残り、C2 を戻せば追いつく。`reason=append_failing` だけは別で、C2 は書けなかった発話を ack するので、DB を直しても自動では追いつかない）。L2 と V2 だけの構成もこの形で起動できる。
    - **V2 の画面の数**: V2 の行の `ws_clients` で OBS の画面が繋がっているかを読める。足りなければ黄色で知らせるが、OBS を後から起動することもあるので止めない。`L2_OBS_WS_URL` が別の PC を指すなら `lan` が 0 のとき（同じ機械で `/status` を開いていると `total` は 0 にならないため）、loopback か未設定なら `total` が 0 のときに知らせる。
 6. **`run_loop` 起動** — `uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend <WakeBackend> [--max-turns <MaxTurns>]` を実行（`--frozen` は配信の直前に解決器を走らせないため、`--all-extras` は lock の更新後に extra が古いまま残らないようにするため）。ループ本体（Wake → 録音 → STT → ルーティング → Pipeline → TTS → 再生）は冒頭の[アーキテクチャ](#アーキテクチャ)図のとおり。
 
@@ -412,7 +412,7 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 - `model/collab-override` が WARN: `L2_ASK_CHARACTER_MODEL_OVERRIDE` があると、キャラの設定によらず協働先は全員 `L2_LLM_PROVIDER` のこのモデルを使う。意図した設定でなければ消す
 - `uv run` の `--no-sync` を外すと、実行前の同期で壊れた環境が黙って直り、版の検査が意味を失う
 - `import/anthropic` が FAIL で版は一致している: Windows のパス長の上限。anthropic は名前の長いファイルを含むので、`LongPathsEnabled` が無効なら venv のパスは約 126 文字以内に収める（anthropic 0.125 以降の目安。今の lock の 0.89 なら約 154 文字）
-- 終了コード 3 で `C2`: C2 の `/health` が 200 を返していない。起動していないか、Redis を読めていない（consumer が止まると listen したまま 503 を返す）。C2 の README の `/health` の節で理由を読める
+- 終了コード 3 で `C2`: C2 の `/health` が 200 を返していない。起動していないか、Redis を読めていないか（consumer が止まると listen したまま 503 を返す）、DB に書けていない（`reason=append_failing`）。C2 の README の `/health` の節で理由を読める
 - 終了コード 3 で `irodori`: `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` で起動する（weights が未取得なら先に `scripts/run_irodori_sidecar.ps1 -AllowDownload` を 1 度流す）
 - ツールから起動すると `ANTHROPIC_BASE_URL` などを継承するが、点検は外してから流し、`env/inherited` の WARN で外した変数名を知らせる。同じシェルから `python -m lab_lounge.run_loop` を直接起動すると継承したまま動くので、接続先や認証が変わる（`run_dev.ps1` / `run_prod.ps1` は外してから起動する）
 - `.env` がそれらの接続先を指定していると終了コード 2 で止まる（本番と別の相手を測らないため）
@@ -491,7 +491,7 @@ echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
 - **別のマイク/スピーカーを使う**: `uv run python -c "import sounddevice; print(sounddevice.query_devices())"` で番号を確認し `--device N` または `L2_AUDIO_DEVICE` を指定。
 - **VOICEPEAK が並列実行エラー/クラッシュ**: 1 プロセス制限のためフィラーと本応答が衝突しうる。`L2_VOICEPEAK_RETRY_WAIT_SEC` / `L2_VOICEPEAK_MAX_RETRIES`（既定 1.0s × 8 回）で自動リトライ。
 - **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
-- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`'aibyss:events-dev' を読んでいます` は別のモードのサービスが動いているので、止めて起動し直す（V2 のポートは dev と prod で同じ）。`/health が stream を返しません` は古いプロセスなので、同じく起動し直す。`HTTP 200。status が ok でも disabled でもなく` と `JSON でない応答` は、ポートに別のサービスがいる印。`aibyss-workspace/scripts/aibyss.ps1 status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
+- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。C2 の `reason=append_failing` だけは別で、Redis は読めているが DB に書けていない印。原因（DB の読み取り専用、ディスク不足、ロックなど）を取り除いたら C2 を再起動する（次の発話が届くまで 503 が残るので）。書けなかった発話は C2 が ack 済みなので自動では追いつかない（Redis のストリームには残る。C2 の README の `/health` の節を参照）。`'aibyss:events-dev' を読んでいます` は別のモードのサービスが動いているので、止めて起動し直す（V2 のポートは dev と prod で同じ）。`/health が stream を返しません` は古いプロセスなので、同じく起動し直す。`HTTP 200。status が ok でも disabled でもなく` と `JSON でない応答` は、ポートに別のサービスがいる印。`aibyss-workspace/scripts/aibyss.ps1 status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
 - **`REDIS_STREAM_KEY が未設定か空です` で `run_dev.ps1` が止まる**: `.env.dev` に `REDIS_STREAM_KEY=aibyss:events-dev` を書く（`.env.dev.example` を参照）。止めるのは、未設定だと `bus` が本番の `aibyss:events` へ publish するため。
 
 ### OBS を別の PC で動かす

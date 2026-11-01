@@ -367,8 +367,16 @@ function Test-ServicesHealthy {
         # WHY: C2 は検索のフラグと無関係に consumer で全発話を記録するので、検索に使わない設定でも確かめる。
         #      ただし止めない。L2 と V2 だけで動かす構成があり、発話は Redis に残るので C2 を戻せば追いつく。
         #      stream を返さない古いプロセスは記録しているかもしれないので、言い切らない。
+        #      append_failing だけは別で、追いつかない。C2 は書けなかった発話も ack し、以後は新しい発話しか読まないので、
+        #      DB を直しても読み直さない。それでも赤で止めないのは、原因を直しても次の発話が届くまで 503 が残り、
+        #      止めると L2 を起動できなくなるから。
         $effect = if ($c2.Ok -and $null -eq $c2.Body.stream) { "歴史書が記録しているかを確かめられません" } else { "歴史書が記録していません" }
-        Write-Host "[$Tag] $label`: $problem。検索に使わない設定なので止めませんが、$effect。発話は Redis に残り、C2 を戻せば追いつきます" -ForegroundColor Yellow
+        $recovery = if ($c2.Body.reason -ceq "append_failing") {
+            "C2 は書けなかった発話を ack するので、DB を直しても自動では追いつきません。発話は Redis のストリームには残ります"
+        } else {
+            "発話は Redis に残り、C2 を戻せば追いつきます"
+        }
+        Write-Host "[$Tag] $label`: $problem。検索に使わない設定なので止めませんが、$effect。$recovery" -ForegroundColor Yellow
     }
 
     $v2Url = if ($env:L2_V2_URL) { $env:L2_V2_URL } else { "http://127.0.0.1:3200" }
