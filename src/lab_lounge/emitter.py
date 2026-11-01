@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from .log_setup import _suppress_sensitive_loggers
 from .pipeline import run_pipeline
 from .stream_context import load_stream_context
 
@@ -37,6 +38,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
+# WHY: basicConfig だけだと、obsws_python が接続時に OBS のパスワードを INFO で平文出力し、httpx も
+#      検索語を含む URL を出す。run_loop は setup_logging で抑制している。
+_suppress_sensitive_loggers()
 
 logger = logging.getLogger(__name__)
 
