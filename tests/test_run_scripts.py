@@ -864,6 +864,25 @@ class TestReadme:
         assert "uv run --frozen --all-extras python -m lab_lounge.run_loop" in section
         assert "先頭のみ" not in section  # キーの先頭はもう出さない
 
+    def test_what_the_checks_do_is_described_as_they_are(self):
+        """起動前の確認で止まる理由と止まらない理由を、スクリプトと同じ内容で書いていること。"""
+        section = self._readme().split("#### dev プロファイルで起動する")[1].split("### 4. `preflight`")[0]
+        for word in (
+            "未設定",  # dev のストリームの拒否
+            "`stream`",  # 読んでいるストリームの照合
+            "古いプロセス",  # stream を返さない V2 と C2
+            "検索に使わない設定",  # C2 は常に読み、止めずに黄色で知らせる
+            "`lan` が 0",  # OBS が別の PC のときの判定
+            "`[HOST]`",  # 見出しの URL を伏せる
+        ):
+            assert word in section, word
+        assert "記憶の検索に使わない C2 では止めない" not in section  # 読まなかったころの説明
+
+    def test_prerequisites_state_how_the_old_powershell_stops(self):
+        """前提の節は、スクリプトの #Requires と同じことを言う。"""
+        section = self._readme().split("### 前提")[1].split("### インストール")[0]
+        assert "#Requires" in section
+
     def test_v2_url_is_in_the_templates(self):
         assert "L2_V2_URL" in (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
 

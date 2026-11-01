@@ -13,15 +13,18 @@
 # 前提:
 #   - PowerShell 7 (pwsh)。共通処理が ?? などの PowerShell 7 の構文を使うので、古い版は先頭の #Requires で原因を伝えて止める
 #   - Redis が起動中 (docker compose up -d redis)
-#   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)
+#   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)。検索に使わない設定なら、止まっていても黄色で知らせて起動する
 #     → aibyss-coral-chronicle/scripts/run_dev.ps1
 #   - V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
 #     → aibyss-nautilus-v2/scripts/run_dev.ps1
 #   - .env.dev が存在する (cp .env.dev.example .env.dev)
 #
 # 【起動前の確認】
-#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。
-#   C2 は記憶の検索に使う設定のときだけ確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   /health の stream も publish 先と比べる。V2 のポートは dev と prod で同じなので、別のモードの V2 も 200 を返すため。
+#   C2 は設定によらず読む (検索に使わなくても全発話を記録するので)。検索に使わない設定なら止めず、黄色で知らせる
+#   (発話は Redis に残り、C2 を戻せば追いつく)。
+#   OBS が別の PC (L2_OBS_WS_URL が loopback でない) なら、LAN からの接続が 0 のときに黄色で知らせる。
 #   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
 #
 # 【本番 C2 (副 C2) について】
@@ -40,6 +43,7 @@
 # 【分離の保証】
 #   このスクリプトで起動した L2 は:
 #     - aibyss:events-dev のみに XADD (本番ストリームには一切書き込まない)
+#       REDIS_STREAM_KEY が本番の値、未設定、空のどれかなら起動しない (bus は未設定を本番と読む)
 #     - 主 C2 = http://127.0.0.1:8101 (dev、書き込み先)
 #     - 副 C2 = http://127.0.0.1:8100 (prod、read-only 参照)
 #   よって発話データは本番 c2.db に混入せず、かつ過去の本番履歴も参照できる。

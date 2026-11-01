@@ -8,21 +8,25 @@
 # 【env 読み込み】
 #   .env (本番設定: REDIS_STREAM_KEY=aibyss:events / L2_C2_URL=:8100 等)
 #   → .env > プロセス環境変数 の優先度 (ファイルが常に勝つ)
+#   REDIS_STREAM_KEY は未設定なら既定の aibyss:events へ向くので通す。aibyss:events-dev と空の値は拒否する。
 #   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
 #
 # 前提:
 #   - PowerShell 7 (pwsh)。共通処理が ?? などの PowerShell 7 の構文を使うので、古い版は先頭の #Requires で原因を伝えて止める
 #   - Redis が起動中 (aibyss-workspace で docker compose up -d redis)
 #   - VOICEVOX が起動中 (port 15021)
-#   - 本番 C2 が稼働中 (port 8100, c2.db)
+#   - 本番 C2 が稼働中 (port 8100, c2.db)。検索に使わない設定なら、止まっていても黄色で知らせて起動する
 #       → aibyss-coral-chronicle/scripts/run_prod.ps1
 #   - 本番 V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
 #       → aibyss-nautilus-v2/scripts/run_prod.ps1
 #   - .env が存在する (cp .env.example .env)
 #
 # 【起動前の確認】
-#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。
-#   C2 は記憶の検索に使う設定のときだけ確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   /health の stream も publish 先と比べる。V2 のポートは dev と prod で同じなので、dev の V2 が残っていても 200 を返すため。
+#   C2 は設定によらず読む (検索に使わなくても全発話を記録するので)。検索に使わない設定なら止めず、黄色で知らせる
+#   (発話は Redis に残り、C2 を戻せば追いつく)。
+#   OBS が別の PC (L2_OBS_WS_URL が loopback でない) なら、LAN からの接続が 0 のときに黄色で知らせる。
 #   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
 #
 # 使い方: PowerShell から実行

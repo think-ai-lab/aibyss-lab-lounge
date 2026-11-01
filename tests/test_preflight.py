@@ -3779,6 +3779,10 @@ class TestLoopbackProxy:
         assert "[WARN ] env/proxy:" in out
         assert "zqx" not in out
 
+    def test_readme_tells_what_to_do(self):
+        row = next(line for line in _readme_section().splitlines() if "`env/proxy`" in line)
+        assert "NO_PROXY" in row
+
 
 class TestRunScriptRefusals:
     """点検が緑でも、run_dev.ps1 / run_prod.ps1 は exit 1 で止まる組がある。python を直接起動する構成もあるので WARN まで。"""

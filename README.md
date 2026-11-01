@@ -133,7 +133,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | 変数 | 既定値 | 説明 |
 |------|--------|------|
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis 接続 URL |
-| `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー |
+| `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー（`run_dev.ps1` は未設定と空を拒否し、`run_prod.ps1` は空を拒否する。C2 と V2 が読むストリームと違えば、起動前の確認で止まる） |
 | `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマ絶対パス（省略で兄弟 workspace を探索） |
 | `L2_USE_REAL_LLM` | `false` | `true` で real LLM を呼ぶ（ダミー応答を無効化） |
 | `L2_LLM_PROVIDER` / `L2_LLM_MODEL` | `openai` / `gpt-5.4` | 既定プロバイダ・モデル（**フォールバック**。キャラ別の指定が `characters.py` にあればそちらが優先） |
@@ -148,12 +148,12 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | `L2_USE_LLM_ROUTER` / `L2_LLM_ROUTER_MODEL` | `true` / `claude-haiku-4-5` | LLM によるキャラ・ルーティング |
 | `L2_USE_INTENT_GATE` / `L2_INTENT_GATE_MODEL` | `true` / `claude-haiku-4-5` | 挙手・承認の意図判定（軽量分類 LLM） |
 | `L2_ENABLE_RAG` / `L2_USE_C2_RETRIEVER` | `false` / `false` | seed corpus RAG / C2 会話メモリ RAG（どちらも `retrieve_memory` ツールからしか呼ばれないので、`L2_ENABLE_TOOLS` が前提） |
-| `L2_C2_URL` | `http://127.0.0.1:8100` | C2 のベース URL（RAG 参照先） |
+| `L2_C2_URL` | `http://127.0.0.1:8100` | C2 のベース URL（RAG 参照先。`run_dev.ps1` / `run_prod.ps1` が起動前に `/health` を確かめる先でもある） |
 | `L2_V2_URL` | `http://127.0.0.1:3200` | V2 のベース URL（`run_dev.ps1` / `run_prod.ps1` が起動前に `/health` を確かめる先。L2 本体は接続しない） |
 | `L2_USE_HANDRAISE` | `true` | 挙手制自発介入の有効化（`bg-continuous` 上で動作） |
 | `L2_ENABLE_TOOLS` | `false` | MCP ツール（Agent モード）の有効化 |
 | `L2_VAD_BACKEND` / `L2_VAD_AGGRESSIVENESS` | `webrtc` / `3` | VAD バックエンドと感度 |
-| `L2_OBS_WS_URL` / `L2_OBS_WS_PASSWORD` | *(任意)* | OBS WebSocket 接続情報（立ち絵切替） |
+| `L2_OBS_WS_URL` / `L2_OBS_WS_PASSWORD` | *(任意)* | OBS WebSocket 接続情報（立ち絵切替）。host が loopback でなければ OBS は別の PC とみなし、起動前の確認で HUD への `ws_clients.lan` を見る |
 | `LANGSMITH_TRACING` | `false` | `true` で LangChain/LangGraph 実行を LangSmith に送信 |
 
 ---
@@ -284,24 +284,27 @@ uv run python -m lab_lounge.run_loop --no-play
 
 1. **継承した接続先を外す** — 親プロセスから `ANTHROPIC_BASE_URL` などの LLM の接続先を継承していたら、名前を表示して外す（Claude Code などのツールから起動すると継承する）。`preflight` は自分の中でしか外さないので、残すと点検が緑でも `run_loop` は別の相手へ繋がる。
 2. **環境変数の読み込み（ファイルが source of truth）** — `.env`（本番と共通の設定 = `OPENAI_API_KEY` / `L2_USE_REAL_LLM` 等を継承）→ `.env.dev`（dev 固有の上書き = ストリーム名・C2 URL）の順に読み込み、いずれも既存のプロセス環境変数を上書きする（過去実行の残値による事故を防ぐ）。
-3. **分離値の確認表示** — `REDIS_STREAM_KEY` / `L2_C2_URL`（主）/ `L2_C2_URL_READONLY`（副）/ VAD 設定 / `OPENAI_API_KEY`（`set` / `unset` だけ）を出力。
-4. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（dev 発話が本番 C2 に混入するのを防ぐ）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
-5. **起動前の確認** — `preflight --static --profile dev` を流し、C2 と V2 の `GET /health` を確かめる。C2 は `L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効なときだけ見る（記憶の検索に使わない C2 では止めない）。失敗はまとめて赤く出し、`exit 1` で止まる。V2 の行の `ws_clients` で OBS の画面が繋がっているかも読める（0 なら黄色で知らせるが、OBS を後から起動することもあるので止めない）。
+3. **分離値の確認表示** — `REDIS_STREAM_KEY` / `L2_C2_URL`（主）/ `L2_C2_URL_READONLY`（副）/ VAD 設定 / `OPENAI_API_KEY`（`set` / `unset` だけ）を出力。URL は `host:port` で表示し、loopback 以外の host は `[HOST]` に伏せる（起動の出力は貼られることがあるため）。
+4. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、未設定、空のどれか、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（`bus` は未設定を本番と読むので、行を書き忘れただけで dev 発話が本番 C2 に混入する。空の値は C2 にも HUD にも届かない）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
+5. **起動前の確認** — `preflight --static --profile dev` を流し、C2 と V2 の `GET /health` を確かめる。失敗はまとめて赤く出し、`exit 1` で止まる。
+   - **読んでいるストリームの照合**: `/health` の `stream` を実効の `REDIS_STREAM_KEY`（未設定は `aibyss:events`）と比べ、違えば止まる。V2 のポートは dev と prod で同じなので、別のモードの V2 が残っていても 200 を返し、確認が緑のまま字幕と bubble が出なくなるため。`status` が `ok` なのに `stream` がないのは古いプロセスなので、これも止まる。`disabled` はバスを読んでいないので比べず、黄色で知らせて続ける。
+   - **C2**: 検索の設定によらず読む（C2 は検索のフラグと無関係に全発話を記録するので）。`L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効（記憶の検索に使う）なら、問題があれば赤で止まる。検索に使わない設定なら、接続できない、503、`stream` が違うときも止めず、黄色で知らせる（発話は Redis に残り、C2 を戻せば追いつく）。L2 と V2 だけの構成もこの形で起動できる。
+   - **V2 の画面の数**: V2 の行の `ws_clients` で OBS の画面が繋がっているかを読める。足りなければ黄色で知らせるが、OBS を後から起動することもあるので止めない。`L2_OBS_WS_URL` が別の PC を指すなら `lan` が 0 のとき（同じ機械で `/status` を開いていると `total` は 0 にならないため）、loopback か未設定なら `total` が 0 のときに知らせる。
 6. **`run_loop` 起動** — `uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend <WakeBackend> [--max-turns <MaxTurns>]` を実行（`--frozen` は配信の直前に解決器を走らせないため、`--all-extras` は lock の更新後に extra が古いまま残らないようにするため）。ループ本体（Wake → 録音 → STT → ルーティング → Pipeline → TTS → 再生）は冒頭の[アーキテクチャ](#アーキテクチャ)図のとおり。
 
 | パラメータ | 既定 | 説明 |
 |-----------|------|------|
 | `-WakeBackend` | `continuous` | run_loop の `--wake-backend` に渡す（上記 6 種から選択） |
 | `-MaxTurns` | `3` | 暴走防止のターン上限。`0` 以下なら `--max-turns` を渡さず **無制限** にする |
-| `-SkipHealthCheck` | なし | C2 と V2 の `/health` の確認を省く（どちらも置かない構成のため）。`preflight --static` は省かない |
+| `-SkipHealthCheck` | なし | C2 と V2 の `/health` の確認を省く（どちらも置かない構成のため）。`preflight --static` は省かない。C2 だけを置かない構成には要らない（上の黄色の知らせで起動する） |
 
-本番は `scripts/run_prod.ps1`。`.env` だけを読み、同じ確認を `--profile prod` で流す（`-MaxTurns` の既定は `0`）。Stream Deck などから起動するときは `scripts/l2-start-dev.bat` / `scripts/l2-start-prod.bat` を使う（新しい窓を開き、エラーで終わっても窓が残る）。
+本番は `scripts/run_prod.ps1`。`.env` だけを読み、同じ確認を `--profile prod` で流す（`-MaxTurns` の既定は `0`）。`REDIS_STREAM_KEY` は未設定なら既定の本番 `aibyss:events` へ向くので通し、`aibyss:events-dev` と空の値は拒否する。dev と prod を切り替えるときは、動いている V2 を止めてから起動する（ポートが同じなので、残っているとストリームの照合で止まる）。Stream Deck などから起動するときは `scripts/l2-start-dev.bat` / `scripts/l2-start-prod.bat` を使う（新しい窓を開き、エラーで終わっても窓が残る）。
 
-**分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://127.0.0.1:8101`（dev・書き込み先）、副 C2 = `http://127.0.0.1:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。
+**分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://127.0.0.1:8101`（dev・書き込み先）、副 C2 = `http://127.0.0.1:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。`REDIS_STREAM_KEY` が本番の値、未設定、空のどれかなら起動しない。
 
 **前提**:
 - Redis 起動済み（`aibyss-workspace` で `docker compose up -d`）
-- 開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`、`aibyss-coral-chronicle/scripts/run_dev.ps1`）と V2（port 3200、`aibyss-nautilus-v2/scripts/run_dev.ps1`。別の URL なら `L2_V2_URL` で指す）が稼働
+- 開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`、`aibyss-coral-chronicle/scripts/run_dev.ps1`。検索に使わない設定なら、止まっていても黄色で知らせて起動する）と V2（port 3200、`aibyss-nautilus-v2/scripts/run_dev.ps1`。別の URL なら `L2_V2_URL` で指す）が稼働
 - 本番 C2（port 8100 / `c2.db`）は過去の本番履歴を読むための副 C2 で、止まっていても起動できる。止まっている間は、検索のたびに副 C2 の分が `L2_C2_RETRIEVER_BUDGET_MS`（既定 600 ms）で打ち切りになり、本番の履歴なしで続く（`preflight --paid` の `c2/readonly` と `memory` は WARN）。本番 C2 を動かさない期間は `.env.dev` の `L2_C2_URL_READONLY` を空にすれば待たずに済む
 - `.env.dev` を作成済み（`cp .env.dev.example .env.dev`）
 
@@ -395,6 +398,7 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 - `flag/<設定名>` や `url/<設定名>` の値が読めない: 今の設定で本番が読むものは FAIL、読まないものは WARN（値は表示しない）。`flag/L2_VOICEPEAK_*` のように配信に出ないキャラだけが使うものは `[FAIL*]`
 - `env/quoting` が WARN: ダブルクォートの中の `\r` や `\v` が制御文字に変わっている。`python-dotenv` と `run_*.ps1` で読み方が違うので、パスは引用符を外して書く
 - `run-script/*` が WARN: `run_dev.ps1` / `run_prod.ps1` が起動を拒否する組（dev で `.env.dev` がない、dev で `L2_C2_URL` が `:8100`、prod で `:8101`）
+- `env/proxy` が WARN: `HTTP_PROXY` があり、`NO_PROXY` に `127.0.0.1` がない。C2 の検索と TTS の接続がプロキシを通る。`run_dev.ps1` / `run_prod.ps1` の `/health` の確認はプロキシを通らないので、確認だけが緑で本番が繋がらないことがある。`NO_PROXY=127.0.0.1` を足す
 - `obs` が WARN で「立ち絵（`<slug>_neutral`）がありません」: グループがあっても、中のソース名が `<slug>_<pose>` でないと立ち絵は切り替わらない。接続の失敗の理由は `logs/preflight/` に残る
 - `schema` が FAIL: Event Envelope のスキーマが見つからない。`aibyss-workspace` を兄弟に clone するか、`AIBYSS_SCHEMA_PATH` でスキーマのファイルを指す。本番はダミー起動でも全ターンが落ちる
 - `persona/<slug>` が FAIL: 人格のファイルが空か UTF-8 以外。空なら人格なしで応答し、UTF-8 以外ならそのキャラのターンがすべて落ちる
@@ -487,13 +491,14 @@ echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
 - **別のマイク/スピーカーを使う**: `uv run python -c "import sounddevice; print(sounddevice.query_devices())"` で番号を確認し `--device N` または `L2_AUDIO_DEVICE` を指定。
 - **VOICEPEAK が並列実行エラー/クラッシュ**: 1 プロセス制限のためフィラーと本応答が衝突しうる。`L2_VOICEPEAK_RETRY_WAIT_SEC` / `L2_VOICEPEAK_MAX_RETRIES`（既定 1.0s × 8 回）で自動リトライ。
 - **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
-- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`aibyss-workspace/scripts/aibyss.ps1 status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
+- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`'aibyss:events-dev' を読んでいます` は別のモードのサービスが動いているので、止めて起動し直す（V2 のポートは dev と prod で同じ）。`/health が stream を返しません` は古いプロセスなので、同じく起動し直す。`HTTP 200。status が ok でも disabled でもなく` と `JSON でない応答` は、ポートに別のサービスがいる印。`aibyss-workspace/scripts/aibyss.ps1 status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
+- **`REDIS_STREAM_KEY が未設定か空です` で `run_dev.ps1` が止まる**: `.env.dev` に `REDIS_STREAM_KEY=aibyss:events-dev` を書く（`.env.dev.example` を参照）。止めるのは、未設定だと `bus` が本番の `aibyss:events` へ publish するため。
 
 ### OBS を別の PC で動かす
 
 V2 の HUD を `V2_HUD_HOST` で LAN へ出し、別の PC の OBS のブラウザソースで開く構成の確認手順。OBS に何も映らないときは上から順に確かめる。`192.0.2.10` は HUD を動かす PC、`192.0.2.20` は OBS の PC のアドレスに読み替える（どちらも文書用の例）。
 
-1. **HUD の PC で、OBS が繋がっているかを見る。** `run_dev.ps1` / `run_prod.ps1` の起動時の `V2` の行と同じものを読める。`ws_clients.lan` が 0 なら、OBS の PC は繋がっていない。
+1. **HUD の PC で、OBS が繋がっているかを見る。** `run_dev.ps1` / `run_prod.ps1` の起動時の `V2` の行と同じものを読める。`ws_clients.lan` が 0 なら、OBS の PC は繋がっていない。`L2_OBS_WS_URL` が別の PC を指していれば、起動時に `別の PC の OBS が HUD に繋がっていません` と黄色で知らせる。
 
    ```powershell
    curl.exe -s http://127.0.0.1:3200/health
