@@ -805,9 +805,13 @@ class TestScriptText:
         assert tuple(re.findall(r'"([A-Z_]+)"', block)) == preflight.INHERITED_LLM_VARS
 
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
-    def test_powershell_7_is_required_on_the_first_line(self, script):
-        """run_common.ps1 は ?? を使うので、古い版では構文エラーになる。実際に古い版で流すテストは TestStartup にある。"""
-        assert self._read(script).splitlines()[0] == "#Requires -Version 7.0"
+    def test_powershell_7_5_is_required_on_the_first_line(self, script):
+        """run_common.ps1 は ?? を使い、REDIS_STREAM_KEY= の検査には空の値の環境変数が要る。
+
+        7.4 以前は空の値を入れると環境変数ごと消えるので、prod の空の値が未設定に見えて検査を通る。
+        実際に古い版で流すテストは TestStartup にある。
+        """
+        assert self._read(script).splitlines()[0] == "#Requires -Version 7.5"
 
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
     def test_every_uv_run_uses_the_locked_environment(self, script):
