@@ -34,59 +34,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ── dotenv パーサー (run_dev.ps1 と同一ロジック) ──
-# 対応書式: KEY=value / KEY="value" / KEY='value' / export KEY=value /
-#           KEY=value # comment / KEY="value # keep"
-function Import-DotEnvFile {
-    param(
-        [string]$Path,
-        [switch]$Override
-    )
-    if (-not (Test-Path $Path)) { return }
-    foreach ($rawLine in Get-Content $Path) {
-        $line = $rawLine.Trim()
-        if (-not $line -or $line.StartsWith("#")) { continue }
-        if ($line.StartsWith("export ")) {
-            $line = $line.Substring(7).Trim()
-        }
-        if (-not $line.Contains("=")) { continue }
-        $eqIdx = $line.IndexOf("=")
-        $key = $line.Substring(0, $eqIdx).Trim()
-        $value = $line.Substring($eqIdx + 1).Trim()
-
-        $isQuoted = $false
-        if ($value.Length -ge 2) {
-            $first = $value[0]
-            if ($first -eq '"' -or $first -eq "'") {
-                $closeIdx = $value.IndexOf($first, 1)
-                if ($closeIdx -gt 0) {
-                    $value = $value.Substring(1, $closeIdx - 1)
-                    $isQuoted = $true
-                }
-            }
-        }
-
-        if (-not $isQuoted) {
-            $spaceHash = $value.IndexOf(" #")
-            $tabHash = $value.IndexOf("`t#")
-            $commentIdx = -1
-            if ($spaceHash -ge 0 -and $tabHash -ge 0) {
-                $commentIdx = [Math]::Min($spaceHash, $tabHash)
-            } elseif ($spaceHash -ge 0) {
-                $commentIdx = $spaceHash
-            } elseif ($tabHash -ge 0) {
-                $commentIdx = $tabHash
-            }
-            if ($commentIdx -ge 0) {
-                $value = $value.Substring(0, $commentIdx).TrimEnd()
-            }
-        }
-
-        if ($Override -or -not [Environment]::GetEnvironmentVariable($key, "Process")) {
-            [Environment]::SetEnvironmentVariable($key, $value, "Process")
-        }
-    }
-}
+. (Join-Path $PSScriptRoot "run_common.ps1")
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
