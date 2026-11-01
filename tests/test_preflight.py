@@ -546,16 +546,9 @@ class TestServiceChecks:
         assert _status(report, "c2").status == "SKIP"
         assert preflight._c2_retriever_enabled() is False
 
-    def test_tcp_ok_fills_in_the_default_port(self, isolated):
-        with patch("socket.create_connection") as connect:
-            connect.return_value.__enter__.return_value = None
-            assert preflight._tcp_ok("http://c2.invalid") is True
-        assert connect.call_args.args[0] == ("c2.invalid", 80)
-
     def test_missing_services(self, isolated):
         os.environ.update({"L2_ENABLE_TOOLS": "true", "L2_ENABLE_RAG": "true", "L2_USE_C2_RETRIEVER": "true"})
-        with patch.object(preflight, "_tcp_ok", return_value=False), \
-                patch.object(preflight, "_http_ok", return_value=False):
+        with patch.object(preflight, "_http_ok", return_value=False):
             missing = preflight.missing_services(get_all_characters(), with_pipeline=True)
         assert set(missing) == {"C2", "Redis", "irodori", "voicevox"}
 
@@ -2442,11 +2435,6 @@ class TestLiveness:
         with patch("urllib.request.urlopen", side_effect=OSError("refused")):
             assert preflight._http_ok("http://127.0.0.1:1/x") is False
 
-    def test_tcp_ok_judges_failure(self):
-        with patch("socket.create_connection", side_effect=OSError("refused")):
-            assert preflight._tcp_ok("http://127.0.0.1:8100") is False
-        assert preflight._tcp_ok("redis://:pw/x@127.0.0.1:6") is False
-
     def test_tts_status_honours_the_irodori_url(self, isolated):
         os.environ["L2_TTS_IRODORI_URL"] = "http://127.0.0.1:9"
         with patch.object(preflight, "_http_ok", return_value=True) as ok:
@@ -2456,9 +2444,32 @@ class TestLiveness:
     def test_missing_services_honours_the_c2_url(self, isolated):
         os.environ.update({"L2_ENABLE_TOOLS": "true", "L2_ENABLE_RAG": "true", "L2_USE_C2_RETRIEVER": "true"})
         os.environ["L2_C2_URL"] = "http://127.0.0.1:9"
-        with patch.object(preflight, "_tcp_ok", return_value=True) as ok:
+        with patch.object(preflight, "_http_ok", return_value=True) as ok:
             preflight.missing_services([], with_pipeline=False)
-        assert ok.call_args.args[0] == "http://127.0.0.1:9"
+        assert ok.call_args.args[0] == "http://127.0.0.1:9/health"
+
+    def test_missing_services_does_not_double_the_slash_of_the_c2_url(self, isolated):
+        os.environ.update(_C2_ON)
+        os.environ["L2_C2_URL"] = "http://127.0.0.1:9/"
+        with patch.object(preflight, "_http_ok", return_value=True) as ok:
+            preflight.missing_services([], with_pipeline=False)
+        assert ok.call_args.args[0] == "http://127.0.0.1:9/health"
+
+    def test_c2_that_listens_but_reports_503_is_missing(self, isolated):
+        """consumer が止まっても C2 は listen を続ける。接続できるだけで「いる」と言うと、記録されないまま課金が始まる。"""
+        import urllib.error
+
+        os.environ.update(_C2_ON)
+        error = urllib.error.HTTPError("http://127.0.0.1:8100/health", 503, "Service Unavailable", {}, None)
+        with patch("urllib.request.urlopen", side_effect=error):
+            assert preflight.missing_services([], with_pipeline=False) == ["C2"]
+
+    def test_c2_that_reports_200_is_not_missing(self, isolated):
+        os.environ.update(_C2_ON)
+        response = MagicMock(status=200)
+        response.__enter__.return_value = response
+        with patch("urllib.request.urlopen", return_value=response):
+            assert preflight.missing_services([], with_pipeline=False) == []
 
     def test_check_c2_requires_primary_and_not_readonly(self, isolated):
         os.environ.update({
@@ -2807,9 +2818,9 @@ class TestDefaultUrlsMatchProduction:
     def test_c2_liveness_and_probe(self, isolated):
         os.environ.update({"L2_ENABLE_RAG": "true", "L2_ENABLE_TOOLS": "true", "L2_USE_C2_RETRIEVER": "true"})
         expected = _production_c2_url()
-        with patch.object(preflight, "_tcp_ok", return_value=True) as tcp:
+        with patch.object(preflight, "_http_ok", return_value=True) as ok:
             preflight.missing_services([], with_pipeline=False)
-        assert tcp.call_args.args[0] == expected
+        assert ok.call_args.args[0] == f"{expected}/health"
         with patch.object(preflight, "_check_c2_endpoint") as endpoint:
             preflight.check_c2(preflight.Report())
         assert endpoint.call_args.args[2] == expected
@@ -5360,17 +5371,9 @@ class TestServiceProblemLog:
 class TestServiceLiveness:
     """前提サービスの生死の見方。読み違えると、止まるべきところで課金が始まる。"""
 
-    def test_tcp_ok_uses_the_port_written_in_the_url(self):
-        """http://host:8100 を 80 番で測ると、止まっている C2 を「いる」と言いかねない。"""
-        with patch("socket.create_connection") as connect:
-            assert preflight._tcp_ok("http://c2.invalid:8100") is True
-        assert connect.call_args.args[0] == ("c2.invalid", 8100)
-
-    def test_tcp_ok_gives_up_without_a_port_to_try(self):
-        """port もスキームの既定もない URL は繋ぐ先が決まらない。「届く」にすると C2 なしで課金が始まる。"""
-        with patch("socket.create_connection") as connect:
-            assert preflight._tcp_ok("c2://c2.invalid") is False
-        connect.assert_not_called()
+    def test_http_ok_gives_up_on_a_scheme_it_cannot_speak(self):
+        """繋ぐ先が決まらない URL を「届く」にすると、C2 なしで課金が始まる。"""
+        assert preflight._http_ok("c2://c2.invalid/health") is False
 
     def test_provider_without_a_local_engine_counts_as_usable(self):
         """edge_tts は README が載せるプロバイダで、キャラ単位で選べる。ローカルのエンジンを持たない。
@@ -5850,9 +5853,9 @@ class TestMemoryToolGate:
     def test_tools_off_needs_no_c2_and_no_embedding(self, isolated, capture):
         """.env.dev.example の既定の形（RAG と C2 だけ真）。本番は C2 も埋め込みも呼ばない。"""
         os.environ.update({"L2_ENABLE_RAG": "true", "L2_USE_C2_RETRIEVER": "true"})
-        with patch.object(preflight, "_tcp_ok", return_value=False) as tcp:
+        with patch.object(preflight, "_http_ok", return_value=False) as ok:
             assert preflight.missing_services([], with_pipeline=False) == []
-        tcp.assert_not_called()
+        ok.assert_not_called()
         report = preflight.Report()
         with patch("lab_lounge.retriever._embed") as embed, patch("urllib.request.urlopen") as urlopen:
             preflight.check_embeddings(report, capture)
@@ -5864,7 +5867,7 @@ class TestMemoryToolGate:
 
     def test_paid_is_not_stopped_by_a_c2_production_never_calls(self, isolated):
         _write_real_env(isolated, L2_ENABLE_TOOLS="false", L2_ENABLE_RAG="true", L2_USE_C2_RETRIEVER="true")
-        with patch.object(preflight, "run_paid") as paid, patch.object(preflight, "_tcp_ok", return_value=False):
+        with patch.object(preflight, "run_paid") as paid, patch.object(preflight, "_http_ok", return_value=False):
             code = preflight.main(["--paid", "--profile", "dev", "--characters", "octamaid", "--no-pipeline"], repo_root=isolated)
         assert code == preflight.EXIT_OK
         paid.assert_called_once()
@@ -7863,10 +7866,10 @@ class TestUnreadableInputsAreRows:
         assert "dim=0" in check.detail
 
     @pytest.mark.parametrize("error", [OSError("refused"), UnicodeError("label empty")], ids=["refused", "bad-host"])
-    def test_tcp_failure_of_any_kind_means_not_reachable(self, error):
+    def test_http_failure_of_any_kind_means_not_reachable(self, error):
         """host の形が不正だと IDNA 変換で UnicodeError になる。抜けると前提サービスの一覧も出ない。"""
-        with patch("socket.create_connection", side_effect=error):
-            assert preflight._tcp_ok("http://a..b:8100") is False
+        with patch("urllib.request.urlopen", side_effect=error):
+            assert preflight._http_ok("http://a..b:8100/health") is False
 
 
 class TestReadsFlagsLikeProduction:
@@ -7915,9 +7918,9 @@ class TestReadsFlagsLikeProduction:
     def test_c2_that_production_does_not_call_is_not_required(self, isolated):
         """止まっている C2 で --paid を止めたり FAIL にしたりすると、正常な構成で点検を通せない。"""
         os.environ.update({"L2_ENABLE_TOOLS": "true", "L2_USE_C2_RETRIEVER": "true"})
-        with patch.object(preflight, "_tcp_ok", return_value=False) as tcp:
+        with patch.object(preflight, "_http_ok", return_value=False) as ok:
             assert preflight.missing_services([], with_pipeline=False) == []
-        tcp.assert_not_called()
+        ok.assert_not_called()
         report = preflight.Report()
         preflight.check_c2(report)
         assert _status(report, "c2").status == "SKIP"

@@ -335,7 +335,7 @@ uv run --frozen --all-extras --no-sync python -m lab_lounge.preflight --paid --p
 
 引数の省略形（`--all` や `--pa`）は受け付けない。`--all` が `--allow-prod` として通ると、本番ストリームの拒否が外れてしまうため。
 
-**`--paid` の前提**: Redis、`L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効なら C2、必須キャラの TTS エンジン（irodori を使うキャラがいれば `aibyss.ps1 start -Irodori`、VOICEVOX）。`L2_USE_REAL_LLM` と `L2_USE_REAL_TTS` が真でないと、課金する前に止まる。`--no-pipeline` は Redis と TTS を前提にしないので、`L2_USE_REAL_TTS` を問わず、`tts/*` と `tts-config/*` の行は記録だけで合否に数えない。
+**`--paid` の前提**: Redis、`L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効なら C2（`GET /health` が 200 を返すこと。ポートが開いているだけでは足りない）、必須キャラの TTS エンジン（irodori を使うキャラがいれば `aibyss.ps1 start -Irodori`、VOICEVOX）。`L2_USE_REAL_LLM` と `L2_USE_REAL_TTS` が真でないと、課金する前に止まる。`--no-pipeline` は Redis と TTS を前提にしないので、`L2_USE_REAL_TTS` を問わず、`tts/*` と `tts-config/*` の行は記録だけで合否に数えない。
 
 **初回の少額の流し方**: 全キャラへ流す前に、1 キャラだけで LLM の経路を確かめられる。
 
@@ -400,6 +400,7 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 - `model/collab-override` が WARN: `L2_ASK_CHARACTER_MODEL_OVERRIDE` があると、キャラの設定によらず協働先は全員 `L2_LLM_PROVIDER` のこのモデルを使う。意図した設定でなければ消す
 - `uv run` の `--no-sync` を外すと、実行前の同期で壊れた環境が黙って直り、版の検査が意味を失う
 - `import/anthropic` が FAIL で版は一致している: Windows のパス長の上限。anthropic は名前の長いファイルを含むので、`LongPathsEnabled` が無効なら venv のパスは約 126 文字以内に収める（anthropic 0.125 以降の目安。今の lock の 0.89 なら約 154 文字）
+- 終了コード 3 で `C2`: C2 の `/health` が 200 を返していない。起動していないか、Redis を読めていない（consumer が止まると listen したまま 503 を返す）。C2 の README の `/health` の節で理由を読める
 - 終了コード 3 で `irodori`: `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` で起動する（weights が未取得なら先に `scripts/run_irodori_sidecar.ps1 -AllowDownload` を 1 度流す）
 - ツールから起動すると `ANTHROPIC_BASE_URL` などを継承するが、点検は外してから流し、`env/inherited` の WARN で外した変数名を知らせる。同じシェルから本番を起動すると継承したまま動くので、接続先や認証が変わる
 - `.env` がそれらの接続先を指定していると終了コード 2 で止まる（本番と別の相手を測らないため）

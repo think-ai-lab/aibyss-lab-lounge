@@ -2071,23 +2071,6 @@ def _http_ok(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
-def _tcp_ok(url: str, timeout: float = 1.0) -> bool:
-    """URL の host:port へ TCP で繋がるかどうかを返す。port がなければスキームの既定を使う。"""
-    location = _url_location(url)
-    if location is None:
-        return False
-    host, port = location
-    port = port or _DEFAULT_PORTS.get(urlsplit(url).scheme)
-    if not port:
-        return False
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (OSError, ValueError):
-        # host の形が不正だと、名前解決の前の IDNA 変換で UnicodeError（ValueError の一種）になる。
-        return False
-
-
 def tts_engine_status(character: Any) -> tuple[bool, str]:
     """キャラの TTS エンジンが使える状態かを返す。合成はしない。
 
@@ -2121,8 +2104,10 @@ def missing_services(characters: list[Any], *, with_pipeline: bool) -> list[str]
         足りないサービスの名前
     """
     missing: list[str] = []
-    c2_url = os.environ.get("L2_C2_URL", "http://127.0.0.1:8100")
-    if _c2_retriever_enabled() and not _tcp_ok(c2_url):
+    # WHY: Redis の consumer が止まっても C2 は listen を続けるので、TCP の接続だけでは「いる」と誤る。
+    #      /health は consumer の生死と読み取りの鮮度を見て 503 を返す。
+    c2_url = os.environ.get("L2_C2_URL", "http://127.0.0.1:8100").rstrip("/")
+    if _c2_retriever_enabled() and not _http_ok(f"{c2_url}/health"):
         missing.append("C2")
     if not with_pipeline:
         return missing
