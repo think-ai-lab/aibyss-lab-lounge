@@ -488,6 +488,52 @@ echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
 - **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
 - **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`aibyss-workspace` の `aibyss status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
 
+### OBS を別の PC で動かす
+
+V2 の HUD を `V2_HUD_HOST` で LAN へ出し、別の PC の OBS のブラウザソースで開く構成の確認手順。OBS に何も映らないときは上から順に確かめる。`192.0.2.10` は HUD を動かす PC、`192.0.2.20` は OBS の PC のアドレスに読み替える（どちらも文書用の例）。
+
+1. **HUD の PC で、OBS が繋がっているかを見る。** `run_dev.ps1` / `run_prod.ps1` の起動時の `V2` の行と同じものを読める。`ws_clients.lan` が 0 なら、OBS の PC は繋がっていない。
+
+   ```powershell
+   curl.exe -s http://127.0.0.1:3200/health
+   ```
+
+2. **OBS の PC から HUD へ届くかを確かめる。** 届かないなら、HUD の PC の Firewall かネットワークで止まっている。
+
+   ```powershell
+   # OBS の PC が Windows のとき（TcpTestSucceeded を見る）
+   Test-NetConnection 192.0.2.10 -Port 3200
+   ```
+
+   ```bash
+   # OBS の PC が macOS のとき（JSON が返れば届いている）
+   curl -s --max-time 3 http://192.0.2.10:3200/health
+   ```
+
+3. **OBS の PC の送信元のアドレスが、Firewall の許可先と同じかを確かめる。** NIC が複数ある PC（Wi-Fi と有線など）では、HUD へ向かう通信が思っていたのと別のアドレスから出ることがある。許可していないアドレスから出ると、2 が届かない。
+
+   ```powershell
+   # OBS の PC が Windows のとき（上の Test-NetConnection の SourceAddress と InterfaceAlias を見る）
+   Test-NetConnection 192.0.2.10 -Port 3200 -InformationLevel Detailed
+   ```
+
+   ```bash
+   # OBS の PC が macOS のとき
+   route -n get 192.0.2.10 | grep interface   # HUD へ向かう通信が出ていく NIC（例: en0）
+   ipconfig getifaddr en0                     # その NIC のアドレス。HUD の PC の Firewall ではこれを許可する
+   ```
+
+   違っていたら、HUD の PC の Firewall の許可先をそのアドレスへ合わせるか、OBS の PC の NIC の優先順位を変える（macOS は「ネットワーク」の「サービスの順序を設定」）。
+
+   > macOS で出ていく NIC を変えようとして `route add -host 192.0.2.10 -interface en0` を使わない。相手の MAC アドレスの代わりに自分の MAC アドレスを持つ固定エントリになり、かえって届かなくなる。
+
+4. **立ち絵の切り替えは逆向きなので、別に確かめる。** L2 は HUD の PC から OBS の PC の WebSocket（`L2_OBS_WS_URL`、既定のポート 4455）へ接続する。`preflight --static` の `obs` の行でも読める。
+
+   ```powershell
+   # L2 を動かす PC から
+   Test-NetConnection 192.0.2.20 -Port 4455
+   ```
+
 ---
 
 ## テスト

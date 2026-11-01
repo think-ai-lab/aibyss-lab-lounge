@@ -414,6 +414,9 @@ class TestReadme:
     def _readme() -> str:
         return (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
+    def _obs_section(self) -> str:
+        return self._readme().split("### OBS を別の PC で動かす")[1].split("\n---\n")[0]
+
     def test_startup_checks_are_described_where_the_script_is_explained(self):
         section = self._readme().split("#### dev プロファイルで起動する")[1].split("### 4. `preflight`")[0]
         for word in ("-SkipHealthCheck", "preflight --static --profile dev", "/health", "L2_V2_URL", "l2-start-prod.bat"):
@@ -423,3 +426,20 @@ class TestReadme:
 
     def test_v2_url_is_in_the_templates(self):
         assert "L2_V2_URL" in (_REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    def test_guide_for_obs_on_another_pc_covers_both_systems(self):
+        section = self._obs_section()
+        for word in ("Test-NetConnection", "SourceAddress", "route -n get", "ipconfig getifaddr", "ws_clients", "Firewall"):
+            assert word in section
+
+    def test_guide_warns_against_the_interface_route(self):
+        """自分の MAC の固定エントリになる操作は、手順としてではなく禁止として書く。"""
+        section = self._obs_section()
+        command = next(line for line in section.splitlines() if "route add -host" in line)
+        assert "使わない" in command
+
+    def test_addresses_in_the_guide_are_for_documentation(self):
+        section = self._obs_section()
+        addresses = set(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", section))
+        assert addresses
+        assert {address for address in addresses if not address.startswith(("192.0.2.", "127.0.0.1"))} == set()
