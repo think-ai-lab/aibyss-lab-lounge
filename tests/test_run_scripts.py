@@ -154,6 +154,8 @@ class Scene:
             "L2_V2_URL": self.v2.url,
         }
         self.dotenv_dev: dict[str, str] = {"REDIS_STREAM_KEY": "aibyss:events-dev"}
+        # 置かないファイル（".env" か ".env.dev"）。
+        self.absent_files: set[str] = set()
         self._log = root / "uv.log"
         scripts = root / "scripts"
         scripts.mkdir()
@@ -185,7 +187,8 @@ class Scene:
         # 消すと既定の URL の実サービスへ繋がるので、どの場面にも必ず置く。
         assert {"L2_C2_URL", "L2_V2_URL"} <= set(self.dotenv)
         for name, values in ((".env", self.dotenv), (".env.dev", self.dotenv_dev)):
-            (self.root / name).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
+            if name not in self.absent_files:
+                (self.root / name).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
         stream = _stream_of(script)
         if self.c2.body is None:
             self.c2.answer(200, {"status": "ok", "stream": stream, "last_read_age_sec": 0.1})
@@ -564,6 +567,7 @@ class TestStartup:
         ("ws://127.0.0.1:4455", {"total": 1, "loopback": 1, "lan": 0}, None),
         ("ws://127.0.0.1:4455", {"total": 0, "loopback": 0, "lan": 0}, _TOTAL_NOTICE),
         ("localhost:4455", {"total": 1, "loopback": 1, "lan": 0}, None),
+        ("ws://[::1]:4455", {"total": 1, "loopback": 1, "lan": 0}, None),  # IPv6 の loopback も同じ機械
         (None, {"total": 1, "loopback": 1, "lan": 0}, None),
         (None, {"total": 0, "loopback": 0, "lan": 0}, _TOTAL_NOTICE),
     ])
@@ -659,6 +663,39 @@ class TestStartup:
         assert done.returncode == 1, output
         assert scene.uv_calls == []
         assert reason in output
+
+    @pytest.mark.parametrize("script,url,reason", [
+        ("run_dev.ps1", "http://127.0.0.1:8100", "本番ポート 8100"),
+        ("run_dev.ps1", "http://127.0.0.1:8100/", "本番ポート 8100"),
+        ("run_prod.ps1", "http://127.0.0.1:8101", "dev C2 ポート 8101"),
+        ("run_prod.ps1", "http://127.0.0.1:8101/", "dev C2 ポート 8101"),
+    ])
+    def test_c2_port_of_the_other_mode_stops_before_the_checks(self, scene, script, url, reason):
+        """dev が本番の C2 を主に読む、本番が dev の C2 を読む設定。何も流さずに止まる。
+
+        -SkipHealthCheck は、止まらなくなる退行が入っても実サービスの /health へ繋がないため。
+        """
+        file_values = scene.dotenv_dev if script == "run_dev.ps1" else scene.dotenv
+        file_values["L2_C2_URL"] = url
+
+        done = scene.run(script, "-SkipHealthCheck")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert scene.uv_calls == []
+        assert reason in output
+
+    @pytest.mark.parametrize("script,missing", [("run_prod.ps1", ".env"), ("run_dev.ps1", ".env.dev")])
+    def test_missing_env_file_stops_before_anything_runs(self, scene, script, missing):
+        """読むはずのファイルがないまま進むと、シェルに残った値か既定の接続先で動いてしまう。"""
+        scene.absent_files = {missing}
+
+        done = scene.run(script, "-SkipHealthCheck")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert scene.uv_calls == []
+        assert f"{missing} が見つかりません" in output
 
     def test_prod_without_a_stream_line_starts_because_the_default_is_prod(self, scene):
         """prod で行がないのは正しい設定。bus の既定が本番なので、ここで止めると .env を最小にした利用者が起動できない。"""
