@@ -575,9 +575,18 @@ class TestComposeSystemPrompt:
 class TestRoutingNodeStreamContextMerge:
     """routing ノードが state["stream_context"] を system_prompt にマージする検証。"""
 
+    # キャラ素体の身代わり。実人格の文面は公開の都合で差し替わるので、テストを文言に依存させない。
+    _PERSONA = "PERSONA-FIXTURE テスト用のキャラ素体です。"
+
     @pytest.fixture()
     def mock_publish(self):
         with patch("lab_lounge.pipeline.publish", return_value="1-0"):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def fixed_persona(self):
+        """_routing_node が読むキャラ素体を固定する。"""
+        with patch("lab_lounge.characters.load_system_prompt", return_value=self._PERSONA):
             yield
 
     def _make_state(self, stream_context: str | None):
@@ -623,8 +632,8 @@ class TestRoutingNodeStreamContextMerge:
 
         merged = result["system_prompt"]
         assert merged is not None
-        # オクタメイドのキャラ素体テキスト由来の語が含まれている
-        assert "オクタメイド" in merged
+        # キャラ素体が含まれている
+        assert self._PERSONA in merged
         # 配信文脈見出しと本文が含まれている
         assert "## 本日の配信" in merged
         assert "今日は1年ぶりの配信、大神をプレイ" in merged
@@ -639,7 +648,7 @@ class TestRoutingNodeStreamContextMerge:
 
         merged = result["system_prompt"]
         assert merged is not None
-        assert "オクタメイド" in merged
+        assert self._PERSONA in merged
         # 配信文脈見出しが入っていないこと (= キャラ素体 + 現在日時のみ)
         assert "## 本日の配信" not in merged
 
