@@ -290,6 +290,56 @@ function Get-ServiceProblem {
     return ""
 }
 
+function Test-ObsOnAnotherPc {
+    <#
+    .SYNOPSIS
+        L2_OBS_WS_URL が別の PC を指しているかどうかを返す。
+    .DESCRIPTION
+        obs.py の _parse_ws_url と同じく、ws:// のない host:port の形も受ける。
+        未設定と読めない形は $false にする (読めない形は preflight の obs の行が知らせる)。
+    .OUTPUTS
+        [bool]
+    #>
+    $url = $env:L2_OBS_WS_URL
+    if (-not $url) {
+        return $false
+    }
+    if (-not $url.Contains("://")) {
+        $url = "ws://$url"
+    }
+    $uri = $null
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri)) {
+        return $false
+    }
+    return -not $uri.IsLoopback
+}
+
+function Write-HudClientNotice {
+    <#
+    .SYNOPSIS
+        HUD に繋がっている画面が足りないときに黄色で知らせる。OBS を後から起動することもあるので、止めない。
+    .DESCRIPTION
+        WHY: OBS が別の PC だと、同じ機械で /status を開いているだけで total は 0 にならず、OBS の PC が繋がっていなくても
+             気づけない。L2_OBS_WS_URL が別の PC を指すときは、LAN からの接続の数で判定する。
+             OBS の PC のアドレスは、起動の出力が貼られることがあるので出さない。
+    .PARAMETER Tag
+        表示の先頭に付ける名前
+    .PARAMETER Clients
+        V2 の /health の ws_clients
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Tag,
+        [Parameter(Mandatory)]$Clients
+    )
+    if (Test-ObsOnAnotherPc) {
+        if ([int]$Clients.lan -eq 0) {
+            Write-Host "[$Tag] 別の PC の OBS が HUD に繋がっていません (lan=0)。OBS の bubble のソースと、README の「OBS を別の PC で動かす」を確かめてください" -ForegroundColor Yellow
+        }
+    } elseif ([int]$Clients.total -eq 0) {
+        Write-Host "[$Tag] HUD に繋がっている画面がありません。OBS を使うなら bubble のソースが読み込まれているかを確かめてください (別の PC なら README の「OBS を別の PC で動かす」)" -ForegroundColor Yellow
+    }
+}
+
 function Test-ServicesHealthy {
     <#
     .SYNOPSIS
@@ -331,9 +381,8 @@ function Test-ServicesHealthy {
         $clients = $v2.Body.ws_clients
         $extra = if ($null -ne $clients) { "ws_clients total=$($clients.total) loopback=$($clients.loopback) lan=$($clients.lan)" } else { "" }
         Write-ServiceHealthLine -Tag $Tag -Label $label -Status $v2.Body.status -Extra $extra
-        if ($null -ne $clients -and [int]$clients.total -eq 0) {
-            # OBS を後から起動することもあるので、止めずに知らせる。
-            Write-Host "[$Tag] HUD に繋がっている画面がありません。OBS を使うなら bubble のソースが読み込まれているかを確かめてください (別の PC なら README の「OBS を別の PC で動かす」)" -ForegroundColor Yellow
+        if ($null -ne $clients) {
+            Write-HudClientNotice -Tag $Tag -Clients $clients
         }
     }
 

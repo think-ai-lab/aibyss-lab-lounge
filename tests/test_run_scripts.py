@@ -62,6 +62,11 @@ _SHOW_COLORS = (
 )
 
 
+# V2 に繋がっている画面が足りないときの案内。テストで見分けられるように、片方がもう片方を含まない文にしてある。
+_TOTAL_NOTICE = "HUD に繋がっている画面がありません"
+_LAN_NOTICE = "別の PC の OBS が HUD に繋がっていません"
+
+
 def _stream_of(script: str) -> str:
     """スクリプトの publish 先を返す。.env.example と .env.dev.example の値と同じ。"""
     return "aibyss:events-dev" if script == "run_dev.ps1" else "aibyss:events"
@@ -471,6 +476,37 @@ class TestStartup:
         assert re.search(r"OPENAI_API_KEY\s+= unset", output)
         assert "disabled" in output
         assert "HUD に繋がっている画面がありません" in output
+
+    @pytest.mark.parametrize("obs_url,clients,notice", [
+        # OBS が別の PC。同じ機械で /status を開いていると total は増えるので、lan で見る。
+        ("ws://192.0.2.20:4455", {"total": 1, "loopback": 1, "lan": 0}, _LAN_NOTICE),
+        ("ws://192.0.2.20:4455", {"total": 0, "loopback": 0, "lan": 0}, _LAN_NOTICE),
+        ("192.0.2.20:4455", {"total": 1, "loopback": 1, "lan": 0}, _LAN_NOTICE),  # 本番は ws:// のない形も受ける
+        ("ws://192.0.2.20:4455", {"total": 2, "loopback": 1, "lan": 1}, None),
+        # OBS が同じ機械か未設定。今までどおり total で見る。
+        ("ws://127.0.0.1:4455", {"total": 1, "loopback": 1, "lan": 0}, None),
+        ("ws://127.0.0.1:4455", {"total": 0, "loopback": 0, "lan": 0}, _TOTAL_NOTICE),
+        ("localhost:4455", {"total": 1, "loopback": 1, "lan": 0}, None),
+        (None, {"total": 1, "loopback": 1, "lan": 0}, None),
+        (None, {"total": 0, "loopback": 0, "lan": 0}, _TOTAL_NOTICE),
+    ])
+    def test_notice_about_the_screens_on_the_hud(self, scene, obs_url, clients, notice):
+        """OBS の PC が繋がっていないことを起動時に見つける。OBS を後から起動することもあるので止めない。"""
+        if obs_url:
+            scene.dotenv["L2_OBS_WS_URL"] = obs_url
+        scene.v2.answer(200, _v2_ok("aibyss:events", **clients))
+
+        done = scene.run("run_prod.ps1", colors=True)
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 0, output
+        assert scene.called("lab_lounge.run_loop")
+        for text in (_TOTAL_NOTICE, _LAN_NOTICE):
+            if text == notice:
+                assert f"<Yellow>[lab-lounge/prod] {text}" in output, output
+            else:
+                assert text not in output, output
+        assert "192.0.2" not in output  # 起動の出力は貼られることがあるので、OBS の PC のアドレスを出さない
 
     def test_dotenv_that_sets_an_endpoint_reaches_preflight_which_refuses_it(self, scene):
         """.env の指定は黙って消さない。読む前に外すので残り、preflight が終了コード 2 で止める。"""
