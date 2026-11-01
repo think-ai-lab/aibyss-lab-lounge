@@ -99,8 +99,8 @@ if ($ViolationFound) {
 Write-Host "[lab-lounge/prod] run_loop を起動します (wake-backend=$WakeBackend)..." -ForegroundColor Green
 if ($MaxTurns -gt 0) {
     Write-Host "  max-turns=$MaxTurns (有限)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
 } else {
     Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend
 }

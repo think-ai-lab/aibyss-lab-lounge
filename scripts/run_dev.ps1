@@ -116,8 +116,8 @@ Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBack
 #      無制限を指定したいケース (長時間の手動実験) に対応する。
 if ($MaxTurns -gt 0) {
     Write-Host "  max-turns=$MaxTurns (有限)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
 } else {
     Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend
 }
