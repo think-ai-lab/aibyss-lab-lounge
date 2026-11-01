@@ -6,7 +6,8 @@
 # 【env 読み込み順 (後勝ち)】
 #   1. .env       (本番と共通の設定を継承: OPENAI_API_KEY, L2_USE_REAL_LLM 等)
 #   2. .env.dev   (dev プロファイル固有の上書き: ストリーム名、C2 URL)
-#   → プロセス環境変数 > .env.dev > .env の優先度
+#   → .env.dev > .env > プロセス環境変数 の優先度 (ファイルが常に勝つ)
+#   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
 #
 # 前提:
 #   - Redis が起動中 (docker compose up -d redis)
@@ -14,13 +15,21 @@
 #     → aibyss-coral-chronicle/scripts/run_prod.ps1
 #   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)
 #     → aibyss-coral-chronicle/scripts/run_dev.ps1
+#   - V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
+#     → aibyss-nautilus-v2/scripts/run_dev.ps1
 #   - .env.dev が存在する (cp .env.dev.example .env.dev)
+#
+# 【起動前の確認】
+#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。
+#   C2 は記憶の検索に使う設定のときだけ確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
 #
 # 使い方: PowerShell から実行
 #   .\scripts\run_dev.ps1
 #   .\scripts\run_dev.ps1 -MaxTurns 5
 #   .\scripts\run_dev.ps1 -MaxTurns 0                          # 無制限 (Ctrl+C で停止、prod と同じ挙動)
 #   .\scripts\run_dev.ps1 -WakeBackend continuous -MaxTurns 3
+#   .\scripts\run_dev.ps1 -SkipHealthCheck                     # C2 も V2 も置かない構成
 #
 # 【分離の保証】
 #   このスクリプトで起動した L2 は:
@@ -34,7 +43,9 @@ param(
     [string]$WakeBackend = "continuous",
     # MaxTurns: dev の default は 3 ターン (暴走防止)。
     # 0 以下を指定すると --max-turns を渡さず run_loop 側で無制限になる (prod と仕様統一)。
-    [int]$MaxTurns = 3
+    [int]$MaxTurns = 3,
+    # C2 と V2 の /health の確認を省く。preflight --static は省かない。
+    [switch]$SkipHealthCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,7 +90,6 @@ Write-Host "  L2_C2_URL (primary)   = $env:L2_C2_URL"
 Write-Host "  L2_C2_URL_READONLY    = $env:L2_C2_URL_READONLY"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
-
 Write-KeyStatus -Name "OPENAI_API_KEY" -Required
 Write-Host ""
 
@@ -106,6 +116,26 @@ if ($ViolationFound) {
     exit 1
 }
 
+# ── 起動前の確認 ──
+# WHY: 1 つずつ止めると、直して流し直すたびに次の失敗を知ることになる。全部見てから止める。
+#      --frozen は配信の直前に解決器を走らせないため。--all-extras は点検の版の検査が全 extra を見るのと揃えるため。
+Write-Host "[lab-lounge/dev] 起動前の点検 (preflight --static)..." -ForegroundColor Cyan
+$StartupFailed = $false
+uv run --frozen --all-extras python -m lab_lounge.preflight --static --profile dev
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[lab-lounge/dev] preflight が失敗しました (exit $LASTEXITCODE)。上の FAIL の行を直してください。" -ForegroundColor Red
+    $StartupFailed = $true
+}
+if ($SkipHealthCheck) {
+    Write-Host "[lab-lounge/dev] -SkipHealthCheck: C2 と V2 の /health の確認を省きます。" -ForegroundColor Yellow
+} elseif (-not (Test-ServicesHealthy -Tag "lab-lounge/dev")) {
+    $StartupFailed = $true
+}
+if ($StartupFailed) {
+    Write-Host "[lab-lounge/dev] 起動を中止します。" -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBackend)..." -ForegroundColor Green
 # WHY: prod と仕様を揃え、$MaxTurns が 0 以下なら --max-turns を渡さず
 #      run_loop 側で無制限ループにする (Python 側 default = None = 無制限)。
@@ -118,3 +148,4 @@ if ($MaxTurns -gt 0) {
     Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
     uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend
 }
+exit $LASTEXITCODE

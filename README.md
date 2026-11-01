@@ -149,6 +149,7 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 | `L2_USE_INTENT_GATE` / `L2_INTENT_GATE_MODEL` | `true` / `claude-haiku-4-5` | 挙手・承認の意図判定（軽量分類 LLM） |
 | `L2_ENABLE_RAG` / `L2_USE_C2_RETRIEVER` | `false` / `false` | seed corpus RAG / C2 会話メモリ RAG（どちらも `retrieve_memory` ツールからしか呼ばれないので、`L2_ENABLE_TOOLS` が前提） |
 | `L2_C2_URL` | `http://127.0.0.1:8100` | C2 のベース URL（RAG 参照先） |
+| `L2_V2_URL` | `http://127.0.0.1:3200` | V2 のベース URL（`run_dev.ps1` / `run_prod.ps1` が起動前に `/health` を確かめる先。L2 本体は接続しない） |
 | `L2_USE_HANDRAISE` | `true` | 挙手制自発介入の有効化（`bg-continuous` 上で動作） |
 | `L2_ENABLE_TOOLS` | `false` | MCP ツール（Agent モード）の有効化 |
 | `L2_VAD_BACKEND` / `L2_VAD_AGGRESSIVENESS` | `webrtc` / `3` | VAD バックエンドと感度 |
@@ -280,21 +281,27 @@ uv run python -m lab_lounge.run_loop --no-play
 
 実行の流れ:
 
-1. **環境変数の読み込み（ファイルが source of truth）** — `.env`（本番と共通の設定 = `OPENAI_API_KEY` / `L2_USE_REAL_LLM` 等を継承）→ `.env.dev`（dev 固有の上書き = ストリーム名・C2 URL）の順に読み込み、いずれも既存のプロセス環境変数を上書きする（過去実行の残値による事故を防ぐ）。
-2. **分離値の確認表示** — `REDIS_STREAM_KEY` / `L2_C2_URL`（主）/ `L2_C2_URL_READONLY`（副）/ VAD 設定 / `OPENAI_API_KEY`（先頭のみ）を出力。
-3. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（dev 発話が本番 C2 に混入するのを防ぐ）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
-4. **`run_loop` 起動** — `uv run python -m lab_lounge.run_loop --wake-backend <WakeBackend> [--max-turns <MaxTurns>]` を実行。ループ本体（Wake → 録音 → STT → ルーティング → Pipeline → TTS → 再生）は冒頭の[アーキテクチャ](#アーキテクチャ)図のとおり。
+1. **継承した接続先を外す** — 親プロセスから `ANTHROPIC_BASE_URL` などの LLM の接続先を継承していたら、名前を表示して外す（Claude Code などのツールから起動すると継承する）。`preflight` は自分の中でしか外さないので、残すと点検が緑でも `run_loop` は別の相手へ繋がる。
+2. **環境変数の読み込み（ファイルが source of truth）** — `.env`（本番と共通の設定 = `OPENAI_API_KEY` / `L2_USE_REAL_LLM` 等を継承）→ `.env.dev`（dev 固有の上書き = ストリーム名・C2 URL）の順に読み込み、いずれも既存のプロセス環境変数を上書きする（過去実行の残値による事故を防ぐ）。
+3. **分離値の確認表示** — `REDIS_STREAM_KEY` / `L2_C2_URL`（主）/ `L2_C2_URL_READONLY`（副）/ VAD 設定 / `OPENAI_API_KEY`（`set` / `unset` だけ）を出力。
+4. **分離違反の安全チェック** — `REDIS_STREAM_KEY` が本番 `aibyss:events`、または `L2_C2_URL` が本番ポート `8100` を指していたら **起動を中断**（dev 発話が本番 C2 に混入するのを防ぐ）。`L2_USE_C2_RETRIEVER` が `true` でない場合は警告のみ。
+5. **起動前の確認** — `preflight --static --profile dev` を流し、C2 と V2 の `GET /health` を確かめる。C2 は `L2_ENABLE_TOOLS` と `L2_ENABLE_RAG` と `L2_USE_C2_RETRIEVER` がすべて有効なときだけ見る（記憶の検索に使わない C2 では止めない）。失敗はまとめて赤く出し、`exit 1` で止まる。V2 の行の `ws_clients` で OBS の画面が繋がっているかも読める（0 なら黄色で知らせるが、OBS を後から起動することもあるので止めない）。
+6. **`run_loop` 起動** — `uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend <WakeBackend> [--max-turns <MaxTurns>]` を実行（`--frozen` は配信の直前に解決器を走らせないため、`--all-extras` は lock の更新後に extra が古いまま残らないようにするため）。ループ本体（Wake → 録音 → STT → ルーティング → Pipeline → TTS → 再生）は冒頭の[アーキテクチャ](#アーキテクチャ)図のとおり。
 
 | パラメータ | 既定 | 説明 |
 |-----------|------|------|
 | `-WakeBackend` | `continuous` | run_loop の `--wake-backend` に渡す（上記 6 種から選択） |
 | `-MaxTurns` | `3` | 暴走防止のターン上限。`0` 以下なら `--max-turns` を渡さず **無制限** にする |
+| `-SkipHealthCheck` | なし | C2 と V2 の `/health` の確認を省く（どちらも置かない構成のため）。`preflight --static` は省かない |
+
+本番は `scripts/run_prod.ps1`。`.env` だけを読み、同じ確認を `--profile prod` で流す（`-MaxTurns` の既定は `0`）。Stream Deck などから起動するときは `scripts/l2-start-dev.bat` / `scripts/l2-start-prod.bat` を使う（新しい窓を開き、エラーで終わっても窓が残る）。
 
 **分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://127.0.0.1:8101`（dev・書き込み先）、副 C2 = `http://127.0.0.1:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。
 
 **前提**:
 - Redis 起動済み（`aibyss-workspace` で `docker compose up -d`）
 - 本番 C2（port 8100 / `c2.db`）と開発 C2（port 8101 / `c2-dev.db` / `aibyss:events-dev`）の両方が稼働（`aibyss-coral-chronicle/scripts/run_prod.ps1` と `run_dev.ps1`）
+- V2（port 3200、`aibyss-nautilus-v2/scripts/run_dev.ps1`。別の URL なら `L2_V2_URL` で指す）が稼働
 - `.env.dev` を作成済み（`cp .env.dev.example .env.dev`）
 
 ### 4. `preflight` — 配信前の点検
@@ -402,7 +409,7 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 - `import/anthropic` が FAIL で版は一致している: Windows のパス長の上限。anthropic は名前の長いファイルを含むので、`LongPathsEnabled` が無効なら venv のパスは約 126 文字以内に収める（anthropic 0.125 以降の目安。今の lock の 0.89 なら約 154 文字）
 - 終了コード 3 で `C2`: C2 の `/health` が 200 を返していない。起動していないか、Redis を読めていない（consumer が止まると listen したまま 503 を返す）。C2 の README の `/health` の節で理由を読める
 - 終了コード 3 で `irodori`: `aibyss-workspace/scripts/aibyss.ps1 start -Irodori` で起動する（weights が未取得なら先に `scripts/run_irodori_sidecar.ps1 -AllowDownload` を 1 度流す）
-- ツールから起動すると `ANTHROPIC_BASE_URL` などを継承するが、点検は外してから流し、`env/inherited` の WARN で外した変数名を知らせる。同じシェルから本番を起動すると継承したまま動くので、接続先や認証が変わる
+- ツールから起動すると `ANTHROPIC_BASE_URL` などを継承するが、点検は外してから流し、`env/inherited` の WARN で外した変数名を知らせる。同じシェルから `python -m lab_lounge.run_loop` を直接起動すると継承したまま動くので、接続先や認証が変わる（`run_dev.ps1` / `run_prod.ps1` は外してから起動する）
 - `.env` がそれらの接続先を指定していると終了コード 2 で止まる（本番と別の相手を測らないため）
 
 **確かめないもの**: マイク、音声の再生、OBS の表示は人の確認が要る。STT（`L2_USE_REAL_STT` の経路とモデルの読み込み）、ウェイクワード、VAD、挙手の状態機械は流さない。C2 への書き込みと V2 の受信も確かめない（publish までを見る）。協働は既定で 1 組だけで、2 人目への連続した振りは通らない。
@@ -479,6 +486,7 @@ echo "L2_STREAM_CONTEXT_FILE=./data/stream_context/20260506_01.md" >> .env
 - **別のマイク/スピーカーを使う**: `uv run python -c "import sounddevice; print(sounddevice.query_devices())"` で番号を確認し `--device N` または `L2_AUDIO_DEVICE` を指定。
 - **VOICEPEAK が並列実行エラー/クラッシュ**: 1 プロセス制限のためフィラーと本応答が衝突しうる。`L2_VOICEPEAK_RETRY_WAIT_SEC` / `L2_VOICEPEAK_MAX_RETRIES`（既定 1.0s × 8 回）で自動リトライ。
 - **LangSmith 401 警告**: `.env` に `LANGSMITH_TRACING=false` を明示する（`langsmith` は `langgraph` の依存として入る）。
+- **`run_dev.ps1` / `run_prod.ps1` が起動前の確認で止まる**: `接続できません` はサービスが起動していない。`HTTP 503` は起動しているが Redis を読めていない（C2 は `reason=consumer_stale` など、V2 は `redis.sub` と `consumer` に理由が出る）。`aibyss-workspace` の `aibyss status` で全体を確かめる。C2 も V2 も置かない構成なら `-SkipHealthCheck`。
 
 ---
 
@@ -506,7 +514,7 @@ aibyss-lab-lounge/
   sherpa-models/      # sherpa-onnx STT モデル
   samples/            # 検証用 WAV
   data/               # index / audio / filler_phrases / stream_context（多くは gitignore）
-  scripts/            # build_index / generate_smoke_wav / calibrate_silence / generate_filler_cache 等
+  scripts/            # run_dev / run_prod / l2-start-*（起動）, build_index / generate_smoke_wav / calibrate_silence / generate_filler_cache 等
   src/lab_lounge/
     events.py             # Event Envelope ビルダー + スキーマ検証
     bus.py                # Redis Streams publisher (XADD)

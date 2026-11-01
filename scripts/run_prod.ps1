@@ -6,21 +6,28 @@
 #
 # 【env 読み込み】
 #   .env (本番設定: REDIS_STREAM_KEY=aibyss:events / L2_C2_URL=:8100 等)
-#   → プロセス環境変数 > .env の優先度
+#   → .env > プロセス環境変数 の優先度 (ファイルが常に勝つ)
+#   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
 #
 # 前提:
 #   - Redis が起動中 (aibyss-workspace で docker compose up -d redis)
 #   - VOICEVOX が起動中 (port 15021)
 #   - 本番 C2 が稼働中 (port 8100, c2.db)
 #       → aibyss-coral-chronicle/scripts/run_prod.ps1
-#   - 本番 V2 が稼働中 (推奨、配信時に必須)
+#   - 本番 V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
 #       → aibyss-nautilus-v2/scripts/run_prod.ps1
 #   - .env が存在する (cp .env.example .env)
+#
+# 【起動前の確認】
+#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。
+#   C2 は記憶の検索に使う設定のときだけ確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
 #
 # 使い方: PowerShell から実行
 #   .\scripts\run_prod.ps1
 #   .\scripts\run_prod.ps1 -WakeBackend continuous
 #   .\scripts\run_prod.ps1 -MaxTurns 5         # 5 ターンで終了 (デフォルト 0 = 無制限)
+#   .\scripts\run_prod.ps1 -SkipHealthCheck    # C2 も V2 も置かない構成
 #
 # 【dev/prod の違い】
 #   prod は .env のみ読み込み aibyss:events ストリームに発話を publish する。
@@ -29,7 +36,9 @@
 
 param(
     [string]$WakeBackend = "continuous",
-    [int]$MaxTurns = 0  # 0 = 無制限 (run_loop の --max-turns を渡さない)
+    [int]$MaxTurns = 0,  # 0 = 無制限 (run_loop の --max-turns を渡さない)
+    # C2 と V2 の /health の確認を省く。preflight --static は省かない。
+    [switch]$SkipHealthCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,7 +74,6 @@ Write-Host "  LANGSMITH_TRACING     = $env:LANGSMITH_TRACING"
 Write-Host "  LANGSMITH_PROJECT     = $env:LANGSMITH_PROJECT"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
-
 Write-KeyStatus -Name "OPENAI_API_KEY" -Required
 Write-KeyStatus -Name "LANGSMITH_API_KEY"
 Write-Host ""
@@ -89,6 +97,26 @@ if ($ViolationFound) {
     exit 1
 }
 
+# ── 起動前の確認 ──
+# WHY: 1 つずつ止めると、直して流し直すたびに次の失敗を知ることになる。全部見てから止める。
+#      --frozen は配信の直前に解決器を走らせないため。--all-extras は点検の版の検査が全 extra を見るのと揃えるため。
+Write-Host "[lab-lounge/prod] 起動前の点検 (preflight --static)..." -ForegroundColor Cyan
+$StartupFailed = $false
+uv run --frozen --all-extras python -m lab_lounge.preflight --static --profile prod
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[lab-lounge/prod] preflight が失敗しました (exit $LASTEXITCODE)。上の FAIL の行を直してください。" -ForegroundColor Red
+    $StartupFailed = $true
+}
+if ($SkipHealthCheck) {
+    Write-Host "[lab-lounge/prod] -SkipHealthCheck: C2 と V2 の /health の確認を省きます。" -ForegroundColor Yellow
+} elseif (-not (Test-ServicesHealthy -Tag "lab-lounge/prod")) {
+    $StartupFailed = $true
+}
+if ($StartupFailed) {
+    Write-Host "[lab-lounge/prod] 起動を中止します。" -ForegroundColor Red
+    exit 1
+}
+
 # ── run_loop 起動 ──
 Write-Host "[lab-lounge/prod] run_loop を起動します (wake-backend=$WakeBackend)..." -ForegroundColor Green
 if ($MaxTurns -gt 0) {
@@ -98,3 +126,4 @@ if ($MaxTurns -gt 0) {
     Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
     uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend
 }
+exit $LASTEXITCODE
