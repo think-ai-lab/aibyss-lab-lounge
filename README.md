@@ -63,7 +63,7 @@ flowchart TD
 - [uv](https://github.com/astral-sh/uv) がインストール済み
 - `aibyss-workspace` が兄弟ディレクトリに clone 済み（Event Envelope スキーマの自動探索に使用）
 - `aibyss-workspace` で Redis が起動済み（`docker compose up -d`、本番実行時）
-- Windows のスクリプト（`aibyss.ps1`, `run_dev.ps1`, `run_irodori_sidecar.ps1` など）は PowerShell 7（`pwsh`）で動かす。Windows PowerShell 5.1 は BOM のない UTF-8 を ANSI として読むので、日本語の Windows では構文エラーで止まる
+- Windows のスクリプト（`aibyss.ps1`, `run_dev.ps1`, `run_irodori_sidecar.ps1` など）は PowerShell 7（`pwsh`）で動かす。`run_dev.ps1` と `run_prod.ps1` は先頭の `#Requires` で、Windows PowerShell 5.1 なら版の違いを伝えて止まる。ほかのスクリプトは、5.1 が BOM のない UTF-8 を ANSI として読むので、日本語の Windows では構文エラーで止まる
 
 ```
 repos/

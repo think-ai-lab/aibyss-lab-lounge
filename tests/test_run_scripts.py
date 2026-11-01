@@ -28,6 +28,8 @@ _RUN_SCRIPTS = ["run_dev.ps1", "run_prod.ps1"]
 # WHY: Windows の subprocess は env の PATH で実行ファイルを探さないので、親のうちに絶対パスにしておく。
 _PWSH = shutil.which("pwsh")
 needs_pwsh = pytest.mark.skipif(_PWSH is None, reason="pwsh がない環境")
+# Windows に標準で入っている古い版 (5.1)。誤ってこちらで開いたときの動きを確かめる。
+_WINDOWS_POWERSHELL = shutil.which("powershell")
 
 # 値が出力に現れないことを確かめる印。先頭だけ出ても見つかるように、頭に短い印を置く。
 _KEY_VALUE = "zqxKEYVALUE-not-a-real-key"
@@ -590,6 +592,23 @@ class TestStartup:
         assert done.returncode == 1, output
         assert "'aibyss:events-dev' を読んでいます" in output
 
+    @pytest.mark.skipif(_WINDOWS_POWERSHELL is None, reason="Windows PowerShell がない環境")
+    @pytest.mark.parametrize("script", _RUN_SCRIPTS)
+    def test_windows_powershell_stops_with_the_reason(self, scene, script):
+        """古い版で開いたときに、読めない構文エラーではなく、版が違うと伝えて止まる。何も起動しない。"""
+        scene._prepare(script)
+
+        done = subprocess.run(
+            [_WINDOWS_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(scene.root / "scripts" / script)],
+            capture_output=True, timeout=120, check=False, env=scene._child_env(), cwd=scene.root,
+        )
+
+        # 文面は OS の言語で変わるので、エラーの識別子で確かめる。
+        assert b"ScriptRequiresUnmatchedPSVersion" in done.stdout + done.stderr
+        assert done.returncode == 1
+        assert scene.uv_calls == []
+
     @pytest.mark.parametrize("script,args,max_turns", [
         ("run_dev.ps1", ["-MaxTurns", "0"], None),
         ("run_prod.ps1", ["-MaxTurns", "5"], "5"),
@@ -651,6 +670,11 @@ class TestScriptText:
         """片方だけ増やすと、点検と本番で別の相手へ繋がる穴が残る。"""
         block = self._read("run_common.ps1").split("$script:InheritedLlmVars = @(")[1].split(")")[0]
         assert tuple(re.findall(r'"([A-Z_]+)"', block)) == preflight.INHERITED_LLM_VARS
+
+    @pytest.mark.parametrize("script", _RUN_SCRIPTS)
+    def test_powershell_7_is_required_on_the_first_line(self, script):
+        """run_common.ps1 は ?? を使うので、古い版では構文エラーになる。実際に古い版で流すテストは TestStartup にある。"""
+        assert self._read(script).splitlines()[0] == "#Requires -Version 7.0"
 
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
     def test_every_uv_run_uses_the_locked_environment(self, script):

@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 # ──────────────────────────────────────────────────────────────
 # Lab Lounge — prod プロファイル run_loop 起動スクリプト
 # ──────────────────────────────────────────────────────────────
@@ -10,6 +11,7 @@
 #   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
 #
 # 前提:
+#   - PowerShell 7 (pwsh)。共通処理が ?? などの PowerShell 7 の構文を使うので、古い版は先頭の #Requires で原因を伝えて止める
 #   - Redis が起動中 (aibyss-workspace で docker compose up -d redis)
 #   - VOICEVOX が起動中 (port 15021)
 #   - 本番 C2 が稼働中 (port 8100, c2.db)
