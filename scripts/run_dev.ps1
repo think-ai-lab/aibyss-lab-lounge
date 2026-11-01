@@ -100,7 +100,13 @@ Write-Host ""
 # ── 分離違反の安全チェック ──
 $ViolationFound = $false
 
-if ($env:REDIS_STREAM_KEY -eq "aibyss:events") {
+# WHY: bus は未設定を本番の aibyss:events と読む (bus._stream_key) ので、行を書き忘れただけで dev の発話が
+#      本番の正史へ入る。正史は追記のみで戻しにくいので、未設定も本番と同じく止める。
+#      空の値は既定へ戻らず空の名前へ publish するので、C2 にも HUD にも届かない。これも止める。
+if ([string]::IsNullOrWhiteSpace($env:REDIS_STREAM_KEY)) {
+    Write-Warning "REDIS_STREAM_KEY が未設定か空です。未設定は本番 'aibyss:events' へ向き、空の値は C2 にも HUD にも届きません。"
+    $ViolationFound = $true
+} elseif ($env:REDIS_STREAM_KEY -eq "aibyss:events") {
     Write-Warning "REDIS_STREAM_KEY が本番ストリーム 'aibyss:events' を指しています。dev 発話が本番 C2 に届いてしまいます。"
     $ViolationFound = $true
 }

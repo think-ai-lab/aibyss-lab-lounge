@@ -131,6 +131,13 @@ class Scene:
         self.c2.close()
         self.v2.close()
 
+    def set_stream_lines(self, dotenv_value: str | None, dotenv_dev_value: str | None) -> None:
+        """.env と .env.dev の REDIS_STREAM_KEY の行を決める。None はその行を書かない。"""
+        for values, value in ((self.dotenv, dotenv_value), (self.dotenv_dev, dotenv_dev_value)):
+            values.pop("REDIS_STREAM_KEY", None)
+            if value is not None:
+                values["REDIS_STREAM_KEY"] = value
+
     def _write_env_files(self) -> None:
         """今の値で .env と .env.dev を書く。"""
         for name, values in ((".env", self.dotenv), (".env.dev", self.dotenv_dev)):
@@ -140,10 +147,13 @@ class Scene:
         """子の環境を返す。
 
         WHY: PATH を偽の uv とシステムのコマンドだけにする。本物の uv が先に見つかると、依存の同期が走ってしまう。
+             conftest がテスト用に入れた REDIS_STREAM_KEY は渡さない。渡すと、env ファイルに行がない場面を作れない
+             （シェルに値が残っている場面は self.env で明示する）。
         """
         system = str(Path(os.environ["SystemRoot"]) / "System32") if os.name == "nt" else "/usr/bin:/bin"
+        inherited = {name: value for name, value in os.environ.items() if name != "REDIS_STREAM_KEY"}
         return {
-            **os.environ,
+            **inherited,
             "PATH": f"{self._bin}{os.pathsep}{system}",
             "UV_STUB_LOG": str(self._log),
             "UV_STUB_PREFLIGHT_EXIT": str(self.preflight_exit),
@@ -311,12 +321,31 @@ class TestStartup:
         assert "LEFT ANTHROPIC_BASE_URL" in scene.uv_lines
         assert not scene.called("lab_lounge.run_loop")
 
-    def test_stream_refusal_comes_before_the_checks(self, scene):
-        """dev で本番ストリームを指していたら、何も流さずに止まる。"""
-        scene.dotenv_dev["REDIS_STREAM_KEY"] = "aibyss:events"
-        done = scene.run("run_dev.ps1")
-        assert done.returncode == 1, done.stdout + done.stderr
+    @pytest.mark.parametrize("script,dotenv_value,dotenv_dev_value,reason", [
+        ("run_dev.ps1", "aibyss:events", "aibyss:events", "本番ストリーム"),
+        ("run_dev.ps1", "aibyss:events", None, "本番ストリーム"),  # .env.dev に行がなく、.env の本番の値が残る
+        ("run_dev.ps1", None, None, "未設定か空"),  # bus は未設定を本番と読む
+        ("run_dev.ps1", "aibyss:events", "", "未設定か空"),  # 空の値は C2 にも HUD にも届かない
+        ("run_dev.ps1", None, '"  "', "未設定か空"),
+        ("run_prod.ps1", "aibyss:events-dev", None, "dev ストリーム"),
+        ("run_prod.ps1", "", None, "空です"),
+        ("run_prod.ps1", '"  "', None, "空です"),
+    ])
+    def test_stream_refusal_comes_before_the_checks(self, scene, script, dotenv_value, dotenv_dev_value, reason):
+        """publish 先がプロファイルと違うか、どこにも届かない名前なら、何も流さずに止まる。None は env ファイルに行がないこと。"""
+        scene.set_stream_lines(dotenv_value, dotenv_dev_value)
+        done = scene.run(script)
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
         assert scene.uv_calls == []
+        assert reason in output
+
+    def test_prod_without_a_stream_line_starts_because_the_default_is_prod(self, scene):
+        """prod で行がないのは正しい設定。bus の既定が本番なので、ここで止めると .env を最小にした利用者が起動できない。"""
+        scene.set_stream_lines(None, None)
+        done = scene.run("run_prod.ps1")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert scene.called("lab_lounge.run_loop")
 
     @pytest.mark.parametrize("script,args,max_turns", [
         ("run_dev.ps1", ["-MaxTurns", "0"], None),

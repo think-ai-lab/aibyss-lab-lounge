@@ -85,6 +85,12 @@ if ($env:REDIS_STREAM_KEY -eq "aibyss:events-dev") {
     Write-Warning "REDIS_STREAM_KEY が dev ストリーム 'aibyss:events-dev' を指しています。prod モードでは 'aibyss:events' が期待値です。"
     $ViolationFound = $true
 }
+# WHY: 未設定は bus の既定の aibyss:events へ向くので、prod では正しい。空の値は既定へ戻らず空の名前へ publish する
+#      (bus._stream_key) ので、C2 にも HUD にも届かない。
+if ($null -ne $env:REDIS_STREAM_KEY -and [string]::IsNullOrWhiteSpace($env:REDIS_STREAM_KEY)) {
+    Write-Warning "REDIS_STREAM_KEY が空です。C2 にも HUD にも発話が届きません。行を消すか 'aibyss:events' を指定してください。"
+    $ViolationFound = $true
+}
 # WHY: URL の完全一致だと、ホスト名を 127.0.0.1 へ変えただけで無言で効かなくなる。
 #      dev と prod を分けているのはポートなので、ポートで判定する。
 if ($env:L2_C2_URL -match ':8101/?$') {
