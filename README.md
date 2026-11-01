@@ -298,7 +298,7 @@ uv run python -m lab_lounge.run_loop --no-play
 | `-MaxTurns` | `3` | 暴走防止のターン上限。`0` 以下なら `--max-turns` を渡さず **無制限** にする |
 | `-SkipHealthCheck` | なし | C2 と V2 の `/health` の確認を省く（どちらも置かない構成のため）。`preflight --static` は省かない。C2 だけを置かない構成には要らない（上の黄色の知らせで起動する） |
 
-本番は `scripts/run_prod.ps1`。値は `.env` だけを読み、同じ確認を `--profile prod` で流す（`-MaxTurns` の既定は `0`）。同じシェルで流した `run_dev.ps1` の残りが本番へ渡らないように、`.env.dev` にあって `.env` にない名前は `.env` を読む前に環境から外し、外した名前を灰色で表示する（`.env.dev` の値は読まない）。`REDIS_STREAM_KEY` は未設定なら既定の本番 `aibyss:events` へ向くので通し、`aibyss:events-dev` と空の値は拒否する。dev と prod を切り替えるときは、動いている V2 を止めてから起動する（ポートが同じなので、残っているとストリームの照合で止まる）。Stream Deck などから起動するときは `scripts/l2-start-dev.bat` / `scripts/l2-start-prod.bat` を使う（新しい窓を開き、エラーで終わっても窓が残る）。
+本番は `scripts/run_prod.ps1`。値は `.env` だけを読み、同じ確認を `--profile prod` で流す（`-MaxTurns` の既定は `0`）。同じシェルで流した `run_dev.ps1` の残りが本番へ渡らないように、`.env.dev` にあって `.env` にない名前は `.env` を読む前に環境から外し、外した名前を灰色で表示する（`.env.dev` の値は読まない）。`REDIS_STREAM_KEY` は未設定なら既定の本番 `aibyss:events` へ向くので通し、`aibyss:events-dev` と空の値は拒否する。dev と prod を切り替えるとき、L2 は `aibyss stop`（`aibyss-workspace/scripts/aibyss.ps1 stop`）では止まらない。先に L2 の窓を Ctrl+C で止める。動いている V2 も止めてから起動する（ポートが同じなので、残っているとストリームの照合で止まる）。Stream Deck などから起動するときは `scripts/l2-start-dev.bat` / `scripts/l2-start-prod.bat` を使う（新しい窓を開き、エラーで終わっても窓が残る）。
 
 **分離の保証**: このスクリプトで起動した L2 は `aibyss:events-dev` のみに XADD し、主 C2 = `http://127.0.0.1:8101`（dev・書き込み先）、副 C2 = `http://127.0.0.1:8100`（prod・read-only 参照）を使う。発話データは本番 `c2.db` に混入せず、過去の本番履歴は参照できる。`REDIS_STREAM_KEY` が本番の値、未設定、空のどれかなら起動しない。
 

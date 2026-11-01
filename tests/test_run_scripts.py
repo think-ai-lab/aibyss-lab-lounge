@@ -992,6 +992,18 @@ class TestScriptText:
         assert prod_start == dev_start.replace("L2 dev", "L2 prod").replace("run_dev.ps1", "run_prod.ps1")
         assert '"%~dp0run_prod.ps1"' in prod_start
 
+    def test_stop_batch_file_runs_as_a_batch_file(self):
+        """Stream Deck から押すボタンの入口。中身が PowerShell の本文だと、cmd は 1 行目から読めずに何も止めない。
+
+        実物は流さない（手元で動いている run_loop を止めてしまう）。cmd は UTF-8 の日本語を読み違えることがあるので ASCII に限る。
+        """
+        raw = (_SCRIPTS / "l2-stop-dev.bat").read_bytes()
+        assert raw.decode("ascii")
+        assert raw.count(b"\n") == raw.count(b"\r\n")
+        lines = raw.decode("ascii").splitlines()
+        assert lines[0] == "@echo off"
+        assert lines[1:] == ['pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0l2-stop-dev.ps1"']
+
 
 class TestReadme:
     """第三者は README だけを読んで動かす。実態から離れた箇所で詰まらないように。"""
@@ -1024,6 +1036,7 @@ class TestReadme:
             "`lan` が 0",  # OBS が別の PC のときの判定
             "`[HOST]`",  # 見出しの URL を伏せる
             "`.env.dev` にあって `.env` にない名前",  # 同じシェルの run_dev.ps1 の残りを prod で外す
+            "では止まらない。先に L2 の窓を Ctrl+C で止める",  # 切り替えのときに dev の run_loop を残さない
         ):
             assert word in section, word
         assert "記憶の検索に使わない C2 では止めない" not in section  # 読まなかったころの説明
