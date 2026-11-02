@@ -707,6 +707,23 @@ class TestStartup:
         assert scene.uv_calls == []
         assert f"{missing} が見つかりません" in output
 
+    def test_missing_dev_env_file_stops_even_when_the_shell_passes_the_checks(self, scene):
+        """.env.dev がないと、シェルに残った dev の値で分離の確認を通っても起動しない。
+
+        WHY: 上のテストの .env は本番のストリームを書いているので、ファイルの確認がなくても次の分離の確認で止まり、気づけない。
+             シェルの残りで通ると、.env.dev の上書きがないまま、.env の設定で dev の run_loop が動く。
+        """
+        scene.absent_files = {".env.dev"}
+        scene.set_stream_lines(None, None)
+        scene.env["REDIS_STREAM_KEY"] = "aibyss:events-dev"
+
+        done = scene.run("run_dev.ps1", "-SkipHealthCheck")
+
+        output = done.stdout + done.stderr
+        assert done.returncode == 1, output
+        assert scene.uv_calls == []
+        assert ".env.dev が見つかりません" in output
+
     def test_prod_without_a_stream_line_starts_because_the_default_is_prod(self, scene):
         """prod で行がないのは正しい設定。bus の既定が本番なので、ここで止めると .env を最小にした利用者が起動できない。"""
         scene.set_stream_lines(None, None)
