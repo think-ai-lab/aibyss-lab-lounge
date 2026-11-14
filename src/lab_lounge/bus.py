@@ -5,7 +5,7 @@ bus.py — Redis Streams Publisher
   - Event Envelope を JSON 文字列化して Redis Stream に XADD する
   - フィールド名は "event" 固定 (C2 Consumer との規約)
   - C2 への HTTP POST は絶対に行わない (Guardrail G-2)
-  - Redis が落ちていても声 (ターン) を止めない (P3)
+  - Redis が落ちていても声 (ターン) を止めない
 
 【Redis Streams メッセージ規約 (v0.1)】
   XADD <stream_key> * event '<Event Envelope JSON 文字列>'
@@ -302,7 +302,7 @@ def publish_best_effort(event: dict) -> str | None:
         XADD の msg_id。Redis の障害で諦め、L2_BUS_FAIL_OPEN が真 (既定) のときは None
 
     Raises:
-        redis.RedisError: Redis の障害で、L2_BUS_FAIL_OPEN が偽のとき (ターンを止める、P3 より前の挙動)
+        redis.RedisError: Redis の障害で、L2_BUS_FAIL_OPEN が偽のとき (ターンを止める、以前の挙動)
         そのほかの例外: event が JSON にできないなど、Redis の障害でないもの。既定でも握らない
             (コードの誤りを、Redis の障害の ERROR ログに紛れさせないため)
 

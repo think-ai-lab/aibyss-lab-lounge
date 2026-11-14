@@ -246,16 +246,16 @@ class TestAskCharacterImpl:
         assert call_kwargs["model"] == "gpt-5.4-nano"
 
 
-# ─── P3: 協働先から応答を得られなかったとき ─────────────────────────────
+# ─── 協働先から応答を得られなかったとき ─────────────────────────────
 
 
 _COLLAB = "lab_lounge.mcp_servers.ask_character._run_collaboration_agent"
 
 
 class TestCollaborationFailure:
-    """協働先の失敗、空の応答、時間切れでは、協働先の声も吹き出しも状態の更新も出さない (P3)。
+    """協働先の失敗、空の応答、時間切れでは、協働先の声も吹き出しも状態の更新も出さない。
 
-    旧実装は「エラー: ...」を協働先の TTS へ渡して読み上げていた (P1 の実 API で再現:
+    旧実装は「エラー: ...」を協働先の TTS へ渡して読み上げていた (2026-11-01 の実 API の点検で再現:
     provider=openai のまま gemini のモデル名を送って 404)。
     """
 
@@ -365,7 +365,7 @@ class TestCollaborationFailure:
 
 
 class TestCollaborationAgentArguments:
-    """協働先の _run_agent に provider と人格を渡す (P3)。Agent が失敗したときのフォールバックが使う。"""
+    """協働先の _run_agent に provider と人格を渡す。Agent が失敗したときのフォールバックが使う。"""
 
     _KWARGS = dict(
         question="質問", model="gemini-3.1-pro-preview", provider="google",
@@ -393,7 +393,7 @@ class TestCollaborationAgentArguments:
         assert kwargs["system_prompt"] == "PERSONA-FIXTURE"
 
     def test_fallback_uses_the_targets_provider_and_prompt(self, agent_parts):
-        """P1 の再現の形: Agent が落ちたとき、フォールバックが協働先の provider と人格で呼ぶ。
+        """実 API の点検で再現した形: Agent が落ちたとき、フォールバックが協働先の provider と人格で呼ぶ。
 
         旧実装は provider=openai (既定) と人格なしで、gemini のモデル名を OpenAI へ送って 404 になっていた。
         """

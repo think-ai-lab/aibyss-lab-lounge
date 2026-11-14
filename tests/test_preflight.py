@@ -4193,7 +4193,7 @@ class TestSilentlyReplacedValues:
         ("L2_USE_HANDRAISE", "false"),
         ("L2_FILLER_ENABLED", "1"),
         ("L2_ENABLE_TOOLS", ""),  # 既定が偽なので、空でも読み方は変わらない
-        ("L2_BUS_FAIL_OPEN", "false"),  # 書いたとおりに P3 より前の挙動へ戻す
+        ("L2_BUS_FAIL_OPEN", "false"),  # 書いたとおりに以前の挙動へ戻す
     ])
     def test_values_production_reads_as_written_stay_quiet(self, isolated, name, value):
         os.environ[name] = value
@@ -8380,6 +8380,41 @@ def _read_public(rel: str) -> str:
     return (_REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
+# 公開する本文の置き場所と拡張子。data/ と logs/ は本文ではなく、キャラの資料 (yml) は本文の言葉として
+# 内部の呼び名と同じ語を使うので見ない。
+_PUBLIC_TEXT_ROOTS = ("src", "tests", "scripts", "sidecar")
+_PUBLIC_TEXT_SUFFIXES = (".py", ".md", ".ps1", ".bat")
+_PUBLIC_TEXT_TOP_FILES = ("README.md", "CHARACTERS.md", ".env.example", ".env.dev.example")
+
+
+def _public_text_files() -> list[str]:
+    """公開する本文 (コード、テスト、スクリプト、文書、env の雛形) の相対パスを返す。
+
+    git の作業ツリーなら追跡中のファイルから、そうでなければ同じ置き場所の glob から選ぶ。
+
+    WHY: 一覧を手で並べると、新しいファイルや、一覧にないファイルへの追記が漏れる (2026-11-15 に bus.py などへ
+         計画の番号を書き、一覧にあった 1 ファイルの分しか赤くならなかった)。追跡外の手元のメモは公開されないので、
+         git があるときは見ない。
+    """
+    if shutil.which("git") is not None and (_REPO_ROOT / ".git").exists():
+        done = subprocess.run(
+            ["git", "--no-optional-locks", "ls-files", "--", *_PUBLIC_TEXT_ROOTS, *_PUBLIC_TEXT_TOP_FILES],
+            cwd=_REPO_ROOT, capture_output=True, text=True, encoding="utf-8", check=True, timeout=60,
+        )
+        tracked = done.stdout.splitlines()
+    else:
+        tracked = [
+            path.relative_to(_REPO_ROOT).as_posix()
+            for root in _PUBLIC_TEXT_ROOTS
+            for path in (_REPO_ROOT / root).rglob("*")
+            if path.is_file()
+        ] + [name for name in _PUBLIC_TEXT_TOP_FILES if (_REPO_ROOT / name).is_file()]
+    return sorted(
+        rel for rel in tracked
+        if rel in _PUBLIC_TEXT_TOP_FILES or (rel.endswith(_PUBLIC_TEXT_SUFFIXES) and "__pycache__" not in rel)
+    )
+
+
 def _readme_section() -> str:
     """README の preflight の節を返す。"""
     return _read_public("README.md").split("### 4. `preflight`")[1].split("\n---\n")[0]
@@ -8659,11 +8694,7 @@ class TestPublicFiles:
         text = _read_public("tests/test_preflight.py")
         assert not re.search(r"\b[A-Z]:[\\/]+repos[\\/]+aibyss|notion\.(?:so|site)|[\w.+-]+@(?:gmail|outlook|yahoo)\.", text)
 
-    @pytest.mark.parametrize("rel", [
-        "README.md", "sidecar/README.md", "src/lab_lounge/preflight.py", "tests/test_preflight.py",
-        "scripts/run_dev.ps1", "scripts/run_prod.ps1", "scripts/run_common.ps1", "scripts/l2-start-prod.bat",
-        "tests/conftest.py", "tests/test_isolation.py", "tests/test_run_scripts.py",
-    ])
+    @pytest.mark.parametrize("rel", _public_text_files())
     def test_no_private_plan_names(self, rel):
         """非公開の計画の番号と内部の呼び名は、第三者が辿れない。"""
         text = _read_public(rel)

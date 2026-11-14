@@ -305,7 +305,7 @@ class TestSummarizeEvent:
         assert "status=?->?" in s
 
 
-# ─── P3: Redis に届かないときの上限、失敗の後の待ち、fail-open ─────────────
+# ─── Redis に届かないときの上限、失敗の後の待ち、fail-open ─────────────
 
 
 def _closed_port() -> int:
@@ -465,7 +465,7 @@ class TestPublishBestEffort:
 
     @pytest.mark.parametrize("value", ["false", "0", "no", ""])
     def test_fail_closed_raises(self, unreachable_redis, monkeypatch, value):
-        """false で P3 より前の挙動 (例外でターンを止める) に戻す。空も、他の既定が真のフラグと同じく偽。"""
+        """false で以前の挙動 (例外でターンを止める) に戻す。空も、他の既定が真のフラグと同じく偽。"""
         monkeypatch.setenv("L2_BUS_FAIL_OPEN", value)
         with pytest.raises(redis.ConnectionError):
             publish_best_effort(SAMPLE_EVENT)
@@ -497,7 +497,7 @@ class TestPublishBestEffort:
 
 
 class TestTurnContinuesWithoutRedis:
-    """Redis が落ちていても、1 ターンが TTS の合成まで進む (P3 の目的: 声は止まらない)。"""
+    """Redis が落ちていても、1 ターンが TTS の合成まで進む (声は止まらない)。"""
 
     _COMMON = dict(stream_id="stream-bus-002", session_id="sess-bus-002", trace_id="trace-bus-002")
 
@@ -532,7 +532,7 @@ class TestTurnContinuesWithoutRedis:
         assert redis_down.call_count == 5
 
     def test_fail_closed_stops_the_turn_before_tts(self, fake_synthesize, redis_down, monkeypatch):
-        """L2_BUS_FAIL_OPEN=false で、P3 より前と同じく utterance.final の publish でターンが止まる。"""
+        """L2_BUS_FAIL_OPEN=false で、以前と同じく utterance.final の publish でターンが止まる。"""
         monkeypatch.setenv("L2_BUS_FAIL_OPEN", "false")
         with pytest.raises(redis.ConnectionError):
             pipeline_mod.run_pipeline("テスト", **self._COMMON)

@@ -108,7 +108,7 @@ _bg_cancel_flags: dict[str, threading.Event] = {}
 
 # 協働先の Agent を待つ上限 (秒)。導入セリフの合成と再生の裏で走るので、多くは待つ前に終わっている。
 # 超えたら協働先は話さず、caller には応答がなかったことだけを返す (_ask_character_impl を参照)。
-# 値は P3 より前と同じ 120 秒。協働先の Agent の壁時計の上限 (L2_AGENT_INVOKE_TIMEOUT_SEC、既定 90 秒) より
+# 値は以前と同じ 120 秒。協働先の Agent の壁時計の上限 (L2_AGENT_INVOKE_TIMEOUT_SEC、既定 90 秒) より
 # 長いので、Agent が時間切れになっても、その後のフォールバックが残りの 30 秒で終われば応答を拾える。
 # テストでは短くする。
 _COLLAB_JOIN_TIMEOUT_SEC = 120.0
@@ -354,7 +354,7 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     協働先から応答を得られなかったとき (例外、空の応答、_COLLAB_JOIN_TIMEOUT_SEC 秒の時間切れ) は、
     協働先の TTS も吹き出しも出さず、caller には「<協働先の表示名>から応答を得られませんでした」とだけ返す
-    (P3。旧実装は「エラー: ...」を協働先の声で読み上げていた)。
+    (旧実装は「エラー: ...」を協働先の声で読み上げていた)。
     """
     # 遅延 import で循環参照を回避
     from ..characters import get_character, load_system_prompt
@@ -581,7 +581,7 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
         failure = None
     if failure is not None:
         # 協働先の声も吹き出しも状態の更新も出さず、caller には応答がなかったことだけを返す。
-        # WHY: 旧実装は失敗の文 (「エラー: ...」) を協働先の声で読み上げていた (P1 の実 API で再現:
+        # WHY: 旧実装は失敗の文 (「エラー: ...」) を協働先の声で読み上げていた (2026-11-01 の実 API の点検で再現:
         #      provider を渡し忘れて gemini のモデル名を OpenAI へ送り 404)。caller は導入セリフで相手に
         #      振った後なので、この戻り値を受けて自分の言葉でつなげる。時間切れのスレッドは止められないが、
         #      戻り値を読む人がいないので、後から終わっても声にはならない。
@@ -1005,7 +1005,7 @@ def _run_collaboration_agent(
     # Agent 実行 (BubbleToolCallbackHandler で bubble.update を発行)
     # provider と system_prompt は、Agent が失敗したときの単一ノードのフォールバックが使う。
     # WHY: 渡さないと provider が既定の "openai" になり、協働先のモデル名 (gemini など) を OpenAI へ
-    #      送って 404 になる。人格もない状態で呼ぶ (P1 の実 API で再現)。
+    #      送って 404 になる。人格もない状態で呼ぶ (2026-11-01 の実 API の点検で再現)。
     result = _run_agent(
         agent,
         question,
