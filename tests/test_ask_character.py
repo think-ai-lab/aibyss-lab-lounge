@@ -306,7 +306,9 @@ class TestCollaborationFailure:
         "   \n",
         '{"response": "", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
         '```json\n{"response": "  ", "pose": "neutral"}\n```',
-    ], ids=["empty", "blank", "empty-json-response", "blank-fenced-json"])
+        # str(None) で "None" になり、「None」と読み上げてしまう (査読で見つかった)
+        '{"response": null, "pose": "neutral"}',
+    ], ids=["empty", "blank", "empty-json-response", "blank-fenced-json", "null-json-response"])
     def test_blank_response_is_not_spoken(self, stage, response):
         with patch(_COLLAB, return_value=response):
             result = _ask_character_impl("chisame", "質問")

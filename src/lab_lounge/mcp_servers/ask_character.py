@@ -118,7 +118,8 @@ def _is_blank_collab_response(response_text: str | None) -> bool:
     """協働先の応答に、声にする本文がなければ True を返す。
 
     構造化 JSON の response が空 ({"response": ""}) のときも空とみなす。TTS と caller へ渡すのは、
-    _parse_voicepeak_json で取り出した本文なので。
+    _parse_voicepeak_json で取り出した本文なので。{"response": null} も空とみなす (_parse_voicepeak_json が
+    str() して "None" になり、そのまま「None」と読み上げてしまうため。preflight の _spoken_problems と同じ扱い)。
 
     Args:
         response_text: 協働先の Agent の生の出力。None は未完了か失敗
@@ -135,7 +136,7 @@ def _is_blank_collab_response(response_text: str | None) -> bool:
     except (TypeError, ValueError):
         # emotion や speed が数でない JSON。本文の有無はここでは決めず、今までどおり後段へ渡す。
         return False
-    return not say_text.strip()
+    return say_text.strip() in ("", "None")
 
 
 def _reset_session_state(session_id: str) -> None:
