@@ -194,7 +194,10 @@ class TestPipelineGraphNodes:
 
     @pytest.fixture()
     def mock_publish(self):
-        with patch("lab_lounge.pipeline.publish", return_value="1-0") as m:
+        # 本流の 3 件は bus.publish_best_effort から bus.publish を呼び、吹き出しは pipeline.publish を呼ぶ。
+        # どちらも同じモックで止める。
+        with patch("lab_lounge.pipeline.publish", return_value="1-0") as m, \
+                patch("lab_lounge.bus.publish", m):
             yield m
 
     @pytest.fixture()
@@ -393,7 +396,9 @@ class TestPipelineGraphFullInvoke:
 
     @pytest.fixture()
     def mock_publish(self):
-        with patch("lab_lounge.pipeline.publish", return_value="1-0"):
+        # 本流の 3 件は bus.publish、吹き出しは pipeline.publish を通る。
+        with patch("lab_lounge.pipeline.publish", return_value="1-0") as m, \
+                patch("lab_lounge.bus.publish", m):
             yield
 
     def test_full_invoke_returns_three_events(self, mock_publish):
@@ -580,7 +585,9 @@ class TestRoutingNodeStreamContextMerge:
 
     @pytest.fixture()
     def mock_publish(self):
-        with patch("lab_lounge.pipeline.publish", return_value="1-0"):
+        # 本流の 3 件は bus.publish、吹き出しは pipeline.publish を通る。
+        with patch("lab_lounge.pipeline.publish", return_value="1-0") as m, \
+                patch("lab_lounge.bus.publish", m):
             yield
 
     @pytest.fixture(autouse=True)

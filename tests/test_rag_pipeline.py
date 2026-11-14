@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+import lab_lounge.bus as bus_mod
 import lab_lounge.pipeline as pipeline_mod
 from lab_lounge.pipeline import run_pipeline
 from lab_lounge.llm import LLMResult
@@ -51,7 +52,9 @@ FAKE_DOCS = [
 
 @pytest.fixture()
 def mock_publish():
-    with patch.object(pipeline_mod, "publish", return_value="1-0") as m:
+    # 本流の 3 件は bus.publish、吹き出しは pipeline.publish を通るので、両方を同じモックで止める。
+    with patch.object(pipeline_mod, "publish", return_value="1-0") as m, \
+            patch.object(bus_mod, "publish", m):
         yield m
 
 

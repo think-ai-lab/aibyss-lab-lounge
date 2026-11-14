@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import lab_lounge.bus as bus_mod
 import lab_lounge.pipeline as pipeline_mod
 from lab_lounge.pipeline import PipelineResult, run_pipeline
 
@@ -36,8 +37,12 @@ COMMON = dict(
 
 @pytest.fixture()
 def mock_publish():
-    """bus.publish をモックして Redis 接続なし。"""
-    with patch.object(pipeline_mod, "publish", return_value="1-0") as m:
+    """bus.publish をモックして Redis 接続なし。
+
+    本流の 3 件は bus.publish、吹き出しは pipeline.publish を通るので、両方を同じモックで止める。
+    """
+    with patch.object(pipeline_mod, "publish", return_value="1-0") as m, \
+            patch.object(bus_mod, "publish", m):
         yield m
 
 
@@ -384,8 +389,10 @@ class TestRunLoopPipelineSection:
         )
         filler_thread.start()
 
-        # パイプライン失敗をシミュレート
-        with patch.object(pipeline_mod, "publish", side_effect=RuntimeError("Redis down")):
+        # パイプライン失敗をシミュレート。RuntimeError は Redis の障害の型ではないので、
+        # bus.publish_best_effort も握らずに送出する (本流の 3 件は bus.publish を通る)。
+        failing = MagicMock(side_effect=RuntimeError("Redis down"))
+        with patch.object(pipeline_mod, "publish", failing), patch.object(bus_mod, "publish", failing):
             try:
                 run_pipeline("失敗テスト", **COMMON)
             except RuntimeError:

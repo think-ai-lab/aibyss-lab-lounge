@@ -215,6 +215,11 @@ _NUMERIC_ENV = (
     ("L2_STT_COMPRESSION_RATIO_THRESHOLD", float),
     ("L2_STT_LOG_PROB_THRESHOLD", float),
     ("L2_STT_NO_SPEECH_THRESHOLD", float),
+    # bus.publish のたびに読む (最後の 1 つは失敗の後だけ)。壊れていると、本流の publish はターンを例外で止め、
+    # 吹き出しなどの publish は WARNING を出して消える。
+    ("L2_BUS_CONNECT_TIMEOUT_SEC", float),
+    ("L2_BUS_SOCKET_TIMEOUT_SEC", float),
+    ("L2_BUS_RETRY_AFTER_SEC", float),
 )
 
 # 本番が空を「指定なし」と読む設定。.env.example の説明どおり空のまま置けるので、壊れた値に数えない。
@@ -230,6 +235,7 @@ _DEFAULT_TRUE_FLAGS = (
     "L2_USE_C2_RECENT",
     "L2_STT_HALLUCINATION_FILTER",
     "L2_LOG_TO_FILE",
+    "L2_BUS_FAIL_OPEN",
 )
 
 # python-dotenv がダブルクォートの中の \a \b \f \n \r \t \v から作る文字。
@@ -2062,7 +2068,7 @@ def _agent_problems(summary: dict[str, Any], logs: list[str]) -> list[str]:
 def _with_deadline(call: Callable[[], Any], seconds: float) -> Any:
     """call を別スレッドで流し、seconds を超えたら TimeoutError にする。
 
-    WHY: langchain_tavily と VOICEVOX と bus.publish は timeout なしで通信し、埋め込みは SDK の既定で
+    WHY: langchain_tavily と VOICEVOX は timeout なしで通信し、埋め込みは SDK の既定で
          最長 30 分待つ。相手が応答を止めると、残りの行も要約も出ないまま点検が固まる。
          固まった worker は、コマンドラインでは _cli の os._exit で消える。
     """

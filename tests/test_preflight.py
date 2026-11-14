@@ -4362,10 +4362,14 @@ class TestPersonaContent:
         assert _status(report, "persona/mimi").status == "FAIL"
 
     def _production_turn(self):
-        """本番の 1 ターンをダミーの LLM と TTS で流す。publish を止め、実リポの data/ も読まない。"""
-        from lab_lounge import pipeline
+        """本番の 1 ターンをダミーの LLM と TTS で流す。publish を止め、実リポの data/ も読まない。
 
-        with patch.object(pipeline, "publish"), patch.object(pipeline, "_BUBBLE_MESSAGES", {}):
+        本流の 3 件は bus.publish、吹き出しは pipeline.publish を通るので、両方を止める。
+        """
+        from lab_lounge import bus, pipeline
+
+        with patch.object(pipeline, "publish"), patch.object(bus, "publish"), \
+                patch.object(pipeline, "_BUBBLE_MESSAGES", {}):
             return pipeline.run_pipeline(
                 "ミミ様", stream_id="s", session_id="s", trace_id="t", speaker_hint="mimi",
                 on_pose_ready=lambda *_args, **_kwargs: None,
@@ -6379,8 +6383,10 @@ class TestPipelineLogCounts:
 
     def test_healthy_turn_through_the_real_graph_stays_pass(self, isolated, capture):
         """正常な 1 ターンで本番がログを出すようになると、全キャラの行が毎回 WARN になって読まれなくなる。"""
-        # 手元のファイルに左右されないよう、人格と吹き出しの文言は固定する。publish も Redis へ出さない。
-        with patch("lab_lounge.pipeline.publish"), patch("lab_lounge.pipeline._BUBBLE_MESSAGES", {}), \
+        # 手元のファイルに左右されないよう、人格と吹き出しの文言は固定する。publish も Redis へ出さない
+        # (本流の 3 件は bus.publish、吹き出しは pipeline.publish を通る)。
+        with patch("lab_lounge.pipeline.publish"), patch("lab_lounge.bus.publish"), \
+                patch("lab_lounge.pipeline._BUBBLE_MESSAGES", {}), \
                 patch("lab_lounge.characters.load_system_prompt", return_value="x"):
             report = preflight.Report()
             preflight.check_pipeline(report, capture, get_character("mimi"), "preflight-x", None, required=True)
@@ -6646,7 +6652,7 @@ class TestDeadlines:
         assert "TimeoutError" in _status(report, "embeddings").detail
 
     def test_stalled_pipeline_is_one_fail_row(self, isolated, capture, monkeypatch):
-        """VOICEVOX と bus.publish は timeout なしで通信する。"""
+        """VOICEVOX は timeout なしで通信する。"""
         monkeypatch.setattr(preflight, "_PIPELINE_DEADLINE_SEC", 0.2)
         release = threading.Event()
         report = preflight.Report()

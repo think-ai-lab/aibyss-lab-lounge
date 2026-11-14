@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import lab_lounge.bus as bus_mod
 import lab_lounge.pipeline as pipeline_mod
 from lab_lounge.pipeline import run_pipeline
 
@@ -21,8 +22,13 @@ COMMON = dict(
 
 @pytest.fixture()
 def mock_publish():
-    """bus.publish をモックして XADD を発行しない。"""
-    with patch.object(pipeline_mod, "publish", return_value="1-0") as m:
+    """bus.publish をモックして XADD を発行しない。
+
+    本流の 3 件は bus.publish_best_effort から bus.publish を呼び、吹き出しは pipeline.publish を呼ぶ。
+    どちらも同じモックで止めるので、呼び出しの回数と順番は 1 つのモックで数えられる。
+    """
+    with patch.object(pipeline_mod, "publish", return_value="1-0") as m, \
+            patch.object(bus_mod, "publish", m):
         yield m
 
 
@@ -521,7 +527,7 @@ class TestRunPipelineDisableTools:
                 latency_ms=0, finish_reason="stop",
             )
 
-        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+        with patch.object(pipeline_mod, "publish", return_value="1-0") as m, patch.object(bus_mod, "publish", m):
             with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
                 run_pipeline(
                     "テスト",
@@ -544,7 +550,7 @@ class TestRunPipelineDisableTools:
                 latency_ms=0, finish_reason="stop",
             )
 
-        with patch.object(pipeline_mod, "publish", return_value="1-0"):
+        with patch.object(pipeline_mod, "publish", return_value="1-0") as m, patch.object(bus_mod, "publish", m):
             with patch("lab_lounge.graph.run_graph", side_effect=fake_run_graph):
                 run_pipeline("テスト", **COMMON)
 

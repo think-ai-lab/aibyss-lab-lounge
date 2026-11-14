@@ -84,6 +84,9 @@ def _isolated_values() -> dict[str, str]:
         "PYTHON_DOTENV_DISABLED": "1",
         "REDIS_URL": _CLOSED_REDIS_URL,
         "REDIS_STREAM_KEY": _TEST_STREAM_KEY,
+        # 本流の publish (utterance.final など) の失敗を握らない。本番の既定 (true) では bus.publish_best_effort が
+        # ERROR ログにして先へ進むので、publish のモックの漏れが緑のまま埋もれる。既定を確かめるテストは消して使う。
+        "L2_BUS_FAIL_OPEN": "false",
         "LANGSMITH_TRACING": "false",
         # LANGSMITH_TRACING=true を立てるテストでも、実発話を含むトレースを外へ送らない。
         "LANGSMITH_ENDPOINT": "http://127.0.0.1:6",
@@ -295,6 +298,19 @@ def set_schema_path(monkeypatch):
     _reset_validator_cache()
     yield
     _reset_validator_cache()
+
+
+@pytest.fixture(autouse=True)
+def reset_bus_state():
+    """bus の「直前に Redis へ届かなかった」記録を、テストの前後で消す。
+
+    WHY: 記録はモジュールの状態なので、残ると次のテストの publish が L2_BUS_RETRY_AFTER_SEC の間、
+         接続を試さずに失敗する。テストの順序で結果が変わらないようにする。
+    """
+    from lab_lounge.bus import _reset_for_tests
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

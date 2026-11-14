@@ -100,7 +100,12 @@ class TestEnvironment:
             "L2_IRODORI_READINGS_JSON",
             "L2_VOICEPEAK_RETRY_WAIT_SEC",
             "L2_VOICEPEAK_MAX_RETRIES",
+            "L2_BUS_FAIL_OPEN",
         }
+
+    def test_core_publish_failures_are_not_swallowed(self):
+        """本流の publish のモックが漏れたテストを、ERROR ログの中に埋もれさせず例外で赤くする。"""
+        assert os.environ["L2_BUS_FAIL_OPEN"] == "false"
 
     def test_changes_do_not_leak_into_the_next_test_first(self):
         """対になる次のテストと合わせて、os.environ への直接の書き込みが持ち越されないことを見る。"""

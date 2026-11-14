@@ -134,6 +134,9 @@ cp .env.example .env   # 既定値のまま動作する。秘匿値（API キー
 |------|--------|------|
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis 接続 URL |
 | `REDIS_STREAM_KEY` | `aibyss:events` | publish 先の Redis Stream キー（`run_dev.ps1` は未設定と空を拒否し、`run_prod.ps1` は空を拒否する。起動前の確認では、V2 と、検索に使う C2 のストリームと違えば止まる（検索に使わない C2 は黄色で知らせて続行）） |
+| `L2_BUS_CONNECT_TIMEOUT_SEC` / `L2_BUS_SOCKET_TIMEOUT_SEC` | `0.5` / `1.0` | Redis への接続と XADD の応答を待つ上限（秒）。再試行はしない |
+| `L2_BUS_RETRY_AFTER_SEC` | `5` | Redis に届かなかった後、接続を試さずにすぐ諦める時間（秒）。`0` で毎回試す |
+| `L2_BUS_FAIL_OPEN` | `true` | `utterance.final` / `llm.final` / `tts.done` の publish が Redis の障害で失敗しても、ERROR ログを残して声を続ける。諦めた event は再送しないので、C2 の正史と V2 の HUD に穴が開く。`false` でそのターンを止める |
 | `AIBYSS_SCHEMA_PATH` | *(自動探索)* | スキーマ絶対パス（省略で兄弟 workspace を探索） |
 | `L2_USE_REAL_LLM` | `false` | `true` で real LLM を呼ぶ（ダミー応答を無効化） |
 | `L2_LLM_PROVIDER` / `L2_LLM_MODEL` | `openai` / `gpt-5.4` | 既定プロバイダ・モデル（**フォールバック**。キャラ別の指定が `characters.py` にあればそちらが優先） |
@@ -558,7 +561,7 @@ OBS (`test_obs`)・フィラー (`test_filler`)・配信文脈 (`test_stream_con
 **テストは手元の環境に触れない**（`tests/conftest.py`、隔離そのものは `test_isolation` で確かめる）。サービスが起動中でも、`.env` に本物のキーがあっても、新しい clone と同じ結果になる。
 
 - `.env` を読まない（`PYTHON_DOTENV_DISABLED=1`）。API キー、LLM や LangSmith の接続先、`L2_*`、プロキシの変数は環境から外す
-- Redis は閉じたポート（`redis://127.0.0.1:6`）を指し、ストリームは `aibyss:events-test`。本番の `aibyss:events` へは書かない
+- Redis は閉じたポート（`redis://127.0.0.1:6`）を指し、ストリームは `aibyss:events-test`。本番の `aibyss:events` へは書かない。本流の publish の失敗も握らない（`L2_BUS_FAIL_OPEN=false`。publish のモックの漏れを赤くするため）
 - loopback の外への接続は遮断し、試みたテストを失敗にする（本番のコードが例外を握りつぶしても赤くなる）。loopback でも、実サービスのいる範囲のポートは閉じたポートと同じ扱いにする
 - ログ、作業ディレクトリ、配信文脈、`voices.json`、`readings.json`、フィラーのキャッシュと音声は、テストのプロセスの一時ディレクトリへ向ける
 
