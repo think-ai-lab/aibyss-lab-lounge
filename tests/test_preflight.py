@@ -2099,6 +2099,9 @@ class TestNumericEnvCoverage:
         ("L2_STT_COMPRESSION_RATIO_THRESHOLD", {"L2_STT_PROVIDER": "faster-whisper"}),
         ("L2_STT_LOG_PROB_THRESHOLD", {"L2_STT_PROVIDER": "faster-whisper"}),
         ("L2_STT_NO_SPEECH_THRESHOLD", {"L2_STT_PROVIDER": "faster-whisper"}),
+        ("L2_BUS_CONNECT_TIMEOUT_SEC", {}),  # ダミーの構成でも publish のたびに読む
+        ("L2_BUS_SOCKET_TIMEOUT_SEC", {}),
+        ("L2_BUS_RETRY_AFTER_SEC", {}),
     ])
     def test_broken_value_on_a_live_path_is_fail_and_hides_the_value(self, isolated, capsys, name, env):
         os.environ.update({name: _MARK, **env})
@@ -4166,6 +4169,7 @@ class TestSilentlyReplacedValues:
         ("L2_USE_C2_RECENT", ""),
         ("L2_STT_HALLUCINATION_FILTER", ""),
         ("L2_LOG_TO_FILE", ""),
+        ("L2_BUS_FAIL_OPEN", ""),  # 空は偽で、Redis の障害でターンが止まる
     ])
     def test_replaced_value_warns_and_does_not_stop(self, isolated, name, value):
         os.environ[name] = value
@@ -4189,6 +4193,7 @@ class TestSilentlyReplacedValues:
         ("L2_USE_HANDRAISE", "false"),
         ("L2_FILLER_ENABLED", "1"),
         ("L2_ENABLE_TOOLS", ""),  # 既定が偽なので、空でも読み方は変わらない
+        ("L2_BUS_FAIL_OPEN", "false"),  # 書いたとおりに P3 より前の挙動へ戻す
     ])
     def test_values_production_reads_as_written_stay_quiet(self, isolated, name, value):
         os.environ[name] = value
@@ -4212,6 +4217,10 @@ class TestSilentlyReplacedValues:
         os.environ.update({"L2_USE_HANDRAISE": "", "L2_FILLER_ENABLED": ""})
         assert _get_handraise_config()["use_handraise"] is False
         assert is_filler_enabled() is False
+        from lab_lounge.bus import _fail_open
+
+        os.environ["L2_BUS_FAIL_OPEN"] = ""
+        assert _fail_open() is False
 
     def test_default_true_list_matches_production(self):
         found = set()
