@@ -24,8 +24,8 @@
 #   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。失敗があれば赤く出して exit 1 で止まる。
 #   /health の stream も publish 先と比べる。V2 のポートは dev と prod で同じなので、別のモードの V2 も 200 を返すため。
 #   C2 は設定によらず読む (検索に使わなくても全発話を記録するので)。検索に使わない設定なら止めず、黄色で知らせる
-#   (発話は Redis に残り、C2 を戻せば追いつく。reason=append_failing だけは別で、C2 は書けなかった発話を ack するので、
-#   DB を直しても自動では追いつかない)。
+#   (発話は Redis に残り、C2 を戻せば追いつく。reason=append_failing でも、C2 は書けなかった発話を ack せずに
+#   読み直すので、DB を直せば追いつく)。
 #   OBS が別の PC (L2_OBS_WS_URL が loopback でない) なら、LAN からの接続が 0 のときに黄色で知らせる。
 #   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
 #

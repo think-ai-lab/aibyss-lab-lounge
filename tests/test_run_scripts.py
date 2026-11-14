@@ -71,9 +71,10 @@ _SHOW_COLORS = (
 _TOTAL_NOTICE = "HUD に繋がっている画面がありません"
 _LAN_NOTICE = "別の PC の OBS が HUD に繋がっていません"
 
-# 検索に使わない C2 の黄色の知らせの結び。止まっていた間の発話は読み直せるが、書けなかった発話は読み直されない。
+# 検索に使わない C2 の黄色の知らせの結び。止まっていた間の発話も、書けなかった発話も、C2 が読み直す。
+# 書けなかったとき（append_failing）だけは、直す相手が DB なので案内を分ける。
 _C2_CATCHES_UP = "発話は Redis に残り、C2 を戻せば追いつきます"
-_C2_DOES_NOT_CATCH_UP = "C2 は書けなかった発話を ack するので、DB を直しても自動では追いつきません。発話は Redis のストリームには残ります"
+_C2_CATCHES_UP_AFTER_THE_DB = "C2 は書けなかった発話を ack せずに読み直すので、DB を直せば追いつきます"
 
 
 def _stream_of(script: str) -> str:
@@ -486,23 +487,22 @@ class TestStartup:
         assert "接続できません" in done.stdout + done.stderr
         assert not scene.called("lab_lounge.run_loop")
 
-    @pytest.mark.parametrize("status,body,reason,effect,catches_up", [
+    @pytest.mark.parametrize("status,body,reason,effect,recovery", [
         (503, {"status": "degraded", "stream": "aibyss:events", "reason": "consumer_stopped", "last_read_age_sec": None},
-         "HTTP 503 reason=consumer_stopped", "歴史書が記録していません", True),
+         "HTTP 503 reason=consumer_stopped", "歴史書が記録していません", _C2_CATCHES_UP),
         (200, {"status": "ok", "stream": "aibyss:events-dev", "last_read_age_sec": 0.1},
-         "'aibyss:events-dev' を読んでいます", "歴史書が記録していません", True),
-        (200, "{}", "別のサービスかもしれません", "歴史書が記録していません", True),
+         "'aibyss:events-dev' を読んでいます", "歴史書が記録していません", _C2_CATCHES_UP),
+        (200, "{}", "別のサービスかもしれません", "歴史書が記録していません", _C2_CATCHES_UP),
         # 古いプロセスは記録しているかもしれないので、言い切らない。
-        (200, {"status": "ok", "last_read_age_sec": 0.1}, "古いプロセス", "歴史書が記録しているかを確かめられません", True),
-        # C2 は書けなかった発話を ack するので、この理由だけは「追いつきます」が嘘になる。
+        (200, {"status": "ok", "last_read_age_sec": 0.1}, "古いプロセス", "歴史書が記録しているかを確かめられません", _C2_CATCHES_UP),
+        # 書けなかった発話も C2 が ack せずに読み直す。直す相手は DB なので、案内だけが違う。
         (503, {"status": "degraded", "stream": "aibyss:events", "reason": "append_failing", "last_read_age_sec": 0.842},
-         "HTTP 503 reason=append_failing", "歴史書が記録していません", False),
+         "HTTP 503 reason=append_failing", "歴史書が記録していません", _C2_CATCHES_UP_AFTER_THE_DB),
     ])
-    def test_c2_that_search_does_not_use_is_reported_in_yellow_and_does_not_stop(self, scene, status, body, reason, effect, catches_up):
+    def test_c2_that_search_does_not_use_is_reported_in_yellow_and_does_not_stop(self, scene, status, body, reason, effect, recovery):
         """C2 は検索のフラグと無関係に全発話を記録する。止めないのは、発話が Redis に残り、C2 を戻せば追いつくから。
 
-        append_failing は追いつかないが、それでも止めない。原因を直しても次の発話が届くまで 503 が残るので、
-        赤で止めると L2 を起動できなくなる。
+        append_failing も同じで、C2 は書けなかった発話を ack せずに読み直すので、DB を直せば追いつく。
         """
         scene.dotenv["L2_ENABLE_RAG"] = "false"
         scene.c2.answer(status, body)
@@ -512,13 +512,13 @@ class TestStartup:
         output = done.stdout + done.stderr
         assert done.returncode == 0, output
         assert scene.called("lab_lounge.run_loop")
-        recovery = _C2_CATCHES_UP if catches_up else _C2_DOES_NOT_CATCH_UP
         assert re.search(
             rf"<Yellow>\[lab-lounge/prod\] C2 127\.0\.0\.1:\d+: .*{re.escape(reason)}.*"
             rf"検索に使わない設定なので止めませんが、{effect}。{recovery}",
             output,
         ), output
-        assert ("追いつきます" in output) == catches_up, output
+        # C2 が書けなかった発話を ack していたころの「追いつきません」を言わない
+        assert "追いつきません" not in output, output
         assert "前提サービスの確認に失敗しました" not in output
 
     @pytest.mark.parametrize("script", _RUN_SCRIPTS)
@@ -1097,7 +1097,7 @@ class TestReadme:
             "`stream`",  # 読んでいるストリームの照合
             "古いプロセス",  # stream を返さない V2 と C2
             "検索に使わない設定",  # C2 は常に読み、止めずに黄色で知らせる
-            "`reason=append_failing` だけは別",  # 書けなかった発話は追いつかない
+            "`reason=append_failing` でも",  # 書けなかった発話も、DB を直せば追いつく
             "`lan` が 0",  # OBS が別の PC のときの判定
             "`[HOST]`",  # 見出しの URL を伏せる
             "`.env.dev` にあって `.env` にない名前",  # 同じシェルの run_dev.ps1 の残りを prod で外す
@@ -1113,11 +1113,14 @@ class TestReadme:
         assert "検索に使わない C2 は黄色" in row
 
     def test_troubleshooting_tells_the_way_out_of_append_failing(self):
-        """Redis を調べても原因にたどり着かない 503。原因を直しても 503 が残るので、再起動まで書く。"""
+        """Redis を調べても原因にたどり着かない 503。直す相手は DB で、直せば C2 が自分で追いつくことまで書く。"""
         row = next(line for line in self._readme().splitlines() if "が起動前の確認で止まる**" in line)
         assert "`reason=append_failing`" in row
         assert "DB に書けていない" in row
-        assert "C2 を再起動" in row
+        assert "再起動しなくても続きから追いつき" in row
+        # C2 が書けなかった発話を ack していたころの案内を残さない
+        assert "C2 を再起動する" not in row
+        assert "自動では追いつかない" not in row
 
     def test_prerequisites_state_how_the_old_powershell_stops(self):
         """前提の節は、スクリプトの #Requires と同じことを言う。"""
