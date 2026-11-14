@@ -183,6 +183,7 @@ _NUMERIC_ENV = (
     ("L2_ROUTER_LLM_TIMEOUT_SEC", float),
     ("L2_LLM_MAX_RETRIES", int),
     ("L2_AGENT_INVOKE_TIMEOUT_SEC", float),
+    ("L2_AGENT_RECURSION_LIMIT", int),
     ("L2_C2_RETRIEVER_TOP_K", int),
     ("L2_C2_RETRIEVER_BUDGET_MS", float),
     ("L2_C2_RECENT_TOP_K", int),
@@ -1192,7 +1193,7 @@ def _numeric_env_use(name: str, characters: list[Any] | None) -> tuple[bool, boo
         return _raw_llm_routes_enabled(), True
     if name == "L2_LLM_MAX_RETRIES":
         return real_llm or _raw_llm_routes_enabled(), True
-    if name == "L2_AGENT_INVOKE_TIMEOUT_SEC":
+    if name in ("L2_AGENT_INVOKE_TIMEOUT_SEC", "L2_AGENT_RECURSION_LIMIT"):
         return real_llm and _is_truthy(os.environ.get("L2_ENABLE_TOOLS")), True
     if name in ("L2_C2_RETRIEVER_TOP_K", "L2_C2_RETRIEVER_BUDGET_MS", "L2_C2_RECENT_TOP_K"):
         return _c2_retriever_enabled(), True
@@ -2640,8 +2641,9 @@ def run_paid(
         if not with_pipeline:
             continue
         if not agent_ok:
-            # 同じ Agent を通すので情報が増えない。_run_agent には recursion_limit がないので、壊れた
-            # 応答が続くと壁時計まで待たされ、打ち切った後も裏で API を呼び続けて課金が増える。
+            # 同じ Agent を通すので情報が増えない。壊れた応答が続くと、_run_agent は recursion_limit
+            # (L2_AGENT_RECURSION_LIMIT、既定 25) に当たるまで API を呼んでからフォールバックするので、
+            # 点検の上限 (_AGENT_RECURSION_LIMIT) の倍以上を課金する。
             report.add(f"pipeline/{character.slug}", "SKIP", "本応答が FAIL なので流しません", required=required)
             continue
         if not engine_ok and not required:

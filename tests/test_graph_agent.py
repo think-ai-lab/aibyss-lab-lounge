@@ -544,3 +544,109 @@ class TestBuildAgentGraphWithStructuredOutput:
 
         # response_format が渡されない
         assert "response_format" not in captured_kwargs
+
+
+# ─── Agent の step 数の上限 ─────────────────────────────────────────
+
+
+class TestRunAgentRecursionLimit:
+    """_run_agent は Agent の step 数に上限を置き、超えたら単一ノードのフォールバックへ落ちる。
+
+    create_agent の既定の上限は 9,999 で、応答が構造化出力の検証に落ち続けると、壁時計の打ち切りの後も
+    裏のスレッドが API を呼び続けた (preflight の偽サーバで 764 step)。
+    """
+
+    @staticmethod
+    def _endless_graph(calls: list):
+        """毎回モデルを呼び、自分では終わらない本物の LangGraph。呼んだ回数を calls に積む。"""
+        from langchain_core.messages import AIMessage
+        from langgraph.graph import START, MessagesState, StateGraph
+
+        def call_model(state):
+            calls.append(1)
+            return {"messages": [AIMessage(content="まだ終わりません")]}
+
+        builder = StateGraph(MessagesState)
+        builder.add_node("model", call_model)
+        builder.add_edge(START, "model")
+        builder.add_edge("model", "model")
+        return builder.compile()
+
+    @staticmethod
+    def _invoked_config(agent: MagicMock) -> dict:
+        """agent.invoke に渡った config を返す (壁時計のガードが別スレッドで invoke(input, config) を呼ぶ)。"""
+        return agent.invoke.call_args.args[1]
+
+    def test_default_limit_is_25(self):
+        from lab_lounge.graph import _run_agent
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        _run_agent(agent, "テスト", "model-x")
+        assert self._invoked_config(agent)["recursion_limit"] == 25
+
+    def test_limit_follows_the_env(self, monkeypatch):
+        from lab_lounge.graph import _run_agent
+
+        monkeypatch.setenv("L2_AGENT_RECURSION_LIMIT", "7")
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        _run_agent(agent, "テスト", "model-x")
+        assert self._invoked_config(agent)["recursion_limit"] == 7
+
+    def test_limit_is_set_together_with_the_callbacks(self):
+        """bubble のコールバックやメタデータと同じ config に入る (片方が他方を上書きしない)。"""
+        from lab_lounge.graph import _run_agent
+
+        agent = MagicMock()
+        agent.invoke.return_value = {"messages": []}
+        with patch("lab_lounge.bus.publish"), patch("lab_lounge.pipeline.publish"):
+            _run_agent(
+                agent, "テスト", "model-x",
+                run_metadata={"stream_id": "s"}, character_slug="mimi",
+                common={"stream_id": "s", "session_id": "ss", "trace_id": "t"},
+            )
+        config = self._invoked_config(agent)
+        assert config["recursion_limit"] == 25
+        assert config["metadata"] == {"stream_id": "s"}
+        assert len(config["callbacks"]) == 1
+
+    def test_endless_agent_stops_at_the_limit_and_falls_back(self, monkeypatch):
+        """本物の LangGraph を上限まで回す。フォールバックは元のキャラの provider と人格で呼ぶ。"""
+        import time
+
+        from lab_lounge.graph import _run_agent
+
+        monkeypatch.setenv("L2_AGENT_RECURSION_LIMIT", "5")
+        calls: list = []
+        fallback_result = LLMResult(
+            text="フォールバックの応答", model="gemini-x", input_tokens=0, output_tokens=0,
+            latency_ms=0, finish_reason="stop",
+        )
+        with patch("lab_lounge.graph.call_llm", return_value=fallback_result) as fallback:
+            result = _run_agent(
+                self._endless_graph(calls), "テスト", "gemini-x",
+                provider="google", system_prompt="PERSONA-FIXTURE",
+            )
+        assert len(calls) == 5
+        assert result.text == "フォールバックの応答"
+        kwargs = fallback.call_args.kwargs
+        assert (kwargs["provider"], kwargs["model"], kwargs["system_prompt"]) == ("google", "gemini-x", "PERSONA-FIXTURE")
+        # 裏のスレッドも止まっている (壁時計の打ち切りと違い、上限では呼び出しが続かない)
+        time.sleep(0.2)
+        assert len(calls) == 5
+
+    def test_broken_value_falls_back_instead_of_breaking_the_turn(self, monkeypatch):
+        """壊れた値は preflight --static が起動前に FAIL にする。起動してしまっても、ターンは単一ノードで続く。"""
+        from lab_lounge.graph import _run_agent
+
+        monkeypatch.setenv("L2_AGENT_RECURSION_LIMIT", "abc")
+        agent = MagicMock()
+        fallback_result = LLMResult(
+            text="単一ノードの応答", model="model-x", input_tokens=0, output_tokens=0,
+            latency_ms=0, finish_reason="stop",
+        )
+        with patch("lab_lounge.graph.call_llm", return_value=fallback_result):
+            result = _run_agent(agent, "テスト", "model-x")
+        assert result.text == "単一ノードの応答"
+        agent.invoke.assert_not_called()

@@ -706,6 +706,19 @@ def _get_agent_invoke_timeout() -> float:
     return float(os.environ.get("L2_AGENT_INVOKE_TIMEOUT_SEC", "90"))
 
 
+def _get_agent_recursion_limit() -> int:
+    """Agent 1 回の step 数の上限を env から取得する。既定 25。
+
+    WHY: create_agent の既定の上限は 9,999 で、応答が構造化出力の検証に落ち続けると、壁時計の打ち切り
+    (L2_AGENT_INVOKE_TIMEOUT_SEC) の後も裏のスレッドが API を呼び続ける (preflight の偽サーバで 764 step、
+    その間ずっと課金が続いた)。実測 (2026-11-14、logs/runs の 357 回) では、モデル呼び出しとツール呼び出しの
+    合計は最大 7 で、LangGraph の数え方では最大 8 前後なので、25 は約 3 倍の余裕になる。
+    超えると LangGraph が GraphRecursionError を送出し、_run_agent の except が単一ノードのフォールバックへ流す。
+    env (L2_AGENT_RECURSION_LIMIT) で調整可能。
+    """
+    return int(os.environ.get("L2_AGENT_RECURSION_LIMIT", "25"))
+
+
 def _invoke_agent_with_timeout(
     agent,
     input_data: dict,
@@ -726,9 +739,12 @@ def _invoke_agent_with_timeout(
 
     制約 / 設計判断:
       - Python はスレッドを強制 kill できないため、timeout 後も orphan thread は
-        裏で走り続ける。ただし各 LLM client に per-request timeout があるため、
-        その時間内に必ず自然終了する (= リークは有界)。dispatcher は 1 ターン
-        single-flight なので orphan が積み上がることはない。
+        裏で走り続け、Agent が自分で終わるまで LLM とツールを呼び続ける。止まるのは、
+        step 数が recursion_limit (_run_agent が config に入れる L2_AGENT_RECURSION_LIMIT、
+        既定 25) に達したときで、各 LLM 呼び出しには per-request timeout があるので、
+        orphan の寿命と課金は「残りの step 数 × per-request timeout」で頭打ちになる。
+        recursion_limit を渡さない呼び出し元では、create_agent の既定の 9,999 step まで
+        止まらない。dispatcher は 1 ターン single-flight なので orphan が積み上がることはない。
       - orphan の返り値は future 放棄で破棄される。発話 (TTS/再生) は _run_agent の
         戻り値駆動で下流が行うため、orphan が最終応答を二重発話することはない。
       - agent.invoke 全体の再実行はしない (ask_character の導入セリフ + target 発話を
@@ -833,6 +849,10 @@ def _run_agent(
     )
 
     try:
+        # step 数の上限 (_get_agent_recursion_limit を参照)。超えると GraphRecursionError で下の except が
+        # フォールバックへ流し、裏のスレッドもそこで止まる。try の中で読むのは、壊れた値でもターンを
+        # フォールバックで続けるため (preflight --static が起動前に FAIL で知らせる)。
+        config["recursion_limit"] = _get_agent_recursion_limit()
         # 外側の壁時計ガードで agent.invoke 全体を包む (= 非 HTTP 系ハングの最終防壁)。
         # timeout 時は TimeoutError を送出し、下の except がフォールバックへ流す。
         session_id = common.get("session_id") if common else None

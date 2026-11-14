@@ -823,7 +823,7 @@ class TestRunPaidWiring:
         return mocks, report
 
     def test_failed_agent_skips_its_pipeline(self, isolated, capture):
-        """_run_agent には recursion_limit がないので、壊れた応答で流すと壁時計まで待って課金が増える。"""
+        """壊れた応答で流すと、_run_agent の recursion_limit (既定 25) まで API を呼んでから落ちるので、課金が増える。"""
         os.environ["L2_ENABLE_TOOLS"] = "true"
         patches = self._patches()
         mocks = {name: p.start() for name, p in patches.items()}
@@ -2077,6 +2077,7 @@ class TestNumericEnvCoverage:
         ("L2_LLM_MAX_RETRIES", {}),
         ("L2_LLM_MAX_RETRIES", {**_RAW_LLM_OFF, "L2_USE_REAL_LLM": "true"}),
         ("L2_AGENT_INVOKE_TIMEOUT_SEC", {"L2_USE_REAL_LLM": "true", "L2_ENABLE_TOOLS": "true"}),
+        ("L2_AGENT_RECURSION_LIMIT", {"L2_USE_REAL_LLM": "true", "L2_ENABLE_TOOLS": "true"}),
         ("L2_C2_RETRIEVER_TOP_K", _C2_ON),
         ("L2_C2_RETRIEVER_BUDGET_MS", _C2_ON),
         ("L2_C2_RECENT_TOP_K", _C2_ON),
@@ -2117,6 +2118,8 @@ class TestNumericEnvCoverage:
         ("L2_LLM_MAX_RETRIES", _RAW_LLM_OFF),
         ("L2_AGENT_INVOKE_TIMEOUT_SEC", {"L2_USE_REAL_LLM": "true"}),  # ツールが無効
         ("L2_AGENT_INVOKE_TIMEOUT_SEC", {"L2_ENABLE_TOOLS": "true"}),  # ダミー LLM
+        ("L2_AGENT_RECURSION_LIMIT", {"L2_USE_REAL_LLM": "true"}),  # ツールが無効なら Agent を作らない
+        ("L2_AGENT_RECURSION_LIMIT", {"L2_ENABLE_TOOLS": "true"}),  # ダミー LLM
         ("L2_C2_RETRIEVER_TOP_K", {**_C2_ON, "L2_USE_C2_RETRIEVER": "false"}),
         ("L2_C2_RETRIEVER_BUDGET_MS", {**_C2_ON, "L2_ENABLE_RAG": "false"}),
         ("L2_C2_RECENT_TOP_K", {**_C2_ON, "L2_USE_C2_RETRIEVER": "1"}),  # graph.py は "true" だけを真と読む
