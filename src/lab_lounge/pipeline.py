@@ -23,6 +23,7 @@ pipeline.py — 開発用テキストパイプライン
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -212,21 +213,96 @@ def run_pipeline(
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
+
+    終わりに 1 行 "TURN SUMMARY ..." を INFO で出す (成功でも例外でも)。基準計測で、
+    1 ターンが何を呼び、何トークン、何秒かを grep 1 回で読むための行。実発話の全文は含めない
+    (件数・名前・時間だけ)。例外はそのまま呼び出し元へ再送出する。
     """
-    return _run_pipeline_graph(
-        text,
-        stream_id=stream_id,
-        session_id=session_id,
-        trace_id=trace_id,
-        utterance_meta=utterance_meta,
-        speaker_hint=speaker_hint,
-        on_tts_chunk_ready=on_tts_chunk_ready,
-        on_pose_ready=on_pose_ready,
-        stream_context=stream_context,
-        suppress_bubble_answering=suppress_bubble_answering,
-        disable_tools=disable_tools,
-        status_manager=status_manager,
-    )
+    from .graph import begin_turn_stats, end_turn_stats
+
+    stats, token = begin_turn_stats()
+    t0 = time.monotonic()
+    outcome = "ok"
+    speaker: str | None = None
+    try:
+        result = _run_pipeline_graph(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
+            stream_context=stream_context,
+            suppress_bubble_answering=suppress_bubble_answering,
+            disable_tools=disable_tools,
+            status_manager=status_manager,
+        )
+        speaker = result.speaker
+        return result
+    except BaseException as exc:
+        # BaseException: KeyboardInterrupt などで止まったターンも「何で終わったか」を残す。再送出する。
+        outcome = type(exc).__name__
+        raise
+    finally:
+        end_turn_stats(token)
+        try:
+            logger.info(
+                "%s", format_turn_summary(
+                    stats, speaker=speaker, trace_id=trace_id, outcome=outcome,
+                    total_ms=int((time.monotonic() - t0) * 1000),
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            # 集計の整形で配信のターンを落とさない (ログは補助の情報)。
+            pass
+
+
+def format_turn_summary(
+    stats: Any,
+    *,
+    speaker: str | None,
+    trace_id: str,
+    outcome: str,
+    total_ms: int,
+) -> str:
+    """TurnStats を、機械で読める 1 行 (key=value を空白で区切る) に整える。
+
+    WHY 1 行 key=value: 基準計測が正規表現 1 本で読めるようにするため。値に空白を入れない
+    (道具は ``名前:回数`` をカンマで並べ、無ければ ``-``)。tokens の形は step の行
+    (``tokens=in:X/out:Y``) と同じにして、読み手を 1 つで済ませる。
+
+    集計の範囲:
+      - steps / tokens / llm_ms は本応答のモデルの分。導入セリフなど道具の中の LLM は
+        aux (呼び出し数と tokens) に分ける。協働先の Agent の分は含めない (別スレッドで走る)。
+      - llm_ms は step の所要の合計。フォールバックと単一ノードは call_llm の所要を足す。
+
+    Args:
+        stats: graph.TurnStats
+        speaker: 結果の話者 (成功時)。例外のときは None で、集計に入っている話者を使う
+        trace_id: ターンのトレース ID (他のログと突き合わせる鍵)
+        outcome: "ok" または例外の型名
+        total_ms: run_pipeline 全体の所要 (ミリ秒)
+    """
+    tools = ",".join(f"{name}:{n}" for name, n in stats.tools.items()) or "-"
+    return " ".join([
+        "TURN SUMMARY",
+        f"trace={trace_id}",
+        f"speaker={speaker or stats.speaker or '?'}",
+        f"path={stats.path or '-'}",
+        f"source={stats.source or '-'}",
+        f"tools={tools}",
+        f"steps={stats.steps}",
+        f"tokens=in:{stats.input_tokens}/out:{stats.output_tokens}",
+        f"reasoning={stats.reasoning_tokens}",
+        f"cache_read={stats.cache_read_tokens}",
+        f"aux={stats.aux_calls}",
+        f"aux_tokens=in:{stats.aux_input_tokens}/out:{stats.aux_output_tokens}",
+        f"llm_ms={stats.llm_ms}",
+        f"total_ms={total_ms}",
+        f"result={outcome}",
+    ])
 
 
 def _run_pipeline_graph(
