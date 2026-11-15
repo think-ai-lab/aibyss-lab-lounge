@@ -194,12 +194,16 @@ class TestSensitiveLoggerSuppression:
         assert logging.getLogger("obsws_python.baseclient").level == logging.WARNING
         assert logging.getLogger("obsws_python.reqs").level == logging.WARNING
 
-    def test_httpx_logger_set_to_warning(self, tmp_path, monkeypatch):
-        """httpx の logger が WARNING 以上に抑制される (API URL 漏洩防止)。"""
+    @pytest.mark.parametrize("name", ["httpx", "httpcore", "httpx2", "httpcore2"])
+    def test_http_library_logger_set_to_warning(self, name, tmp_path, monkeypatch):
+        """HTTP ライブラリの logger が WARNING 以上に抑制される (API URL 漏洩防止)。
+
+        WHY httpx2 / httpcore2 も対象: openai 3.x / anthropic 2.x は httpx2 へ移る。
+        名前が違うので httpx の抑制は効かず、API の URL が INFO で流れてしまう。
+        """
         monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
-        setup_logging(session_name="test_httpx")
-        assert logging.getLogger("httpx").level == logging.WARNING
-        assert logging.getLogger("httpcore").level == logging.WARNING
+        setup_logging(session_name="test_http_lib")
+        assert logging.getLogger(name).level == logging.WARNING
 
 
 class TestEntryPointsWithoutSetupLogging:
