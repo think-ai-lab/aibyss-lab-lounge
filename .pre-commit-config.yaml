@@ -1,14 +1,20 @@
 # pre-commit hooks for OSS publication safety.
 #
-# WHY: 秘匿情報（API キー・トークン等）の混入を commit 段階で検出してブロックする。
-# Push protection (GitHub 側) と二段構えで防御する。
+# WHY: 秘匿情報（APIキー・トークン等）を commit 段階で検出して防ぐ。
+# Push protection (GitHub 側) が二重の防壁になる。
 #
 # セットアップ (clone 直後 / 初回):
 #   uv tool install pre-commit
 #   pre-commit install
 #
-# 手動全件スキャン:
-#   pre-commit run --all-files
+# 手動全件スキャン（全履歴）:
+#   pre-commit run --hook-stage manual gitleaks-history
+#   # 詳しく見るときは手で -v を付ける（検出の行が画面に出る点に注意）
+#
+# WHY: 下の通常の gitleaks hook は commit のときに staged だけを見る。
+#      そのため `pre-commit run --all-files` でも、staged が空なら 0 件を
+#      走査して「通ってしまう」。過去の commit まで見たいときは、上の
+#      全履歴の hook (gitleaks-history) を使う。
 #
 # 参考: https://pre-commit.com/ / https://github.com/gitleaks/gitleaks
 
@@ -16,4 +22,18 @@ repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.0
     hooks:
+      # commit のとき: staged の差分だけを見る（既定の hook）
       - id: gitleaks
+
+      # 手動: 全履歴を見る。
+      # WHY: 同じ repo / rev の hook を entry の上書きで使い回す。rev を上げると
+      #      pre-commit が gitleaks を取り直し、Go のビルド環境まで組み直すため、
+      #      rev は変えずにこの形にしている。
+      # WHY: --verbose を付けないのは、検出の行（秘匿値を含み得る）を画面に出さないため。
+      - id: gitleaks
+        alias: gitleaks-history
+        name: gitleaks (all history)
+        entry: gitleaks git --redact --log-opts=--all
+        stages: [manual]
+        pass_filenames: false
+        always_run: true
