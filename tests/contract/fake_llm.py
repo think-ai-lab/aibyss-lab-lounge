@@ -23,8 +23,11 @@ WHY 偽の HTTP サーバか（ほかの手では SDK の中身を通らない�
 
     - ``scene(provider, name, **params)``: そのプロバイダへの既定の応答を、名前で選ぶ。選べる名前は
       ``SCENES[provider]`` の鍵。何も選ばなければ "ok"
+    - "ok" は Agent の構造化に合わせて答える。要求の tools に応答の型（MimiResponse など）があればそれを呼び、
+      Gemini の構造化出力（responseJsonSchema）なら JSON の本文を返す。どちらでもなければ本文だけ（"text" と同じ）
     - ``script(model, [reply, ...])``: そのモデルへの応答を、呼ばれた順に並べる。使い切ったら scene に戻る。
-      reply は scene の名前（文字列）、``(名前, {params})`` の組、または ``Reply`` そのもの
+      reply は scene の名前（文字列）、``(名前, {params})`` の組、または ``Reply`` そのもの。
+      道具を呼ばせるときは ``("tool_call", {"name": "ask_character_tool", "args": {...}})``
     - ``requests`` / ``requests_for(provider, model)``: 記録した要求。鍵の値は残さない（ヘッダの名前だけ残す）
     - 公式の拒否の規則（``official_rejection``）は、場面と台本より先に見る。当たれば、場面に関わらず 400
 
@@ -40,6 +43,7 @@ OS にポートを選ばせるので、網の内側で動く。
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import threading
@@ -114,7 +118,7 @@ def _error_body(provider: str, status: int, message: str) -> dict[str, Any]:
     return {"error": {"code": status, "message": message, "status": "INVALID_ARGUMENT"}}
 
 
-def _anthropic_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
+def _anthropic_text(req: RecordedRequest, *, text: str = "ok") -> Reply:
     """Anthropic Messages API の、本文 1 つの正常な応答。"""
     return Reply(200, {
         "id": "msg_fake",
@@ -128,8 +132,8 @@ def _anthropic_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
     })
 
 
-def _openai_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
-    """OpenAI の正常な応答。Chat Completions と Responses の両方の道に答える。"""
+def _openai_text(req: RecordedRequest, *, text: str = "ok") -> Reply:
+    """OpenAI の、本文だけの正常な応答。Chat Completions と Responses の両方の道に答える。"""
     model = req.model or "gpt-fake"
     if req.route.endswith("/responses"):
         return Reply(200, {
@@ -175,7 +179,7 @@ def _openai_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
     })
 
 
-def _google_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
+def _google_text(req: RecordedRequest, *, text: str = "ok") -> Reply:
     """Gemini generateContent の、本文 1 つの正常な応答。"""
     return Reply(200, {
         "candidates": [{
@@ -198,7 +202,7 @@ def _anthropic_thinking_first(req: RecordedRequest, *, text: str = "ok") -> Repl
 
     extended thinking（や、既定で考えるモデル）の応答は、content の先頭が thinking になる。
     """
-    reply = _anthropic_ok(req, text=text)
+    reply = _anthropic_text(req, text=text)
     reply.body["content"] = [
         {"type": "thinking", "thinking": "考えています", "signature": "fake-signature"},
         {"type": "text", "text": text},
@@ -208,7 +212,7 @@ def _anthropic_thinking_first(req: RecordedRequest, *, text: str = "ok") -> Repl
 
 def _anthropic_thinking_only_max_tokens(req: RecordedRequest) -> Reply:
     """考えているうちに出力の上限に達し、本文のブロックが 1 つも無い応答を返す。"""
-    reply = _anthropic_ok(req)
+    reply = _anthropic_text(req)
     reply.body["content"] = [{"type": "thinking", "thinking": "考えて", "signature": "fake-signature"}]
     reply.body["stop_reason"] = "max_tokens"
     return reply
@@ -216,7 +220,7 @@ def _anthropic_thinking_only_max_tokens(req: RecordedRequest) -> Reply:
 
 def _anthropic_refusal(req: RecordedRequest) -> Reply:
     """安全上の理由で応答を拒み、content が空の応答を返す（stop_reason が refusal）。"""
-    reply = _anthropic_ok(req)
+    reply = _anthropic_text(req)
     reply.body["content"] = []
     reply.body["stop_reason"] = "refusal"
     return reply
@@ -224,7 +228,7 @@ def _anthropic_refusal(req: RecordedRequest) -> Reply:
 
 def _openai_empty_length(req: RecordedRequest) -> Reply:
     """推論で出力の上限を使い切り、本文が空のまま finish_reason が length の応答を返す。"""
-    reply = _openai_ok(req, text="")
+    reply = _openai_text(req, text="")
     if "choices" in reply.body:
         reply.body["choices"][0]["finish_reason"] = "length"
         reply.body["usage"]["completion_tokens_details"] = {"reasoning_tokens": _USAGE_OUT}
@@ -237,7 +241,7 @@ def _openai_empty_length(req: RecordedRequest) -> Reply:
 
 def _google_max_tokens_no_text(req: RecordedRequest) -> Reply:
     """考えているうちに出力の上限に達し、parts の無い候補を返す（finishReason が MAX_TOKENS）。"""
-    reply = _google_ok(req)
+    reply = _google_text(req)
     reply.body["candidates"] = [{"content": {"role": "model"}, "finishReason": "MAX_TOKENS", "index": 0}]
     reply.body["usageMetadata"]["thoughtsTokenCount"] = _USAGE_OUT
     return reply
@@ -252,21 +256,155 @@ def _http_error(provider: str) -> Callable[..., Reply]:
     return scene
 
 
+# ─── 道具の呼び出しと構造化の応答 ───────────────────────────────
+#
+# Agent（langchain の create_agent）は、応答の型（MimiResponse など）を 2 通りで強制する。
+#   - ToolStrategy: 型を「道具」として tools に足し、tool_choice で必ずどれかを呼ばせる（OpenAI、Anthropic）
+#   - ProviderStrategy: 型の JSON Schema を API の構造化出力に渡す（Gemini の responseJsonSchema）
+# 既定の "ok" は、要求にどちらかがあれば、その JSON Schema から妥当な値を作って返す。無ければ本文だけを返す。
+# WHY: テストが台本を書かなくても、Agent が 1 往復で構造化の応答に着く。
+
+# 構造化の型の道具の名前（graph._get_character_response_schema が作る <Slug>Response）。
+_STRUCTURED_TOOL = re.compile(r"^[A-Z][A-Za-z0-9]*Response$")
+
+
+def example_from_schema(schema: dict[str, Any], *, text: str) -> Any:
+    """JSON Schema から、妥当な値を 1 つ作る。
+
+    既定値があればそれを使い、無ければ型から作る。文字列は text にする（"response" を確かめられるように）。
+    $ref と anyOf は扱わない（今の応答の型には出てこない）。
+    """
+    if "default" in schema:
+        return schema["default"]
+    kind = str(schema.get("type", "string")).lower()
+    if kind == "object":
+        return {name: example_from_schema(sub, text=text) for name, sub in schema.get("properties", {}).items()}
+    if kind == "integer":
+        return int(schema.get("minimum", 0))
+    if kind == "number":
+        return float(schema.get("minimum", 0))
+    if kind == "boolean":
+        return False
+    if kind == "array":
+        return []
+    return text
+
+
+def tool_schemas(req: RecordedRequest) -> dict[str, dict[str, Any]]:
+    """要求の tools を、名前 → 引数の JSON Schema の辞書にして返す（3 社の形を読む）。"""
+    found: dict[str, dict[str, Any]] = {}
+    for tool in req.body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if "function" in tool:  # OpenAI Chat Completions
+            found[tool["function"].get("name", "")] = tool["function"].get("parameters") or {}
+        elif "input_schema" in tool:  # Anthropic
+            found[tool.get("name", "")] = tool["input_schema"]
+        elif tool.get("type") == "function" and "name" in tool:  # OpenAI Responses
+            found[tool["name"]] = tool.get("parameters") or {}
+        for decl in tool.get("functionDeclarations") or []:  # Gemini
+            found[decl.get("name", "")] = decl.get("parameters") or decl.get("parametersJsonSchema") or {}
+    return found
+
+
+def structured_tool_name(req: RecordedRequest) -> str | None:
+    """要求の tools に構造化の型の道具（ToolStrategy）があれば、その名前を返す。"""
+    return next((name for name in tool_schemas(req) if _STRUCTURED_TOOL.match(name)), None)
+
+
+def google_response_schema(req: RecordedRequest) -> dict[str, Any] | None:
+    """Gemini の要求が構造化出力（ProviderStrategy）なら、その JSON Schema を返す。"""
+    config = req.body.get("generationConfig") or {}
+    if config.get("responseMimeType") != "application/json":
+        return None
+    return config.get("responseJsonSchema") or config.get("responseSchema") or {}
+
+
+# 道具の呼び出しの ID。会話の中で重ならないように、プロセスで 1 つずつ増やす。
+_call_ids = itertools.count(1)
+
+
+def _tool_call(provider: str, req: RecordedRequest, name: str, args: dict[str, Any]) -> Reply:
+    """道具 name を引数 args で呼ぶ応答を、そのプロバイダの形で返す。"""
+    call_id = next(_call_ids)
+    arguments = json.dumps(args, ensure_ascii=False)
+    if provider == "anthropic":
+        reply = _anthropic_text(req)
+        reply.body["content"] = [{"type": "tool_use", "id": f"toolu_fake_{call_id}", "name": name, "input": args}]
+        reply.body["stop_reason"] = "tool_use"
+        return reply
+    if provider == "openai":
+        reply = _openai_text(req)
+        if req.route.endswith("/responses"):
+            reply.body["output"] = [{
+                "type": "function_call", "id": f"fc_fake_{call_id}", "call_id": f"call_fake_{call_id}",
+                "name": name, "arguments": arguments, "status": "completed",
+            }]
+            return reply
+        choice = reply.body["choices"][0]
+        choice["message"] = {
+            "role": "assistant",
+            "content": None,
+            "refusal": None,
+            "tool_calls": [{
+                "id": f"call_fake_{call_id}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }],
+        }
+        choice["finish_reason"] = "tool_calls"
+        return reply
+    reply = _google_text(req)
+    reply.body["candidates"][0]["content"]["parts"] = [{"functionCall": {"name": name, "args": args}}]
+    return reply
+
+
+def _scene_tool_call(provider: str) -> Callable[..., Reply]:
+    """道具を呼ぶ場面を作る。台本では ("tool_call", {"name": ..., "args": {...}}) の形で使う。"""
+
+    def scene(req: RecordedRequest, *, name: str, args: dict[str, Any]) -> Reply:
+        return _tool_call(provider, req, name, args)
+
+    return scene
+
+
+def _scene_ok(provider: str) -> Callable[..., Reply]:
+    """既定の正常な応答の場面を作る。構造化の要求には構造化で、ほかは本文で答える。"""
+    text_reply = {"anthropic": _anthropic_text, "openai": _openai_text, "google": _google_text}[provider]
+
+    def scene(req: RecordedRequest, *, text: str = "ok") -> Reply:
+        name = structured_tool_name(req)
+        if name is not None:
+            return _tool_call(provider, req, name, example_from_schema(tool_schemas(req)[name], text=text))
+        schema = google_response_schema(req) if provider == "google" else None
+        if schema is not None:
+            return text_reply(req, text=json.dumps(example_from_schema(schema, text=text), ensure_ascii=False))
+        return text_reply(req, text=text)
+
+    return scene
+
+
 SCENES: dict[str, dict[str, Callable[..., Reply]]] = {
     "anthropic": {
-        "ok": _anthropic_ok,
+        "ok": _scene_ok("anthropic"),
+        "text": _anthropic_text,
+        "tool_call": _scene_tool_call("anthropic"),
         "thinking_first": _anthropic_thinking_first,
         "thinking_only_max_tokens": _anthropic_thinking_only_max_tokens,
         "refusal": _anthropic_refusal,
         "http_error": _http_error("anthropic"),
     },
     "openai": {
-        "ok": _openai_ok,
+        "ok": _scene_ok("openai"),
+        "text": _openai_text,
+        "tool_call": _scene_tool_call("openai"),
         "empty_length": _openai_empty_length,
         "http_error": _http_error("openai"),
     },
     "google": {
-        "ok": _google_ok,
+        "ok": _scene_ok("google"),
+        "text": _google_text,
+        "tool_call": _scene_tool_call("google"),
         "max_tokens_no_text": _google_max_tokens_no_text,
         "http_error": _http_error("google"),
     },
@@ -352,7 +490,10 @@ class FakeLLMServer:
         self._server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
         self.openai_base_url = f"{self.url}/v1"
-        self._thread = threading.Thread(target=self._server.serve_forever, name="fake-llm", daemon=True)
+        # WHY poll_interval: shutdown() は次の見回りまで待つ。既定の 0.5 秒だと、テスト 1 件ごとに 0.5 秒の待ちが積もる。
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.02}, name="fake-llm", daemon=True,
+        )
         self._thread.start()
 
     # ── テストが使う口 ──
