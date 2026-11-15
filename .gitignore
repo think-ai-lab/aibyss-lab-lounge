@@ -222,6 +222,8 @@ data/audio/*.wav
 # 各自 `uv run python scripts/generate_filler_cache.py` で再生成する (data/filler_phrases/*.txt から)。
 data/filler_cache/**/*.wav
 output.wav
+# smoke-real-e2e.ps1 が生成するサンプル
+samples/smoke_test.wav
 
 # stream context
 # 配信文脈は個人メモ・配信外で得た情報を含みうるため、実ファイルは丸ごと git 外。
@@ -232,8 +234,13 @@ data/stream_context/*.md
 !data/stream_context/current.example.md
 
 # 実発話を含むローカルデータ
-# 判定ログ、リプレイセット、計測結果は配信外の発話を含みうるので、公開リポジトリへ入れない。
+# 判定ログ、リプレイセット、計測結果、点検の問題ログ、合成音声は配信外の発話を含みうるので、公開リポジトリへ入れない。
+# logs/ 直下の debug.py の書き出し（llm_prompt.txt / llm_response.txt / retrieval.json / stt_output.json）も、
+# 実発話・実プロンプトを含みうるため追跡しない。書き出し時に L2 がディレクトリを作るので .gitkeep は不要。
+/logs/
 logs/decisions/
+logs/preflight/
+data/audio/*.mp3
 data/replay/
 data/probe/
 # 一時作業ディレクトリ

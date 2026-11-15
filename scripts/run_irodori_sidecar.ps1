@@ -14,6 +14,7 @@
 # 【使い方】
 #   .\scripts\run_irodori_sidecar.ps1                       # vd を 18080 で起動
 #   .\scripts\run_irodori_sidecar.ps1 -Port 50081 -Models vd
+#   .\scripts\run_irodori_sidecar.ps1 -AllowDownload        # 初回だけ。weights を取得する
 #
 # 【環境変数による上書き (任意)】
 #   L2_IRODORI_REPO     : irodori リポのパス (既定 T:\irodori-tts\Irodori-TTS)
@@ -24,7 +25,8 @@
 
 param(
     [int]$Port = 18080,
-    [string]$Models = "vd"
+    [string]$Models = "vd",
+    [switch]$AllowDownload
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +55,9 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 # irodori_server.py が irodori_tts を import するためのパス + weights キャッシュ。
 $env:HF_HOME = $HfHome
 $env:L2_IRODORI_REPO = $IrodoriRepo
+# WHY: weights の revision を固定していないので、起動時に上流の更新を無言で取り込むと調整済みの声が
+#      変わる。既定では取得済みの weights だけを使い、取得するときは -AllowDownload で明示する。
+$env:HF_HUB_OFFLINE = if ($AllowDownload) { "0" } else { "1" }
 
 Write-Host ""
 Write-Host "════════════════════════════════════════════════════════════" -ForegroundColor Cyan
@@ -62,6 +67,7 @@ Write-Host "  irodori repo : $IrodoriRepo"
 Write-Host "  HF_HOME      : $HfHome"
 Write-Host "  port         : $Port"
 Write-Host "  models       : $Models"
+Write-Host "  weights 取得 : $(if ($AllowDownload) { '許可' } else { 'しない（取得済みのみ）' })"
 Write-Host ""
 Write-Host "  モデルロードに数十秒かかります。'起動完了' ログが出るまでお待ちください。" -ForegroundColor Yellow
 Write-Host ""

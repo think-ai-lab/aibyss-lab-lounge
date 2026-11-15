@@ -70,6 +70,8 @@ logger = logging.getLogger(__name__)
 
 _FILLER_PHRASES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_phrases"
 _FILLER_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "filler_cache"
+# その場で LLM に作らせたフィラーを合成した WAV の置き場所。
+_FILLER_AUDIO_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
 
 _VALID_SECTIONS = {"opener", "continue", "bridge", "closer", "handraise"}
 # "handraise" は Phase 0.5-A で追加。挙手 (interjection_candidate) 検知時に
@@ -687,7 +689,7 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
             filler_pose[0] = _pose
             logger.info("フィラー continue (LLM): [%s] %r", slug, filler_text)
             try:
-                out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
+                out_dir = _FILLER_AUDIO_DIR
                 out_dir.mkdir(parents=True, exist_ok=True)
                 tts_result = synthesize(
                     filler_text,
@@ -811,7 +813,7 @@ def run_filler_loop(slug: str, stop_event: threading.Event, *, user_text: str = 
                 slug, additional_filler_text[:60],
             )
             try:
-                out_dir = Path(__file__).resolve().parent.parent.parent / "data" / "audio"
+                out_dir = _FILLER_AUDIO_DIR
                 out_dir.mkdir(parents=True, exist_ok=True)
                 tts_result = synthesize(
                     additional_filler_text,

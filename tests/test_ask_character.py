@@ -4,14 +4,20 @@ test_ask_character.py — ask_character MCP サーバーのユニットテスト
 Phase 3: AITuber 掛け合い
 """
 
+import logging
+import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from lab_lounge.characters import get_character
 from lab_lounge.mcp_servers.ask_character import (
     _ask_character_impl,
     reset_ask_character_context,
     set_ask_character_context,
+    wait_bg_tts_complete,
 )
 
 
@@ -238,6 +244,170 @@ class TestAskCharacterImpl:
 
         call_kwargs = mock_collab.call_args.kwargs
         assert call_kwargs["model"] == "gpt-5.4-nano"
+
+
+# ─── 協働先から応答を得られなかったとき ─────────────────────────────
+
+
+_COLLAB = "lab_lounge.mcp_servers.ask_character._run_collaboration_agent"
+
+
+class TestCollaborationFailure:
+    """協働先の失敗、空の応答、時間切れでは、協働先の声も吹き出しも状態の更新も出さない。
+
+    旧実装は「エラー: ...」を協働先の TTS へ渡して読み上げていた (2026-11-01 の実 API の点検で再現:
+    provider=openai のまま gemini のモデル名を送って 404)。
+    """
+
+    _COMMON = {"stream_id": "s1", "session_id": "ss-collab-fail", "trace_id": "t1"}
+
+    @pytest.fixture()
+    def stage(self, monkeypatch, mock_bridge_filler_path):
+        """本物の TTS の経路を有効にし、協働先 (chisame) が話そうとしたら分かるようにする。"""
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+        chunks = MagicMock()
+        status = MagicMock()
+        set_ask_character_context(
+            on_tts_chunk=chunks,
+            tts_output_dir="/tmp/audio",
+            caller_slug="mimi",
+            common=dict(self._COMMON),
+            status_manager=status,
+        )
+        with patch("lab_lounge.tts.synthesize") as synthesize, \
+                patch("lab_lounge.pipeline._publish_bubble") as bubble, \
+                patch("lab_lounge.mcp_servers.ask_character._generate_intro",
+                      return_value="ちさめ、深海の話を聞かせてちょうだい"):
+            yield SimpleNamespace(chunks=chunks, status=status, synthesize=synthesize, bubble=bubble)
+
+    @staticmethod
+    def _assert_target_silent(stage) -> None:
+        """協働先の TTS、再生キュー (bridge filler を含む)、吹き出し、状態の更新が 1 つもない。"""
+        assert [c for c in stage.synthesize.call_args_list if c.kwargs.get("speaker") == "chisame"] == []
+        assert [c for c in stage.chunks.call_args_list if c.args[3] == "chisame"] == []
+        assert [c for c in stage.bubble.call_args_list if c.args[1] == "chisame"] == []
+        assert [c for c in stage.status.set_status.call_args_list if c.args[0] == "chisame"] == []
+
+    @staticmethod
+    def _no_response() -> str:
+        return f"{get_character('chisame').display_name}から応答を得られませんでした"
+
+    def test_error_is_not_spoken(self, stage):
+        error = RuntimeError("Error code: 404 - model gemini-3.1-pro-preview not found")
+        with patch(_COLLAB, side_effect=error):
+            result = _ask_character_impl("chisame", "深海で一番好きな生き物は？")
+        assert result == self._no_response()
+        self._assert_target_silent(stage)
+        # 導入セリフ (caller の声) は失敗が分かる前に流れている。相手に振ったこと自体は事実
+        assert [c.kwargs.get("speaker") for c in stage.synthesize.call_args_list] == ["mimi"]
+
+    @pytest.mark.parametrize("response", [
+        "",
+        "   \n",
+        '{"response": "", "emotion": {"happy": 0}, "speed": 100, "pose": "neutral"}',
+        '```json\n{"response": "  ", "pose": "neutral"}\n```',
+        # str(None) で "None" になり、「None」と読み上げてしまう (査読で見つかった)
+        '{"response": null, "pose": "neutral"}',
+    ], ids=["empty", "blank", "empty-json-response", "blank-fenced-json", "null-json-response"])
+    def test_blank_response_is_not_spoken(self, stage, response):
+        with patch(_COLLAB, return_value=response):
+            result = _ask_character_impl("chisame", "質問")
+        assert result == self._no_response()
+        self._assert_target_silent(stage)
+
+    def test_timeout_is_not_spoken(self, stage, monkeypatch):
+        """120 秒の待ちが切れたら話さない。後から終わっても、戻り値を読む人がいないので声にならない。"""
+        monkeypatch.setattr("lab_lounge.mcp_servers.ask_character._COLLAB_JOIN_TIMEOUT_SEC", 0.2)
+        release = threading.Event()
+        finished = threading.Event()
+
+        def stuck(**_kwargs):
+            release.wait(timeout=10)
+            finished.set()
+            return '{"response": "遅れて届いた応答", "pose": "neutral"}'
+
+        try:
+            with patch(_COLLAB, side_effect=stuck):
+                started = time.monotonic()
+                result = _ask_character_impl("chisame", "質問")
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+        assert finished.wait(timeout=5)
+        assert result == self._no_response()
+        assert elapsed < 5
+        self._assert_target_silent(stage)
+
+    def test_failure_is_logged_with_the_wording_preflight_reads(self, stage, caplog):
+        with caplog.at_level(logging.ERROR, logger="lab_lounge.mcp_servers.ask_character"):
+            with patch(_COLLAB, side_effect=RuntimeError("boom")):
+                _ask_character_impl("chisame", "質問")
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert "ask_character 協働先 Agent 失敗: [target=chisame] RuntimeError: boom" in errors
+
+    def test_previous_target_is_still_recorded(self, stage):
+        """導入セリフで相手の名前を出したことは事実なので、次の呼び出しの「直前の相手」は更新する。"""
+        from lab_lounge.mcp_servers.ask_character import _ask_state_lock, _previous_targets
+
+        with patch(_COLLAB, side_effect=RuntimeError("boom")):
+            _ask_character_impl("chisame", "質問")
+        with _ask_state_lock:
+            assert _previous_targets[self._COMMON["session_id"]] == get_character("chisame").display_name
+
+    def test_answer_is_still_spoken(self, stage):
+        """対照: 応答があれば今までどおり協働先が話す (上のテストが何も見ていないのではないことの確かめ)。"""
+        answer = '{"response": "ダイオウイカですね", "emotion": {"happy": 50}, "speed": 100, "pose": "neutral"}'
+        with patch(_COLLAB, return_value=answer):
+            result = _ask_character_impl("chisame", "質問")
+            wait_bg_tts_complete(self._COMMON["session_id"], timeout=5)
+        assert "ダイオウイカですね" in result
+        assert any(c.kwargs.get("speaker") == "chisame" for c in stage.synthesize.call_args_list)
+        assert any(c.args[1] == "chisame" for c in stage.bubble.call_args_list)
+        assert any(c.args[3] == "chisame" for c in stage.chunks.call_args_list)
+
+
+class TestCollaborationAgentArguments:
+    """協働先の _run_agent に provider と人格を渡す。Agent が失敗したときのフォールバックが使う。"""
+
+    _KWARGS = dict(
+        question="質問", model="gemini-3.1-pro-preview", provider="google",
+        combined_prompt="PERSONA-FIXTURE", character_slug="chisame",
+        common={"stream_id": "s", "session_id": "ss", "trace_id": "t"},
+    )
+
+    @pytest.fixture()
+    def agent_parts(self):
+        """ツールの読み込み、LLM、Agent の構築を身代わりにする。_run_agent は本物を通す。"""
+        tool = MagicMock()
+        tool.name = "web_search_tool"
+        with patch("lab_lounge.graph._load_mcp_tools", return_value=[tool]), \
+                patch("lab_lounge.graph._get_llm_for_agent", return_value=MagicMock()), \
+                patch("langgraph.prebuilt.create_react_agent", return_value=MagicMock()):
+            yield
+
+    def test_provider_and_prompt_reach_run_agent(self, agent_parts):
+        from lab_lounge.mcp_servers.ask_character import _run_collaboration_agent
+
+        with patch("lab_lounge.graph._run_agent", return_value=MagicMock(text="応答")) as run_agent:
+            assert _run_collaboration_agent(**self._KWARGS) == "応答"
+        kwargs = run_agent.call_args.kwargs
+        assert kwargs["provider"] == "google"
+        assert kwargs["system_prompt"] == "PERSONA-FIXTURE"
+
+    def test_fallback_uses_the_targets_provider_and_prompt(self, agent_parts):
+        """実 API の点検で再現した形: Agent が落ちたとき、フォールバックが協働先の provider と人格で呼ぶ。
+
+        旧実装は provider=openai (既定) と人格なしで、gemini のモデル名を OpenAI へ送って 404 になっていた。
+        """
+        from lab_lounge.mcp_servers.ask_character import _run_collaboration_agent
+
+        with patch("lab_lounge.graph._invoke_agent_with_timeout", side_effect=TimeoutError("agent.invoke が 90s を超過")), \
+                patch("lab_lounge.graph.call_llm", return_value=MagicMock(text="フォールバックの応答")) as fallback:
+            assert _run_collaboration_agent(**self._KWARGS) == "フォールバックの応答"
+        kwargs = fallback.call_args.kwargs
+        assert (kwargs["provider"], kwargs["model"], kwargs["system_prompt"]) == (
+            "google", "gemini-3.1-pro-preview", "PERSONA-FIXTURE",
+        )
 
 
 # ─── Phase 0.5-B-β-1 commit 4: target キャラのステータス反映 ────────────

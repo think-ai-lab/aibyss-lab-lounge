@@ -67,16 +67,29 @@ class TestLoadStreamContext:
     def test_default_path_when_no_arg_no_env(
         self, tmp_path: Path, monkeypatch
     ):
-        """引数も環境変数もない場合はデフォルトパス (リポ内 data/) を見にいく。
+        """引数も環境変数もない場合はデフォルトパスを読む。
 
-        テスト環境ではデフォルトパスのファイルがない前提なので None が返る。
-        L2_STREAM_CONTEXT_FILE が設定されていない (= 開発環境で誰かが設定済み
-        の可能性) にも対応するため、明示的に delenv する。
+        WHY: 実物の current.md は git に入らない手元の配信メモなので、テストからは読まない。
+             既定のパスを一時ファイルへ差し替えて、読む順序だけを確かめる。
         """
+        default = tmp_path / "current.md"
+        default.write_text("既定の配信文脈", encoding="utf-8")
+        monkeypatch.setattr("lab_lounge.stream_context._DEFAULT_PATH", default)
         monkeypatch.delenv("L2_STREAM_CONTEXT_FILE", raising=False)
-        # デフォルトパスは <repo_root>/data/stream_context/current.md。
-        # 通常テスト時には存在しない (current.example.md のみ commit) ので None。
-        # ただし開発者が手元に current.md を置いている可能性があるため、
-        # ここでは「型と非例外」のみ検証する弱い保証に留める。
-        result = load_stream_context()
-        assert result is None or isinstance(result, str)
+        assert load_stream_context() == "既定の配信文脈"
+
+    def test_returns_none_when_default_path_missing(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """デフォルトパスにファイルがなければ None (新しい clone の状態)。"""
+        monkeypatch.setattr(
+            "lab_lounge.stream_context._DEFAULT_PATH", tmp_path / "current.md"
+        )
+        monkeypatch.delenv("L2_STREAM_CONTEXT_FILE", raising=False)
+        assert load_stream_context() is None
+
+    def test_default_path_points_at_the_documented_place(self):
+        """README が案内する場所から動いていないこと (中身は読まない)。"""
+        from lab_lounge.stream_context import _DEFAULT_PATH
+
+        assert _DEFAULT_PATH.parts[-3:] == ("data", "stream_context", "current.md")

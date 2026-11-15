@@ -2,16 +2,22 @@
 test_bus.py — bus.publish テスト
 
 redis.from_url をモックして実際の Redis 接続なしで検証する。
+Redis に届かないときの上限は、OS が割り当てる範囲の閉じたポートへ本物のクライアントで接続して測る。
 """
 
 import json
 import logging
+import socket
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import redis
+from redis.retry import Retry
 
 import lab_lounge.bus as bus_mod
-from lab_lounge.bus import _summarize_event, publish
+import lab_lounge.pipeline as pipeline_mod
+from lab_lounge.bus import BusUnavailableError, _summarize_event, publish, publish_best_effort
 
 SAMPLE_EVENT = {
     "ver": "0.1",
@@ -297,3 +303,237 @@ class TestSummarizeEvent:
         s = _summarize_event(ev)
         assert "character=?" in s
         assert "status=?->?" in s
+
+
+# ─── Redis に届かないときの上限、失敗の後の待ち、fail-open ─────────────
+
+
+def _closed_port() -> int:
+    """何も待ち受けていない loopback のポートを返す。
+
+    OS に割り当てさせたポートをすぐ閉じる。conftest は OS が割り当てる範囲のポートへの接続を通すので、
+    本物の接続の失敗 (Windows では拒否まで約 2 秒) をそのまま測れる。実サービスのポートには触れない。
+    """
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture()
+def fail_open_default(monkeypatch):
+    """本番の既定 (L2_BUS_FAIL_OPEN 未設定 = 真) に戻す。conftest はモックの漏れを赤くするため false にしている。"""
+    monkeypatch.delenv("L2_BUS_FAIL_OPEN", raising=False)
+
+
+@pytest.fixture()
+def unreachable_redis():
+    """XADD が接続の失敗になる Redis。from_url のモックを返し、接続を試した回数を数えられる。"""
+    client = MagicMock()
+    client.xadd.side_effect = redis.ConnectionError("Error 10061 connecting to 127.0.0.1:6379.")
+    with patch.object(bus_mod.redis, "from_url", return_value=client) as from_url:
+        yield from_url
+
+
+class TestConnectionLimits:
+    """接続と応答に上限を置き、再試行しない。"""
+
+    def test_closed_port_fails_within_one_second(self, monkeypatch):
+        """旧コードは閉じたポートで毎回約 2.05 秒待ってから ConnectionError になった (Windows、redis-py 7.3.0)。
+
+        Windows は接続の上限 (0.5 秒) で TimeoutError、即座に拒否する OS では ConnectionError になる。
+        """
+        monkeypatch.setenv("REDIS_URL", f"redis://127.0.0.1:{_closed_port()}")
+        started = time.monotonic()
+        with pytest.raises((redis.ConnectionError, redis.TimeoutError)):
+            publish(SAMPLE_EVENT)
+        assert time.monotonic() - started < 1.0
+
+    def test_connection_arguments_are_explicit(self, mock_redis_client):
+        """既定に任せない引数。protocol は戻りの形、retry は待ちの積み上がりと二重の XADD に効く。"""
+        publish(SAMPLE_EVENT)
+        kwargs = bus_mod.redis.from_url.call_args.kwargs
+        assert kwargs["decode_responses"] is False
+        assert kwargs["protocol"] == 2
+        assert kwargs["socket_connect_timeout"] == 0.5
+        assert kwargs["socket_timeout"] == 1.0
+        assert isinstance(kwargs["retry"], Retry)
+        assert kwargs["retry"].get_retries() == 0
+
+    def test_limits_follow_the_env(self, mock_redis_client, monkeypatch):
+        monkeypatch.setenv("L2_BUS_CONNECT_TIMEOUT_SEC", "0.25")
+        monkeypatch.setenv("L2_BUS_SOCKET_TIMEOUT_SEC", "0.75")
+        publish(SAMPLE_EVENT)
+        kwargs = bus_mod.redis.from_url.call_args.kwargs
+        assert kwargs["socket_connect_timeout"] == 0.25
+        assert kwargs["socket_timeout"] == 0.75
+
+    def test_client_is_closed_even_when_xadd_fails(self, unreachable_redis):
+        with pytest.raises(redis.ConnectionError):
+            publish(SAMPLE_EVENT)
+        unreachable_redis.return_value.close.assert_called_once()
+
+
+class TestBackoffAfterFailure:
+    """Redis に届かなかった後 L2_BUS_RETRY_AFTER_SEC 秒は、接続を試さずにすぐ諦める。"""
+
+    def test_does_not_connect_right_after_a_failure(self, unreachable_redis):
+        with pytest.raises(redis.ConnectionError):
+            publish(SAMPLE_EVENT)
+        started = time.monotonic()
+        with pytest.raises(BusUnavailableError, match="L2_BUS_RETRY_AFTER_SEC"):
+            publish(SAMPLE_EVENT)
+        assert time.monotonic() - started < 0.1
+        assert unreachable_redis.call_count == 1
+
+    def test_backoff_error_is_a_connection_error(self):
+        """呼び出し側の既存の except (Exception や redis.ConnectionError) が、今までどおり受けられる。"""
+        assert issubclass(BusUnavailableError, redis.ConnectionError)
+
+    def test_timeout_also_starts_the_wait(self):
+        client = MagicMock()
+        client.xadd.side_effect = redis.TimeoutError("Timeout reading from socket")
+        with patch.object(bus_mod.redis, "from_url", return_value=client) as from_url:
+            with pytest.raises(redis.TimeoutError):
+                publish(SAMPLE_EVENT)
+            with pytest.raises(BusUnavailableError):
+                publish(SAMPLE_EVENT)
+        assert from_url.call_count == 1
+
+    def test_connects_again_after_the_wait(self, unreachable_redis, monkeypatch):
+        monkeypatch.setenv("L2_BUS_RETRY_AFTER_SEC", "0.2")
+        with pytest.raises(redis.ConnectionError):
+            publish(SAMPLE_EVENT)
+        time.sleep(0.3)
+        with pytest.raises(redis.ConnectionError) as raised:
+            publish(SAMPLE_EVENT)
+        assert not isinstance(raised.value, BusUnavailableError)
+        assert unreachable_redis.call_count == 2
+
+    def test_zero_turns_the_wait_off(self, unreachable_redis, monkeypatch):
+        monkeypatch.setenv("L2_BUS_RETRY_AFTER_SEC", "0")
+        for _ in range(3):
+            with pytest.raises(redis.ConnectionError) as raised:
+                publish(SAMPLE_EVENT)
+            assert not isinstance(raised.value, BusUnavailableError)
+        assert unreachable_redis.call_count == 3
+
+    def test_success_after_the_wait_publishes_normally(self, monkeypatch):
+        """Redis が戻れば、次の publish から届く。"""
+        monkeypatch.setenv("L2_BUS_RETRY_AFTER_SEC", "0.2")
+        client = MagicMock()
+        client.xadd.side_effect = [redis.ConnectionError("down"), b"1-0", b"2-0"]
+        with patch.object(bus_mod.redis, "from_url", return_value=client):
+            with pytest.raises(redis.ConnectionError):
+                publish(SAMPLE_EVENT)
+            time.sleep(0.3)
+            assert publish(SAMPLE_EVENT) == "1-0"
+            assert publish(SAMPLE_EVENT) == "2-0"
+
+    def test_rejected_command_does_not_start_the_wait(self):
+        """応答のエラーはすぐ返るので、次の publish を止める理由がない。"""
+        client = MagicMock()
+        client.xadd.side_effect = redis.ResponseError("OOM command not allowed when used memory > 'maxmemory'.")
+        with patch.object(bus_mod.redis, "from_url", return_value=client) as from_url:
+            for _ in range(2):
+                with pytest.raises(redis.ResponseError):
+                    publish(SAMPLE_EVENT)
+        assert from_url.call_count == 2
+
+
+class TestPublishBestEffort:
+    """本流の event の publish。Redis の障害では、既定でターンを止めない。"""
+
+    def test_returns_msg_id_on_success(self, mock_redis_client):
+        assert publish_best_effort(SAMPLE_EVENT) == "1741000000000-0"
+
+    def test_fail_open_by_default(self, fail_open_default, unreachable_redis, caplog):
+        with caplog.at_level(logging.ERROR, logger="lab_lounge.bus"):
+            assert publish_best_effort(SAMPLE_EVENT) is None
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert "type=utterance.final" in message
+        assert SAMPLE_EVENT["event_id"] in message
+        assert "ConnectionError" in message
+        # 発話の本文はエラーのログに出さない (成功のログの要約だけが先頭を出す)
+        assert "テスト" not in message
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "TRUE"])
+    def test_truthy_values_fail_open(self, unreachable_redis, monkeypatch, value):
+        monkeypatch.setenv("L2_BUS_FAIL_OPEN", value)
+        assert publish_best_effort(SAMPLE_EVENT) is None
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", ""])
+    def test_fail_closed_raises(self, unreachable_redis, monkeypatch, value):
+        """false で以前の挙動 (例外でターンを止める) に戻す。空も、他の既定が真のフラグと同じく偽。"""
+        monkeypatch.setenv("L2_BUS_FAIL_OPEN", value)
+        with pytest.raises(redis.ConnectionError):
+            publish_best_effort(SAMPLE_EVENT)
+
+    def test_backoff_is_swallowed_too(self, fail_open_default, unreachable_redis):
+        assert publish_best_effort(SAMPLE_EVENT) is None
+        assert publish_best_effort(SAMPLE_EVENT) is None
+        assert unreachable_redis.call_count == 1
+
+    def test_rejected_command_is_swallowed(self, fail_open_default):
+        client = MagicMock()
+        client.xadd.side_effect = redis.ResponseError("MISCONF Redis is configured to save RDB snapshots")
+        with patch.object(bus_mod.redis, "from_url", return_value=client):
+            assert publish_best_effort(SAMPLE_EVENT) is None
+
+    def test_code_errors_are_not_swallowed(self, fail_open_default, mock_redis_client):
+        """JSON にできない event はコードの誤り。Redis の障害の ERROR ログに紛れさせない。"""
+        broken = {**SAMPLE_EVENT, "payload": {"text": object()}}
+        with pytest.raises(TypeError):
+            publish_best_effort(broken)
+
+    def test_closed_port_costs_one_wait_per_window(self, fail_open_default, monkeypatch):
+        """本物のクライアントで: 1 回目だけ接続の上限まで待ち、続く publish は接続を試さずに済む。"""
+        monkeypatch.setenv("REDIS_URL", f"redis://127.0.0.1:{_closed_port()}")
+        started = time.monotonic()
+        for _ in range(3):
+            assert publish_best_effort(SAMPLE_EVENT) is None
+        assert time.monotonic() - started < 1.0
+
+
+class TestTurnContinuesWithoutRedis:
+    """Redis が落ちていても、1 ターンが TTS の合成まで進む (声は止まらない)。"""
+
+    _COMMON = dict(stream_id="stream-bus-002", session_id="sess-bus-002", trace_id="trace-bus-002")
+
+    @pytest.fixture()
+    def fake_synthesize(self, monkeypatch):
+        """本物の TTS の経路を通し、合成だけを身代わりにする。"""
+        from lab_lounge.tts import TTSResult
+
+        monkeypatch.setenv("L2_USE_REAL_TTS", "true")
+        monkeypatch.setenv("L2_TTS_PROVIDER", "edge_tts")
+        monkeypatch.setenv("L2_TTS_VOICE", "ja-JP-NanamiNeural")
+        monkeypatch.setenv("L2_TTS_SPEAKER", "Nanami")
+        result = TTSResult(
+            audio_url="file:///tmp/tts-bus-test.mp3", duration_ms=1200, voice="ja-JP-NanamiNeural",
+            format="mp3", sample_rate=24000, speaker="Nanami",
+        )
+        with patch("lab_lounge.tts.synthesize", return_value=result) as synthesize:
+            yield synthesize
+
+    @pytest.fixture()
+    def redis_down(self):
+        """すべての publish が接続の失敗になる。本流の 3 件は bus.publish、吹き出しは pipeline.publish を通る。"""
+        failing = MagicMock(side_effect=redis.ConnectionError("Redis is down"))
+        with patch.object(bus_mod, "publish", failing), patch.object(pipeline_mod, "publish", failing):
+            yield failing
+
+    def test_turn_reaches_tts_when_every_publish_fails(self, fail_open_default, fake_synthesize, redis_down):
+        result = pipeline_mod.run_pipeline("テスト", **self._COMMON)
+        fake_synthesize.assert_called_once()
+        assert [event["type"] for event in result.events] == ["utterance.final", "llm.final", "tts.done"]
+        # 本流の 3 件と吹き出しの 2 件 (thinking / answering) のすべてで publish を試している
+        assert redis_down.call_count == 5
+
+    def test_fail_closed_stops_the_turn_before_tts(self, fake_synthesize, redis_down, monkeypatch):
+        """L2_BUS_FAIL_OPEN=false で、以前と同じく utterance.final の publish でターンが止まる。"""
+        monkeypatch.setenv("L2_BUS_FAIL_OPEN", "false")
+        with pytest.raises(redis.ConnectionError):
+            pipeline_mod.run_pipeline("テスト", **self._COMMON)
+        fake_synthesize.assert_not_called()

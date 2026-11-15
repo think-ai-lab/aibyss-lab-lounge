@@ -106,6 +106,38 @@ _bg_tts_events: dict[str, list[threading.Event]] = {}
 # が、バッファ済の未再生 chunks は β-2-3 の playback queue drain で破棄する。
 _bg_cancel_flags: dict[str, threading.Event] = {}
 
+# 協働先の Agent を待つ上限 (秒)。導入セリフの合成と再生の裏で走るので、多くは待つ前に終わっている。
+# 超えたら協働先は話さず、caller には応答がなかったことだけを返す (_ask_character_impl を参照)。
+# 値は以前と同じ 120 秒。協働先の Agent の壁時計の上限 (L2_AGENT_INVOKE_TIMEOUT_SEC、既定 90 秒) より
+# 長いので、Agent が時間切れになっても、その後のフォールバックが残りの 30 秒で終われば応答を拾える。
+# テストでは短くする。
+_COLLAB_JOIN_TIMEOUT_SEC = 120.0
+
+
+def _is_blank_collab_response(response_text: str | None) -> bool:
+    """協働先の応答に、声にする本文がなければ True を返す。
+
+    構造化 JSON の response が空 ({"response": ""}) のときも空とみなす。TTS と caller へ渡すのは、
+    _parse_voicepeak_json で取り出した本文なので。{"response": null} も空とみなす (_parse_voicepeak_json が
+    str() して "None" になり、そのまま「None」と読み上げてしまうため。preflight の _spoken_problems と同じ扱い)。
+
+    Args:
+        response_text: 協働先の Agent の生の出力。None は未完了か失敗
+
+    Returns:
+        本文が空か空白だけなら True
+    """
+    if not response_text or not response_text.strip():
+        return True
+    from ..tts import _parse_voicepeak_json
+
+    try:
+        say_text = _parse_voicepeak_json(response_text)[0]
+    except (TypeError, ValueError):
+        # emotion や speed が数でない JSON。本文の有無はここでは決めず、今までどおり後段へ渡す。
+        return False
+    return say_text.strip() in ("", "None")
+
 
 def _reset_session_state(session_id: str) -> None:
     """セッション状態をリセットする (set_ask_character_context から呼ばれる)。"""
@@ -320,6 +352,10 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
 
     協働先は ReAct Agent として実行されるが、ツールセットから ask_character のみ除外
     (再帰防止)。retrieve_memory / web_search は利用可能。
+
+    協働先から応答を得られなかったとき (例外、空の応答、_COLLAB_JOIN_TIMEOUT_SEC 秒の時間切れ) は、
+    協働先の TTS も吹き出しも出さず、caller には「<協働先の表示名>から応答を得られませんでした」とだけ返す
+    (旧実装は「エラー: ...」を協働先の声で読み上げていた)。
     """
     # 遅延 import で循環参照を回避
     from ..characters import get_character, load_system_prompt
@@ -535,12 +571,27 @@ def _ask_character_impl(character_slug: str, question: str) -> str:
                 logger.warning("導入セリフ TTS 失敗: %s", exc)
 
     # 4a-5. 協働先 LLM の完了を待つ (導入再生中に並行実行されていたので大部分は完了済み)
-    collab_thread.join(timeout=120)
-    if collab_error[0]:
-        logger.error("ask_character 協働先 Agent 失敗: %s", collab_error[0])
-        response_text = f"エラー: {collab_error[0]}"
+    collab_thread.join(timeout=_COLLAB_JOIN_TIMEOUT_SEC)
+    if collab_thread.is_alive():
+        failure = f"{_COLLAB_JOIN_TIMEOUT_SEC:g} 秒で終わりませんでした"
+    elif collab_error[0] is not None:
+        failure = f"{type(collab_error[0]).__name__}: {collab_error[0]}"
+    elif _is_blank_collab_response(collab_result[0]):
+        failure = "応答が空でした"
     else:
-        response_text = collab_result[0] or ""
+        failure = None
+    if failure is not None:
+        # 協働先の声も吹き出しも状態の更新も出さず、caller には応答がなかったことだけを返す。
+        # WHY: 旧実装は失敗の文 (「エラー: ...」) を協働先の声で読み上げていた (2026-11-01 の実 API の点検で再現:
+        #      provider を渡し忘れて gemini のモデル名を OpenAI へ送り 404)。caller は導入セリフで相手に
+        #      振った後なので、この戻り値を受けて自分の言葉でつなげる。時間切れのスレッドは止められないが、
+        #      戻り値を読む人がいないので、後から終わっても声にはならない。
+        #      ログの文言は preflight が協働の失敗の判定に使う (test_preflight で固定)。
+        logger.error("ask_character 協働先 Agent 失敗: %s", f"[target={character_slug}] {failure}")
+        # 導入セリフで相手の名前を出した事実は残るので、次の呼び出しの「直前の相手」は更新する。
+        _record_target(session_id, target_char.display_name)
+        return f"{target_char.display_name}から応答を得られませんでした"
+    response_text = collab_result[0]
 
     # 5. 協働先の応答を TTS 合成 + 再生キュー投入
     if on_tts_chunk and use_real_tts:
@@ -953,12 +1004,17 @@ def _run_collaboration_agent(
     agent = create_react_agent(bound_llm, collab_tools, prompt=combined_prompt)
 
     # Agent 実行 (BubbleToolCallbackHandler で bubble.update を発行)
+    # provider と system_prompt は、Agent が失敗したときの単一ノードのフォールバックが使う。
+    # WHY: 渡さないと provider が既定の "openai" になり、協働先のモデル名 (gemini など) を OpenAI へ
+    #      送って 404 になる。人格もない状態で呼ぶ (2026-11-01 の実 API の点検で再現)。
     result = _run_agent(
         agent,
         question,
         model,
+        provider=provider,
         character_slug=character_slug,
         common=common,
+        system_prompt=combined_prompt,
     )
     return result.text
 

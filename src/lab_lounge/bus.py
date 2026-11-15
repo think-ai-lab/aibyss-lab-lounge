@@ -5,23 +5,58 @@ bus.py — Redis Streams Publisher
   - Event Envelope を JSON 文字列化して Redis Stream に XADD する
   - フィールド名は "event" 固定 (C2 Consumer との規約)
   - C2 への HTTP POST は絶対に行わない (Guardrail G-2)
+  - Redis が落ちていても声 (ターン) を止めない
 
 【Redis Streams メッセージ規約 (v0.1)】
   XADD <stream_key> * event '<Event Envelope JSON 文字列>'
+
+【Redis に届かないとき】
+  - publish は接続を L2_BUS_CONNECT_TIMEOUT_SEC (既定 0.5 秒)、応答を L2_BUS_SOCKET_TIMEOUT_SEC
+    (既定 1.0 秒) で諦める。再試行はしない
+  - 接続や応答で失敗した後 L2_BUS_RETRY_AFTER_SEC (既定 5 秒) の間は、接続を試さずにすぐ
+    BusUnavailableError にする。1 ターンに publish は何度もある (本流の 3 件に吹き出しと状態の更新) ので、
+    毎回待つと声が数秒遅れる
+  - ターンの本流 (utterance.final / llm.final / tts.done) は publish_best_effort を使う。
+    L2_BUS_FAIL_OPEN が真 (既定) なら ERROR ログを残して先へ進み、偽ならターンを例外で止める
+  - 諦めた event は再送しない。正史 (C2) と HUD (V2) に穴が開くことは許容する
+    (ルカの決定: Redis の障害時は声を止めない)
 """
 
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 # 日本語テキストをログに含めるとき、長すぎると 1 行が見にくいので先頭のみ。
 # トラブル調査では「どの発話で何が起きたか」が分かれば十分なので 30 文字で打ち切る。
 _LOG_TEXT_PREVIEW_CHARS = 30
+
+# 「Redis に届かない、または答えない」とみなす例外。これが起きたら、しばらく接続を試さない。
+# WHY: どれも次の publish が同じだけ待たされる失敗。Redis がコマンドを拒む応答のエラー
+#      (ResponseError: メモリ不足や永続化の失敗など) はすぐ返るので、試さずに済ませる理由がなく、ここに含めない。
+#      redis-py は socket の例外を ConnectionError / TimeoutError に包むが、包まれずに出る OSError も同じ扱いにする。
+_UNREACHABLE_ERRORS = (redis.ConnectionError, redis.TimeoutError, OSError)
+
+# 直前に Redis へ届かなかった時刻 (time.monotonic())。None なら、まだ失敗していないか、その後に成功した。
+# WHY ロック: publish は録音、再生、Dispatcher などのスレッドから同時に呼ばれる。
+_failure_lock = threading.Lock()
+_last_failure_at: float | None = None
+
+
+class BusUnavailableError(redis.ConnectionError):
+    """直前の失敗から L2_BUS_RETRY_AFTER_SEC 秒以内なので、接続を試さずに諦めた。
+
+    redis.ConnectionError の子にする理由: 呼び出し側の既存の except (Exception や redis.ConnectionError) が、
+    今までの接続の失敗と同じように受けられるようにするため。
+    """
 
 
 def _redis_url() -> str:
@@ -32,6 +67,94 @@ def _redis_url() -> str:
 
 def _stream_key() -> str:
     return os.environ.get("REDIS_STREAM_KEY", "aibyss:events")
+
+
+def _connect_timeout_sec() -> float:
+    """Redis への接続を待つ上限 (秒)。L2_BUS_CONNECT_TIMEOUT_SEC で変えられる。
+
+    WHY: Windows は閉じたポートへの接続を拒むまでに約 2 秒かかる (実測 2.05 秒)。上限がないと、
+         Redis が落ちている間は publish のたびにそのターンの声が 2 秒ずつ遅れる。loopback の Redis なら、
+         接続は 1 ms もかからないので 0.5 秒で足りる。
+    """
+    return float(os.environ.get("L2_BUS_CONNECT_TIMEOUT_SEC", "0.5"))
+
+
+def _socket_timeout_sec() -> float:
+    """XADD の応答を待つ上限 (秒)。L2_BUS_SOCKET_TIMEOUT_SEC で変えられる。
+
+    WHY: Redis が接続を受けたまま答えないと (CLIENT PAUSE やディスクの詰まり)、上限がなければ publish が返らない。
+         待ち切れずに諦めた XADD は、Redis の側では遅れて入ることがある (再送しないので二重にはならない)。
+    """
+    return float(os.environ.get("L2_BUS_SOCKET_TIMEOUT_SEC", "1.0"))
+
+
+def _retry_after_sec() -> float:
+    """Redis に届かなかった後、接続を試さずに諦める時間 (秒)。L2_BUS_RETRY_AFTER_SEC で変えられる。0 で無効。"""
+    return float(os.environ.get("L2_BUS_RETRY_AFTER_SEC", "5"))
+
+
+def _fail_open() -> bool:
+    """本流の publish が Redis の障害で失敗しても、ターンを続けるなら True (既定)。
+
+    L2 の他の既定が真のフラグと同じ読み方。空は既定へ戻らず偽 (ターンを止める) になる。
+    """
+    return os.environ.get("L2_BUS_FAIL_OPEN", "true").lower() in ("1", "true", "yes")
+
+
+def _raise_if_backing_off() -> None:
+    """直前の失敗から L2_BUS_RETRY_AFTER_SEC 秒以内なら、接続を試さずに BusUnavailableError を送出する。"""
+    with _failure_lock:
+        failed_at = _last_failure_at
+    if failed_at is None:
+        return
+    elapsed = time.monotonic() - failed_at
+    wait = _retry_after_sec()
+    if elapsed < wait:
+        raise BusUnavailableError(
+            f"{elapsed:.1f} 秒前に Redis へ届かなかったので、{wait:g} 秒たつまで接続を試しません"
+            " (L2_BUS_RETRY_AFTER_SEC)"
+        )
+
+
+def _record_unreachable() -> None:
+    """Redis に届かなかった時刻を記録する。以後 L2_BUS_RETRY_AFTER_SEC 秒は接続を試さない。"""
+    global _last_failure_at
+    with _failure_lock:
+        _last_failure_at = time.monotonic()
+
+
+def _record_reachable() -> None:
+    """Redis に届いたので、失敗の記録を消す。"""
+    global _last_failure_at
+    with _failure_lock:
+        _last_failure_at = None
+
+
+def _reset_for_tests() -> None:
+    """失敗の記録を消す。テストの間で状態を持ち越さないため (tests/conftest.py の autouse fixture から呼ぶ)。"""
+    _record_reachable()
+
+
+def _new_client(url: str) -> redis.Redis:
+    """publish 1 回分のクライアントを作る。接続は最初のコマンドで張られる。
+
+    明示する引数と WHY:
+      - decode_responses=False: 送受信ともにバイト列を明示的に扱う
+      - protocol=2: 既定に任せず RESP2 に固定する。C2 の consumer と同じく、redis-py の既定が変わっても
+        戻りの形を変えないため
+      - socket_connect_timeout / socket_timeout: _connect_timeout_sec と _socket_timeout_sec を参照
+      - retry=Retry(NoBackoff(), 0): 再試行しない。redis-py 7.3 の既定は作り方で違い (from_url は 0 回、
+        Redis(...) は 3 回)、版の更新で変わりうるので固定する。再試行すると待ちが回数分だけ積み上がり、
+        応答を待ち切れなかった XADD を二重に入れるおそれもある
+    """
+    return redis.from_url(
+        url,
+        decode_responses=False,
+        protocol=2,
+        socket_connect_timeout=_connect_timeout_sec(),
+        socket_timeout=_socket_timeout_sec(),
+        retry=Retry(NoBackoff(), 0),
+    )
 
 
 def _summarize_event(event: dict[str, Any]) -> str:
@@ -128,17 +251,32 @@ def publish(event: dict) -> str:
       - decode_responses=False で redis-py の内部エンコーディング推測に依存しない
       - 受け取った msg_id (bytes) は UTF-8 で decode して str として返す
 
+    Redis に届かないとき (モジュールの説明も参照):
+      - 接続と応答の上限で諦め、再試行しない
+      - 失敗した後 L2_BUS_RETRY_AFTER_SEC 秒の間は、接続を試さずに BusUnavailableError を送出する
+
     Returns:
         XADD で返された Redis メッセージ ID 文字列。
+
+    Raises:
+        BusUnavailableError: 直前の失敗から L2_BUS_RETRY_AFTER_SEC 秒以内 (redis.ConnectionError の子)
+        redis.ConnectionError / redis.TimeoutError: 接続できない、または上限の時間内に応答がない
+        redis.RedisError: Redis がコマンドを拒んだ (メモリ不足など)
+        ValueError: L2_BUS_* の値が数として読めない (preflight --static が起動前に FAIL にする)
     """
+    _raise_if_backing_off()
     url = _redis_url()
     stream = _stream_key()
-    # decode_responses=False: 送受信ともにバイト列を明示的に扱う
-    client = redis.from_url(url, decode_responses=False)
+    client = _new_client(url)
     try:
         # locale 依存の encode を避け、UTF-8 バイト列として明示的に組み立てる
         payload_bytes = json.dumps(event, ensure_ascii=False).encode("utf-8")
-        msg_id: bytes = client.xadd(stream, {"event": payload_bytes})
+        try:
+            msg_id: bytes = client.xadd(stream, {"event": payload_bytes})
+        except _UNREACHABLE_ERRORS:
+            _record_unreachable()
+            raise
+        _record_reachable()
         msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else msg_id
         # ログ強化 L-1: type 別 summary でキャラ識別 + 主要 context をログに残す
         summary = _summarize_event(event)
@@ -149,3 +287,35 @@ def publish(event: dict) -> str:
         return msg_id_str
     finally:
         client.close()
+
+
+def publish_best_effort(event: dict) -> str | None:
+    """ターンの本流の event を publish する。Redis の障害では、既定でターンを止めない。
+
+    graph.py の utterance.final / llm.final / tts.done が使う。ほかの event (bubble.update など) は、
+    呼び出し側が例外を握って WARNING にしている (今までどおり)。
+
+    Args:
+        event: Event Envelope dict
+
+    Returns:
+        XADD の msg_id。Redis の障害で諦め、L2_BUS_FAIL_OPEN が真 (既定) のときは None
+
+    Raises:
+        redis.RedisError: Redis の障害で、L2_BUS_FAIL_OPEN が偽のとき (ターンを止める、以前の挙動)
+        そのほかの例外: event が JSON にできないなど、Redis の障害でないもの。既定でも握らない
+            (コードの誤りを、Redis の障害の ERROR ログに紛れさせないため)
+
+    WHY: 声 (TTS) は Redis を使わない。Redis が落ちたせいで発話を止めるより、正史 (C2) と HUD (V2) に
+         穴が開くほうを選ぶ (ルカの決定)。諦めた event は再送しない。
+    """
+    try:
+        return publish(event)
+    except (redis.RedisError, OSError) as exc:
+        if not _fail_open():
+            raise
+        logger.error(
+            "Redis への publish を諦め、ターンを続けます (L2_BUS_FAIL_OPEN): type=%s event_id=%s error=%s: %s",
+            event.get("type"), event.get("event_id"), type(exc).__name__, exc,
+        )
+        return None

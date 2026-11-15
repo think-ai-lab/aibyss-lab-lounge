@@ -5,6 +5,9 @@ test_log_setup.py — setup_logging() のテスト
 """
 
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -197,6 +200,40 @@ class TestSensitiveLoggerSuppression:
         setup_logging(session_name="test_httpx")
         assert logging.getLogger("httpx").level == logging.WARNING
         assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+class TestEntryPointsWithoutSetupLogging:
+    """setup_logging を通らない入口でも、第三者ライブラリの機密ログを出さない。
+
+    WHY: 抑制は setup_logging の中にあるので、basicConfig だけの emitter と run_once は素通りし、
+         dummy の E2E でも OBS のパスワードがコンソールへ平文で出ていた。
+    """
+
+    @pytest.mark.parametrize("module", ["lab_lounge.emitter", "lab_lounge.run_once"])
+    def test_sensitive_loggers_are_silent_after_import(self, module):
+        """logging の状態はプロセス全体なので、他のテストの影響がない子プロセスで確かめる。"""
+        names = ["obsws_python.baseclient.ObsClient", "obsws_python.reqs.ReqClient", "httpx"]
+        code = (
+            f"import logging, {module}\n"
+            f"print([n for n in {names!r} if logging.getLogger(n).isEnabledFor(logging.INFO)])\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+            env={**os.environ, "PYTHON_DOTENV_DISABLED": "1"},
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip().splitlines()[-1] == "[]"
+
+    def test_every_module_with_basic_config_silences_them(self):
+        """新しい入口を足しても素通りしないように、書き方で固定する。"""
+        source_dir = Path(__file__).resolve().parents[1] / "src" / "lab_lounge"
+        missing = [
+            path.name for path in source_dir.glob("*.py")
+            if "logging.basicConfig(" in (text := path.read_text(encoding="utf-8"))
+            and "_suppress_sensitive_loggers()" not in text
+        ]
+        assert missing == []
 
     def test_llm_retry_loggers_set_to_info(self, tmp_path, monkeypatch):
         """OpenAI / Anthropic の _base_client は retry 行を出すため INFO に解放される。

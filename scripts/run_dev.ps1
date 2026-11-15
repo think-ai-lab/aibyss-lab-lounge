@@ -1,3 +1,4 @@
+#Requires -Version 7.5
 # ──────────────────────────────────────────────────────────────
 # Lab Lounge — dev プロファイル run_loop 起動スクリプト
 # ──────────────────────────────────────────────────────────────
@@ -6,25 +7,45 @@
 # 【env 読み込み順 (後勝ち)】
 #   1. .env       (本番と共通の設定を継承: OPENAI_API_KEY, L2_USE_REAL_LLM 等)
 #   2. .env.dev   (dev プロファイル固有の上書き: ストリーム名、C2 URL)
-#   → プロセス環境変数 > .env.dev > .env の優先度
+#   → .env.dev > .env > プロセス環境変数 の優先度 (ファイルが常に勝つ)
+#   親プロセスから継承した LLM の接続先 (ANTHROPIC_BASE_URL など) は、読み込みの前に外す。
 #
 # 前提:
+#   - PowerShell 7.5 以上 (pwsh)。共通処理が ?? などの PowerShell 7 の構文を使い、REDIS_STREAM_KEY= の検査には空の値の
+#     環境変数が要る (7.4 以前は空の値を入れると環境変数ごと消える) ので、古い版は先頭の #Requires で原因を伝えて止める
 #   - Redis が起動中 (docker compose up -d redis)
-#   - 本番 C2 が稼働中 (port 8100, c2.db)
-#     → aibyss-coral-chronicle/scripts/run_prod.ps1
-#   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)
+#   - 開発 C2 が稼働中 (port 8101, c2-dev.db, aibyss:events-dev)。検索に使わない設定なら、止まっていても黄色で知らせて起動する
 #     → aibyss-coral-chronicle/scripts/run_dev.ps1
+#   - V2 が稼働中 (port 3200。別の URL なら L2_V2_URL で指す)
+#     → aibyss-nautilus-v2/scripts/run_dev.ps1
 #   - .env.dev が存在する (cp .env.dev.example .env.dev)
+#
+# 【起動前の確認】
+#   run_loop の前に preflight --static を流し、C2 と V2 の /health を確かめる。失敗があれば赤く出して exit 1 で止まる。
+#   /health の stream も publish 先と比べる。V2 のポートは dev と prod で同じなので、別のモードの V2 も 200 を返すため。
+#   C2 は設定によらず読む (検索に使わなくても全発話を記録するので)。検索に使わない設定なら止めず、黄色で知らせる
+#   (発話は Redis に残り、C2 を戻せば追いつく。reason=append_failing でも、C2 は書けなかった発話を ack せずに
+#   読み直すので、DB を直せば追いつく)。
+#   OBS が別の PC (L2_OBS_WS_URL が loopback でない) なら、LAN からの接続が 0 のときに黄色で知らせる。
+#   C2 も V2 も置かない構成では -SkipHealthCheck で /health の確認だけを省ける。
+#
+# 【本番 C2 (副 C2) について】
+#   本番 C2 (port 8100, c2.db) は過去の本番履歴を読むための副 C2 で、止まっていても起動できる。
+#   止まっている間は、検索のたびに副 C2 の分が予算 (L2_C2_RETRIEVER_BUDGET_MS、既定 600 ms) で
+#   打ち切りになり、本番の履歴なしで続く (WARN が出る)。
+#   本番 C2 を動かさない期間は、.env.dev の L2_C2_URL_READONLY を空にすれば待たずに済む。
 #
 # 使い方: PowerShell から実行
 #   .\scripts\run_dev.ps1
 #   .\scripts\run_dev.ps1 -MaxTurns 5
 #   .\scripts\run_dev.ps1 -MaxTurns 0                          # 無制限 (Ctrl+C で停止、prod と同じ挙動)
 #   .\scripts\run_dev.ps1 -WakeBackend continuous -MaxTurns 3
+#   .\scripts\run_dev.ps1 -SkipHealthCheck                     # C2 も V2 も置かない構成
 #
 # 【分離の保証】
 #   このスクリプトで起動した L2 は:
 #     - aibyss:events-dev のみに XADD (本番ストリームには一切書き込まない)
+#       REDIS_STREAM_KEY が本番の値、未設定、空のどれかなら起動しない (bus は未設定を本番と読む)
 #     - 主 C2 = http://127.0.0.1:8101 (dev、書き込み先)
 #     - 副 C2 = http://127.0.0.1:8100 (prod、read-only 参照)
 #   よって発話データは本番 c2.db に混入せず、かつ過去の本番履歴も参照できる。
@@ -34,86 +55,27 @@ param(
     [string]$WakeBackend = "continuous",
     # MaxTurns: dev の default は 3 ターン (暴走防止)。
     # 0 以下を指定すると --max-turns を渡さず run_loop 側で無制限になる (prod と仕様統一)。
-    [int]$MaxTurns = 3
+    [int]$MaxTurns = 3,
+    # C2 と V2 の /health の確認を省く。preflight --static は省かない。
+    [switch]$SkipHealthCheck
 )
 
 $ErrorActionPreference = "Stop"
 
-# ── dotenv パーサー (python-dotenv 準拠) ──
-# 対応書式:
-#   - KEY=value
-#   - KEY = value       (前後空白)
-#   - KEY="value"       (ダブルクォート)
-#   - KEY='value'       (シングルクォート)
-#   - export KEY=value  (bash 互換)
-#   - KEY=value # comment   (クォート無し: 空白+# 以降をコメントとして除去)
-#   - KEY="value # not"     (クォート内: # は文字列の一部として保持)
-#   - KEY=value#literal     (# 直前が非空白: 文字列として残す)
-function Import-DotEnvFile {
-    param(
-        [string]$Path,
-        [switch]$Override
-    )
-    if (-not (Test-Path $Path)) { return }
-    foreach ($rawLine in Get-Content $Path) {
-        $line = $rawLine.Trim()
-        if (-not $line -or $line.StartsWith("#")) { continue }
-        if ($line.StartsWith("export ")) {
-            $line = $line.Substring(7).Trim()
-        }
-        if (-not $line.Contains("=")) { continue }
-        $eqIdx = $line.IndexOf("=")
-        $key = $line.Substring(0, $eqIdx).Trim()
-        $value = $line.Substring($eqIdx + 1).Trim()
-
-        # クォート付きかチェック
-        $isQuoted = $false
-        if ($value.Length -ge 2) {
-            $first = $value[0]
-            if ($first -eq '"' -or $first -eq "'") {
-                # 閉じクォートを探す
-                $closeIdx = $value.IndexOf($first, 1)
-                if ($closeIdx -gt 0) {
-                    $value = $value.Substring(1, $closeIdx - 1)
-                    $isQuoted = $true
-                    # 閉じクォートの外側は全て無視 (コメント扱い)
-                }
-            }
-        }
-
-        if (-not $isQuoted) {
-            # クォート無し: ASCII 空白 or タブ + # をコメント境界とする
-            # `value # comment` → `value`
-            # `value#literal`   → `value#literal` (# 直前が非空白なので保持)
-            $spaceHash = $value.IndexOf(" #")
-            $tabHash = $value.IndexOf("`t#")
-            $commentIdx = -1
-            if ($spaceHash -ge 0 -and $tabHash -ge 0) {
-                $commentIdx = [Math]::Min($spaceHash, $tabHash)
-            } elseif ($spaceHash -ge 0) {
-                $commentIdx = $spaceHash
-            } elseif ($tabHash -ge 0) {
-                $commentIdx = $tabHash
-            }
-            if ($commentIdx -ge 0) {
-                $value = $value.Substring(0, $commentIdx).TrimEnd()
-            }
-        }
-
-        if ($Override -or -not [Environment]::GetEnvironmentVariable($key, "Process")) {
-            [Environment]::SetEnvironmentVariable($key, $value, "Process")
-        }
-    }
-}
+. (Join-Path $PSScriptRoot "run_common.ps1")
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $RepoRoot
+# WHY: -LiteralPath は、clone 先のパスの [ ] をワイルドカードと読ませないため (読むと場所が見つからず止まる)。
+Set-Location -LiteralPath $RepoRoot
 
 $EnvFile = Join-Path $RepoRoot ".env.dev"
-if (-not (Test-Path $EnvFile)) {
+if (-not (Test-Path -LiteralPath $EnvFile)) {
     Write-Error ".env.dev が見つかりません。先に 'cp .env.dev.example .env.dev' を実行してください。"
     exit 1
 }
+
+# ── 継承した LLM の接続先を外す (.env を読む前に。理由は Remove-InheritedLlmVar を参照) ──
+Remove-InheritedLlmVar -Tag "lab-lounge/dev"
 
 # ── 1. .env を base として読み込み (強制上書き) ──
 # 【重要】-Override を指定する理由:
@@ -122,7 +84,7 @@ if (-not (Test-Path $EnvFile)) {
 # 再利用されてしまう事故を防ぐ。ファイルが常に source of truth となる。
 # シェルレベルで一時上書きしたい場合は run_dev.ps1 実行後に設定する。
 $BaseEnvFile = Join-Path $RepoRoot ".env"
-if (Test-Path $BaseEnvFile) {
+if (Test-Path -LiteralPath $BaseEnvFile) {
     Write-Host "[lab-lounge/dev] .env を base として読み込み (API キー等を継承)..." -ForegroundColor Gray
     Import-DotEnvFile -Path $BaseEnvFile -Override
 } else {
@@ -137,24 +99,25 @@ Write-Host ""
 Write-Host "[lab-lounge/dev] 分離確認 (最終値):" -ForegroundColor Cyan
 Write-Host "  REDIS_STREAM_KEY      = $env:REDIS_STREAM_KEY"
 Write-Host "  L2_USE_C2_RETRIEVER   = $env:L2_USE_C2_RETRIEVER"
-Write-Host "  L2_C2_URL (primary)   = $env:L2_C2_URL"
-Write-Host "  L2_C2_URL_READONLY    = $env:L2_C2_URL_READONLY"
+# WHY: 起動の出力は貼られることがあるので、/health の行と同じく host を伏せる (理由は Format-ServiceEndpoint)。
+#      ポートは残るので、dev と prod の分離の確認には足りる。
+Write-Host "  L2_C2_URL (primary)   = $(if ($env:L2_C2_URL) { Format-ServiceEndpoint $env:L2_C2_URL })"
+Write-Host "  L2_C2_URL_READONLY    = $(if ($env:L2_C2_URL_READONLY) { Format-ServiceEndpoint $env:L2_C2_URL_READONLY })"
 Write-Host "  L2_VAD_BACKEND        = $env:L2_VAD_BACKEND"
 Write-Host "  L2_VAD_AGGRESSIVENESS = $env:L2_VAD_AGGRESSIVENESS"
-
-# OPENAI_API_KEY が読み込まれているか簡易確認 (値そのものは表示しない)
-if ($env:OPENAI_API_KEY) {
-    $keyPreview = $env:OPENAI_API_KEY.Substring(0, [Math]::Min(7, $env:OPENAI_API_KEY.Length))
-    Write-Host "  OPENAI_API_KEY        = $keyPreview... (length=$($env:OPENAI_API_KEY.Length))"
-} else {
-    Write-Host "  OPENAI_API_KEY        = (未設定)" -ForegroundColor Yellow
-}
+Write-KeyStatus -Name "OPENAI_API_KEY" -Required
 Write-Host ""
 
 # ── 分離違反の安全チェック ──
 $ViolationFound = $false
 
-if ($env:REDIS_STREAM_KEY -eq "aibyss:events") {
+# WHY: bus は未設定を本番の aibyss:events と読む (bus._stream_key) ので、行を書き忘れただけで dev の発話が
+#      本番の正史へ入る。正史は追記のみで戻しにくいので、未設定も本番と同じく止める。
+#      空の値は既定へ戻らず空の名前へ publish するので、C2 にも HUD にも届かない。これも止める。
+if ([string]::IsNullOrWhiteSpace($env:REDIS_STREAM_KEY)) {
+    Write-Warning "REDIS_STREAM_KEY が未設定か空です。未設定は本番 'aibyss:events' へ向き、空の値は C2 にも HUD にも届きません。"
+    $ViolationFound = $true
+} elseif ($env:REDIS_STREAM_KEY -eq "aibyss:events") {
     Write-Warning "REDIS_STREAM_KEY が本番ストリーム 'aibyss:events' を指しています。dev 発話が本番 C2 に届いてしまいます。"
     $ViolationFound = $true
 }
@@ -174,6 +137,26 @@ if ($ViolationFound) {
     exit 1
 }
 
+# ── 起動前の確認 ──
+# WHY: 1 つずつ止めると、直して流し直すたびに次の失敗を知ることになる。全部見てから止める。
+#      --frozen は配信の直前に解決器を走らせないため。--all-extras は点検の版の検査が全 extra を見るのと揃えるため。
+Write-Host "[lab-lounge/dev] 起動前の点検 (preflight --static)..." -ForegroundColor Cyan
+$StartupFailed = $false
+uv run --frozen --all-extras python -m lab_lounge.preflight --static --profile dev
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[lab-lounge/dev] preflight が失敗しました (exit $LASTEXITCODE)。上の FAIL の行を直してください。" -ForegroundColor Red
+    $StartupFailed = $true
+}
+if ($SkipHealthCheck) {
+    Write-Host "[lab-lounge/dev] -SkipHealthCheck: C2 と V2 の /health の確認を省きます。" -ForegroundColor Yellow
+} elseif (-not (Test-ServicesHealthy -Tag "lab-lounge/dev")) {
+    $StartupFailed = $true
+}
+if ($StartupFailed) {
+    Write-Host "[lab-lounge/dev] 起動を中止します。" -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBackend)..." -ForegroundColor Green
 # WHY: prod と仕様を揃え、$MaxTurns が 0 以下なら --max-turns を渡さず
 #      run_loop 側で無制限ループにする (Python 側 default = None = 無制限)。
@@ -181,8 +164,9 @@ Write-Host "[lab-lounge/dev] run_loop を起動します (wake-backend=$WakeBack
 #      無制限を指定したいケース (長時間の手動実験) に対応する。
 if ($MaxTurns -gt 0) {
     Write-Host "  max-turns=$MaxTurns (有限)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend --max-turns $MaxTurns
 } else {
     Write-Host "  max-turns=無制限 (Ctrl+C で停止)" -ForegroundColor Gray
-    uv run python -m lab_lounge.run_loop --wake-backend $WakeBackend
+    uv run --frozen --all-extras python -m lab_lounge.run_loop --wake-backend $WakeBackend
 }
+exit $LASTEXITCODE
