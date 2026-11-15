@@ -88,3 +88,7 @@ packages = ["src/lab_lounge"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# xfail の印のテストが通ったら（XPASS）、失敗にする。
+# WHY: 直した commit で xfail の印を外し忘れると、その時点で赤くなる。網の印がコードの状態と必ず一致し、
+#      「直ったのに xfail のまま」「壊れ直しても xfail に隠れる」が残らない。
+xfail_strict = true
