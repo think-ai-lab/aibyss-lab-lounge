@@ -1,0 +1,117 @@
+[
+  {
+    "path": "/v1/chat/completions",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "authorization",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-stainless-arch",
+      "x-stainless-async",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-raw-response",
+      "x-stainless-read-timeout",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version"
+    ],
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "max_completion_tokens": 4096,
+      "messages": [
+        {
+          "content": "<str>",
+          "role": "system"
+        },
+        {
+          "content": "<str>",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-5.5",
+      "stream": false,
+      "tool_choice": "required",
+      "tools": [
+        {
+          "function": {
+            "description": "<str>",
+            "name": "web_search_tool",
+            "parameters": {
+              "properties": {
+                "query": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "<str>",
+            "name": "ask_character_tool",
+            "parameters": {
+              "properties": {
+                "character_slug": {
+                  "type": "string"
+                },
+                "question": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "character_slug",
+                "question"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "description": "<str>",
+            "name": "MimiResponse",
+            "parameters": {
+              "properties": {
+                "pose": {
+                  "default": "<str>",
+                  "description": "<str>",
+                  "type": "string"
+                },
+                "response": {
+                  "description": "<str>",
+                  "type": "string"
+                },
+                "speed": {
+                  "default": 100,
+                  "description": "<str>",
+                  "maximum": 200,
+                  "minimum": 50,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "response"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,44 @@
+[
+  {
+    "path": "/v1/chat/completions",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "authorization",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-stainless-arch",
+      "x-stainless-async",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-raw-response",
+      "x-stainless-read-timeout",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version"
+    ],
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "max_completion_tokens": 4096,
+      "messages": [
+        {
+          "content": "<str>",
+          "role": "system"
+        },
+        {
+          "content": "<str>",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-5.4-mini",
+      "reasoning_effort": "low",
+      "stream": false
+    }
+  }
+]
