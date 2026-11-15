@@ -19,8 +19,6 @@ from __future__ import annotations
 import logging
 import re
 
-import pytest
-
 from lab_lounge import graph
 from lab_lounge.characters import get_character
 from lab_lounge.mcp_servers import ask_character
@@ -138,7 +136,6 @@ def test_target_failure_returns_no_reply_without_target_voice(agent_env, monkeyp
 # ─── 方針のテスト ─────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(reason="導入セリフの call_llm が、親のコールバックを contextvars で受け継ぎ、caller の Agent LLM step に数えられる。道具の実行の子の呼び出しを step から外し、補助として別の行にする")
 def test_intro_is_not_counted_as_caller_step(agent_env, caplog):
     """caller の step は、本応答のモデルの 2 回（道具を呼ぶ、締める）だけで、導入セリフは数えない。
 
@@ -150,3 +147,8 @@ def test_intro_is_not_counted_as_caller_step(agent_env, caplog):
     _start_round_trip(agent_env)
 
     assert _caller_steps(caplog) == [1, 2]
+    # 導入セリフは「補助」として別の行に出る (開始と完了が 1 回ずつ。tokens と finish とモデルも付く)。
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("Agent 補助 LLM 開始" in m for m in messages) == 1
+    (aux_end,) = [m for m in messages if "Agent 補助 LLM 完了" in m]
+    assert "tokens=in:12/out:3" in aux_end and "finish=stop" in aux_end
