@@ -1473,6 +1473,45 @@ class TestEnvPreparation:
         assert "L2_LLM_MODEL" not in os.environ
 
 
+class TestPaidForcesDecisionLogOff:
+    """--paid は判定ログを強制でオフにする (点検の試験の発話が、判定のリプレイの入力に混ざらないように)。"""
+
+    def test_silence_side_outputs_turns_it_off_and_returns_the_production_value(self, isolated):
+        os.environ["L2_DECISION_LOG"] = "true"
+        production = preflight.silence_side_outputs()
+        assert production["L2_DECISION_LOG"] == "true"
+        assert os.environ["L2_DECISION_LOG"] == "false"
+
+    def test_decision_log_module_sees_the_forced_off(self, isolated):
+        """decision_log は毎回環境変数を読むので、import 済みのプロセスでも切り替えが効く。"""
+        from lab_lounge import decision_log
+
+        os.environ["L2_DECISION_LOG"] = "true"
+        assert decision_log.is_enabled() is True
+        preflight.silence_side_outputs()
+        assert decision_log.is_enabled() is False
+
+    def test_row_reports_production_value_but_not_when_it_was_off(self, isolated):
+        report = preflight.Report()
+        preflight._report_silenced_outputs(report, {"L2_DECISION_LOG": "true"})
+        row = _status(report, "flag/L2_DECISION_LOG")
+        assert row.status == "WARN" and "この実行では止めています" in row.detail
+
+        report = preflight.Report()
+        preflight._report_silenced_outputs(report, {"L2_DECISION_LOG": "false"})
+        assert not any(c.name == "flag/L2_DECISION_LOG" for c in report.checks)
+
+    def test_paid_main_path_stops_it(self, isolated, capsys):
+        (isolated / ".env").write_text(
+            "L2_DECISION_LOG=true\nREDIS_STREAM_KEY=aibyss:events-dev\n", encoding="utf-8",
+        )
+        with patch.object(preflight, "run_paid"):
+            preflight.main(["--paid", "--profile", "dev", "--characters", "octamaid"], repo_root=isolated)
+        out = capsys.readouterr().out
+        assert "[WARN ] flag/L2_DECISION_LOG: 本番は true" in out
+        assert os.environ["L2_DECISION_LOG"] == "false"
+
+
 class TestSilencedOutputsRow:
     """--paid は実発話が外へ出る設定を止めるが、本番でその設定が有効なことは表から消さない。"""
 
@@ -1721,6 +1760,17 @@ class TestStaticFindings:
         report = preflight.Report()
         preflight._check_flags(report)
         assert _status(report, "flag/L2_DEBUG_ARTIFACTS").status == "WARN"
+
+    def test_decision_log_warns_only_when_on(self, isolated):
+        """判定ログは実発話を平文で残すので、オンのときだけ WARN を出す (既定の false では行を出さない)。"""
+        report = preflight.Report()
+        preflight._check_flags(report)
+        assert not any(c.name == "flag/L2_DECISION_LOG" for c in report.checks)
+
+        os.environ["L2_DECISION_LOG"] = "true"
+        report = preflight.Report()
+        preflight._check_flags(report)
+        assert _status(report, "flag/L2_DECISION_LOG").status == "WARN"
 
     def test_broken_numeric_env_is_fail_and_hides_the_value(self, isolated, capsys):
         os.environ["L2_LLM_MAX_RETRIES"] = "abc-value"

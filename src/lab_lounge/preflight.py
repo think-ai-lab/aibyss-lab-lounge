@@ -772,10 +772,12 @@ def silence_side_outputs(*, trace: bool = False) -> dict[str, str | None]:
 
     WHY: 点検の 1 ターンを本番の LangSmith プロジェクトに混ぜず、実発話も送らない。
          L2_DEBUG_ARTIFACTS は追跡済みの logs/ を上書きするので、公開リポジトリへ混ざりうる。
+         L2_DECISION_LOG (判定ログ) は、点検用の試験の発話が、本番の判定のリプレイの入力に混ざらないよう止める。
          SDK の import が langsmith のキャッシュへ値を入れるので、run_static より先に呼ぶ必要がある。
     """
-    production = {name: os.environ.get(name) for name in ("L2_DEBUG_ARTIFACTS", *_TRACING_VARS)}
+    production = {name: os.environ.get(name) for name in ("L2_DEBUG_ARTIFACTS", "L2_DECISION_LOG", *_TRACING_VARS)}
     os.environ["L2_DEBUG_ARTIFACTS"] = "false"
+    os.environ["L2_DECISION_LOG"] = "false"
     if not trace:
         for name in _TRACING_VARS:
             os.environ[name] = "false"
@@ -790,6 +792,8 @@ def _report_silenced_outputs(report: Report, production: dict[str, str | None]) 
     """
     if _is_truthy(production.get("L2_DEBUG_ARTIFACTS")):
         report.add("flag/L2_DEBUG_ARTIFACTS", "WARN", "本番は true。追跡済みの logs/ に実発話が書かれます（この実行では止めています）")
+    if _is_truthy(production.get("L2_DECISION_LOG")):
+        report.add("flag/L2_DECISION_LOG", "WARN", "本番は true。logs/decisions に実発話が平文で書かれます（この実行では止めています）")
     # --trace のときは止めていないので、run_static の行がそのまま本番の状態を示している。
     enabled = [name for name in _TRACING_VARS if _is_truthy(production.get(name)) and not _is_truthy(os.environ.get(name))]
     if enabled:
@@ -1088,6 +1092,8 @@ def _check_flags(report: Report, file_names: Iterable[str] = ()) -> None:
         report.add(f"flag/{name}", "INFO", value if value is not None else "(未設定)")
     if _is_truthy(os.environ.get("L2_DEBUG_ARTIFACTS")):
         report.add("flag/L2_DEBUG_ARTIFACTS", "WARN", "true。追跡済みの logs/ に実発話が書かれます")
+    if _is_truthy(os.environ.get("L2_DECISION_LOG")):
+        report.add("flag/L2_DECISION_LOG", "WARN", "true。logs/decisions に実発話が平文で書かれます（判定のリプレイ用。使わないときは false）")
     if os.environ.get("L2_WAKE_BACKEND") == "porcupine" and not os.environ.get("L2_PORCUPINE_ACCESS_KEY"):
         report.add("flag/L2_WAKE_BACKEND", "WARN", "porcupine ですが L2_PORCUPINE_ACCESS_KEY がありません")
     _check_silently_replaced_values(report)
