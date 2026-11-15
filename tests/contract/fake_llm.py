@@ -26,6 +26,7 @@ WHY 偽の HTTP サーバか（ほかの手では SDK の中身を通らない�
     - ``script(model, [reply, ...])``: そのモデルへの応答を、呼ばれた順に並べる。使い切ったら scene に戻る。
       reply は scene の名前（文字列）、``(名前, {params})`` の組、または ``Reply`` そのもの
     - ``requests`` / ``requests_for(provider, model)``: 記録した要求。鍵の値は残さない（ヘッダの名前だけ残す）
+    - 公式の拒否の規則（``official_rejection``）は、場面と台本より先に見る。当たれば、場面に関わらず 400
 
 受ける道:
     - Anthropic: POST /v1/messages
@@ -192,6 +193,56 @@ def _google_ok(req: RecordedRequest, *, text: str = "ok") -> Reply:
     })
 
 
+def _anthropic_thinking_first(req: RecordedRequest, *, text: str = "ok") -> Reply:
+    """先頭に thinking のブロック、続けて本文のブロックを返す。
+
+    extended thinking（や、既定で考えるモデル）の応答は、content の先頭が thinking になる。
+    """
+    reply = _anthropic_ok(req, text=text)
+    reply.body["content"] = [
+        {"type": "thinking", "thinking": "考えています", "signature": "fake-signature"},
+        {"type": "text", "text": text},
+    ]
+    return reply
+
+
+def _anthropic_thinking_only_max_tokens(req: RecordedRequest) -> Reply:
+    """考えているうちに出力の上限に達し、本文のブロックが 1 つも無い応答を返す。"""
+    reply = _anthropic_ok(req)
+    reply.body["content"] = [{"type": "thinking", "thinking": "考えて", "signature": "fake-signature"}]
+    reply.body["stop_reason"] = "max_tokens"
+    return reply
+
+
+def _anthropic_refusal(req: RecordedRequest) -> Reply:
+    """安全上の理由で応答を拒み、content が空の応答を返す（stop_reason が refusal）。"""
+    reply = _anthropic_ok(req)
+    reply.body["content"] = []
+    reply.body["stop_reason"] = "refusal"
+    return reply
+
+
+def _openai_empty_length(req: RecordedRequest) -> Reply:
+    """推論で出力の上限を使い切り、本文が空のまま finish_reason が length の応答を返す。"""
+    reply = _openai_ok(req, text="")
+    if "choices" in reply.body:
+        reply.body["choices"][0]["finish_reason"] = "length"
+        reply.body["usage"]["completion_tokens_details"] = {"reasoning_tokens": _USAGE_OUT}
+    else:
+        reply.body["status"] = "incomplete"
+        reply.body["incomplete_details"] = {"reason": "max_output_tokens"}
+        reply.body["output"] = []
+    return reply
+
+
+def _google_max_tokens_no_text(req: RecordedRequest) -> Reply:
+    """考えているうちに出力の上限に達し、parts の無い候補を返す（finishReason が MAX_TOKENS）。"""
+    reply = _google_ok(req)
+    reply.body["candidates"] = [{"content": {"role": "model"}, "finishReason": "MAX_TOKENS", "index": 0}]
+    reply.body["usageMetadata"]["thoughtsTokenCount"] = _USAGE_OUT
+    return reply
+
+
 def _http_error(provider: str) -> Callable[..., Reply]:
     """HTTP のエラーを返す場面を作る。既定は 400。"""
 
@@ -202,10 +253,56 @@ def _http_error(provider: str) -> Callable[..., Reply]:
 
 
 SCENES: dict[str, dict[str, Callable[..., Reply]]] = {
-    "anthropic": {"ok": _anthropic_ok, "http_error": _http_error("anthropic")},
-    "openai": {"ok": _openai_ok, "http_error": _http_error("openai")},
-    "google": {"ok": _google_ok, "http_error": _http_error("google")},
+    "anthropic": {
+        "ok": _anthropic_ok,
+        "thinking_first": _anthropic_thinking_first,
+        "thinking_only_max_tokens": _anthropic_thinking_only_max_tokens,
+        "refusal": _anthropic_refusal,
+        "http_error": _http_error("anthropic"),
+    },
+    "openai": {
+        "ok": _openai_ok,
+        "empty_length": _openai_empty_length,
+        "http_error": _http_error("openai"),
+    },
+    "google": {
+        "ok": _google_ok,
+        "max_tokens_no_text": _google_max_tokens_no_text,
+        "http_error": _http_error("google"),
+    },
 }
+
+
+# ─── 公式の拒否の規則 ─────────────────────────────────────────────
+#
+# 実 API が 400 で拒むと公式ドキュメントに書かれている組み合わせ（2026-11 時点）だけを真似る。
+# 場面や台本より先に見るので、テストが "ok" を選んでいても 400 になる（実 API と同じ）。
+# WHY: 今のキャラのモデルと SDK では発火しない。モデルや SDK を替えたとき、黙って 400 → None に落ちる
+#     経路を、この網で赤くするための備え。
+# 嬉しくない点: 規則を足し忘れると、実 API が拒むものを網が通してしまう。実 API の受理は --paid の点検で見る。
+
+# この版以降の anthropic-version では、temperature を受け付けない。
+_ANTHROPIC_NO_TEMPERATURE_SINCE = "2026-10-21"
+# 強制の tool_choice（any / tool）と、thinking の disabled を拒むモデル（名前の先頭で見る）。
+_ANTHROPIC_NO_FORCED_TOOL_CHOICE = ("claude-sonnet-5-5", "claude-opus-5-5")
+
+
+def official_rejection(req: RecordedRequest) -> Reply | None:
+    """公式の拒否の規則に当たれば 400 の応答を、当たらなければ None を返す。"""
+    if req.provider != "anthropic":
+        return None
+    body = req.body
+    version = req.headers.get("anthropic-version", "")
+    if "temperature" in body and version >= _ANTHROPIC_NO_TEMPERATURE_SINCE:
+        return Reply(400, _error_body("anthropic", 400, "temperature: not supported in this API version"))
+    if (req.model or "").startswith(_ANTHROPIC_NO_FORCED_TOOL_CHOICE):
+        tool_choice = body.get("tool_choice") or {}
+        if isinstance(tool_choice, dict) and tool_choice.get("type") in ("any", "tool"):
+            return Reply(400, _error_body("anthropic", 400, "tool_choice: forced tool use is not supported"))
+        thinking = body.get("thinking") or {}
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            return Reply(400, _error_body("anthropic", 400, "thinking: disabled is not supported"))
+    return None
 
 
 # ─── サーバ ───────────────────────────────────────────────────────
@@ -339,6 +436,9 @@ class FakeLLMServer:
         """台本があれば台本から、無ければ scene から応答を作る。ロックの中で呼ぶ。"""
         if req.provider == "unknown":
             return Reply(404, {"error": {"message": f"fake_llm: 知らない道です: {req.route}"}})
+        rejected = official_rejection(req)
+        if rejected is not None:
+            return rejected
         queue = self._scripts.get(req.model or "")
         item: Any = queue.popleft() if queue else self._scenes[req.provider]
         if isinstance(item, Reply):
