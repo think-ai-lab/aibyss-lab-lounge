@@ -600,6 +600,7 @@ aibyss-lab-lounge/
     emitter.py / run_once.py / run_loop.py   # 3 つのエントリポイント
     preflight.py          # 配信前の点検（本番経路からは呼ばれない）
     spend.py              # 有料の計測の価格表・支出の記録・上限（本番経路からは呼ばれない）
+    replay_set.py         # 判定のリプレイのセット（実走ログから組み直し、確認のファイル）
     mcp_servers/          # ask_character / web_search / retrieve_memory
     system_prompts/       # キャラ別システムプロンプト
   tests/
