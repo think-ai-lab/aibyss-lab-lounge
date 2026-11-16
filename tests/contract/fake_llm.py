@@ -47,6 +47,7 @@ import itertools
 import json
 import re
 import threading
+import traceback
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -465,10 +466,13 @@ class FakeLLMServer:
         url:             サーバの根の URL（例: http://127.0.0.1:50123）。Anthropic と Gemini の向け先
         openai_base_url: OpenAI の向け先（url + "/v1"）。OpenAI の SDK は base_url に /v1 を含める
         requests:        受けた要求の記録（受けた順）
+        errors:          偽サーバ自身の失敗（応答を作る途中の例外）の記録。空であるべきもの。
+                         ``fake_llm`` fixture が、テストの後に空であることを確かめる
     """
 
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
+        self.errors: list[str] = []
         self._scenes: dict[str, tuple[str, dict[str, Any]]] = {p: ("ok", {}) for p in SCENES}
         self._scripts: dict[str, deque[Any]] = defaultdict(deque)
         # WHY ロック: ThreadingHTTPServer は要求ごとにスレッドを立てる。協働（ask_character）では
@@ -539,7 +543,22 @@ class FakeLLMServer:
     # ── 中身 ──
 
     def _handle(self, handler: BaseHTTPRequestHandler) -> None:
-        """1 回の要求を読み、記録し、応答を返す。"""
+        """1 回の要求を読み、記録し、応答を返す。偽サーバ自身の例外は 500 にして、errors へ残す。
+
+        WHY: 例外をそのままにすると、接続が切れて SDK の接続エラーになり、L2 は None を返す。
+        それが「偽サーバが壊れた」のか「L2 が本当に None を返した」のか、テストから見分けられない。
+        500 と文面で返し、errors に残せば、fixture の後始末が赤くして、原因を示せる。
+        """
+        try:
+            reply = self._serve(handler)
+        except Exception as exc:  # noqa: BLE001 - 何が起きても 500 で返す
+            with self._lock:
+                self.errors.append(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            reply = Reply(500, {"error": {"message": f"fake_llm 自身の失敗: {type(exc).__name__}: {exc}"}})
+        self._send(handler, reply)
+
+    def _serve(self, handler: BaseHTTPRequestHandler) -> Reply:
+        """要求を読んで記録し、返す応答を決める。"""
         raw = _read_body(handler)
         try:
             body = json.loads(raw) if raw else {}
@@ -563,6 +582,11 @@ class FakeLLMServer:
         with self._lock:
             self.requests.append(recorded)
             reply = self._next_reply(recorded)
+        return reply
+
+    @staticmethod
+    def _send(handler: BaseHTTPRequestHandler, reply: Reply) -> None:
+        """応答を書く。"""
         payload = json.dumps(reply.body, ensure_ascii=False).encode("utf-8")
         try:
             handler.send_response(reply.status)

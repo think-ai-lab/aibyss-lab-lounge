@@ -25,6 +25,9 @@ from fake_llm import DUMMY_API_KEY, FakeLLMServer
 # 失敗の場面（400 や時間切れ）を速くする。既定は 20〜40 秒の時間切れと 1 回の再試行。
 _FAST_TIMEOUT_SEC = "5"
 
+# 上の tests/conftest.py の socket の網が loopback で通す、ポートの下限（_EPHEMERAL_PORT_MIN と同じ値）。
+_SOCKET_GUARD_MIN_PORT = 32768
+
 
 @pytest.fixture
 def fake_llm(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeLLMServer]:
@@ -52,6 +55,14 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeLLMServer]:
         FakeLLMServer: 立てたサーバ。テストの終わりに止める
     """
     server = FakeLLMServer()
+    port = int(server.url.rsplit(":", 1)[1])
+    if port < _SOCKET_GUARD_MIN_PORT:
+        server.close()
+        pytest.fail(
+            f"偽サーバのポートが {port} で、socket の網が通す {_SOCKET_GUARD_MIN_PORT} 以上ではありません。"
+            "OS が選ぶ範囲が違う環境です（Linux の既定は 32768 から）。tests/conftest.py の _EPHEMERAL_PORT_MIN を確かめてください",
+            pytrace=False,
+        )
     env = {
         "ANTHROPIC_BASE_URL": server.url,
         "OPENAI_BASE_URL": server.openai_base_url,
@@ -64,6 +75,10 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeLLMServer]:
         "L2_LLM_MAX_RETRIES": "0",
         "L2_LLM_TIMEOUT_SEC": _FAST_TIMEOUT_SEC,
         "L2_ROUTER_LLM_TIMEOUT_SEC": _FAST_TIMEOUT_SEC,
+        # WHY: Windows のレジストリや HTTP_PROXY の設定が、loopback への要求をプロキシへ回すことがある。
+        #     偽サーバへ届かず、テストが理由の分からない接続エラーになる。両方の綴りで loopback を除外する。
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
     }
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -71,6 +86,8 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeLLMServer]:
         yield server
     finally:
         server.close()
+    # 偽サーバ自身の失敗は、L2 の None や例外と見分けがつかないので、ここで赤くして原因を示す。
+    assert not server.errors, "偽サーバ自身が失敗しました:\n" + "\n".join(server.errors)
 
 
 # Agent の呼び出しに渡す、ストリームの識別子。BubbleToolCallbackHandler と ask_character は、
