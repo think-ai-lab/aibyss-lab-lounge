@@ -1770,7 +1770,18 @@ class TestStaticFindings:
         os.environ["L2_DECISION_LOG"] = "true"
         report = preflight.Report()
         preflight._check_flags(report)
-        assert _status(report, "flag/L2_DECISION_LOG").status == "WARN"
+        row = _status(report, "flag/L2_DECISION_LOG")
+        assert row.status == "WARN"
+        # 書き先は cwd からの相対なので、絶対パスで示す。
+        assert str(Path.cwd() / "logs" / "decisions") in row.detail
+
+    def test_debug_artifacts_warn_does_not_call_logs_tracked(self, isolated):
+        """logs/ は gitignore 済み。「追跡済み」と書くと、公開リポジトリに入ると誤解させる。"""
+        os.environ["L2_DEBUG_ARTIFACTS"] = "true"
+        report = preflight.Report()
+        preflight._check_flags(report)
+        detail = _status(report, "flag/L2_DEBUG_ARTIFACTS").detail
+        assert "gitignore 済み" in detail and "追跡済み" not in detail
 
     def test_broken_numeric_env_is_fail_and_hides_the_value(self, isolated, capsys):
         os.environ["L2_LLM_MAX_RETRIES"] = "abc-value"
