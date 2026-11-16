@@ -4,6 +4,9 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
 責務:
   - raw:     本物の判定の関数（挙手の候補と承認）と、filler の LLM 呼び出し（キャラごとのモデル）を、
              合成の入力で n 回ずつ流し、p50 / p90 / 最大、失敗の数、tokens、費用を出す
+  - agent:   本番と同じ Agent（道具つき）の組み立てで、キャラごとに合成の発話を流し、全体の時間、step ごとの
+             時間と tokens（キャッシュの読み書きを含む）、道具の発火、費用を測る。道具は長さを固定した定型の応答
+             に差し替える（外の検索や記憶や他キャラの TTS を呼ばない）。返答の本文は聴き比べ用に別ファイルへ残す
 
 本番の経路からは呼ばれない。このモジュールを消しても配信の挙動は変わらない
 （本番のモジュールがこれを import しないことはテストで固定している）。
@@ -21,20 +24,27 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
 
 【使い方】
   uv run --frozen --all-extras python -m lab_lounge.probe raw --profile dev --label <名前> --max-usd 0.5
+  uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label <名前> --max-usd 3
+  #   少数で試す: --limit 2 --characters mimi / 別のモデルで全キャラ: --llm anthropic:claude-sonnet-4-6
 
   入力は合成の行だけ（実発話は使わない）:
     - 挙手の候補と承認: measure_sets/replay_synthetic.jsonl（--synthetic で差し替え）
-    - filler:          measure_sets/agent_utterances.jsonl（--utterances で差し替え）。{name} は
+    - filler と agent: measure_sets/agent_utterances.jsonl（--utterances で差し替え）。{name} は
                        そのキャラの wake_word、{other} は別のパネリストの wake_word に置き換える
 
 【終了コード】
-  0: 正常 / 1: 呼び出しの失敗がある、または想定外のエラー / 2: 断った（同じ名前の回がある、入力が足りない）
+  0: 正常 / 1: 呼び出しの失敗がある、時間切れ、または想定外のエラー / 2: 断った（同じ名前の回がある、入力が足りない、
+  ツールが無効）
   4: 上限、価格表にないモデル、usage の拾い損ねで止めた（spend）/ 64: コマンドラインの誤り / 130: Ctrl+C
 
 【出力】（data/probe/、gitignore 済み）
   raw_<名前>.jsonl:        1 呼び出し 1 行（グループ、入力の id、モデル、時間、失敗の型、費用、tokens）。本文なし
   raw_<名前>.meta.json:    commit、uv.lock のハッシュ、SDK の版、モデル、入力の数とハッシュ
   raw_<名前>.problems.log: 実行中の WARNING 以上のログ（例外の文言を含みうるので Claude は開かない）
+  agent_<名前>.jsonl:          1 呼び出し 1 行（数字 + 返答の本文）。返答の本文はこのファイルだけに書く（Claude は開かない）
+  agent_<名前>.metrics.jsonl:  上から本文を除いたもの（数字だけ）
+  agent_<名前>.meta.json:      commit、モデル、配信文脈と人格のハッシュ、集計
+  stream_context_snapshot.md:  最初の回の配信文脈の写し。後の回も同じものを使う（--refresh-snapshot で取り直す）
 
 【出力の約束】
   画面には、件数、時間、tokens、費用だけを出す。発話の本文と、モデルの答えは出さず、ファイルにも書かない。
@@ -43,7 +53,9 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
+import contextvars
 import hashlib
 import json
 import math
@@ -514,6 +526,517 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     return EXIT_FAILED if failed else EXIT_OK
 
 
+# ─── agent ───────────────────────────────────────────────────────
+
+AGENT_CHARACTERS = ("mimi", "chisame", "sakura", "octamaid")
+
+# 道具の定型の応答の長さ（文字数）の既定。WHY: 道具の応答の長さは、次の step の入力 tokens と時間に効く。
+# 実の検索（web_search）は長く、記憶（retrieve_memory）は中くらい、他キャラの返答（ask_character）は短い。
+# 回をまたいで同じ長さにして、モデルや設定の違いだけが数字に出るようにする。
+DEFAULT_TOOL_CHARS = {"web_search": 1200, "retrieve_memory": 600, "ask_character": 300}
+
+# 定型の応答の素。深海の一般的な説明（中身に意味はなく、毎回同じ文を繰り返して長さをそろえる）。
+_CANNED_BASE = ("深海には光がほとんど届かず、多くの生き物が自ら光を出して暮らしています。"
+                "水圧は水深とともに増し、千メートルでは地上の約百倍になります。"
+                "深海の調査は、無人探査機と音響の観測を組み合わせて進められています。")
+
+# meta に値を残す環境変数（Agent の組み立てと時間に効くもの）。
+_AGENT_ENV_IN_META = (*_ENV_IN_META, "L2_ENABLE_TOOLS", "L2_ENABLE_RAG", "L2_AGENT_INVOKE_TIMEOUT_SEC",
+                      "L2_AGENT_RECURSION_LIMIT", "L2_LLM_REASONING_EFFORT", "L2_LLM_TIMEOUT_SEC")
+
+_TOOL_NAME_OK = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+
+
+def canned_text(tool: str, chars: int) -> str:
+    """道具の定型の応答。ちょうど chars 文字で、同じ引数なら同じ文字列になる。"""
+    prefix = f"[{tool} の定型の応答]\n"
+    body = (_CANNED_BASE * (chars // len(_CANNED_BASE) + 1))[: max(0, chars - len(prefix))]
+    return (prefix + body)[:chars]
+
+
+@contextlib.contextmanager
+def canned_tools(lengths: dict[str, int], fires: Counter) -> Iterator[None]:
+    """with の中だけ、3 つの道具の本体を、長さを固定した定型の応答を返す関数に差し替える。出るときに戻す。
+
+    差し替えるのは mcp_servers の関数（web_search / retrieve_memory / ask_character）だけで、LangChain に渡す
+    道具のスキーマ（名前、引数、説明）は graph._load_mcp_tools が作る本物のまま。graph は道具を組み立てる
+    たびにこれらの関数を import するので、モジュールの属性を差し替えれば効く。
+    WHY: 外の検索（費用と時間のばらつき）、記憶検索（C2）、他キャラの生成と TTS を呼ばずに、本応答の LLM の
+         step だけを測るため。発火した数は fires に数える。
+    """
+    from .mcp_servers import ask_character, retrieve_memory, web_search
+
+    targets = [(web_search, "web_search"), (retrieve_memory, "retrieve_memory"), (ask_character, "ask_character")]
+    lock = threading.Lock()
+    originals = []
+
+    def make(name: str) -> Callable[..., str]:
+        text = canned_text(name, lengths[name])
+
+        def canned(*_args: Any, **_kwargs: Any) -> str:
+            with lock:
+                fires[name] += 1
+            return text
+
+        return canned
+
+    for module, name in targets:
+        originals.append((module, name, getattr(module, name)))
+        setattr(module, name, make(name))
+    try:
+        yield
+    finally:
+        for module, name, original in originals:
+            setattr(module, name, original)
+
+
+def tag_speaker(text: str) -> str:
+    """本番の user の前置きの規則（発話者がルカだと LLM に明示する）。
+
+    graph._generation_node のなかの規則の写し。関数に切り出されていないので、写してテストで固定する
+    （tests/test_probe.py が graph.py の該当の行を読み、変わったら赤くなる）。
+    WHY 写す: これが無いと、user message の発話者を LLM が視聴者と推測して、呼び方や口調が本番とずれ、
+         出力の長さ（= 時間と tokens）まで変わりうる。本番の graph.py の経路は変えない方針なので、複製する。
+    """
+    if text and not text.startswith("[") and "アビスメイト" not in text[:30]:
+        return f"[ルカからの発言]\n{text}"
+    return text
+
+
+def _safe_tool_name(name: object) -> str:
+    return name if isinstance(name, str) and _TOOL_NAME_OK.fullmatch(name) else "<不正な名前>"
+
+
+def make_recorder() -> Any:
+    """step ごとの時間と tokens、道具の時間を、run_id で開始と終了を組んで記録するコールバックを作る。
+
+    WHY BaseCallbackHandler を継承: LangChain が handler に求める属性が更新で増えても、属性の不足で例外が握られて
+         黙って記録しなくなるのを避ける。関数の中で import するのは、langchain_core の import が壊れた環境でも
+         モジュールの読み込みを止めないため。
+    WHY run_id で組む: 並列の step や道具の中の LLM があっても、開始と終了を取り違えない。
+    WHY 道具の名前を検査して残す: 名前はモデルの出力から来る。本文は残さない。
+    """
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    from .graph import _extract_llm_usage, _first_generation_message
+
+    class _Recorder(BaseCallbackHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.steps: list[dict[str, Any]] = []
+            self.tools: list[dict[str, Any]] = []
+            self._llm_open: dict[Any, float] = {}
+            self._tool_open: dict[Any, tuple[str, float]] = {}
+
+        def on_chat_model_start(self, serialized: Any, messages: Any, *, run_id: Any, **_kwargs: Any) -> None:
+            self._llm_open[run_id] = time.monotonic()
+
+        def on_llm_end(self, response: Any, *, run_id: Any, **_kwargs: Any) -> None:
+            started = self._llm_open.pop(run_id, None)
+            info = _extract_llm_usage(response)
+            message = _first_generation_message(response)
+            calls = [_safe_tool_name(call.get("name")) for call in (getattr(message, "tool_calls", None) or [])
+                     if isinstance(call, dict)]
+            self.steps.append({
+                "n": len(self.steps) + 1,
+                "ms": None if started is None else int((time.monotonic() - started) * 1000),
+                **{key: int(info[key] or 0) for key in _TOKEN_KEYS},
+                "finish": info["finish"] if isinstance(info["finish"], str) else None,
+                "model": info["model"] if isinstance(info["model"], str) else None,
+                "tool_calls": calls, "error": None,
+            })
+
+        def _llm_failed(self, error: BaseException, run_id: Any) -> None:
+            started = self._llm_open.pop(run_id, None)
+            self.steps.append({
+                "n": len(self.steps) + 1,
+                "ms": None if started is None else int((time.monotonic() - started) * 1000),
+                **dict.fromkeys(_TOKEN_KEYS, 0), "finish": None, "model": None, "tool_calls": [],
+                "error": type(error).__name__,
+            })
+
+        def on_llm_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+            self._llm_failed(error, run_id)
+
+        def on_chat_model_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+            self._llm_failed(error, run_id)
+
+        def on_tool_start(self, serialized: Any, input_str: str, *, run_id: Any, **kwargs: Any) -> None:
+            name = (serialized or {}).get("name") if isinstance(serialized, dict) else None
+            self._tool_open[run_id] = (_safe_tool_name(name or kwargs.get("name")), time.monotonic())
+
+        def _tool_done(self, run_id: Any, error: BaseException | None) -> None:
+            name, started = self._tool_open.pop(run_id, ("<不明>", time.monotonic()))
+            self.tools.append({"name": name, "ms": int((time.monotonic() - started) * 1000),
+                               "error": None if error is None else type(error).__name__})
+
+        def on_tool_end(self, output: Any, *, run_id: Any, **_kwargs: Any) -> None:
+            self._tool_done(run_id, None)
+
+        def on_tool_error(self, error: BaseException, *, run_id: Any, **_kwargs: Any) -> None:
+            self._tool_done(run_id, error)
+
+    return _Recorder()
+
+
+class AgentTimeout(Exception):
+    """agent.invoke が時間切れになった。呼び出し側が記録してから hard_exit する。
+
+    Attributes:
+        line: 時間切れまでに取れた分（step、道具、費用）の行。measure_agent_call が入れる
+    """
+
+    line: dict[str, Any] | None = None
+
+
+def resolve_stream_context(snapshot: Path, *, refresh: bool,
+                           load_live: Callable[[], str | None]) -> tuple[str | None, dict[str, Any]]:
+    """配信文脈を決める。写しがあればそれを使い、無ければ今のものを読んで写しを作る。
+
+    WHY 写す: 配信文脈は日々書き換わるので、そのまま読むと回ごとに system prompt が変わり、モデルや設定の
+         違いと見分けられない。最初の回の写しを `data/probe/` に残し、後の回も同じものを使う。
+    meta には、由来、文字数、ハッシュだけを残す（中身は書かない）。
+    """
+    origin = "snapshot"
+    text: str | None = None
+    if snapshot.is_file() and not refresh:
+        text = snapshot.read_text(encoding="utf-8").strip() or None
+    if text is None:
+        origin = "live"
+        text = load_live()
+        if text:
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            with snapshot.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(text + "\n")
+    if not text:
+        return None, {"origin": "none", "chars": 0, "sha": None}
+    return text, {"origin": origin, "chars": len(text), "sha": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]}
+
+
+def persona_hashes(slug: str) -> dict[str, str | None]:
+    """人格ファイルと Skills のハッシュ（再現のため。中身は残さない）。"""
+    from .characters import get_character, load_system_prompt
+    from .skill_loader import build_skills_prompt
+
+    def sha(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    try:
+        persona = sha(load_system_prompt(get_character(slug)))
+    except FileNotFoundError:
+        persona = None
+    return {"persona_sha": persona, "skills_sha": sha(build_skills_prompt(slug))}
+
+
+def response_text(result: dict[str, Any]) -> str:
+    """agent の戻り値から返答の本文を取る（構造化出力を優先し、無ければ最後の AI の本文）。聴き比べ用。"""
+    structured = result.get("structured_response")
+    if structured is not None:
+        if hasattr(structured, "model_dump_json"):
+            return structured.model_dump_json()
+        if isinstance(structured, dict):
+            return json.dumps(structured, ensure_ascii=False)
+    for message in reversed(result.get("messages", [])):
+        if getattr(message, "type", "") in ("ai", "assistant"):
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                return "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+            return str(content)
+    return ""
+
+
+def invoke_agent(agent: Any, tagged_text: str, recorder: Any, *, timeout_sec: float, recursion_limit: int) -> dict[str, Any]:
+    """agent.invoke を別スレッドで呼び、壁時計の時間切れで打ち切る。
+
+    graph._invoke_agent_with_timeout は使わない: 打ち切りの後始末（協働先の TTS を止める）は計測では要らず、
+    打ち切ったら記録してプロセスごと終える（orphan のスレッドの課金を止めるため）。
+    contextvars は呼び出し元のものを引き継ぐ（本番と同じ）。
+
+    Raises:
+        AgentTimeout: timeout_sec を超えた
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    context = contextvars.copy_context()
+    config = {"recursion_limit": recursion_limit, "callbacks": [recorder]}
+    future = executor.submit(context.run, agent.invoke, {"messages": [{"role": "user", "content": tagged_text}]}, config)
+    try:
+        return future.result(timeout=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        raise AgentTimeout(f"{timeout_sec:.0f} 秒") from None
+    finally:
+        executor.shutdown(wait=False)
+
+
+@dataclass
+class AgentSettings:
+    """1 回の計測で共通の設定。"""
+
+    stream_context: str | None
+    timeout_sec: float
+    recursion_limit: int
+    llm_override: tuple[str, str] | None = None  # (provider, model)
+
+
+def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: AgentSettings,
+                       ledger: spend.SpendLedger, label: str) -> tuple[dict[str, Any], str]:
+    """1 回の Agent の呼び出しを測り、(数字の行, 返答の本文) を返す。
+
+    組み立ては preflight と同じ（_agent_prompt、_build_agent_graph、agent.invoke を直に）。_run_agent は使わない:
+    失敗をフォールバックで隠し、finish を固定し、tokens を最後の 1 回分しか数えないため。
+    Agent は本番と同じくターンごとに作る（build_ms に出る。LLM のクライアントの作り直しも含む）。
+
+    Raises:
+        AgentTimeout: 時間切れ（呼び出し側が記録して終える）
+        spend.SpendStop: 上限などで止めた
+    """
+    from . import graph
+    from .characters import get_character
+    from .pipeline import _get_llm_mode
+    from .preflight import _agent_prompt, _summarize_agent_result
+
+    character = get_character(slug)
+    _, provider, model = _get_llm_mode(character)
+    if settings.llm_override:
+        provider, model = settings.llm_override
+    spend.last_call()
+    usd_before, calls_before = ledger.run_usd(label), ledger.data["by_run"].get(label, {}).get("calls", 0)
+    line: dict[str, Any] = {
+        "i": index, "character": slug, "utterance_id": utterance.id, "category": utterance.category,
+        "cold": index == 0, "provider": provider, "model": model,
+        "build_ms": None, "total_ms": None, "error": None, "source": None, "response_chars": 0,
+        "steps": [], "tools": [], "tools_fired": [], "finish": None, "model_on_wire": [],
+    }
+    recorder = make_recorder()
+    body = ""
+    started = time.monotonic()
+    try:
+        prompt = _agent_prompt(character, settings.stream_context)
+        agent = graph._build_agent_graph(provider, model, prompt, character_slug=slug)
+        line["build_ms"] = int((time.monotonic() - started) * 1000)
+        if agent is None:
+            line["error"] = "NoAgent"
+        else:
+            invoked = time.monotonic()
+            try:
+                result = invoke_agent(agent, tag_speaker(expand_utterance(utterance.text, slug)), recorder,
+                                      timeout_sec=settings.timeout_sec, recursion_limit=settings.recursion_limit)
+            finally:
+                line["total_ms"] = int((time.monotonic() - invoked) * 1000)
+                line["steps"], line["tools"] = recorder.steps, recorder.tools
+            summary = _summarize_agent_result(result)
+            body = response_text(result)
+            # source が structured_response でないとき（本番はメッセージの本文へ落ちる）は、失敗にせず source に出す。
+            line.update(source=summary["source"], response_chars=summary["response_len"], finish=summary["finish"],
+                        tools_fired=[_safe_tool_name(name) for name in summary["tools"]])
+    except AgentTimeout as exc:
+        line["error"] = "Timeout"
+        exc.line = line  # finally が費用を書き足した後の同じ行を、呼び出し側が記録する
+        raise
+    except spend.SpendStop:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 失敗の型だけを残す（文言には本文が入りうる）
+        line["error"] = type(exc).__name__
+    finally:
+        line["usd"] = ledger.run_usd(label) - usd_before
+        line["http_calls"] = ledger.data["by_run"].get(label, {}).get("calls", 0) - calls_before
+    return line, body
+
+
+def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """1 キャラの集計。時間は成功した呼び出しだけ、cold は最初の 1 回、warm は 2 回目以降。"""
+    ok = [line for line in lines if not line["error"] and line["total_ms"] is not None]
+    cold = [float(line["total_ms"]) for line in ok if line["cold"]]
+    warm = [float(line["total_ms"]) for line in ok if not line["cold"]]
+    steps = [step for line in ok for step in line["steps"]]
+    step_ms = [float(step["ms"]) for step in steps if step["ms"] is not None and not step["error"]]
+    tokens = {key: sum(step[key] for line in lines for step in line["steps"]) for key in _TOKEN_KEYS}
+    fired: Counter = Counter()
+    for line in ok:
+        fired.update(line["tools_fired"])
+    return {
+        "n": len(lines), "failed": len(lines) - len(ok), "cold_ms": cold[0] if cold else None,
+        "warm_p50": percentile(warm, 0.5), "warm_p90": percentile(warm, 0.9), "warm_max": max(warm) if warm else None,
+        "step_p50": percentile(step_ms, 0.5), "step_p90": percentile(step_ms, 0.9),
+        "steps_mean": (len(steps) / len(ok)) if ok else None, "tokens": tokens,
+        "tools_fired": dict(fired), "source": dict(Counter(line["source"] for line in lines if line["source"])),
+        "usd": sum(line.get("usd", 0.0) for line in lines),
+        "models": dict(Counter(line["model"] for line in lines if line["model"])),
+        "model_on_wire": dict(Counter(step["model"] for line in lines for step in line["steps"] if step["model"])),
+        "finish": dict(Counter(line["finish"] for line in lines if line["finish"])),
+    }
+
+
+def print_agent_summary(slug: str, summary: dict[str, Any]) -> None:
+    """キャラごとの 2 行を画面へ（時間、steps、tokens、道具、source、費用だけ）。"""
+    models = "/".join(spend._showable(m) for m in sorted(summary["models"])) or "-"
+    wire = "/".join(spend._showable(m) for m in sorted(summary["model_on_wire"])) or "-"
+    n_ok = max(summary["n"] - summary["failed"], 1)
+    t = summary["tokens"]
+    fired = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["tools_fired"].items())) or "なし"
+    source = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["source"].items())) or "-"
+    emit(f"  {slug}: モデル {models}（応答 {wire}）  n={summary['n']} 失敗={summary['failed']}  "
+         f"cold={_ms(summary['cold_ms'])}ms  warm p50={_ms(summary['warm_p50'])}ms p90={_ms(summary['warm_p90'])}ms "
+         f"最大={_ms(summary['warm_max'])}ms  step p50={_ms(summary['step_p50'])}ms p90={_ms(summary['step_p90'])}ms")
+    emit(f"      steps 平均 {summary['steps_mean'] if summary['steps_mean'] is None else round(summary['steps_mean'], 2)}  "
+         f"tokens/回 in={t['input'] // n_ok} out={t['output'] // n_ok} reasoning={t['reasoning'] // n_ok} "
+         f"cache_read={t['cache_read'] // n_ok} cache_creation={t['cache_creation'] // n_ok}  "
+         f"道具 {fired}  source {source}  ${summary['usd']:.4f}")
+
+
+def parse_tool_chars(texts: list[str]) -> dict[str, int]:
+    """``--tool-chars web_search=800`` の列を、既定に重ねた長さの表にする。
+
+    Raises:
+        ValueError: 名前が道具にない、または長さが 1 以上の整数でない
+    """
+    lengths = dict(DEFAULT_TOOL_CHARS)
+    for text in texts:
+        name, _, value = text.partition("=")
+        if name not in lengths or not value.isdecimal() or int(value) < 1:
+            raise ValueError("--tool-chars は 道具名=文字数（web_search / retrieve_memory / ask_character）の形にしてください")
+        lengths[name] = int(value)
+    return lengths
+
+
+def parse_llm_override(text: str | None) -> tuple[str, str] | None:
+    """``--llm anthropic:claude-sonnet-4-6`` を (provider, model) にする。
+
+    Raises:
+        ValueError: provider:model の形でない、または provider が違う
+    """
+    if not text:
+        return None
+    provider, _, model = text.partition(":")
+    if provider not in ("openai", "anthropic", "google") or not model:
+        raise ValueError("--llm は provider:model（provider は openai / anthropic / google）の形にしてください")
+    return provider, model
+
+
+def agent_meta(label: str, args: argparse.Namespace, *, characters: list[str], settings: AgentSettings,
+               context_meta: dict[str, Any], lengths: dict[str, int], utterances: list[Utterance]) -> dict[str, Any]:
+    """agent の meta。値は設定と版とハッシュと数だけ（本文なし）。"""
+    from .characters import get_character
+    from .pipeline import _get_llm_mode
+
+    models = {}
+    for slug in characters:
+        _, provider, model = _get_llm_mode(get_character(slug))
+        models[slug] = f"{settings.llm_override[0]}:{settings.llm_override[1]}" if settings.llm_override else f"{provider}:{model}"
+    return {
+        "tool": "agent", "label": label, "started": datetime.now(UTC).isoformat(timespec="seconds"),
+        "commit": git_commit(), "uv_lock_sha": file_sha(_REPO_ROOT / "uv.lock"), "sdk": sdk_versions(),
+        "profile": args.profile, "characters": characters, "models": models,
+        "llm_override": args.llm, "env": {name: os.environ.get(name) for name in _AGENT_ENV_IN_META},
+        "timeout_sec": settings.timeout_sec, "recursion_limit": settings.recursion_limit,
+        "stream_context": context_meta, "personas": {slug: persona_hashes(slug) for slug in characters},
+        "tool_chars": lengths, "gap_sec": args.gap_sec,
+        "utterances": {"n": len(utterances), "sha": digest([(u.id, u.category, u.text) for u in utterances])},
+    }
+
+
+def _cmd_agent(args: argparse.Namespace) -> int:
+    from . import graph
+    from .preflight import _captured_logs, prepare_env, silence_side_outputs
+    from .stream_context import load_stream_context
+
+    if not spend._RUN_NAME.fullmatch(args.label):
+        emit("--label は英数字と _.- で 64 字までにしてください")
+        return EXIT_USAGE
+    characters = [c for c in args.characters.split(",") if c] if args.characters else list(AGENT_CHARACTERS)
+    if not characters or any(c not in AGENT_CHARACTERS for c in characters):
+        emit(f"--characters は {', '.join(AGENT_CHARACTERS)} のいくつかをコンマ区切りで指定してください")
+        return EXIT_USAGE
+    try:
+        lengths = parse_tool_chars(args.tool_chars)
+        llm_override = parse_llm_override(args.llm)
+    except ValueError as exc:  # 自分の検査の文言（入力の値は含まない）
+        emit(str(exc))
+        return EXIT_USAGE
+    out_dir = args.out_dir or spend.default_spend_dir()
+    run_path = out_dir / f"agent_{args.label}.jsonl"
+    if run_path.exists():
+        emit(f"実行 {args.label} はすでにあります（別の名前で --label）")
+        return EXIT_REFUSED
+    try:
+        utterances = load_utterances(args.utterances)
+    except ValueError as exc:
+        emit(f"[断りました] {exc}")
+        return EXIT_REFUSED
+    if args.limit:
+        utterances = utterances[: args.limit]
+
+    prepare_env(args.profile, _REPO_ROOT)
+    silence_side_outputs()
+    if decision_log.is_enabled():
+        emit("判定ログを止められませんでした")
+        return EXIT_REFUSED
+    if not graph._is_tools_enabled():
+        # WHY 断る: ツールが無効だと、本番は Agent を通らず単一ノードで答える。Agent を測っても本番の物差しにならない。
+        emit("[断りました] L2_ENABLE_TOOLS が無効です（本番は Agent を通りません）")
+        return EXIT_REFUSED
+    if not graph._is_rag_enabled():
+        emit("[警告] L2_ENABLE_RAG が無効で、retrieve_memory は道具に入りません（本番と同じ設定です）")
+
+    stream_context, context_meta = resolve_stream_context(
+        out_dir / "stream_context_snapshot.md", refresh=args.refresh_snapshot, load_live=load_stream_context)
+    settings = AgentSettings(stream_context, graph._get_agent_invoke_timeout(), graph._get_agent_recursion_limit(),
+                             llm_override)
+    meta = agent_meta(args.label, args, characters=characters, settings=settings, context_meta=context_meta,
+                      lengths=lengths, utterances=utterances)
+    meta_path = out_dir / f"agent_{args.label}.meta.json"
+    _write_json(meta_path, meta)
+
+    overrides = dict(spend.parse_price_override(text) for text in args.price)
+    ledger = spend.SpendLedger(args.spend_dir or spend.default_spend_dir())
+    emit(f"agent {args.label}: {len(characters)} キャラ × {len(utterances)} 発話、上限 ${args.max_usd:.2f}、"
+         f"時間切れ {settings.timeout_sec:.0f} 秒、recursion_limit {settings.recursion_limit}、"
+         f"配信文脈 {context_meta['origin']}（{context_meta['chars']} 字）")
+    full, metrics = replay.RunFile(run_path), replay.RunFile(out_dir / f"agent_{args.label}.metrics.jsonl")
+    summaries: dict[str, dict[str, Any]] = {}
+    fires: Counter = Counter()
+    done = 0
+    with prevent_sleep(), _captured_logs(out_dir / f"agent_{args.label}.problems.log"), \
+            spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
+            canned_tools(lengths, fires):
+        for slug in characters:
+            lines: list[dict[str, Any]] = []
+            for index, utterance in enumerate(utterances):
+                if index and args.gap_sec > 0:
+                    time.sleep(args.gap_sec)
+                try:
+                    line, body = measure_agent_call(slug, utterance, index, settings, ledger, args.label)
+                except AgentTimeout as timeout:
+                    # 時間切れ: 取れた分（step、道具、費用）を残してから、残りのスレッドを待たずに終える。
+                    line = timeout.line or {"i": index, "character": slug, "utterance_id": utterance.id,
+                                            "category": utterance.category, "cold": index == 0, "error": "Timeout",
+                                            "total_ms": None, "steps": [], "tools": [], "tools_fired": [],
+                                            "source": None, "model": None, "usd": 0.0}
+                    metrics.append(line)
+                    full.append({**line, "response": ""})
+                    lines.append(line)
+                    summaries[slug] = summarize_agent(lines)
+                    meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=True,
+                                summary=summaries)
+                    _write_json(meta_path, meta)
+                    emit(f"[時間切れ] {slug} の {utterance.id} が {settings.timeout_sec:.0f} 秒を超えました。"
+                         f"記録して終えます（取り残したスレッドの課金を止めるため）")
+                    spend.hard_exit(EXIT_FAILED)
+                lines.append(line)
+                metrics.append(line)
+                full.append({**line, "response": body})
+                done += 0 if line["error"] else 1
+            meter.check_capture(done)
+            summaries[slug] = summarize_agent(lines)
+            print_agent_summary(slug, summaries[slug])
+    meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=False, summary=summaries,
+                tools_fired_total=dict(fires))
+    _write_json(meta_path, meta)
+    failed = sum(s["failed"] for s in summaries.values())
+    emit(f"合計 ${sum(s['usd'] for s in summaries.values()):.4f}、失敗 {failed}、"
+         f"道具の発火（定型の応答を返した数）{dict(fires)}、usage を拾えず見積もりで数えた呼び出し {meter.stats.uncounted}")
+    return EXIT_FAILED if failed else EXIT_OK
+
+
 # ─── コマンドライン ──────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -531,11 +1054,25 @@ def build_parser() -> argparse.ArgumentParser:
     raw.add_argument("--price", action="append", default=[], help="model=in,out[,cache_read[,cache_write]]")
     raw.add_argument("--out-dir", type=Path, default=None, help=argparse.SUPPRESS)
     raw.add_argument("--spend-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    agent = sub.add_parser("agent", help="本番と同じ Agent の時間、step ごとの tokens、道具の発火、費用（課金あり）")
+    agent.add_argument("--profile", choices=("dev", "prod"), required=True)
+    agent.add_argument("--label", required=True, help="実行の名前（英数字と _.- で 64 字まで）")
+    agent.add_argument("--max-usd", type=float, required=True, help="この実行の上限（同じ名前の過去の分を含む）")
+    agent.add_argument("--characters", default="", help=f"コンマ区切り（既定は {','.join(AGENT_CHARACTERS)}）")
+    agent.add_argument("--limit", type=int, default=0, help="発話を先頭から N 本だけ流す（少数で試す用）")
+    agent.add_argument("--gap-sec", type=float, default=2.0, help="呼び出しの間（秒）。既定 2")
+    agent.add_argument("--llm", default=None, help="全キャラのモデルを provider:model で差し替える（食べ比べ用）")
+    agent.add_argument("--tool-chars", action="append", default=[], help="道具の定型の応答の長さ 道具名=文字数")
+    agent.add_argument("--utterances", type=Path, default=None, help="計測の発話（既定は measure_sets/ の中）")
+    agent.add_argument("--refresh-snapshot", action="store_true", help="配信文脈の写しを今のもので取り直す")
+    agent.add_argument("--price", action="append", default=[], help="model=in,out[,cache_read[,cache_write]]")
+    agent.add_argument("--out-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    agent.add_argument("--spend-dir", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m lab_lounge.probe <raw>``。"""
+    """``python -m lab_lounge.probe <raw|agent>``。"""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -545,6 +1082,11 @@ def main(argv: list[str] | None = None) -> int:
             emit("--n は 1 以上、--gap-sec は 0 以上にしてください")
             return EXIT_USAGE
         return _cmd_raw(args)
+    if args.command == "agent":
+        if args.limit < 0 or args.gap_sec < 0:
+            emit("--limit と --gap-sec は 0 以上にしてください")
+            return EXIT_USAGE
+        return _cmd_agent(args)
     return EXIT_USAGE
 
 

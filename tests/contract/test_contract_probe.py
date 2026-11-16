@@ -13,6 +13,7 @@ import json
 import pytest
 
 from lab_lounge import preflight, probe, spend
+from lab_lounge.characters import get_character
 
 _SENTINEL = "SENTINEL-probe-contract-7c19"
 
@@ -127,3 +128,179 @@ def test_budget_stop_sends_nothing(probe_env, fake_llm):
                     "--out-dir", str(out_dir), "--spend-dir", str(spend_dir), "--synthetic", str(synthetic),
                     "--utterances", str(utterances), "--only", "router"])
     assert fake_llm.requests_for("anthropic") == []
+
+
+# ─── agent ───────────────────────────────────────────────────────
+
+_CONTEXT_SENTINEL = "SENTINEL-probe-context-3e55"
+_ANSWER_SENTINEL = "SENTINEL-probe-answer-91ab"
+_AGENT_SLUGS = ("mimi", "chisame", "sakura", "octamaid")
+
+
+class _Exited(Exception):
+    """hard_exit の代わり。本物はプロセスを終えるので、テストでは例外にして止める。"""
+
+
+@pytest.fixture
+def agent_probe_env(agent_env, tmp_path, monkeypatch):
+    """Agent の経路を偽サーバだけで流せる環境と、合成の発話、配信文脈を用意する。"""
+    utterances = _write_jsonl(tmp_path / "agent_utterances.jsonl", [
+        {"id": "u01", "category": "greeting", "text": f"{{name}}、{_SENTINEL}-u1"},
+        {"id": "u02", "category": "collab", "text": f"{{name}}と{{other}}で{_SENTINEL}-u2"},
+        {"id": "u03", "category": "deep", "text": f"{{name}}、{_SENTINEL}-u3"},
+    ])
+    context = tmp_path / "current.md"
+    context.write_text(f"今日の配信 {_CONTEXT_SENTINEL}\n", encoding="utf-8")
+    monkeypatch.setenv("L2_STREAM_CONTEXT_FILE", str(context))
+    monkeypatch.setattr(preflight, "prepare_env", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(probe, "_set_execution_state", lambda *, prevent: False)
+    for name in ("L2_DEBUG_ARTIFACTS", "L2_DECISION_LOG", *preflight._TRACING_VARS):
+        monkeypatch.setenv(name, "false")
+    for provider in ("anthropic", "openai", "google"):
+        agent_env.llm.scene(provider, "ok", text=_ANSWER_SENTINEL)
+    return agent_env, tmp_path / "out", tmp_path / "spend", utterances, context
+
+
+def _agent_run(env, *extra, label="agt", limit="2"):
+    _agent, out_dir, spend_dir, utterances, _context = env
+    return probe.main(["agent", "--profile", "dev", "--label", label, "--max-usd", "1", "--limit", limit,
+                       "--gap-sec", "0", "--out-dir", str(out_dir), "--spend-dir", str(spend_dir),
+                       "--utterances", str(utterances), *extra])
+
+
+def _metrics(out_dir, label="agt"):
+    path = out_dir / f"agent_{label}.metrics.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _llm_of(slug):
+    char = get_character(slug)
+    return char.llm_provider, char.llm_model or "gpt-5.4-mini"
+
+
+def _tool_names(body):
+    return {t.get("function", {}).get("name") or t.get("name") for t in body["tools"]}
+
+
+def test_agent_measures_steps_tools_and_cache_fields_without_text(agent_probe_env, capsys):
+    agent, out_dir, spend_dir, _utterances, _context = agent_probe_env
+    provider, model = _llm_of("mimi")
+    agent.llm.script(model, [("tool_call", {"name": "web_search_tool", "args": {"query": "q"}})])
+
+    assert _agent_run(agent_probe_env) == 0
+
+    captured = capsys.readouterr()
+    lines = _metrics(out_dir)
+    assert len(lines) == 8
+    assert [(x["character"], x["i"], x["cold"]) for x in lines][:3] == [
+        ("mimi", 0, True), ("mimi", 1, False), ("chisame", 0, True)]
+    first = lines[0]
+    assert (first["error"], first["source"], first["tools_fired"]) == (None, "structured_response", ["web_search_tool"])
+    assert len(first["steps"]) >= 2 and first["steps"][0]["tool_calls"] == ["web_search_tool"]
+    assert [t["name"] for t in first["tools"]] == ["web_search_tool"]
+    for line in lines:
+        assert line["total_ms"] is not None and line["build_ms"] is not None and line["usd"] > 0
+        for step in line["steps"]:
+            assert step["input"] > 0 and step["output"] > 0 and step["ms"] is not None and step["model"]
+            assert {"reasoning", "cache_read", "cache_creation", "finish"} <= set(step)
+    assert "response" not in first
+    # 道具は定型の応答で、スキーマは本物のまま: 2 回目の要求に定型の応答が載り、1 回目の要求に 3 つの道具の名前がある。
+    sent = agent.llm.requests_for(provider, model)
+    assert "web_search の定型の応答" in json.dumps(sent[1].body, ensure_ascii=False)
+    assert {"web_search_tool", "ask_character_tool"} <= _tool_names(sent[0].body)
+    # 本番と同じ user の前置きと、配信文脈（写し）が system prompt に入る。
+    body_text = json.dumps(sent[0].body, ensure_ascii=False)
+    assert "[ルカからの発言]" in body_text and "ミミ様" in body_text and _CONTEXT_SENTINEL in body_text
+    # 画面と数字のファイルには、発話も返答も配信文脈も出ない。返答は 1 つのファイルだけ。
+    assert all(token not in captured.out + captured.err for token in (_SENTINEL, _ANSWER_SENTINEL, _CONTEXT_SENTINEL))
+    assert _ANSWER_SENTINEL in (out_dir / "agent_agt.jsonl").read_text(encoding="utf-8")
+    for path in [*out_dir.iterdir(), *spend_dir.iterdir()]:
+        if path.suffix == ".log" or path.name in ("agent_agt.jsonl", "stream_context_snapshot.md"):
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert all(token not in text for token in (_SENTINEL, _ANSWER_SENTINEL, _CONTEXT_SENTINEL)), path.name
+    meta = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))
+    assert meta["stream_context"]["origin"] == "live" and meta["stream_context"]["chars"] > 0
+    assert set(meta["personas"]) == set(_AGENT_SLUGS) and meta["timed_out"] is False
+    assert meta["tools_fired_total"] == {"web_search": 1}
+    assert set(meta["summary"]) == set(_AGENT_SLUGS)
+    assert "cold=" in captured.out and "warm p50=" in captured.out and "cache_creation=" in captured.out
+
+
+def test_agent_tools_are_restored_after_the_run(agent_probe_env):
+    from lab_lounge.mcp_servers import web_search
+
+    original = web_search.web_search
+    assert _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1") == 0
+    assert web_search.web_search is original
+
+
+def test_later_runs_reuse_the_stream_context_snapshot(agent_probe_env):
+    agent, out_dir, _spend_dir, _utterances, context = agent_probe_env
+    assert _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1") == 0
+    context.write_text("まったく違う配信", encoding="utf-8")
+    assert _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1", label="agt2") == 0
+    first = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))["stream_context"]
+    second = json.loads((out_dir / "agent_agt2.meta.json").read_text(encoding="utf-8"))["stream_context"]
+    assert second["origin"] == "snapshot" and second["sha"] == first["sha"]
+    assert "まったく違う配信" not in json.dumps([r.body for r in agent.llm.requests_for()], ensure_ascii=False)
+
+
+def test_llm_override_sends_every_character_to_one_model(agent_probe_env):
+    agent, out_dir, _spend_dir, _utterances, _context = agent_probe_env
+    assert _agent_run(agent_probe_env, "--llm", "anthropic:claude-haiku-4-5", "--limit", "1") == 0
+    assert agent.llm.requests_for("openai") == [] and agent.llm.requests_for("google") == []
+    assert len(agent.llm.requests_for("anthropic")) == 4
+    meta = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))
+    assert set(meta["models"].values()) == {"anthropic:claude-haiku-4-5"}
+    assert {line["model"] for line in _metrics(out_dir)} == {"claude-haiku-4-5"}
+
+
+def test_failed_agent_calls_are_recorded_by_type_and_exit_1(agent_probe_env, capsys):
+    agent, out_dir, _spend_dir, _utterances, _context = agent_probe_env
+    agent.llm.scene("anthropic", "http_error", status=400)
+    assert _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "2") == 1
+    lines = _metrics(out_dir)
+    assert all(line["error"] for line in lines) and all(line["error"].isidentifier() for line in lines)
+    captured = capsys.readouterr()
+    assert "失敗=2" in captured.out and _SENTINEL not in captured.out + captured.err
+
+
+def test_timeout_is_recorded_before_exiting(agent_probe_env, monkeypatch, capsys):
+    _agent, out_dir, _spend_dir, _utterances, _context = agent_probe_env
+    codes = []
+
+    def hard_exit(code):
+        codes.append(code)
+        raise _Exited
+
+    def too_slow(*_args, **_kwargs):
+        raise probe.AgentTimeout("90 秒")
+
+    monkeypatch.setattr(spend, "hard_exit", hard_exit)
+    monkeypatch.setattr(probe, "invoke_agent", too_slow)
+    with pytest.raises(_Exited):
+        _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "2")
+    assert codes == [probe.EXIT_FAILED]
+    (line,) = _metrics(out_dir)
+    assert line["error"] == "Timeout" and line["character"] == "sakura"
+    meta = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))
+    assert meta["timed_out"] is True and meta["summary"]["sakura"]["failed"] == 1
+    out = capsys.readouterr().out
+    assert "時間切れ" in out and _SENTINEL not in out
+
+
+def test_agent_is_refused_when_tools_are_disabled(agent_probe_env, monkeypatch, capsys):
+    monkeypatch.setenv("L2_ENABLE_TOOLS", "false")
+    assert _agent_run(agent_probe_env) == probe.EXIT_REFUSED
+    assert "L2_ENABLE_TOOLS" in capsys.readouterr().out
+    assert agent_probe_env[0].llm.requests_for() == []
+
+
+def test_agent_budget_stop_sends_nothing(agent_probe_env):
+    agent, out_dir, spend_dir, utterances, _context = agent_probe_env
+    with pytest.raises(spend.BudgetExceeded):
+        probe.main(["agent", "--profile", "dev", "--label", "tiny", "--max-usd", "0.0000001", "--limit", "1",
+                    "--gap-sec", "0", "--out-dir", str(out_dir), "--spend-dir", str(spend_dir),
+                    "--utterances", str(utterances)])
+    assert agent.llm.requests_for() == []

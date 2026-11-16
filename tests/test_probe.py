@@ -8,11 +8,17 @@ LLM を呼ぶ 2 点（router._call_router_llm と filler._call_filler_llm）を�
 
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
+import time
+import uuid
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
-from lab_lounge import characters, filler, probe, replay, router, spend
+from lab_lounge import characters, filler, graph, probe, replay, router, spend
 
 _SENTINEL = "SENTINEL-probe-5d2e"
 
@@ -293,3 +299,252 @@ class TestCommandLine:
                            "--synthetic", str(tmp_path / "none.jsonl"), "--utterances", str(tmp_path / "none2.jsonl")])
         assert code == probe.EXIT_REFUSED
         assert "断りました" in capsys.readouterr().out
+
+
+# ─── agent ───────────────────────────────────────────────────────
+
+_VAR: contextvars.ContextVar[str] = contextvars.ContextVar("probe_test_var", default="unset")
+
+
+class TestTagSpeaker:
+    @pytest.mark.parametrize("text, tagged", [
+        ("今日の天気は？", True),
+        ("[ルカからの発言]\nすでに付いている", False),
+        ("[システム] 通知", False),
+        ("アビスメイトからの質問です", False),
+        ("あ" * 30 + "アビスメイトのみなさん", True),  # 先頭 30 字より後ろの「アビスメイト」は無視される（本番と同じ）
+        ("", False),
+    ])
+    def test_matches_the_production_rule(self, text, tagged):
+        assert probe.tag_speaker(text) == (f"[ルカからの発言]\n{text}" if tagged else text)
+
+    def test_production_source_still_has_the_rule_we_copied(self):
+        """graph._generation_node の規則が変わったら赤くなる（規則は関数でなく本文の中にあるため、字面で固定する）。"""
+        source = Path(graph.__file__).read_text(encoding="utf-8")
+        assert 'if text and not text.startswith("[") and "アビスメイト" not in text[:30]:' in source
+        assert 'tagged_text = f"[ルカからの発言]\\n{text}"' in source
+        assert "run_graph(\n            tagged_text," in source  # run_graph へ渡すのはこの値
+
+
+class TestCannedTools:
+    @pytest.mark.parametrize("chars", [1, 20, 300, 1200, 5000])
+    def test_exact_length_and_deterministic(self, chars):
+        text = probe.canned_text("web_search", chars)
+        assert len(text) == chars and text == probe.canned_text("web_search", chars)
+
+    def test_patches_the_module_functions_and_restores(self):
+        from lab_lounge.mcp_servers import ask_character, retrieve_memory, web_search
+
+        originals = (web_search.web_search, retrieve_memory.retrieve_memory, ask_character.ask_character)
+        fires: Counter = Counter()
+        with probe.canned_tools(probe.DEFAULT_TOOL_CHARS, fires):
+            assert len(web_search.web_search("q")) == probe.DEFAULT_TOOL_CHARS["web_search"]
+            assert len(retrieve_memory.retrieve_memory("q")) == probe.DEFAULT_TOOL_CHARS["retrieve_memory"]
+            assert len(ask_character.ask_character("mimi", "q")) == probe.DEFAULT_TOOL_CHARS["ask_character"]
+        assert fires == {"web_search": 1, "retrieve_memory": 1, "ask_character": 1}
+        assert (web_search.web_search, retrieve_memory.retrieve_memory, ask_character.ask_character) == originals
+
+    def test_restores_after_an_error(self):
+        from lab_lounge.mcp_servers import web_search
+
+        original = web_search.web_search
+        with pytest.raises(ZeroDivisionError), probe.canned_tools(probe.DEFAULT_TOOL_CHARS, Counter()):
+            1 / 0
+        assert web_search.web_search is original
+
+    def test_tool_arguments_do_not_leak_into_the_response(self):
+        from lab_lounge.mcp_servers import ask_character
+
+        with probe.canned_tools(probe.DEFAULT_TOOL_CHARS, Counter()):
+            assert _SENTINEL not in ask_character.ask_character("mimi", _SENTINEL)
+
+    def test_parse_tool_chars(self):
+        assert probe.parse_tool_chars(["web_search=800"])["web_search"] == 800
+        assert probe.parse_tool_chars([])["ask_character"] == probe.DEFAULT_TOOL_CHARS["ask_character"]
+        for bad in ("nope=10", "web_search=0", "web_search=x", "web_search"):
+            with pytest.raises(ValueError):
+                probe.parse_tool_chars([bad])
+
+
+class TestLlmOverride:
+    def test_parse(self):
+        assert probe.parse_llm_override("anthropic:claude-sonnet-4-6") == ("anthropic", "claude-sonnet-4-6")
+        assert probe.parse_llm_override(None) is None
+        for bad in ("claude-sonnet-4-6", "mistral:x", "openai:"):
+            with pytest.raises(ValueError):
+                probe.parse_llm_override(bad)
+
+
+class TestRecorder:
+    def _response(self, *, tool_calls=(), usage=None, meta=None):
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        message = AIMessage(content=_SENTINEL, tool_calls=list(tool_calls), usage_metadata=usage,
+                            response_metadata=meta or {})
+        return LLMResult(generations=[[ChatGeneration(message=message)]])
+
+    def test_step_gets_time_tokens_cache_finish_and_model(self):
+        recorder = probe.make_recorder()
+        run = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run)
+        recorder.on_llm_end(self._response(
+            tool_calls=[{"name": "web_search_tool", "args": {"query": _SENTINEL}, "id": "c1"}],
+            usage={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                   "input_token_details": {"cache_read": 60, "cache_creation": 30},
+                   "output_token_details": {"reasoning": 5}},
+            meta={"stop_reason": "tool_use", "model_name": "claude-haiku-4-5-20251001"}), run_id=run)
+        (step,) = recorder.steps
+        assert step["n"] == 1 and step["ms"] is not None and step["error"] is None
+        assert (step["input"], step["output"], step["reasoning"], step["cache_read"], step["cache_creation"]) == (
+            100, 20, 5, 60, 30)
+        assert (step["finish"], step["model"], step["tool_calls"]) == (
+            "tool_use", "claude-haiku-4-5-20251001", ["web_search_tool"])
+        assert _SENTINEL not in json.dumps(recorder.steps)
+
+    def test_two_overlapping_runs_are_paired_by_run_id(self):
+        recorder = probe.make_recorder()
+        first, second = uuid.uuid4(), uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=first)
+        recorder.on_chat_model_start({}, [[]], run_id=second)
+        recorder.on_llm_end(self._response(usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+                            run_id=second)
+        recorder.on_llm_end(self._response(usage={"input_tokens": 2, "output_tokens": 2, "total_tokens": 4}),
+                            run_id=first)
+        assert [s["input"] for s in recorder.steps] == [1, 2] and not recorder._llm_open
+
+    def test_error_step_keeps_only_the_type(self):
+        recorder = probe.make_recorder()
+        run = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run)
+        recorder.on_chat_model_error(RuntimeError(_SENTINEL), run_id=run)
+        (step,) = recorder.steps
+        assert step["error"] == "RuntimeError" and _SENTINEL not in json.dumps(recorder.steps)
+
+    def test_missing_usage_is_zero_not_a_crash(self):
+        recorder = probe.make_recorder()
+        run = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run)
+        recorder.on_llm_end(self._response(), run_id=run)
+        assert recorder.steps[0]["input"] == 0 and recorder.steps[0]["cache_read"] == 0
+
+    def test_tool_name_and_time_are_recorded_and_odd_names_are_hidden(self):
+        recorder = probe.make_recorder()
+        ok, odd, failed = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        recorder.on_tool_start({"name": "web_search_tool"}, _SENTINEL, run_id=ok)
+        recorder.on_tool_end(_SENTINEL, run_id=ok)
+        recorder.on_tool_start({"name": f"bad name {_SENTINEL}"}, "x", run_id=odd)
+        recorder.on_tool_end("x", run_id=odd)
+        recorder.on_tool_start({}, "x", run_id=failed, name="ask_character_tool")
+        recorder.on_tool_error(ValueError(_SENTINEL), run_id=failed)
+        assert [t["name"] for t in recorder.tools] == ["web_search_tool", "<不正な名前>", "ask_character_tool"]
+        assert recorder.tools[2]["error"] == "ValueError" and _SENTINEL not in json.dumps(recorder.tools)
+
+
+class TestStreamContext:
+    def test_first_run_snapshots_and_later_runs_reuse_it(self, tmp_path):
+        snapshot = tmp_path / "ctx.md"
+        text, meta = probe.resolve_stream_context(snapshot, refresh=False, load_live=lambda: f"今日の配信 {_SENTINEL}")
+        assert meta["origin"] == "live" and meta["chars"] == len(text) and snapshot.is_file()
+        text2, meta2 = probe.resolve_stream_context(snapshot, refresh=False, load_live=lambda: "変わった内容")
+        assert text2 == text and meta2["origin"] == "snapshot" and meta2["sha"] == meta["sha"]
+
+    def test_refresh_takes_the_live_one(self, tmp_path):
+        snapshot = tmp_path / "ctx.md"
+        probe.resolve_stream_context(snapshot, refresh=False, load_live=lambda: "古い")
+        text, meta = probe.resolve_stream_context(snapshot, refresh=True, load_live=lambda: "新しい")
+        assert text == "新しい" and meta["origin"] == "live"
+        assert probe.resolve_stream_context(snapshot, refresh=False, load_live=lambda: None)[0] == "新しい"
+
+    def test_no_context_at_all(self, tmp_path):
+        text, meta = probe.resolve_stream_context(tmp_path / "ctx.md", refresh=False, load_live=lambda: None)
+        assert text is None and meta == {"origin": "none", "chars": 0, "sha": None}
+        assert not (tmp_path / "ctx.md").exists()
+
+    def test_meta_never_has_the_text(self, tmp_path):
+        _, meta = probe.resolve_stream_context(tmp_path / "ctx.md", refresh=False, load_live=lambda: _SENTINEL)
+        assert _SENTINEL not in json.dumps(meta)
+
+
+def test_persona_hashes_exist_for_every_measured_character():
+    for slug in probe.AGENT_CHARACTERS:
+        hashes = probe.persona_hashes(slug)
+        assert len(hashes["skills_sha"]) == 16 and (hashes["persona_sha"] is None or len(hashes["persona_sha"]) == 16)
+
+
+class TestInvokeAgent:
+    class _Agent:
+        def __init__(self, work):
+            self.work, self.seen = work, {}
+
+        def invoke(self, payload, config):
+            self.seen = {"payload": payload, "config": config, "context": _VAR.get()}
+            return self.work()
+
+    def test_passes_the_message_config_and_contextvars(self):
+        _VAR.set("from-caller")
+        agent = self._Agent(lambda: {"ok": True})
+        recorder = object()
+        assert probe.invoke_agent(agent, "こんにちは", recorder, timeout_sec=5, recursion_limit=25) == {"ok": True}
+        assert agent.seen["payload"] == {"messages": [{"role": "user", "content": "こんにちは"}]}
+        assert agent.seen["config"] == {"recursion_limit": 25, "callbacks": [recorder]}
+        assert agent.seen["context"] == "from-caller"
+
+    def test_timeout_raises_without_waiting_for_the_worker(self):
+        release = threading.Event()
+        agent = self._Agent(lambda: release.wait(5))
+        started = time.monotonic()
+        with pytest.raises(probe.AgentTimeout):
+            probe.invoke_agent(agent, "x", object(), timeout_sec=0.05, recursion_limit=25)
+        assert time.monotonic() - started < 2
+        release.set()
+
+    def test_worker_exceptions_propagate_including_spend_stops(self):
+        def boom():
+            raise spend.BudgetExceeded("上限")
+
+        with pytest.raises(spend.BudgetExceeded):
+            probe.invoke_agent(self._Agent(boom), "x", object(), timeout_sec=5, recursion_limit=25)
+
+
+class TestSummarizeAgent:
+    def _line(self, ms, *, cold=False, error=None, steps=2, tools=(), usd=0.01, source="structured_response"):
+        step = {"ms": 100, "input": 10, "output": 5, "reasoning": 1, "cache_read": 4, "cache_creation": 2,
+                "finish": "stop", "model": "m-wire", "error": None, "tool_calls": []}
+        return {"cold": cold, "error": error, "total_ms": ms, "steps": [step] * steps, "tools_fired": list(tools),
+                "source": source, "usd": usd, "model": "m", "finish": "stop"}
+
+    def test_splits_cold_and_warm_and_ignores_failures_in_times(self):
+        lines = [self._line(5000, cold=True), self._line(1000), self._line(2000), self._line(3000),
+                 self._line(90000, error="Timeout")]
+        summary = probe.summarize_agent(lines)
+        assert summary["cold_ms"] == 5000.0 and summary["warm_p50"] == 2000.0 and summary["warm_max"] == 3000.0
+        assert (summary["n"], summary["failed"], summary["steps_mean"]) == (5, 1, 2.0)
+        assert summary["usd"] == pytest.approx(0.05)
+
+    def test_tokens_tools_and_sources(self):
+        summary = probe.summarize_agent([self._line(1, tools=["web_search_tool"]),
+                                         self._line(1, tools=["web_search_tool", "ask_character_tool"],
+                                                    source="messages")])
+        assert summary["tokens"]["cache_read"] == 16 and summary["tokens"]["cache_creation"] == 8
+        assert summary["tools_fired"] == {"web_search_tool": 2, "ask_character_tool": 1}
+        assert summary["source"] == {"structured_response": 1, "messages": 1}
+
+    def test_print_shows_numbers_only(self, capsys):
+        probe.print_agent_summary("mimi", probe.summarize_agent([self._line(1200, cold=True), self._line(900)]))
+        out = capsys.readouterr().out
+        assert "cold=1200ms" in out and "warm p50=900ms" in out and "cache_creation=" in out
+
+
+class TestAgentCommandLine:
+    def test_bad_arguments(self):
+        base = ["agent", "--profile", "dev", "--label", "x", "--max-usd", "1"]
+        assert probe.main([*base, "--characters", "ruka"]) == probe.EXIT_USAGE
+        assert probe.main([*base, "--llm", "bad"]) == probe.EXIT_USAGE
+        assert probe.main([*base, "--tool-chars", "nope=1"]) == probe.EXIT_USAGE
+        assert probe.main([*base, "--limit", "-1"]) == probe.EXIT_USAGE
+
+    def test_missing_utterances_are_refused(self, tmp_path, capsys):
+        code = probe.main(["agent", "--profile", "dev", "--label", "x", "--max-usd", "1", "--out-dir", str(tmp_path),
+                           "--utterances", str(tmp_path / "none.jsonl")])
+        assert code == probe.EXIT_REFUSED and "断りました" in capsys.readouterr().out
