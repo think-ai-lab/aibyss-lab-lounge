@@ -19,7 +19,8 @@ WHY 既定はオフ:
 
 【環境変数】
   L2_DECISION_LOG                — true で有効 (デフォルト: "false")
-  L2_DECISION_LOG_RETENTION_DAYS — 何日前までのファイルを残すか (デフォルト: 30)
+  L2_DECISION_LOG_RETENTION_DAYS — 何日前までのファイルを残すか (デフォルト: 30、上限 36500)
+                                   0 は当日分だけ残す。読めない値や負の値は 30 にする
 
 【出力ファイル】
   logs/decisions/decisions_YYYYMMDD.jsonl  (カレントディレクトリからの相対。1 日 1 ファイル)
@@ -31,7 +32,8 @@ WHY 既定はオフ:
   character          判定対象のキャラ slug (意図ゲートのみ。ほかは null)
   candidates         候補の slug の一覧 (無ければ null)
   input              LLM に渡した発話の全文
-  raw                LLM の生の応答 (呼び出しに失敗したときは null)
+  raw                LLM の応答。_call_router_llm が小文字にして前後の空白を除いた後の値
+                     (API が返した綴りそのままではない。呼び出しに失敗したときは null)
   result             解釈した結果 (文字列か dict。解釈できなかったときは null)
   elapsed_ms         _call_router_llm の前後で測った所要時間
   error              呼び出しが失敗したときの例外の型名 (成功なら null)
@@ -54,6 +56,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RETENTION_DAYS = 30
+# 保持日数の上限 (約 100 年)。巨大な値で日付の計算が桁あふれ (OverflowError) しないように切る。
+_MAX_RETENTION_DAYS = 36500
 _FILE_PATTERN = re.compile(r"^decisions_(\d{8})\.jsonl$")
 
 # 書き込みの直列化と、「その日の最初の書き込みだけ掃除する」「警告は 1 回だけ」の状態。
@@ -73,13 +77,18 @@ def is_enabled() -> bool:
 
 
 def _retention_days() -> int:
-    """保持日数。読めない値や負の値は既定の 30 日にする (掃除で全消しにしないため)。"""
+    """保持日数。読めない値や負の値は既定の 30 日、上限 (36500) を超える値は上限にする。
+
+    WHY 読めない値を 30 にする: 掃除は消す処理なので、設定の打ち間違いで全消し (0 日) にしない。
+    """
     raw = os.environ.get("L2_DECISION_LOG_RETENTION_DAYS", "")
     try:
         days = int(raw)
     except ValueError:
         return _DEFAULT_RETENTION_DAYS
-    return days if days >= 0 else _DEFAULT_RETENTION_DAYS
+    if days < 0:
+        return _DEFAULT_RETENTION_DAYS
+    return min(days, _MAX_RETENTION_DAYS)
 
 
 def _log_dir() -> Path:
@@ -141,7 +150,7 @@ def record(
         model: 判定に使ったモデル名
         system_prompt: 判定に渡した system prompt (全文は残さず、ハッシュだけ残す)
         input_text: 判定に渡した発話の全文
-        raw: LLM の生の応答。呼び出しに失敗したときは None
+        raw: LLM の応答 (_call_router_llm が小文字にして前後の空白を除いた後の値)。呼び出しに失敗したときは None
         result: 解釈した結果 (文字列、dict、dataclass、None)
         elapsed_ms: LLM 呼び出しの所要時間 (ミリ秒)
         character: 判定対象のキャラ slug (意図ゲートのみ)
@@ -181,10 +190,18 @@ def record(
                 _cleaned_for = today
                 try:
                     _remove_old_files(directory, today)
-                except OSError as exc:
+                except (OSError, OverflowError, ValueError) as exc:
                     logger.debug("判定ログ: 古いファイルの掃除に失敗: %s", exc)
-            with open(directory / f"decisions_{today:%Y%m%d}.jsonl", "a", encoding="utf-8") as f:
+            # newline="\n": Windows でも行末を CRLF にしない (JSONL を 1 行 = \n 区切りで読む道具のため)。
+            # errors="backslashreplace": 文字起こしに対の無いサロゲートが混ざっていても、1 行を落とさず
+            # \udXXX の形で残す (strict だと UnicodeEncodeError でその判定の記録が消える)。
+            with open(
+                directory / f"decisions_{today:%Y%m%d}.jsonl", "a",
+                encoding="utf-8", errors="backslashreplace", newline="\n",
+            ) as f:
                 f.write(line)
+            # 書けた: 次の障害では、また 1 回警告が出るようにする (障害ごとに 1 回)。
+            _warned = False
     except Exception as exc:  # noqa: BLE001
         if not _warned:
             _warned = True

@@ -140,6 +140,24 @@ def test_default_retention_is_30_days(in_tmp, enabled):
     assert keep.exists() and not drop.exists()
 
 
+def test_zero_retention_keeps_only_today(in_tmp, enabled, monkeypatch):
+    monkeypatch.setenv("L2_DECISION_LOG_RETENTION_DAYS", "0")
+    yesterday = _touch_day(in_tmp, 1)
+    _record()
+    assert not yesterday.exists()
+    assert len(_rows(in_tmp)) == 1  # 当日のファイルは残り、書けている
+
+
+@pytest.mark.parametrize("value", ["99999999999999999999", "10000000", "36501"])
+def test_huge_retention_is_capped_and_does_not_break_the_write(in_tmp, enabled, monkeypatch, value):
+    """巨大な値で日付の計算が桁あふれしても、今の 1 行は書き、保持の範囲内のファイルは消さない。"""
+    monkeypatch.setenv("L2_DECISION_LOG_RETENTION_DAYS", value)
+    assert decision_log._retention_days() == 36500
+    recent = _touch_day(in_tmp, 400)
+    _record()
+    assert recent.exists() and len(_rows(in_tmp)) == 2  # 触った日の 1 行 ({}) と、今の 1 行
+
+
 @pytest.mark.parametrize("value", ["abc", "-3", ""])
 def test_bad_retention_falls_back_to_default(in_tmp, enabled, monkeypatch, value):
     """読めない値で全消しにならない。"""
@@ -162,6 +180,42 @@ def test_unwritable_directory_does_not_raise_and_warns_once(in_tmp, enabled, cap
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "判定は続けます" in warnings[0].getMessage()
+
+
+def test_writes_lf_line_endings_even_on_windows(in_tmp, enabled):
+    _record()
+    _record()
+    (path,) = (in_tmp / "logs" / "decisions").iterdir()
+    data = path.read_bytes()
+    assert b"\r" not in data and data.count(b"\n") == 2
+
+
+def test_lone_surrogate_in_the_input_does_not_lose_the_line(in_tmp, enabled):
+    """文字起こしに対の無いサロゲートが混ざっても、その判定の 1 行を落とさない。"""
+    _record(input_text="こんにちは\ud800さようなら")
+    (row,) = _rows(in_tmp)
+    assert "こんにちは" in row["input"] and "さようなら" in row["input"]
+
+
+def test_warning_comes_back_after_a_successful_write(in_tmp, enabled, caplog):
+    """警告は障害ごとに 1 回。書けた後にまた壊れたら、もう一度出る。"""
+    caplog.set_level(logging.WARNING, logger="lab_lounge.decision_log")
+    blocker = in_tmp / "logs"
+    blocker.write_text("file", encoding="utf-8")
+    _record()
+    _record()
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    blocker.unlink()  # 障害が直った
+    _record()
+    assert len(_rows(in_tmp)) == 1
+
+    (in_tmp / "logs" / "decisions" / f"decisions_{date.today():%Y%m%d}.jsonl").unlink()
+    (in_tmp / "logs" / "decisions").rmdir()
+    (in_tmp / "logs").rmdir()
+    blocker.write_text("file", encoding="utf-8")  # また壊れた
+    _record()
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
 
 
 # ─── router.py の 4 か所 ──────────────────────────────────────────
