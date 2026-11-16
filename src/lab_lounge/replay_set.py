@@ -75,6 +75,9 @@ EPOCH_GAP_SEC = 30.0
 #      余計に手を挙げる、関係ない発話で許可する、という変化に気づけない。
 UNDECIDED_SHARE = {"approval": 0.3, "interjection": 0.5, "route": 0.3}
 
+# wake の行と Agent.invoke の行を組にする期限（秒）。wake の直後に応答が始まるので、これより後は別の呼び出し。
+WAKE_PAIR_SEC = 30.0
+
 # 判定の本文がログに入り始めた日（router._text_preview の導入）。これより前の実走ログは組み直せない。
 DEFAULT_SINCE = date(2026, 5, 8)
 
@@ -124,6 +127,21 @@ _UTTERANCE_PREFIXES = ("STT 認識結果", "BG buffer 蓄積", "Agent.invoke 開
                        *JUDGMENT_PREFIXES)
 # repr で書かれた文字列（発話の断片を含みうる）。印を照らす前に取り除く。
 _QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+
+
+def production_context_max_chars() -> tuple[int, str]:
+    """意図ゲートの入力（extract_context）の上限を、本番と同じ L2_CONTEXT_MAX_CHARS から読む。
+
+    Returns:
+        (値, どこから読んだか)。読めなければ本番の既定（2000）
+
+    WHY: 本番の値が既定と違うと、組み直した意図ゲートの入力の切り詰め方が当時と違い、プレビューの照合で
+         黙って捨てる行が増える。どの値を仮定したかは meta に残す。
+    """
+    raw = os.environ.get("L2_CONTEXT_MAX_CHARS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw), "L2_CONTEXT_MAX_CHARS"
+    return DEFAULT_CONTEXT_MAX_CHARS, "既定"
 
 
 def default_out_dir() -> Path:
@@ -234,6 +252,8 @@ class BuildReport:
 
     files_seen: int = 0
     notes: list[str] = field(default_factory=list)
+    context_max_chars: int = DEFAULT_CONTEXT_MAX_CHARS
+    context_source: str = "既定"
     files_by_rule: Counter = field(default_factory=Counter)
     found: Counter = field(default_factory=Counter)
     dropped: Counter = field(default_factory=Counter)
@@ -326,6 +346,26 @@ def _messages(text: str) -> Iterator[tuple[str, str]]:
         yield name, msg
 
 
+def _literal_slugs(text: str) -> list[str] | None:
+    """%s で書かれた slug の一覧（['mimi', 'chisame']）を戻す。戻せなければ None（例外は出さない）。"""
+    if not re.fullmatch(r"\[[\w', ]*\]", text):
+        return None
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return None
+    return [str(slug) for slug in value] if isinstance(value, list) else None
+
+
+def jsonl_lines(text: str) -> list[str]:
+    """JSONL と確認のファイルを行に分ける（空の行は除く）。
+
+    WHY splitlines を使わない: 本文に U+2028 / U+2029 / U+0085 があると splitlines はそこでも割り、
+         1 件が 2 行に壊れる。書くときは \\n だけで区切っているので、\\n で割る（CRLF の \\r は落とす）。
+    """
+    return [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+
+
 def _literal_str(text: str) -> str | None:
     """%r で書かれた文字列を戻す。戻せなければ None（例外の文言は本文を含みうるので使わない）。"""
     try:
@@ -364,12 +404,10 @@ def _parse_judgment(kind: str, rest: str) -> _Judgment | None:
         character = None
         if tail.startswith("candidates="):
             found = re.match(r"candidates=(\[[^\]]*\]) ", tail)
-            if not found:
+            parsed = _literal_slugs(found[1]) if found else None
+            if parsed is None:
                 return None
-            parsed = ast.literal_eval(found[1]) if re.fullmatch(r"\[[\w', ]*\]", found[1]) else None
-            if not isinstance(parsed, list):
-                return None
-            candidates = [str(slug) for slug in parsed]
+            candidates = parsed
             tail = tail[found.end():]
         elif tail.startswith("char="):
             character, _, tail = tail[len("char="):].partition(" ")
@@ -390,6 +428,7 @@ class _FileState:
     last_bg_at: datetime | None = None
     epoch: int = 0
     pending_wake: tuple[str, int] | None = None
+    pending_wake_at: datetime | None = None
     pending_route: list[str] | None = None
 
 
@@ -406,14 +445,14 @@ def rows_from_runlog(path: Path, report: BuildReport, *, context_max_chars: int)
         elif msg.startswith("BG wake 検知: "):
             found = _BG_WAKE.match(msg)
             state.pending_wake = (found["slug"], int(found["len"])) if found else None
+            state.pending_wake_at = _log_time(stamp)
         elif msg.startswith("Agent.invoke 開始 "):
-            row = _on_agent(state, msg, report)
+            row = _on_agent(state, msg, report, at=_log_time(stamp))
             if row:
                 rows.append(row)
         elif msg.startswith(ROUTE_DELEGATE_PREFIX):
             found = _ROUTE_DELEGATE.match(msg)
-            parsed = ast.literal_eval(found["list"]) if found and re.fullmatch(r"\[[\w', ]*\]", found["list"]) else None
-            state.pending_route = [str(s) for s in parsed] if isinstance(parsed, list) else None
+            state.pending_route = _literal_slugs(found["list"]) if found else None
         else:
             for prefix, kind in JUDGMENT_PREFIXES.items():
                 if msg.startswith(prefix):
@@ -435,15 +474,21 @@ def _log_time(stamp: str) -> datetime | None:
 
 def _new_epoch(previous: datetime | None, now: datetime | None) -> bool:
     """前の行から EPOCH_GAP_SEC より空いたか（時刻が読めなければ区切る）。"""
-    return previous is None or now is None or (now - previous).total_seconds() > EPOCH_GAP_SEC
+    return _new_epoch_after(previous, now, EPOCH_GAP_SEC)
+
+
+def _new_epoch_after(previous: datetime | None, now: datetime | None, seconds: float) -> bool:
+    """前の時刻から seconds より空いたか（時刻が読めなければ空いたとみなす）。"""
+    return previous is None or now is None or (now - previous).total_seconds() > seconds
 
 
 def _on_bg(state: _FileState, msg: str, report: BuildReport, *, at: datetime | None = None) -> None:
     found = _BG_BUFFER.match(msg)
     text = _literal_str(found["text"]) if found else None
     if found is None or text is None:
-        # 読めないセグメントがあると、以後の末尾 N 個がずれる。このファイルの残りは組み直さない。
-        report.dropped["BG の行を読めない（以後のファイルの残りを使わない）"] += 1
+        # 読めないセグメントは印を付けて覚える。バッファの末尾 N 個にこの印が入る間の判定は捨て
+        # （「読めないセグメントを含む」）、窓が過ぎて押し出された後は、また組み直せる。
+        report.dropped["BG の行を読めない"] += 1
         state.segments.append("\0unreadable")
         state.last_bg = None
         return
@@ -514,14 +559,18 @@ def _on_judgment(state: _FileState, kind: str, rest: str, report: BuildReport,
                 epoch=f"{state.stem}#{state.epoch}", day=state.day)
 
 
-def _on_agent(state: _FileState, msg: str, report: BuildReport) -> dict[str, Any] | None:
+def _on_agent(state: _FileState, msg: str, report: BuildReport, *, at: datetime | None = None) -> dict[str, Any] | None:
     """Agent.invoke の行が、直前の BG wake 検知の発話そのものなら callout の行にする。
 
     WHY wake と組にする: Agent は挙手の承認や協働でも呼ばれ、そのときの本文はルカの呼びかけではない。
          直前の wake のキャラと文脈の長さが一致したものだけを、呼びかけとして使う。
+         wake から WAKE_PAIR_SEC より後の Agent は組にしない（古い wake が、関係ない Agent と組まないように）。
     """
     found = _AGENT_INVOKE.match(msg)
     wake, state.pending_wake = state.pending_wake, None
+    if wake is not None and _new_epoch_after(state.pending_wake_at, at, WAKE_PAIR_SEC):
+        report.dropped["wake から時間が経った Agent の行"] += 1
+        return None
     text = _literal_str(found["text"]) if found else None
     if found is None or text is None:
         report.dropped["Agent の行を読めない"] += 1
@@ -559,7 +608,7 @@ def rows_from_decision_log(directory: Path, since: date, report: BuildReport) ->
         day = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:]}"
         # 判定ログの塊は時刻で区切る（EPOCH_GAP_SEC より空いたら次の塊）。
         epoch, previous = 0, None
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in jsonl_lines(path.read_text(encoding="utf-8", errors="replace")):
             try:
                 item = json.loads(line)
             except ValueError:
@@ -677,8 +726,13 @@ def _write_atomic(path: Path, text: str) -> None:
 
 
 def _one_line(text: str) -> str:
-    """確認のファイルの 1 行に収める（改行は ⏎、タブは空白）。"""
-    return text.replace("\r\n", "⏎").replace("\n", "⏎").replace("\r", "⏎").replace("\t", " ")
+    """確認のファイルの 1 行に収める（改行は ⏎、タブは空白）。
+
+    U+2028 / U+2029 / U+0085 も ⏎ にする（エディタがそこで行を割り、行番号と印がずれるため）。
+    """
+    for mark in ("\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085"):
+        text = text.replace(mark, "⏎")
+    return text.replace("\t", " ")
 
 
 _REVIEW_HEADER = """\
@@ -705,6 +759,7 @@ def write_outputs(rows: list[dict[str, Any]], out_dir: Path, report: BuildReport
         "seed": seed, "targets": TARGETS, "per_epoch": PER_EPOCH, "epoch_gap_sec": EPOCH_GAP_SEC,
         "undecided_share": UNDECIDED_SHARE, "kept": dict(report.kept), "informative": dict(report.informative),
         "undecided": dict(report.undecided), "notes": report.notes, "files": dict(report.files_by_rule),
+        "context_max_chars": report.context_max_chars, "context_max_chars_source": report.context_source,
         "dropped": dict(report.dropped), "found": dict(report.found), "epochs": report.epochs,
     }
     _write_atomic(out_dir / "set.meta.json", json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True))
@@ -714,7 +769,7 @@ def write_outputs(rows: list[dict[str, Any]], out_dir: Path, report: BuildReport
 def load_set(out_dir: Path) -> list[dict[str, Any]]:
     """set.jsonl を読む。"""
     path = out_dir / "set.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in jsonl_lines(path.read_text(encoding="utf-8"))]
 
 
 def load_synthetic(path: Path | None = None) -> list[dict[str, Any]]:
@@ -729,7 +784,8 @@ def load_synthetic(path: Path | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     bad: list[int] = []
     seen: set[str] = set()
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+        line = line.rstrip("\r")
         if not line.strip():
             continue
         try:
@@ -787,7 +843,8 @@ def read_review(review_path: Path, known_ids: set[str]) -> ExcludeResult:
     excluded: list[str] = []
     malformed: list[int] = []
     unknown = 0
-    for number, line in enumerate(review_path.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(review_path.read_text(encoding="utf-8").split("\n"), start=1):
+        line = line.rstrip("\r")
         if not line.startswith("- ["):
             continue
         match = re.match(r"^- \[(?P<mark>.)\] (?P<id>\S+) ", line)
@@ -818,7 +875,7 @@ def load_exclusions(out_dir: Path) -> tuple[set[str], str | None]:
 # ─── コマンドライン ──────────────────────────────────────────────
 
 def build(logs_dir: Path, out_dir: Path, *, since: date = DEFAULT_SINCE, seed: int = DEFAULT_SEED,
-          context_max_chars: int = DEFAULT_CONTEXT_MAX_CHARS, force: bool = False,
+          context_max_chars: int | None = None, force: bool = False,
           dry_run: bool = False) -> BuildReport:
     """セットを作って書く（dry_run なら数えるだけで書かない）。判定ログ（L2_DECISION_LOG）がオフであることを前提にする。
 
@@ -831,6 +888,11 @@ def build(logs_dir: Path, out_dir: Path, *, since: date = DEFAULT_SINCE, seed: i
     if (out_dir / "review.md").exists() and not force and not dry_run:
         raise FileExistsError("review.md がすでにあります（印を消さないよう止めました。--force で作り直し）")
     report = BuildReport()
+    if context_max_chars is None:
+        context_max_chars, report.context_source = production_context_max_chars()
+    else:
+        report.context_source = "--context-max-chars"
+    report.context_max_chars = context_max_chars
     rows: list[dict[str, Any]] = []
     for path in select_files(logs_dir / "runs", since, report):
         rows.extend(rows_from_runlog(path, report, context_max_chars=context_max_chars))
@@ -856,7 +918,8 @@ def _print_build(report: BuildReport) -> None:
         emit(f"  {rule}: {count}")
     for note in report.notes:
         emit(f"  注: {note}")
-    emit(f"判定ログの行: {report.decision_rows}  塊: {report.epochs}")
+    emit(f"判定ログの行: {report.decision_rows}  塊: {report.epochs}  "
+         f"意図ゲートの入力の上限: {report.context_max_chars}（{report.context_source}）")
     emit("見つけた判定: " + ", ".join(f"{k} {v}" for k, v in sorted(report.found.items())))
     emit("捨てた理由:")
     for reason, count in sorted(report.dropped.items()):
@@ -879,7 +942,10 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--out", type=Path, default=None, help="出力の場所（既定は data/replay/）")
     b.add_argument("--since", type=date.fromisoformat, default=DEFAULT_SINCE, help="この日以降のログを使う")
     b.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    b.add_argument("--context-max-chars", type=int, default=DEFAULT_CONTEXT_MAX_CHARS)
+    b.add_argument("--context-max-chars", type=int, default=None,
+                   help="意図ゲートの入力の上限（既定は L2_CONTEXT_MAX_CHARS、無ければ 2000）")
+    b.add_argument("--profile", choices=("dev", "prod"), default=None,
+                   help="本番の設定（L2_CONTEXT_MAX_CHARS など）を .env から読む。API は呼ばない")
     b.add_argument("--force", action="store_true", help="review.md があっても作り直す（付けた印は消える）")
     b.add_argument("--dry-run", action="store_true", help="数えるだけで、ファイルを書かない")
     e = sub.add_parser("exclude", help="review.md の [x] を exclude.txt へ移す（id だけ）")
@@ -896,17 +962,21 @@ def main(argv: list[str] | None = None) -> int:
             emit("review.md がありません（先に build を流してください）")
             return EXIT_FAILED
         result = read_review(review, {row["id"] for row in load_set(out_dir)})
+        if result.malformed_lines:
+            # WHY 書かない: 崩れた行の印を落としたまま書くと、外したつもりの行がリプレイに混ざる。
+            emit(f"形の崩れた行（直してから流し直してください。exclude.txt は書いていません）: "
+                 f"{', '.join(map(str, result.malformed_lines))} 行目")
+            return EXIT_FAILED
         _write_atomic(out_dir / "exclude.txt", "".join(f"{i}\n" for i in result.excluded))
         emit(f"除外: {len(result.excluded)} 行")
         if result.unknown_ids:
             emit(f"セットに無い id の印: {result.unknown_ids} 行（無視しました）")
-        if result.malformed_lines:
-            emit(f"形の崩れた行（直してから流し直してください）: {', '.join(map(str, result.malformed_lines))} 行目")
-            return EXIT_FAILED
         return EXIT_OK
 
-    from .preflight import _captured_logs, silence_side_outputs
+    from .preflight import _captured_logs, prepare_env, silence_side_outputs
 
+    if args.profile:
+        prepare_env(args.profile, _repo_root())
     silence_side_outputs()
     with _captured_logs():
         report = build(args.logs or default_logs_dir(), out_dir, since=args.since, seed=args.seed,

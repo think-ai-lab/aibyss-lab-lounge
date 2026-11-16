@@ -230,14 +230,38 @@ class TestRebuild:
         assert rows == []
         assert report.dropped["Agent の行が wake の発話でない"] == 1
 
-    def test_unreadable_bg_line_stops_the_rest_of_the_file(self, runlog, logs):
+    def test_unreadable_bg_line_poisons_only_tails_that_include_it(self, runlog, logs):
         log = runlog()
         log.bg(f"{_SENTINEL} 一")
         log.raw(f"2026-06-01 20:00:00,000 INFO     lab_lounge.wake_word: BG buffer 蓄積: '{_SENTINEL} (segments=2 chars=9)")
         log.judge("approval", "none", text=f"{_SENTINEL} 一")
         rows, report = _rows(logs)
         assert rows == []
-        assert report.dropped["BG の行を読めない（以後のファイルの残りを使わない）"] == 1
+        assert report.dropped["BG の行を読めない"] == 1
+
+    def test_unquoted_candidate_lists_are_dropped_not_fatal(self, runlog, logs):
+        log = runlog()
+        log.bg(_SENTINEL)
+        log.raw("2026-06-01 20:00:00,000 INFO     lab_lounge.router: check_approval 応答: 'none' "
+                "(model=m candidates=[mimi, chisame] text=" + router._text_preview(_SENTINEL) + ")")
+        log.raw("2026-06-01 20:00:00,000 INFO     lab_lounge.router: 複数キャラクター検出: [mimi, chisame] → LLM ルーターへ委譲 (text='x')")
+        log.raw("2026-06-01 20:00:00,000 INFO     lab_lounge.router: LLM ルーター応答: 'mimi' "
+                "(model=m text=" + router._text_preview(_SENTINEL) + ")")
+        rows, report = _rows(logs)
+        assert rows == []
+        assert report.dropped["判定の行の形が違う"] == 1
+        assert report.dropped["振り分けの候補が分からない"] == 1
+
+    def test_stale_wake_does_not_pair_with_a_later_agent(self, runlog, logs):
+        log = runlog()
+        log.bg(_SENTINEL)
+        tagged = replay_set.CALLOUT_PREFIX + _SENTINEL
+        log.raw(f"2026-06-01 20:00:00,000 INFO     lab_lounge.wake_word: BG wake 検知: chisame (context={len(_SENTINEL)} chars)")
+        log.raw("2026-06-01 20:00:45,000 INFO     lab_lounge.graph: "
+                + replay_set.AGENT_INVOKE_FORMAT % ("chisame", len(tagged), tagged))
+        rows, report = _rows(logs)
+        assert rows == []
+        assert report.dropped["wake から時間が経った Agent の行"] == 1
 
     def test_answers_with_brackets_and_markers_are_parsed(self):
         rest = "'none (model=x) )' (model=claude-haiku-4-5 candidates=['chisame'] text='a)b'...)"
@@ -509,8 +533,39 @@ class TestCommandLine:
         assert replay_set.main(["exclude", "--out", str(out)]) == 1
         captured = capsys.readouterr()
         assert f"{len(lines) - 2}, {len(lines) - 1} 行目" in captured.out
-        assert "セットに無い id の印: 1 行" in captured.out
         assert _SENTINEL not in captured.out + captured.err
+        assert not (out / "exclude.txt").exists()  # 崩れた行の印を落としたまま書かない
+
+        review.write_text("\n".join(lines[:-3] + [lines[-1]]) + "\n", encoding="utf-8")
+        assert replay_set.main(["exclude", "--out", str(out)]) == 0
+        assert "セットに無い id の印: 1 行" in capsys.readouterr().out
+
+    def test_review_lines_survive_unicode_line_separators(self, runlog, logs, tmp_path, monkeypatch, capsys):
+        log = runlog()
+        log.bg(f"{_SENTINEL} 分かれる\u0085行")
+        log.judge("approval", "none")
+        _silence(monkeypatch)
+        out = tmp_path / "out"
+        assert replay_set.main(["build", "--logs", str(logs), "--out", str(out)]) == 0
+        (row,) = replay_set.load_set(out)
+        assert " " in row["input"]
+        line = next(x for x in (out / "review.md").read_text(encoding="utf-8").split("\n") if x.startswith("- [ ]"))
+        assert " " not in line and "⏎分かれる⏎行" in line
+
+    def test_context_limit_comes_from_the_production_setting(self, runlog, logs, tmp_path, monkeypatch, capsys):
+        log = runlog()
+        log.bg(_SENTINEL)
+        log.judge("approval", "none")
+        _silence(monkeypatch)
+        monkeypatch.setenv("L2_CONTEXT_MAX_CHARS", "1500")
+        called = []
+        monkeypatch.setattr(preflight, "prepare_env", lambda profile, root: called.append(profile) or [])
+        out = tmp_path / "out"
+        assert replay_set.main(["build", "--logs", str(logs), "--out", str(out), "--profile", "prod"]) == 0
+        assert called == ["prod"]
+        meta = json.loads((out / "set.meta.json").read_text(encoding="utf-8"))
+        assert (meta["context_max_chars"], meta["context_max_chars_source"]) == (1500, "L2_CONTEXT_MAX_CHARS")
+        assert "意図ゲートの入力の上限: 1500" in capsys.readouterr().out
 
 
 # ─── 合成の行 ────────────────────────────────────────────────────
