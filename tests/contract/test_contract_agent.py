@@ -102,12 +102,12 @@ def test_google_empty_reply_falls_back(agent_env, caplog):
 @pytest.mark.parametrize("slug, banned", [
     pytest.param(
         "mimi", lambda body: body.get("parallel_tool_calls") is False,
-        marks=pytest.mark.xfail(reason="AGENT-01: bind_tools の parallel_tool_calls=False を create_agent が bind し直して消す。create_agent に渡した後も残る形で付ける"),
+        marks=pytest.mark.xfail(raises=AssertionError, reason="AGENT-01: bind_tools の parallel_tool_calls=False を create_agent が bind し直して消す。create_agent に渡した後も残る形で付ける"),
         id="openai",
     ),
     pytest.param(
         "sakura", lambda body: (body.get("tool_choice") or {}).get("disable_parallel_tool_use") is True,
-        marks=pytest.mark.xfail(reason="AGENT-01, CL-08: tool_choice の disable_parallel_tool_use が create_agent の bind し直しで消える。消えない形で付ける"),
+        marks=pytest.mark.xfail(raises=AssertionError, reason="AGENT-01, CL-08: tool_choice の disable_parallel_tool_use が create_agent の bind し直しで消える。消えない形で付ける"),
         id="anthropic",
     ),
 ])
@@ -125,7 +125,7 @@ def test_parallel_tool_calls_are_disabled_on_the_wire(agent_env, slug, banned):
     assert banned(sent.body), {k: sent.body.get(k) for k in ("parallel_tool_calls", "tool_choice")}
 
 
-@pytest.mark.xfail(reason="AGENT-04, OAI-09: ToolStrategy で本文が空の length が返ると、空の応答をそのまま返す。finish_reason を見てフォールバックへ流す")
+@pytest.mark.xfail(raises=AssertionError, reason="AGENT-04, OAI-09: ToolStrategy で本文が空の length が返ると、空の応答をそのまま返す。finish_reason を見てフォールバックへ流す")
 def test_openai_empty_length_falls_back(agent_env):
     """OpenAI が推論で上限を使い切って本文が空なら、単一ノードのフォールバックで答える。"""
     provider, model = _model_of("mimi")
@@ -137,7 +137,7 @@ def test_openai_empty_length_falls_back(agent_env):
     assert result.text == "フォールバックです"
 
 
-@pytest.mark.xfail(reason="AGENT-03: Agent の組み立て（モデルの構築や create_agent）の例外が run_graph の外へ抜ける。組み立ても try に入れてフォールバックへ流す")
+@pytest.mark.xfail(raises=ValueError, reason="AGENT-03: Agent の組み立て（モデルの構築や create_agent）の例外が run_graph の外へ抜ける。組み立ても try に入れてフォールバックへ流す")
 def test_agent_build_failure_falls_back(agent_env, monkeypatch):
     """Agent の組み立てで例外が出ても、単一ノードのフォールバックで答える。
 

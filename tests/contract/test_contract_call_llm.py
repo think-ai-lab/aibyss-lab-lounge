@@ -41,7 +41,7 @@ def test_normal_reply_reaches_llm_result(fake_llm, provider):
     assert sent.model == _MODELS[provider]
 
 
-@pytest.mark.xfail(reason="CL-03: content がブロックのリストのとき str(list) をそのまま本文にする。type が text のブロックだけをつなぐ")
+@pytest.mark.xfail(raises=AssertionError, reason="CL-03: content がブロックのリストのとき str(list) をそのまま本文にする。type が text のブロックだけをつなぐ")
 def test_anthropic_thinking_and_text_returns_only_the_text(fake_llm):
     """thinking と本文のブロックが並ぶ応答でも、本文だけを返す。
 

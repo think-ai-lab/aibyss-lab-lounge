@@ -17,6 +17,7 @@ router と filler の raw SDK 呼び出しの契約テスト
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable
 
 import pytest
@@ -58,16 +59,23 @@ def _warnings_of(caplog: pytest.LogCaptureFixture, which: str) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == _LOGGERS[which] and r.levelno >= logging.WARNING]
 
 
-def _assert_silent_none_is_explained(results: dict, caplog: pytest.LogCaptureFixture, reason: str) -> None:
-    """両方が None を返し、それぞれが理由（stop_reason / finish_reason）をログに出したことを確かめる。
+def _assert_silent_none_is_explained(results: dict, caplog: pytest.LogCaptureFixture, expected: str) -> None:
+    """両方が None を返し、それぞれが理由を ``key=value`` の形でログに出したことを確かめる。
+
+    Args:
+        expected: ログに出るべき ``key=value``（例: ``stop_reason=max_tokens``、``finish_reason=MAX_TOKENS``）。
+                  値は API が返した綴りのまま（Gemini の MAX_TOKENS は大文字）
 
     WHY: None 自体は今の契約（呼び出し元が定型文へ落とす）。黙っていると、配信の後でログを読んでも、
          上限切れか拒否か SDK の故障かを分けられない。
+    WHY key=value の形で確かめる: 部分文字列（max_tokens など）だと、max_tokens=20 という別の説明文にも
+         当たってしまう。直す側が出すべき形をここで決め、grep で理由別に数えられるようにする。
     """
+    pattern = re.compile(rf"(?<![\w]){re.escape(expected)}(?![\w])")
     for which, value in results.items():
         assert value is None, f"{which}: 本文の無い応答で None を返さなかった: {value!r}"
         logs = _warnings_of(caplog, which)
-        assert any(reason in line.lower() for line in logs), f"{which}: ログに {reason} が無い: {logs}"
+        assert any(pattern.search(line) for line in logs), f"{which}: ログに {expected} の形が無い: {logs}"
 
 
 # ─── 挙動のテスト ─────────────────────────────────────────────────
@@ -110,7 +118,10 @@ def test_anthropic_http_400_returns_none_with_log(fake_llm, caplog):
 # ─── 方針のテスト ─────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(reason="CL-04: content[0] だけを読むので、先頭が thinking だと本文を取れない。type が text のブロックを探して読む")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="CL-04: content[0] だけを読むので、先頭が thinking だと本文を取れない。type が text のブロックを探して読む",
+)
 def test_anthropic_thinking_first_reads_the_text_block(fake_llm):
     """先頭が thinking でも、本文のブロックを読んで返す。"""
     fake_llm.scene("anthropic", "thinking_first", text="  Mimi\n")
@@ -121,23 +132,32 @@ def test_anthropic_thinking_first_reads_the_text_block(fake_llm):
     assert results["filler"] == "Mimi", f"filler: {results['filler']!r}"
 
 
-@pytest.mark.xfail(reason="CL-04: 本文の無い応答を AttributeError で None に変え、stop_reason を捨てる。None と stop_reason をログに出す")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="CL-04: 本文の無い応答を AttributeError で None に変え、stop_reason を捨てる。None を返し、ログに stop_reason=max_tokens の形で出す",
+)
 def test_anthropic_thinking_only_max_tokens_logs_stop_reason(fake_llm, caplog):
     """thinking だけで出力の上限に達したら、None を返し、stop_reason（max_tokens）をログに出す。"""
     fake_llm.scene("anthropic", "thinking_only_max_tokens")
 
-    _assert_silent_none_is_explained(_call_both(_PROVIDERS["anthropic"]["model"]), caplog, "max_tokens")
+    _assert_silent_none_is_explained(_call_both(_PROVIDERS["anthropic"]["model"]), caplog, "stop_reason=max_tokens")
 
 
-@pytest.mark.xfail(reason="CL-06: content が空の拒否を IndexError で None に変え、refusal を捨てる。None と stop_reason をログに出す")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="CL-06: content が空の拒否を IndexError で None に変え、refusal を捨てる。None を返し、ログに stop_reason=refusal の形で出す",
+)
 def test_anthropic_refusal_logs_stop_reason(fake_llm, caplog):
     """拒否（content が空）なら、None を返し、stop_reason（refusal）をログに出す。"""
     fake_llm.scene("anthropic", "refusal")
 
-    _assert_silent_none_is_explained(_call_both(_PROVIDERS["anthropic"]["model"]), caplog, "refusal")
+    _assert_silent_none_is_explained(_call_both(_PROVIDERS["anthropic"]["model"]), caplog, "stop_reason=refusal")
 
 
-@pytest.mark.xfail(reason="CL-01: Anthropic へ temperature を送っている。新しい API と SDK は受け付けないので、送らない")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="CL-01: Anthropic へ temperature を送っている。新しい API と SDK は受け付けないので、送らない",
+)
 def test_anthropic_does_not_send_temperature(fake_llm):
     """Anthropic への要求に temperature を入れない。"""
     results = _call_both(_PROVIDERS["anthropic"]["model"])
@@ -148,17 +168,23 @@ def test_anthropic_does_not_send_temperature(fake_llm):
         assert "temperature" not in req.body, f"{which}: temperature={req.body['temperature']!r}"
 
 
-@pytest.mark.xfail(reason="OAI-05: 本文が空で length の応答を、router は空文字で返し、filler は黙って None にする。None と finish_reason をログに出す")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="OAI-05: 本文が空で length の応答を、router は空文字で返し、filler は黙って None にする。None を返し、ログに finish_reason=length の形で出す",
+)
 def test_openai_empty_length_logs_finish_reason(fake_llm, caplog):
     """推論で上限を使い切って本文が空なら、None を返し、finish_reason（length）をログに出す。"""
     fake_llm.scene("openai", "empty_length")
 
-    _assert_silent_none_is_explained(_call_both(_PROVIDERS["openai"]["model"]), caplog, "length")
+    _assert_silent_none_is_explained(_call_both(_PROVIDERS["openai"]["model"]), caplog, "finish_reason=length")
 
 
-@pytest.mark.xfail(reason="GEM-01, GEM-13: resp.text が None の応答を AttributeError で None に変え、finishReason を捨てる。None と finishReason をログに出す")
+@pytest.mark.xfail(
+    raises=AssertionError,
+    reason="GEM-01, GEM-13: resp.text が None の応答を AttributeError で None に変え、finishReason を捨てる。None を返し、ログに finish_reason=MAX_TOKENS の形で出す",
+)
 def test_google_max_tokens_without_text_logs_finish_reason(fake_llm, caplog):
     """上限に達して本文が無ければ、None を返し、finishReason（MAX_TOKENS）をログに出す。"""
     fake_llm.scene("google", "max_tokens_no_text")
 
-    _assert_silent_none_is_explained(_call_both(_PROVIDERS["google"]["model"]), caplog, "max_tokens")
+    _assert_silent_none_is_explained(_call_both(_PROVIDERS["google"]["model"]), caplog, "finish_reason=MAX_TOKENS")
