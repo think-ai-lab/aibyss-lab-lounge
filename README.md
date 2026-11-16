@@ -602,7 +602,8 @@ aibyss-lab-lounge/
     spend.py              # 有料の計測の価格表・支出の記録・上限（本番経路からは呼ばれない）
     replay_set.py         # 判定のリプレイのセット（実走ログから組み直し、確認のファイル）
     replay.py             # 判定のリプレイ（本物の判定の関数をセットにかけ、集計して基準の回と比べる）
-    probe.py              # 判定と filler の LLM 呼び出しの時間と費用の物差し（本番経路からは呼ばれない）
+    probe.py              # 判定・filler・Agent の時間と費用の物差し、実走ログの月ごとの時間（本番経路からは呼ばれない）
+    c2_probe.py           # C2（記憶検索）の時間の分布と、実走ログのタイムアウトの数え上げ（本番経路からは呼ばれない）
     mcp_servers/          # ask_character / web_search / retrieve_memory
     system_prompts/       # キャラ別システムプロンプト
   tests/
