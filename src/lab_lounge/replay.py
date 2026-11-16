@@ -6,6 +6,9 @@ replay.py — 判定のリプレイ（固定のセットに本物の判定の関
             本物の判定の関数（check_approval / check_intent / _route_by_llm）をかけ、答えと時間を 1 行ずつ残す
   - report: 1 回の実行の、種類ごとの自己一致率（Wilson の 95% 区間）、unknown とエラーの数、混同行列、
             合成の行の正答数、当時の答えとの一致率を出す
+  - compare: 基準の回と新しい回を比べる（承認の反転、unknown の増減、違う行の数を遷移ごとに）
+  - review:  違う行だけを確認のファイル（data/replay/review_<回>_vs_<基準>.md）へ書く。人が印を付ける
+  - score:   印を数え、合格基準（反転 0、誤り 3 以下、callout → mention の誤り 1 以下、unknown が基準 + 3 以内）と並べる
 
 本番の経路からは呼ばれない。このモジュールを消しても配信の挙動は変わらない。
 
@@ -24,11 +27,23 @@ replay.py — 判定のリプレイ（固定のセットに本物の判定の関
   # 集計
   uv run --frozen --all-extras python -m lab_lounge.replay report --run <名前>
 
+  # 判定の変更の後の回を、基準の回と比べる（費用なし）
+  uv run --frozen --all-extras python -m lab_lounge.replay compare --base <基準> --run <名前>
+  uv run --frozen --all-extras python -m lab_lounge.replay review  --base <基準> --run <名前>
+  #   → data/replay/review_<名前>_vs_<基準>.md に印を付けてから
+  uv run --frozen --all-extras python -m lab_lounge.replay score   --base <基準> --run <名前>
+
+【終了コード】
+  0: 正常（compare は反転なし、score は全部 PASS）/ 1: 失敗（compare は反転あり、score は FAIL）
+  2: 実行を断った（同じ名前の回がある、再開の条件が違う、確認のファイルがすでにある）
+  3: score で未判定の行が残っている / 4: 上限などで止めた（spend）/ 64: コマンドラインの誤り
+
 【出力】（data/replay/runs/、gitignore 済み）
   <名前>.jsonl:        1 判定 1 行（id、rep、attempt、生の答え、result_key、時間、エラーの型、prompt のハッシュ、
                        応答のモデル名）。入力の本文は書かない（id でセットと結ぶ）
   <名前>.meta.json:    commit、uv.lock のハッシュ、SDK の版、モデル、フラグ、セットのハッシュ、件数
   <名前>.problems.log: 実行中の WARNING 以上のログ（判定の関数の警告は答えや本文の断片を含みうる）
+  review_<名前>_vs_<基準>.md と judged.jsonl（data/replay/）: 違う行の確認と、付けた印（id と答えと印だけ）
 
 【出力の約束】
   画面には、件数、率、表、時間、費用だけを出す。発話の本文と生の答えは出さない。
@@ -44,12 +59,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
@@ -404,6 +420,310 @@ def _runs_dir(set_dir: Path) -> Path:
     return set_dir / "runs"
 
 
+# ─── 比べ方 ──────────────────────────────────────────────────────
+
+# 合格基準（判定の変更の後の回を、基準の回と比べるときの線）。
+# WHY この線: 承認の反転は配信事故（断ったのに話し出す、承認したのに黙る）に直結するので 0。
+#     違う行の誤りは、temperature 0 でも残る揺れを見込んで少しだけ許す。callout → mention は呼んでも
+#     答えない事故なので、さらに絞る。
+MAX_FLIPS = 0
+MAX_WRONG = 3
+MAX_WRONG_CALLOUT_TO_MENTION = 1
+MAX_EXTRA_UNKNOWN = 3
+
+# review のファイルの印。o: 新しい答えが正しい / x: 新しい答えが誤り / a: 別の候補も妥当（挙手候補だけ）/ 空白: 未判定
+_MARKS = {" ": None, "o": "correct", "x": "wrong", "a": "alternative"}
+_REVIEW_LINE = re.compile(r"^- \[(?P<mark>.)\] (?P<id>\S+) (?P<kind>\S+) (?P<base>\S+) → (?P<new>\S+) \| ")
+
+EXIT_UNDECIDED = 3
+
+KIND_ORDER = list(replay_set.KINDS)
+
+
+@dataclass
+class Diff:
+    """基準と違う答えになった 1 行。"""
+
+    row: dict[str, Any]
+    base: str
+    new: str
+    unstable: bool
+
+
+@dataclass
+class Comparison:
+    """基準の回（rep 1）と新しい回（rep 1）の比べ（数と結果の鍵だけ）。"""
+
+    compared: int = 0
+    unstable: int = 0
+    flips: int = 0
+    flips_unstable: int = 0
+    unknown_base: int = 0
+    unknown_run: int = 0
+    errors_base: int = 0
+    errors_run: int = 0
+    missing: int = 0
+    transitions: Counter = field(default_factory=Counter)
+    diffs: list[Diff] = field(default_factory=list)
+
+
+def _is_flip(base: str, new: str) -> bool:
+    """承認の granted と denied が入れ替わったか（対象のキャラは問わない）。"""
+    return {base.split(":", 1)[0], new.split(":", 1)[0]} == {"granted", "denied"}
+
+
+def compare_runs(rows: list[dict[str, Any]], base_lines: list[dict[str, Any]], run_lines: list[dict[str, Any]],
+                 *, base_reps: int) -> Comparison:
+    """基準の回と新しい回を比べる。
+
+    基準は base の rep 1。base の rep 1 と rep 2 で答えが揺れた行は「揺れる行」として数え、反転の数から外す
+    （temperature 0 でも揺れる行の違いは、変更のせいとは言えないため）。エラーの行は比べずに数だけ数える。
+    """
+    base, run = _final_by_key(base_lines), _final_by_key(run_lines)
+    result = Comparison()
+    for row in rows:
+        first = base.get((row["id"], 1), {}).get("result_key")
+        second = base.get((row["id"], 2), {}).get("result_key") if base_reps >= 2 else None
+        new = run.get((row["id"], 1), {}).get("result_key")
+        if first is None or new is None:
+            result.missing += 1
+            continue
+        result.errors_base += first.startswith("error:")
+        result.errors_run += new.startswith("error:")
+        if first.startswith("error:") or new.startswith("error:"):
+            continue
+        result.compared += 1
+        result.unknown_base += first == "unknown"
+        result.unknown_run += new == "unknown"
+        unstable = second is not None and not second.startswith("error:") and second != first
+        result.unstable += unstable
+        if first == new:
+            continue
+        result.transitions[f"{replay_set.bucket(row)}: {first} → {new}"] += 1
+        if row["kind"] == "approval" and _is_flip(first, new):
+            if unstable:
+                result.flips_unstable += 1
+            else:
+                result.flips += 1
+        result.diffs.append(Diff(row, first, new, unstable))
+    return result
+
+
+def print_comparison(base: str, run: str, comparison: Comparison) -> None:
+    """比べた結果を画面へ出す（数と結果の鍵だけ）。"""
+    emit(f"{run} を {base} と比べる: 比べた {comparison.compared} 行（基準で揺れる行 {comparison.unstable}、"
+         f"結果の無い行 {comparison.missing}）")
+    emit(f"承認の反転（granted ⇔ denied、揺れない行）: {comparison.flips}"
+         f"（揺れる行の反転 {comparison.flips_unstable} は別に数える）")
+    emit(f"unknown: {comparison.unknown_base} → {comparison.unknown_run}  "
+         f"エラー: {comparison.errors_base} → {comparison.errors_run}")
+    emit(f"違う行: {len(comparison.diffs)}")
+    for transition, count in sorted(comparison.transitions.items()):
+        emit(f"  {transition}: {count}")
+
+
+def _review_path(set_dir: Path, base: str, run: str) -> Path:
+    return set_dir / f"review_{run}_vs_{base}.md"
+
+
+def load_judged(set_dir: Path) -> dict[tuple[str, str], str]:
+    """これまでに付けた印を (id, 新しい答え) → 印 で返す（後のものが勝つ）。"""
+    path = set_dir / "judged.jsonl"
+    judged: dict[tuple[str, str], str] = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                item = json.loads(line)
+                judged[(item["id"], item["new"])] = item["mark"]
+    return judged
+
+
+_REVIEW_HEADER = """\
+# 違う行の判定
+
+基準の回と違う答えになった行です。行頭の `[ ]` に印を付けて保存し、`python -m lab_lounge.replay score` を流してください。
+- `[o]` 新しい答えが正しい / `[x]` 新しい答えが誤り / `[a]` 別の候補も妥当（挙手候補だけ）/ `[ ]` 未判定
+行の形は `- [ ] <id> <種類> <基準の答え> → <新しい答え> | <本文>`。本文の改行は ⏎ で表しています。
+種類の後ろの `~` は、基準の 2 回で答えが揺れた行です。
+
+"""
+
+
+def write_review(set_dir: Path, base: str, run: str, comparison: Comparison) -> tuple[Path, int, int]:
+    """違う行だけを確認のファイルへ書く。前に判定した (id, 新しい答え) は飛ばす。
+
+    Returns:
+        (ファイル, 書いた行の数, 前の判定で飛ばした行の数)
+
+    Raises:
+        FileExistsError: すでにある（付けた印を上書きで消さない）
+    """
+    path = _review_path(set_dir, base, run)
+    if path.exists():
+        raise FileExistsError("確認のファイルがすでにあります")
+    judged = load_judged(set_dir)
+    lines, skipped = [], 0
+    for diff in sorted(comparison.diffs, key=lambda d: (KIND_ORDER.index(d.row["kind"]), d.row["id"])):
+        if (diff.row["id"], diff.new) in judged:
+            skipped += 1
+            continue
+        kind = diff.row["kind"] + ("~" if diff.unstable else "")
+        lines.append(f"- [ ] {diff.row['id']} {kind} {diff.base} → {diff.new} | {replay_set._one_line(diff.row['input'])}")
+    replay_set._write_atomic(path, _REVIEW_HEADER + "".join(line + "\n" for line in lines))
+    return path, len(lines), skipped
+
+
+@dataclass
+class Score:
+    """印の集計。"""
+
+    correct: int = 0
+    wrong: int = 0
+    alternative: int = 0
+    undecided: int = 0
+    wrong_unstable: int = 0
+    wrong_callout_to_mention: int = 0
+
+
+def read_marks(path: Path, diffs: dict[str, Diff]) -> tuple[dict[tuple[str, str], str], list[int]]:
+    """確認のファイルの印を読む。形の崩れた行、今の違いと合わない行、[a] を挙手候補以外に付けた行は行番号で返す。"""
+    marks: dict[tuple[str, str], str] = {}
+    malformed: list[int] = []
+    if not path.is_file():
+        return marks, malformed
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.startswith("- ["):
+            continue
+        match = _REVIEW_LINE.match(line)
+        diff = diffs.get(match["id"]) if match else None
+        if match is None or match["mark"] not in _MARKS or diff is None or diff.new != match["new"]:
+            malformed.append(number)
+            continue
+        mark = _MARKS[match["mark"]]
+        if mark == "alternative" and diff.row["kind"] != "interjection":
+            malformed.append(number)
+            continue
+        if mark is not None:
+            marks[(match["id"], match["new"])] = mark
+    return marks, malformed
+
+
+def score(comparison: Comparison, marks: dict[tuple[str, str], str]) -> Score:
+    """違う行の印を数える。"""
+    result = Score()
+    for diff in comparison.diffs:
+        mark = marks.get((diff.row["id"], diff.new))
+        if mark is None:
+            result.undecided += 1
+        elif mark == "correct":
+            result.correct += 1
+        elif mark == "alternative":
+            result.alternative += 1
+        else:
+            result.wrong += 1
+            result.wrong_unstable += diff.unstable
+            result.wrong_callout_to_mention += diff.base == "callout" and diff.new == "mention"
+    return result
+
+
+def verdicts(comparison: Comparison, result: Score) -> list[tuple[str, str, str]]:
+    """合格基準ごとの (名前, 値, PASS / FAIL / 未確定) を返す。印が要る基準は、未判定があれば未確定。"""
+    pending = result.undecided > 0
+
+    def judge(ok: bool, *, needs_marks: bool = False) -> str:
+        if not ok:
+            return "FAIL"
+        return "未確定" if needs_marks and pending else "PASS"
+
+    return [
+        ("(a) 承認の反転（揺れない行）", f"{comparison.flips} / 上限 {MAX_FLIPS}", judge(comparison.flips <= MAX_FLIPS)),
+        ("(b) 誤りとした行", f"{result.wrong} / 上限 {MAX_WRONG}（うち揺れる行 {result.wrong_unstable}）",
+         judge(result.wrong <= MAX_WRONG, needs_marks=True)),
+        ("(b) callout → mention の誤り", f"{result.wrong_callout_to_mention} / 上限 {MAX_WRONG_CALLOUT_TO_MENTION}",
+         judge(result.wrong_callout_to_mention <= MAX_WRONG_CALLOUT_TO_MENTION, needs_marks=True)),
+        ("(c) unknown", f"{comparison.unknown_run} / 上限 {comparison.unknown_base + MAX_EXTRA_UNKNOWN}",
+         judge(comparison.unknown_run <= comparison.unknown_base + MAX_EXTRA_UNKNOWN)),
+    ]
+
+
+def save_judged(set_dir: Path, base: str, run: str, marks: dict[tuple[str, str], str]) -> None:
+    """付けた印を judged.jsonl へ足す（id と答えと印だけ。本文は写さない）。"""
+    known = load_judged(set_dir)
+    new = {key: mark for key, mark in marks.items() if known.get(key) != mark}
+    if not new:
+        return
+    stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    with (set_dir / "judged.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
+        for (row_id, answer), mark in sorted(new.items()):
+            stream.write(json.dumps({"id": row_id, "new": answer, "mark": mark, "base": base, "run": run,
+                                     "ts": stamp}, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _load_pair(args: argparse.Namespace) -> tuple[Path, Comparison] | None:
+    """compare / review / score が共通で読む、基準と新しい回の比べ。"""
+    set_dir = args.set_dir or replay_set.default_out_dir()
+    runs = _runs_dir(set_dir)
+    metas = {}
+    for label in (args.base, args.run):
+        path = runs / f"{label}.meta.json"
+        if not path.is_file():
+            emit(f"実行 {spend._showable(label)} の meta がありません")
+            return None
+        metas[label] = json.loads(path.read_text(encoding="utf-8"))
+    rows, _, _ = load_rows(set_dir, args.synthetic)
+    base_lines, run_lines = RunFile(runs / f"{args.base}.jsonl").lines(), RunFile(runs / f"{args.run}.jsonl").lines()
+    ran = {line["id"] for line in base_lines} & {line["id"] for line in run_lines}
+    rows = [row for row in rows if row["id"] in ran]
+    if metas[args.base].get("set_sha") != metas[args.run].get("set_sha"):
+        emit("[警告] 2 つの回のセットのハッシュが違います（共通の行だけを比べます）")
+    return set_dir, compare_runs(rows, base_lines, run_lines, base_reps=int(metas[args.base]["reps"]))
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    loaded = _load_pair(args)
+    if loaded is None:
+        return EXIT_FAILED
+    print_comparison(args.base, args.run, loaded[1])
+    return EXIT_FAILED if loaded[1].flips > MAX_FLIPS else EXIT_OK
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    loaded = _load_pair(args)
+    if loaded is None:
+        return EXIT_FAILED
+    set_dir, comparison = loaded
+    try:
+        path, written, skipped = write_review(set_dir, args.base, args.run, comparison)
+    except FileExistsError:
+        emit(f"{_review_path(set_dir, args.base, args.run).name} はすでにあります（印を消さないよう止めました）")
+        return EXIT_REFUSED
+    emit(f"{path.name} に {written} 行を書きました（前に判定した答えの {skipped} 行は飛ばしました）")
+    return EXIT_OK
+
+
+def _cmd_score(args: argparse.Namespace) -> int:
+    loaded = _load_pair(args)
+    if loaded is None:
+        return EXIT_FAILED
+    set_dir, comparison = loaded
+    diffs = {diff.row["id"]: diff for diff in comparison.diffs}
+    marks, malformed = read_marks(_review_path(set_dir, args.base, args.run), diffs)
+    if malformed:
+        emit(f"形の崩れた行、または合わない印（直してから流し直してください）: {', '.join(map(str, malformed))} 行目")
+        return EXIT_FAILED
+    save_judged(set_dir, args.base, args.run, marks)
+    result = score(comparison, {**load_judged(set_dir), **marks})
+    emit(f"違う行 {len(comparison.diffs)}: 正しい {result.correct}、誤り {result.wrong}、"
+         f"別の候補も妥当 {result.alternative}、未判定 {result.undecided}")
+    table = verdicts(comparison, result)
+    for name, value, verdict in table:
+        emit(f"  {verdict} {name}: {value}")
+    states = {verdict for _, _, verdict in table}
+    if "FAIL" in states:
+        return EXIT_FAILED
+    return EXIT_UNDECIDED if "未確定" in states else EXIT_OK
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     from .preflight import _captured_logs, prepare_env, silence_side_outputs
 
@@ -501,11 +821,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--spend-dir", type=Path, default=None, help=argparse.SUPPRESS)
     report = sub.add_parser("report", help="1 回の実行の集計")
     report.add_argument("--run", required=True)
+    for name, text in (("compare", "基準の回と比べる（承認の反転が 1 以上なら終了コード 1）"),
+                       ("review", "違う行だけを確認のファイルへ書く"),
+                       ("score", "確認のファイルの印を数え、合格基準と並べる")):
+        pair = sub.add_parser(name, help=text)
+        pair.add_argument("--base", required=True, help="基準の回の名前")
+        pair.add_argument("--run", required=True, help="比べる回の名前")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m lab_lounge.replay <run|report>``。"""
+    """``python -m lab_lounge.replay <run|report|compare|review|score>``。"""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -515,7 +841,8 @@ def main(argv: list[str] | None = None) -> int:
             emit("--reps と --workers は 1 以上、--canary は 0 以上にしてください")
             return EXIT_USAGE
         return _cmd_run(args)
-    return _cmd_report(args)
+    commands = {"report": _cmd_report, "compare": _cmd_compare, "review": _cmd_review, "score": _cmd_score}
+    return commands[args.command](args)
 
 
 if __name__ == "__main__":

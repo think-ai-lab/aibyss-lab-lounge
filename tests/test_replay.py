@@ -199,3 +199,137 @@ class TestSetHandling:
         rows = [_row(i, "approval") for i in range(3)] + [_row(i, "interjection") for i in range(3)]
         picked = replay.canary_rows(rows, 3)
         assert [replay_set.bucket(r) for r in picked] == ["approval", "interjection", "approval"]
+
+
+# ─── compare / review / score ────────────────────────────────────
+
+
+def _lines_for(rows, keys_by_rep):
+    return [{"id": r["id"], "rep": rep, "attempt": 1, "result_key": keys[i], "error": None}
+            for rep, keys in keys_by_rep.items() for i, r in enumerate(rows) if keys[i] is not None]
+
+
+class TestCompare:
+    def test_flips_unstable_rows_and_transitions(self):
+        rows = [_row(1), _row(2), _row(3), _row(4, "intent"), _row(5, "intent"), _row(6)]
+        base = _lines_for(rows, {1: ["granted:chisame", "granted:chisame", "none", "callout", "unknown", "error:X"],
+                                 2: ["granted:chisame", "denied:chisame", "none", "callout", "unknown", "none"]})
+        new = _lines_for(rows, {1: ["denied:chisame", "denied:chisame", "none", "mention", "callout", "none"]})
+        result = replay.compare_runs(rows, base, new, base_reps=2)
+        assert (result.compared, result.flips, result.flips_unstable, result.unstable) == (5, 1, 1, 1)
+        assert (result.unknown_base, result.unknown_run, result.errors_base) == (1, 0, 1)
+        assert result.transitions["callout: callout → mention"] == 1
+        assert {(d.base, d.new, d.unstable) for d in result.diffs} == {
+            ("granted:chisame", "denied:chisame", False), ("granted:chisame", "denied:chisame", True),
+            ("callout", "mention", False), ("unknown", "callout", False)}
+
+    def test_single_rep_base_has_no_unstable_rows(self):
+        rows = [_row(1)]
+        result = replay.compare_runs(rows, _lines_for(rows, {1: ["granted:chisame"]}),
+                                     _lines_for(rows, {1: ["denied:chisame"]}), base_reps=1)
+        assert (result.flips, result.unstable) == (1, 0)
+
+    def test_missing_results_are_counted(self):
+        rows = [_row(1), _row(2)]
+        result = replay.compare_runs(rows, _lines_for(rows, {1: ["none", "none"]}),
+                                     _lines_for(rows, {1: ["none", None]}), base_reps=1)
+        assert (result.compared, result.missing) == (1, 1)
+
+
+@pytest.fixture
+def pair(tmp_path):
+    """基準の回（2 回）と新しい回（1 回）を、セットと一緒に置く。"""
+    rows = [_row(1), _row(2), _row(3, "intent"), _row(4, "interjection"), _row(5)]
+    (tmp_path / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                                        encoding="utf-8")
+    (tmp_path / "exclude.txt").write_text("", encoding="utf-8")
+    runs = tmp_path / "runs"
+    runs.mkdir()
+
+    def put(label, reps, keys_by_rep):
+        (runs / f"{label}.meta.json").write_text(json.dumps({"reps": reps, "set_sha": "x", "rows": len(rows)}),
+                                                 encoding="utf-8")
+        (runs / f"{label}.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in _lines_for(rows, keys_by_rep)), encoding="utf-8")
+
+    put("base", 2, {1: ["none", "granted:chisame", "callout", "mimi", "none"],
+                    2: ["none", "granted:chisame", "callout", "mimi", "none"]})
+    put("new", 1, {1: ["none", "granted:chisame", "mention", "sakura", "granted:chisame"]})
+    put("flip", 1, {1: ["none", "denied:chisame", "callout", "mimi", "none"]})
+    return tmp_path, rows
+
+
+def _cli(set_dir, *args):
+    return replay.main(["--set-dir", str(set_dir), "--synthetic", str(set_dir / "none.jsonl"), *args])
+
+
+def _mark(path, marks: dict[str, str]):
+    """確認のファイルの行に印を付ける（id → 印）。"""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        for row_id, mark in marks.items():
+            if line.startswith(f"- [ ] {row_id} "):
+                line = line.replace("- [ ]", f"- [{mark}]", 1)
+        out.append(line)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+class TestCompareCommands:
+    def test_compare_exit_code_follows_flips(self, pair, capsys):
+        set_dir, _ = pair
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "new") == 0
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "flip") == 1
+        out = capsys.readouterr().out
+        assert "承認の反転（granted ⇔ denied、揺れない行）: 1" in out and _SENTINEL not in out
+
+    def test_review_score_round_trip(self, pair, capsys):
+        set_dir, rows = pair
+        assert _cli(set_dir, "review", "--base", "base", "--run", "new") == 0
+        review = set_dir / "review_new_vs_base.md"
+        text = review.read_text(encoding="utf-8")
+        assert text.count("\n- [ ] ") == 3 and "callout → mention" in text
+        assert _cli(set_dir, "review", "--base", "base", "--run", "new") == replay.EXIT_REFUSED
+
+        assert _cli(set_dir, "score", "--base", "base", "--run", "new") == replay.EXIT_UNDECIDED
+        _mark(review, {rows[2]["id"]: "x", rows[3]["id"]: "a", rows[4]["id"]: "o"})
+        assert _cli(set_dir, "score", "--base", "base", "--run", "new") == 0
+        out = capsys.readouterr().out
+        assert "正しい 1、誤り 1、別の候補も妥当 1、未判定 0" in out
+        assert "PASS (b) callout → mention の誤り: 1 / 上限 1" in out
+        assert _SENTINEL not in out
+
+        # 付けた印は覚えていて、作り直した確認のファイルには出さない
+        review.unlink()
+        assert _cli(set_dir, "review", "--base", "base", "--run", "new") == 0
+        assert "3 行は飛ばしました" in capsys.readouterr().out
+        assert _cli(set_dir, "score", "--base", "base", "--run", "new") == 0
+
+    def test_score_fails_on_too_many_wrong(self, pair, capsys, monkeypatch):
+        set_dir, rows = pair
+        monkeypatch.setattr(replay, "MAX_WRONG", 0)
+        _cli(set_dir, "review", "--base", "base", "--run", "new")
+        _mark(set_dir / "review_new_vs_base.md", {rows[2]["id"]: "o", rows[3]["id"]: "o", rows[4]["id"]: "x"})
+        assert _cli(set_dir, "score", "--base", "base", "--run", "new") == 1
+        assert "FAIL (b) 誤りとした行" in capsys.readouterr().out
+
+    def test_score_reports_bad_marks_by_line_number(self, pair, capsys):
+        set_dir, rows = pair
+        _cli(set_dir, "review", "--base", "base", "--run", "new")
+        review = set_dir / "review_new_vs_base.md"
+        _mark(review, {rows[4]["id"]: "a"})  # [a] は挙手候補だけ
+        with review.open("a", encoding="utf-8") as stream:
+            stream.write(f"- [?] {rows[2]['id']} intent callout → mention | {_SENTINEL}\n")
+            stream.write(f"- [o] {rows[3]['id']} interjection mimi → chisame | {_SENTINEL}\n")  # 今の違いと合わない
+        assert _cli(set_dir, "score", "--base", "base", "--run", "new") == 1
+        out = capsys.readouterr().out
+        total = len(review.read_text(encoding="utf-8").splitlines())
+        bad_a = next(i for i, line in enumerate(review.read_text(encoding="utf-8").splitlines(), start=1)
+                     if line.startswith("- [a]"))
+        assert f"{bad_a}, {total - 1}, {total} 行目" in out
+        assert _SENTINEL not in out
+        assert not (set_dir / "judged.jsonl").exists()
+
+    def test_missing_meta(self, pair, capsys):
+        set_dir, _ = pair
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "nope") == 1
