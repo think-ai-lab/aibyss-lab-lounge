@@ -4,6 +4,7 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
 責務:
   - raw:     本物の判定の関数（挙手の候補と承認）と、filler の LLM 呼び出し（キャラごとのモデル）を、
              合成の入力で n 回ずつ流し、p50 / p90 / 最大、失敗の数、tokens、費用を出す
+  - history: 実走ログから、キャラごと・月ごとの Agent の全体の時間と step の時間を数える（数字だけ。課金なし）
   - agent:   本番と同じ Agent（道具つき）の組み立てで、キャラごとに合成の発話を流し、全体の時間、step ごとの
              時間と tokens（キャッシュの読み書きを含む）、道具の発火、費用を測る。道具は長さを固定した定型の応答
              に差し替える（外の検索や記憶や他キャラの TTS を呼ばない）。返答の本文は聴き比べ用に別ファイルへ残す
@@ -26,6 +27,7 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
   uv run --frozen --all-extras python -m lab_lounge.probe raw --profile dev --label <名前> --max-usd 0.5
   uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label <名前> --max-usd 3
   #   少数で試す: --limit 2 --characters mimi / 別のモデルで全キャラ: --llm anthropic:claude-sonnet-4-6
+  uv run --frozen --all-extras python -m lab_lounge.probe history --label <名前>   # 実走ログの月ごとの時間（課金なし）
 
   入力は合成の行だけ（実発話は使わない）:
     - 挙手の候補と承認: measure_sets/replay_synthetic.jsonl（--synthetic で差し替え）
@@ -41,6 +43,7 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
   raw_<名前>.jsonl:        1 呼び出し 1 行（グループ、入力の id、モデル、時間、失敗の型、費用、tokens）。本文なし
   raw_<名前>.meta.json:    commit、uv.lock のハッシュ、SDK の版、モデル、入力の数とハッシュ
   raw_<名前>.problems.log: 実行中の WARNING 以上のログ（例外の文言を含みうるので Claude は開かない）
+  history_<名前>.json:         月ごとの時間の表（数字だけ）
   agent_<名前>.jsonl:          1 呼び出し 1 行（数字 + 返答の本文）。返答の本文はこのファイルだけに書く（Claude は開かない）
   agent_<名前>.metrics.jsonl:  上から本文を除いたもの（数字だけ）
   agent_<名前>.meta.json:      commit、モデル、配信文脈と人格のハッシュ、集計
@@ -67,7 +70,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -1037,6 +1040,171 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     return EXIT_FAILED if failed else EXIT_OK
 
 
+# ─── history ─────────────────────────────────────────────────────
+
+# 実走ログの書式がいつから出ているか（git の履歴で確かめた日付。graph.py の logger.info の文面）。
+# WHY: 書式の無い期間は、0 件ではなく「データなし」と出して、数字が無いことを誤読させない。
+#   - Agent LLM step N 完了 [character=..] latency_ms=..:  2026-05-11 から（commit e2651e8）
+#   - Agent 実行完了 [character=..]: latency_ms=.. source=..: 2026-05-08 から（commit 2333898。
+#     それ以前は [character=..] が無く、キャラごとに分けられない）
+#   - Agent 実行失敗 [character=..]:                         2026-05-08 から（同上）
+LOG_FORMATS_SINCE = {"step": "2026-05-11", "total": "2026-05-08", "failed": "2026-05-08"}
+
+_STEP_LINE = re.compile(r"^Agent LLM step (?P<n>\d+) 完了 \[character=(?P<slug>[^\]]+)\] latency_ms=(?P<ms>-?\d+)")
+_TOTAL_LINE = re.compile(r"^Agent 実行完了 \[character=(?P<slug>[^\]]+)\]: latency_ms=(?P<ms>\d+) source=")
+_FAILED_LINE = re.compile(r"^Agent 実行失敗 \[character=(?P<slug>[^\]]+)\]")
+_SLUG_OK = re.compile(r"[a-z0-9_]{1,24}")
+_LOG_DATE = re.compile(r"^run_loop_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})_\d{6}\.log$")
+
+
+def default_runs_dir() -> Path:
+    """実走ログの場所（リポジトリの logs/runs/、gitignore 済み）。"""
+    return replay_set.default_logs_dir() / "runs"
+
+
+def select_run_logs(runs_dir: Path, since: date) -> tuple[list[Path], Counter]:
+    """計測に使う実走ログを選ぶ（replay_set と同じ規則: pytest の残りを除き、本物の配信の回だけ）。
+
+    Returns:
+        (ファイル, 規則ごとの本数)。本数は画面に出してよい
+    """
+    report = replay_set.BuildReport()
+    paths = replay_set.select_files(runs_dir, since, report)
+    return paths, report.files_by_rule
+
+
+def log_month(path: Path) -> str | None:
+    """ファイル名の日付の月（YYYY-MM）。名前の形が違えば None。"""
+    match = _LOG_DATE.match(path.name)
+    return f"{match['y']}-{match['m']}" if match else None
+
+
+def log_day(path: Path) -> str | None:
+    """ファイル名の日付（YYYY-MM-DD）。名前の形が違えば None。"""
+    match = _LOG_DATE.match(path.name)
+    return f"{match['y']}-{match['m']}-{match['d']}" if match else None
+
+
+def log_messages(path: Path) -> Iterator[str]:
+    """実走ログの 1 行ごとの本文（行頭の形が無い続きの行は飛ばす）。本文は呼び出し側が先頭の形だけを見る。"""
+    for _name, message in replay_set._messages(path.read_text(encoding="utf-8", errors="replace")):
+        yield message
+
+
+def _slug_of(value: str) -> str:
+    return value if _SLUG_OK.fullmatch(value) else "?"
+
+
+def history_stats(paths: list[Path]) -> dict[str, Any]:
+    """実走ログから、キャラごと、月ごとに Agent の全体の時間と step の時間を数える（数字だけ）。
+
+    全体の時間は Agent 実行完了の latency_ms（_run_agent の開始から完了まで）、step の時間は
+    Agent LLM step N 完了の latency_ms。行の本文（text=...）は読まない（先頭の形だけを見る）。
+    """
+    totals: dict[tuple[str, str], list[float]] = {}
+    steps: dict[tuple[str, str], list[float]] = {}
+    failed: Counter = Counter()
+    for path in paths:
+        month = log_month(path)
+        if month is None:
+            continue
+        for message in log_messages(path):
+            if message.startswith("Agent LLM step "):
+                found = _STEP_LINE.match(message)
+                if found and int(found["ms"]) >= 0:
+                    steps.setdefault((_slug_of(found["slug"]), month), []).append(float(found["ms"]))
+            elif message.startswith("Agent 実行完了 "):
+                found = _TOTAL_LINE.match(message)
+                if found:
+                    totals.setdefault((_slug_of(found["slug"]), month), []).append(float(found["ms"]))
+            elif message.startswith("Agent 実行失敗 "):
+                found = _FAILED_LINE.match(message)
+                if found:
+                    failed[(_slug_of(found["slug"]), month)] += 1
+    return {"totals": totals, "steps": steps, "failed": failed}
+
+
+def _dist(values: list[float]) -> dict[str, Any]:
+    return {"n": len(values), "p50": percentile(values, 0.5), "p90": percentile(values, 0.9),
+            "max": max(values) if values else None}
+
+
+def months_between(first: str, last: str) -> list[str]:
+    """YYYY-MM の first から last までの月を並べる。"""
+    year, month = int(first[:4]), int(first[5:])
+    out = []
+    while f"{year:04d}-{month:02d}" <= last:
+        out.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+    return out
+
+
+def history_report(stats: dict[str, Any], months: list[str]) -> dict[str, Any]:
+    """history_stats の結果を、キャラ → 月 → {total, steps, failed} の表にする。書式の無い月は None（データなし）。"""
+    slugs = sorted({key[0] for key in (*stats["totals"], *stats["steps"], *stats["failed"])})
+    table: dict[str, dict[str, Any]] = {}
+    for slug in slugs:
+        table[slug] = {}
+        for month in months:
+            key = (slug, month)
+            cell: dict[str, Any] = {
+                "total": _dist(stats["totals"].get(key, [])) if month >= LOG_FORMATS_SINCE["total"][:7] else None,
+                "steps": _dist(stats["steps"].get(key, [])) if month >= LOG_FORMATS_SINCE["step"][:7] else None,
+                "failed": stats["failed"].get(key, 0) if month >= LOG_FORMATS_SINCE["failed"][:7] else None,
+            }
+            table[slug][month] = cell
+    return table
+
+
+def _dist_text(cell: dict[str, Any] | None) -> str:
+    if cell is None:
+        return "書式なし"
+    if cell["n"] == 0:
+        return "データなし"
+    return f"n={cell['n']} p50={_ms(cell['p50'])} p90={_ms(cell['p90'])}"
+
+
+def print_history(table: dict[str, dict[str, Any]]) -> None:
+    """キャラごと、月ごとの 1 行を画面へ（件数と ms だけ）。"""
+    for slug, by_month in table.items():
+        emit(f"  {slug}:")
+        for month, cell in by_month.items():
+            emit(f"    {month}  全体 {_dist_text(cell['total'])}  |  step {_dist_text(cell['steps'])}  |  "
+                 f"失敗 {'-' if cell['failed'] is None else cell['failed']}")
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    from .preflight import silence_side_outputs
+
+    silence_side_outputs()
+    runs_dir = args.logs_dir or default_runs_dir()
+    if not runs_dir.is_dir():
+        emit(f"実走ログの場所がありません: {runs_dir.name}")
+        return EXIT_FAILED
+    paths, by_rule = select_run_logs(runs_dir, args.since)
+    emit(f"実走ログ: 使う {by_rule.get('使う', 0)} 本（" + "、".join(
+        f"{rule} {count}" for rule, count in sorted(by_rule.items()) if rule != "使う") + "）")
+    if not paths:
+        emit("使える実走ログがありません")
+        return EXIT_FAILED
+    months_present = sorted({m for m in map(log_month, paths) if m})
+    months = months_between(months_present[0], months_present[-1])
+    table = history_report(history_stats(paths), months)
+    print_history(table)
+    out_dir = args.out_dir or spend.default_spend_dir()
+    _write_json(out_dir / f"history_{args.label}.json", {
+        "tool": "history", "label": args.label, "generated": datetime.now(UTC).isoformat(timespec="seconds"),
+        "since": args.since.isoformat(), "files": {"used": len(paths), "by_rule": dict(by_rule)},
+        "formats_since": LOG_FORMATS_SINCE, "months": months, "table": table,
+        "notes": ["全体 = Agent 実行完了の latency_ms（_run_agent の開始から完了まで）、step = Agent LLM step N 完了の latency_ms",
+                  "月は実走ログのファイル名の日付。書式なし = その書式のログが出る前の月、データなし = 書式はあるが該当の行が 0 件"],
+    })
+    emit(f"書き出し: history_{args.label}.json")
+    return EXIT_OK
+
+
 # ─── コマンドライン ──────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1054,6 +1222,12 @@ def build_parser() -> argparse.ArgumentParser:
     raw.add_argument("--price", action="append", default=[], help="model=in,out[,cache_read[,cache_write]]")
     raw.add_argument("--out-dir", type=Path, default=None, help=argparse.SUPPRESS)
     raw.add_argument("--spend-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    history = sub.add_parser("history", help="実走ログから、キャラごと・月ごとの Agent の時間を数える（課金なし）")
+    history.add_argument("--label", default="history", help="出力のファイル名（history_<名前>.json）")
+    history.add_argument("--since", type=date.fromisoformat, default=replay_set.DEFAULT_SINCE,
+                         help="この日以降のログを使う（既定は判定の本文が残る日）")
+    history.add_argument("--logs-dir", type=Path, default=None, help="logs/runs/ の場所（既定はリポジトリの logs/runs/）")
+    history.add_argument("--out-dir", type=Path, default=None, help=argparse.SUPPRESS)
     agent = sub.add_parser("agent", help="本番と同じ Agent の時間、step ごとの tokens、道具の発火、費用（課金あり）")
     agent.add_argument("--profile", choices=("dev", "prod"), required=True)
     agent.add_argument("--label", required=True, help="実行の名前（英数字と _.- で 64 字まで）")
@@ -1072,7 +1246,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m lab_lounge.probe <raw|agent>``。"""
+    """``python -m lab_lounge.probe <raw|agent|history>``。"""
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -1082,6 +1256,11 @@ def main(argv: list[str] | None = None) -> int:
             emit("--n は 1 以上、--gap-sec は 0 以上にしてください")
             return EXIT_USAGE
         return _cmd_raw(args)
+    if args.command == "history":
+        if not spend._RUN_NAME.fullmatch(args.label):
+            emit("--label は英数字と _.- で 64 字までにしてください")
+            return EXIT_USAGE
+        return _cmd_history(args)
     if args.command == "agent":
         if args.limit < 0 or args.gap_sec < 0:
             emit("--limit と --gap-sec は 0 以上にしてください")

@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -548,3 +549,88 @@ class TestAgentCommandLine:
         code = probe.main(["agent", "--profile", "dev", "--label", "x", "--max-usd", "1", "--out-dir", str(tmp_path),
                            "--utterances", str(tmp_path / "none.jsonl")])
         assert code == probe.EXIT_REFUSED and "断りました" in capsys.readouterr().out
+
+
+# ─── history ─────────────────────────────────────────────────────
+
+def _log_line(message: str, name: str = "lab_lounge.graph", stamp: str = "2026-06-01 12:00:00,123") -> str:
+    return f"{stamp} INFO     {name}: {message}\n"
+
+
+def _step(n: int, slug: str, ms: int) -> str:
+    return _log_line("Agent LLM step %d 完了 [character=%s] latency_ms=%d tokens=in:1/out:1 finish=stop model=m"
+                     % (n, slug, ms))
+
+
+def _total(slug: str, ms: int, text: str = _SENTINEL) -> str:
+    return _log_line("Agent 実行完了 [character=%s]: latency_ms=%d source=structured_response text_len=%d text=%r"
+                     % (slug, ms, len(text), text))
+
+
+def _write_log(runs, name, lines):
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / name).write_text("".join(lines), encoding="utf-8")
+
+
+class TestHistory:
+    def _runs(self, tmp_path):
+        runs = tmp_path / "runs"
+        _write_log(runs, "run_loop_20260601_120000.log", [
+            _step(1, "mimi", 1000), _step(2, "mimi", 3000), _total("mimi", 4500),
+            _step(1, "sakura", 500), _total("sakura", 700, _SENTINEL + "\n続きの行"),
+            "続きの行（行頭の形なし）\n",
+            _log_line("Agent 実行失敗 [character=mimi]: " + _SENTINEL + "。単一ノードにフォールバック。"),
+        ])
+        _write_log(runs, "run_loop_20260605_120000.log", [_step(1, "mimi", 2000), _total("mimi", 2500)])
+        _write_log(runs, "run_loop_20260705_120000.log", [_step(1, "mimi", 800), _total("mimi", 900)])
+        # 使わない: pytest の残り（名前）、テストの目印、応答の無い回
+        _write_log(runs, "run_loop_20261031_100000.log", [_step(1, "mimi", 99999), _total("mimi", 99999)])
+        _write_log(runs, "run_loop_20260610_120000.log", [_step(1, "mimi", 99999), "boom\n"])
+        _write_log(runs, "run_loop_20260611_120000.log", [_total("mimi", 99999)])
+        return runs
+
+    def test_selects_like_the_replay_set_and_counts_by_month(self, tmp_path):
+        runs = self._runs(tmp_path)
+        paths, by_rule = probe.select_run_logs(runs, date(2026, 5, 8))
+        assert by_rule["使う"] == 3 and sum(by_rule.values()) == 6
+        stats = probe.history_stats(paths)
+        assert sorted(stats["totals"][("mimi", "2026-06")]) == [2500.0, 4500.0]
+        assert sorted(stats["steps"][("mimi", "2026-06")]) == [1000.0, 2000.0, 3000.0]
+        assert stats["totals"][("sakura", "2026-06")] == [700.0] and stats["failed"][("mimi", "2026-06")] == 1
+        assert max(stats["totals"][("mimi", "2026-07")]) == 900.0  # 使わない回の 99999 は入らない
+
+    def test_report_marks_months_before_the_format_and_empty_months(self):
+        stats = {"totals": {("mimi", "2026-06"): [1.0, 2.0, 3.0]}, "steps": {}, "failed": {}}
+        table = probe.history_report(stats, ["2026-04", "2026-05", "2026-06", "2026-07"])
+        assert table["mimi"]["2026-04"] == {"total": None, "steps": None, "failed": None}
+        assert table["mimi"]["2026-05"]["steps"]["n"] == 0 and table["mimi"]["2026-05"]["total"]["n"] == 0
+        assert table["mimi"]["2026-06"]["total"] == {"n": 3, "p50": 2.0, "p90": 3.0, "max": 3.0}
+        assert probe._dist_text(table["mimi"]["2026-04"]["total"]) == "書式なし"
+        assert probe._dist_text(table["mimi"]["2026-07"]["total"]) == "データなし"
+
+    def test_months_between(self):
+        assert probe.months_between("2026-11", "2027-02") == ["2026-11", "2026-12", "2027-01", "2027-02"]
+
+    def test_command_prints_numbers_only_and_writes_json(self, tmp_path, capsys):
+        runs = self._runs(tmp_path)
+        out_dir = tmp_path / "out"
+        assert probe.main(["history", "--label", "t", "--logs-dir", str(runs), "--out-dir", str(out_dir)]) == 0
+        captured = capsys.readouterr()
+        assert _SENTINEL not in captured.out + captured.err
+        assert "n=2 p50=2500 p90=4500" in captured.out and "データなし" in captured.out
+        saved = json.loads((out_dir / "history_t.json").read_text(encoding="utf-8"))
+        assert _SENTINEL not in json.dumps(saved) and saved["formats_since"]["step"] == "2026-05-11"
+        assert saved["table"]["mimi"]["2026-06"]["steps"]["n"] == 3
+        assert saved["files"]["used"] == 3
+
+    def test_no_logs_is_a_failure(self, tmp_path, capsys):
+        (tmp_path / "runs").mkdir()
+        assert probe.main(["history", "--logs-dir", str(tmp_path / "runs"), "--out-dir", str(tmp_path)]) == 1
+        assert probe.main(["history", "--logs-dir", str(tmp_path / "missing"), "--out-dir", str(tmp_path)]) == 1
+
+    def test_the_log_formats_we_read_still_exist_in_graph(self):
+        """graph.py の文面が変わったら赤くなる（history は先頭の形だけを読むので、変わると黙って 0 件になる）。"""
+        source = Path(graph.__file__).read_text(encoding="utf-8")
+        assert '"Agent LLM step %d 完了 [character=%s] latency_ms=%d%s"' in source
+        assert '"Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r"' in source
+        assert '"Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。"' in source
