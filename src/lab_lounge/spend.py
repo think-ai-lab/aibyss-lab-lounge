@@ -606,8 +606,20 @@ class _Call:
 _ACTIVE: UsageMeter | None = None
 _ACTIVE_LOCK = threading.Lock()
 
+# スレッドごとの、最後に数えた呼び出し（last_call が返す）。
+# WHY: 同期の SDK は、呼んだスレッドの中で HTTP を送って受ける。呼び出し側（リプレイの 1 行）が、
+#      自分の呼び出しに答えたモデルの名前を、本文に触れずに知るため。
+_THREAD = threading.local()
+
 # os._exit の前に必ず流す後始末（支出の記録のロックを消す、など）。hard_exit と run_tool が流す。
 _EXIT_CLEANUPS: list[Callable[[], None]] = []
+
+
+def last_call() -> dict[str, Any] | None:
+    """このスレッドで最後に数えた呼び出しの情報（model、model_on_wire、status、usd）を返し、消す。無ければ None。"""
+    last = getattr(_THREAD, "last", None)
+    _THREAD.last = None
+    return last
 
 
 def _classify(request: Any) -> tuple[str, str | None, bool] | None:
@@ -868,6 +880,7 @@ class UsageMeter:
                 self.stats.uncounted += 1
             self.ledger.add(run=self.run, model=call.model, usd=usd, usage=usage, status=status,
                             model_on_wire=wire_model, http_status=http_status)
+        _THREAD.last = {"model": call.model, "model_on_wire": wire_model, "status": status, "usd": usd}
 
     def _after_response(self, call: _Call, response: Any, module: Any) -> None:
         """応答を受けた後。読み終えていれば今数え、stream なら読み終えたときに数える。"""

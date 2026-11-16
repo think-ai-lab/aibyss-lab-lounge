@@ -180,6 +180,20 @@ class TestMeter:
         captured = capsys.readouterr()
         assert _SENTINEL not in captured.out + captured.err
 
+    def test_last_call_is_per_thread_and_cleared(self, ledger):
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0),                 _client(lambda r: httpx.Response(200, json=_anthropic_reply())) as client:
+            spend.last_call()
+            client.post(_ANTHROPIC, json=_body())
+            other: list = []
+            worker = __import__("threading").Thread(target=lambda: other.append(spend.last_call()))
+            worker.start()
+            worker.join()
+            last = spend.last_call()
+        assert other == [None]
+        assert (last["model"], last["model_on_wire"], last["status"]) == (
+            "claude-haiku-4-5", "claude-haiku-4-5-20251001", "usage")
+        assert spend.last_call() is None
+
     def test_send_is_restored_even_after_an_error(self, ledger):
         before = (httpx.Client.__dict__["send"], httpx.AsyncClient.__dict__["send"])
         with pytest.raises(ZeroDivisionError), spend.UsageMeter(ledger, "unit", max_usd=1.0):

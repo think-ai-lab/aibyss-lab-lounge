@@ -601,6 +601,7 @@ aibyss-lab-lounge/
     preflight.py          # 配信前の点検（本番経路からは呼ばれない）
     spend.py              # 有料の計測の価格表・支出の記録・上限（本番経路からは呼ばれない）
     replay_set.py         # 判定のリプレイのセット（実走ログから組み直し、確認のファイル）
+    replay.py             # 判定のリプレイ（本物の判定の関数をセットにかけ、集計する）
     mcp_servers/          # ask_character / web_search / retrieve_memory
     system_prompts/       # キャラ別システムプロンプト
   tests/
