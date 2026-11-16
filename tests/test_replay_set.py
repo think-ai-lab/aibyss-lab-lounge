@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -339,6 +339,15 @@ class TestDecisionLog:
         assert report.dropped["判定ログの呼び出しが失敗した行"] == 2
         assert report.dropped["判定ログの行を読めない"] == 1
 
+    def test_rows_close_in_time_share_an_epoch(self, logs):
+        (logs / "decisions").mkdir()
+        stamps = ["2026-11-20T21:00:00.000+09:00", "2026-11-20T21:00:20.000+09:00", "2026-11-20T21:05:00.000+09:00"]
+        (logs / "decisions" / "decisions_20261120.jsonl").write_text("".join(
+            _decision("approval", f"{_SENTINEL} {i}", ts=stamp) + "\n" for i, stamp in enumerate(stamps)),
+            encoding="utf-8")
+        rows = replay_set.rows_from_decision_log(logs / "decisions", date(2026, 5, 8), replay_set.BuildReport())
+        assert [r["epoch"] for r in rows] == ["decisions_20261120#1"] * 2 + ["decisions_20261120#2"]
+
     def test_same_input_as_the_runlog_has_the_same_id(self):
         a = replay_set.row_id("approval", None, ["chisame"], "x")
         assert a == replay_set.row_id("approval", None, ["chisame"], "x")
@@ -352,13 +361,55 @@ class TestSelect:
                 "character": None, "candidates": ["chisame"], "hist_raw": hist, "hist_key": hist,
                 "epoch": epoch, "date": "2026-06-01"}
 
-    def test_epoch_cap_prefers_informative_answers(self):
-        rows = [self._row(i, epoch="a#1") for i in range(5)] + [self._row(9, epoch="a#1", hist="denied:chisame")]
+    def test_epoch_cap_is_separate_for_decided_and_undecided_rows(self):
+        rows = [self._row(i, epoch="a#1") for i in range(5)] + [
+            self._row(10 + i, epoch="a#1", hist="denied:chisame") for i in range(3)]
         report = replay_set.BuildReport()
         chosen = replay_set.select_rows(rows, report, seed=1)
-        assert len(chosen) == replay_set.PER_EPOCH
-        assert "denied:chisame" in {r["hist_key"] for r in chosen}
+        assert sorted(r["hist_key"] for r in chosen) == ["denied:chisame"] * 2 + ["none"] * 2
         assert report.dropped["同じ塊の上限を超えた"] == 4
+
+    @pytest.mark.parametrize(("name", "kind", "decided_hist", "target", "expected_undecided"), [
+        ("interjection", "interjection", "sakura", 10, 5),
+        ("approval", "approval", "granted:chisame", 10, 3),
+        ("route", "route", "chisame", 10, 3),
+    ])
+    def test_undecided_rows_get_their_share(self, monkeypatch, name, kind, decided_hist, target, expected_undecided):
+        monkeypatch.setitem(replay_set.TARGETS, name, target)
+        rows = [self._row(i, epoch=f"d#{i}", hist=decided_hist, kind=kind) for i in range(20)]
+        rows += [self._row(100 + i, epoch=f"u#{i}", hist="none", kind=kind) for i in range(20)]
+        report = replay_set.BuildReport()
+        chosen = replay_set.select_rows(rows, report, seed=3)
+        assert len(chosen) == target
+        assert (report.undecided[name], report.informative[name]) == (expected_undecided, target - expected_undecided)
+
+    def test_shortfalls_are_filled_from_the_other_side(self, monkeypatch):
+        monkeypatch.setitem(replay_set.TARGETS, "interjection", 10)
+        few_undecided = [self._row(i, epoch=f"d#{i}", hist="sakura", kind="interjection") for i in range(20)]
+        few_undecided.append(self._row(99, epoch="u#1", hist="unknown", kind="interjection"))
+        report = replay_set.BuildReport()
+        assert len(replay_set.select_rows(few_undecided, report, seed=1)) == 10
+        assert report.undecided["interjection"] == 1
+
+        few_decided = [self._row(i, epoch=f"u#{i}", hist="unknown", kind="interjection") for i in range(20)]
+        report = replay_set.BuildReport()
+        assert len(replay_set.select_rows(few_decided, report, seed=1)) == 10
+        assert report.undecided["interjection"] == 10
+
+    def test_full_buffer_stays_in_one_epoch_until_empty_or_a_gap(self):
+        state = replay_set._FileState(stem="s", day="2026-06-01")
+        report = replay_set.BuildReport()
+        start = datetime(2026, 6, 1, 20, 0, 0)
+
+        def bg(n, seconds):
+            text = "x"
+            msg = replay_set.BG_BUFFER_FORMAT % (text, n, n)
+            replay_set._on_bg(state, msg, report, at=start + timedelta(seconds=seconds))
+            return state.epoch
+
+        assert [bg(1, 0), bg(2, 5), bg(3, 10), bg(3, 15), bg(3, 20)] == [1, 1, 1, 1, 1]  # 満杯でも同じ塊
+        assert bg(1, 25) == 2  # 空から始まった
+        assert bg(2, 60) == 3  # 30 秒より空いた
 
     def test_targets_and_determinism(self, monkeypatch):
         monkeypatch.setitem(replay_set.TARGETS, "approval", 3)

@@ -46,7 +46,7 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,9 +61,19 @@ KINDS = ("approval", "intent", "interjection", "route")
 # 種類ごと（intent は callout と mention に分ける）に、セットへ入れる目標の数。
 TARGETS = {"approval": 100, "interjection": 120, "callout": 70, "mention": 40, "route": 20}
 
-# 1 つの塊（同じファイルで、バッファのセグメント数が増え続ける間）から、種類ごとに取る上限。
+# 1 つの塊（同じ会話のひとまとまり）から、区分ごと・「決めた / 決めなかった」ごとに取る上限。
 # WHY: 伸びていくバッファの判定は、ほとんど同じ入力が続く。上限が無いと、1 つの長い会話がセットを占める。
 PER_EPOCH = 2
+
+# 塊の区切り: バッファが空から始まった（segments=1）か、前の行から この秒数より空いたとき。
+# WHY: 満杯のバッファは古い方から消えていくので、セグメントの数は増えない。数の増減で区切ると、
+#      長い会話では毎行が新しい塊になり、上限が効かない。30 秒は本番のバッファの窓（L2_CONTEXT_WINDOW_SEC）の既定。
+EPOCH_GAP_SEC = 30.0
+
+# 区分ごとに、「何も決めなかった行」（当時の答えが none / unknown）に取っておく割合。足りなければある分だけ。
+# WHY: 本番で一番多いのは「誰も手を挙げない」「挙手中の無関係な発話」。決めた行だけを集めると、新しいモデルが
+#      余計に手を挙げる、関係ない発話で許可する、という変化に気づけない。
+UNDECIDED_SHARE = {"approval": 0.3, "interjection": 0.5, "route": 0.3}
 
 # 判定の本文がログに入り始めた日（router._text_preview の導入）。これより前の実走ログは組み直せない。
 DEFAULT_SINCE = date(2026, 5, 8)
@@ -229,6 +239,7 @@ class BuildReport:
     dropped: Counter = field(default_factory=Counter)
     kept: Counter = field(default_factory=Counter)
     informative: Counter = field(default_factory=Counter)
+    undecided: Counter = field(default_factory=Counter)
     epochs: int = 0
     decision_rows: int = 0
 
@@ -376,6 +387,7 @@ class _FileState:
     day: str
     segments: list[str] = field(default_factory=list)
     last_bg: tuple[int, int] | None = None
+    last_bg_at: datetime | None = None
     epoch: int = 0
     pending_wake: tuple[str, int] | None = None
     pending_route: list[str] | None = None
@@ -388,9 +400,9 @@ def rows_from_runlog(path: Path, report: BuildReport, *, context_max_chars: int)
     day = f"{match['date'][:4]}-{match['date'][4:6]}-{match['date'][6:]}"
     state = _FileState(stem=path.stem, day=day)
     rows: list[dict[str, Any]] = []
-    for _name, msg in _messages(path.read_text(encoding="utf-8", errors="replace")):
+    for stamp, _name, msg in _records(path.read_text(encoding="utf-8", errors="replace")):
         if msg.startswith("BG buffer 蓄積: "):
-            _on_bg(state, msg, report)
+            _on_bg(state, msg, report, at=_log_time(stamp))
         elif msg.startswith("BG wake 検知: "):
             found = _BG_WAKE.match(msg)
             state.pending_wake = (found["slug"], int(found["len"])) if found else None
@@ -413,7 +425,20 @@ def rows_from_runlog(path: Path, report: BuildReport, *, context_max_chars: int)
     return rows
 
 
-def _on_bg(state: _FileState, msg: str, report: BuildReport) -> None:
+def _log_time(stamp: str) -> datetime | None:
+    """ログの時刻（2026-06-01 20:00:00,123）を読む。読めなければ None。"""
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S,%f")
+    except ValueError:
+        return None
+
+
+def _new_epoch(previous: datetime | None, now: datetime | None) -> bool:
+    """前の行から EPOCH_GAP_SEC より空いたか（時刻が読めなければ区切る）。"""
+    return previous is None or now is None or (now - previous).total_seconds() > EPOCH_GAP_SEC
+
+
+def _on_bg(state: _FileState, msg: str, report: BuildReport, *, at: datetime | None = None) -> None:
     found = _BG_BUFFER.match(msg)
     text = _literal_str(found["text"]) if found else None
     if found is None or text is None:
@@ -423,10 +448,11 @@ def _on_bg(state: _FileState, msg: str, report: BuildReport) -> None:
         state.last_bg = None
         return
     n, chars = int(found["n"]), int(found["chars"])
-    if state.last_bg is None or n <= state.last_bg[0]:
+    if state.last_bg is None or n == 1 or _new_epoch(state.last_bg_at, at):
         state.epoch += 1
     state.segments.append(text)
     state.last_bg = (n, chars)
+    state.last_bg_at = at
 
 
 def _buffer_tail(state: _FileState, report: BuildReport) -> list[str] | None:
@@ -531,7 +557,9 @@ def rows_from_decision_log(directory: Path, since: date, report: BuildReport) ->
         if not re.fullmatch(r"\d{8}", stamp) or date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:])) < since:
             continue
         day = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:]}"
-        for index, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
+        # 判定ログの塊は時刻で区切る（EPOCH_GAP_SEC より空いたら次の塊）。
+        epoch, previous = 0, None
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 item = json.loads(line)
             except ValueError:
@@ -551,9 +579,16 @@ def rows_from_decision_log(directory: Path, since: date, report: BuildReport) ->
                 report.dropped["判定ログの種類が違う"] += 1
                 continue
             report.decision_rows += 1
+            try:
+                at = datetime.fromisoformat(str(item.get("ts"))).replace(tzinfo=None)
+            except ValueError:
+                at = None
+            if _new_epoch(previous, at):
+                epoch += 1
+            previous = at
             rows.append(_row(kind=kind, text=item["input"], character=character, candidates=candidates,
                              source="decision_log", hist_raw=str(item["raw"]), hist_model=item.get("model"),
-                             epoch=f"{path.stem}#{index}", day=day))
+                             epoch=f"{path.stem}#{epoch}", day=day))
     return rows
 
 
@@ -572,8 +607,25 @@ def _informative(row: dict[str, Any]) -> bool:
     return key is not None and key not in ("none", "unknown")
 
 
+def _take(rows: list[dict[str, Any]], limit: int, rng: random.Random) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """長さと日付の層を順にめぐって limit 行まで取る。(取った行, 残り) を返す。"""
+    strata: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        strata[(_length_band(row["input"]), row["date"] or "")].append(row)
+    queues = [strata[key] for key in sorted(strata)]
+    for queue in queues:
+        rng.shuffle(queue)
+    taken: list[dict[str, Any]] = []
+    while len(taken) < limit and any(queues):
+        for queue in queues:
+            if queue and len(taken) < limit:
+                taken.append(queue.pop())
+    return taken, [row for queue in queues for row in queue]
+
+
 def select_rows(rows: list[dict[str, Any]], report: BuildReport, *, seed: int) -> list[dict[str, Any]]:
-    """重複を除き、塊ごとの上限をかけ、長さと日付の層に分けて目標の数まで取る。固定の seed で決まる。"""
+    """重複を除き、塊ごとの上限をかけ、区分ごとに「何も決めなかった行」の枠を取ってから、長さと日付の層に分けて
+    目標の数まで取る。固定の seed で決まる。"""
     rng = random.Random(seed)
     unique: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -582,14 +634,13 @@ def select_rows(rows: list[dict[str, Any]], report: BuildReport, *, seed: int) -
         else:
             unique[row["id"]] = row
 
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, bool], list[dict[str, Any]]] = defaultdict(list)
     for row in unique.values():
-        groups[(row["epoch"], bucket(row))].append(row)
+        groups[(row["epoch"], bucket(row), _informative(row))].append(row)
     capped: list[dict[str, Any]] = []
     for key in sorted(groups):
         group = groups[key]
         rng.shuffle(group)
-        group.sort(key=lambda r: not _informative(r))
         capped.extend(group[:PER_EPOCH])
         if len(group) > PER_EPOCH:
             report.dropped["同じ塊の上限を超えた"] += len(group) - PER_EPOCH
@@ -597,25 +648,17 @@ def select_rows(rows: list[dict[str, Any]], report: BuildReport, *, seed: int) -
     chosen: list[dict[str, Any]] = []
     for name, target in TARGETS.items():
         pool = [r for r in capped if bucket(r) == name]
-        for informative in (True, False):
-            strata: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-            for row in pool:
-                if _informative(row) == informative:
-                    strata[(_length_band(row["input"]), row["date"])].append(row)
-            queues = [strata[key] for key in sorted(strata)]
-            for queue in queues:
-                rng.shuffle(queue)
-            while queues and report.kept[name] < target:
-                for queue in list(queues):
-                    if report.kept[name] >= target:
-                        break
-                    if not queue:
-                        queues.remove(queue)
-                        continue
-                    chosen.append(queue.pop())
-                    report.kept[name] += 1
-                    report.informative[name] += informative
-                queues = [q for q in queues if q]
+        decided = [r for r in pool if _informative(r)]
+        undecided = [r for r in pool if not _informative(r)]
+        quota = round(target * UNDECIDED_SHARE.get(name, 0.0))
+        first, undecided = _take(undecided, quota, rng)
+        second, _ = _take(decided, target - len(first), rng)
+        third, _ = _take(undecided, target - len(first) - len(second), rng)  # 決めた行が足りなければ埋める
+        for row in [*first, *second, *third]:
+            chosen.append(row)
+            report.kept[name] += 1
+            report.informative[name] += _informative(row)
+            report.undecided[name] += not _informative(row)
         if len(pool) > report.kept[name]:
             report.dropped["目標の数を超えた"] += len(pool) - report.kept[name]
     return chosen
@@ -659,8 +702,9 @@ def write_outputs(rows: list[dict[str, Any]], out_dir: Path, report: BuildReport
     _write_atomic(out_dir / "set.jsonl", "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
                                                   for r in ordered))
     meta = {
-        "seed": seed, "targets": TARGETS, "per_epoch": PER_EPOCH, "kept": dict(report.kept),
-        "informative": dict(report.informative), "files": dict(report.files_by_rule),
+        "seed": seed, "targets": TARGETS, "per_epoch": PER_EPOCH, "epoch_gap_sec": EPOCH_GAP_SEC,
+        "undecided_share": UNDECIDED_SHARE, "kept": dict(report.kept), "informative": dict(report.informative),
+        "undecided": dict(report.undecided), "notes": report.notes, "files": dict(report.files_by_rule),
         "dropped": dict(report.dropped), "found": dict(report.found), "epochs": report.epochs,
     }
     _write_atomic(out_dir / "set.meta.json", json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True))
@@ -817,9 +861,13 @@ def _print_build(report: BuildReport) -> None:
     emit("捨てた理由:")
     for reason, count in sorted(report.dropped.items()):
         emit(f"  {reason}: {count}")
-    emit("セットに入れた行（うち当時の答えが何かを決めた行）:")
+    emit("セットに入れた行（当時の答えが何かを決めた行 / 何も決めなかった行）:")
     for name, target in TARGETS.items():
-        emit(f"  {name}: {report.kept[name]} / 目標 {target}（{report.informative[name]}）")
+        kept = report.kept[name]
+        share = report.undecided[name] / kept if kept else 0.0
+        goal = f"、枠 {UNDECIDED_SHARE[name]:.0%}" if name in UNDECIDED_SHARE else ""
+        emit(f"  {name}: {kept} / 目標 {target}（決めた {report.informative[name]} / 決めなかった {report.undecided[name]}"
+             f" = {share:.0%}{goal}）")
 
 
 def main(argv: list[str] | None = None) -> int:
