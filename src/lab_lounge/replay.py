@@ -758,7 +758,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         runs.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
 
-    overrides = dict(spend.parse_price_override(text) for text in args.price)
+    overrides = args.overrides
     ledger = spend.SpendLedger(args.spend_dir or spend.default_spend_dir())
     emit(f"実行 {args.label}: {len(rows)} 行 × {args.reps} 回、並列 {args.workers}、上限 ${args.max_usd:.2f}"
          f"（除外 {excluded}）")
@@ -840,6 +840,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         if args.reps < 1 or args.workers < 1 or args.canary < 0:
             emit("--reps と --workers は 1 以上、--canary は 0 以上にしてください")
+            return EXIT_USAGE
+        if not (args.max_usd > 0 and math.isfinite(args.max_usd)):
+            emit("--max-usd は正の数にしてください")
+            return EXIT_USAGE
+        try:
+            args.overrides = dict(spend.parse_price_override(text) for text in args.price)
+        except ValueError as exc:
+            emit(str(exc))  # parse_price_override が自分で組み立てた案内だけ
             return EXIT_USAGE
         return _cmd_run(args)
     commands = {"report": _cmd_report, "compare": _cmd_compare, "review": _cmd_review, "score": _cmd_score}

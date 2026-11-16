@@ -130,9 +130,10 @@ class TestPrices:
         real = spend.cost_usd(_HAIKU, spend.Usage(input=len(body) // 4, output=20))
         assert spend.estimate_usd(_HAIKU, len(body), 20) > real
 
-    @pytest.mark.parametrize("name", ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "models/gemini-3.1-flash-lite"])
+    @pytest.mark.parametrize("name", ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "models/gemini-3.1-flash-lite",
+                                      "gpt-5.4-mini-2026-03-05"])
     def test_lookup_strips_dates_and_prefixes(self, name):
-        assert spend.lookup_price(name, spend.PRICES).provider in ("anthropic", "google")
+        assert spend.lookup_price(name, spend.PRICES).provider in ("anthropic", "google", "openai")
 
     @pytest.mark.parametrize("name", [None, "", "claude-haiku-9"])
     def test_lookup_refuses_unknown_models(self, name):
@@ -149,7 +150,7 @@ class TestPrices:
         assert (name, price.rate.input, price.rate.output, price.rate.cache_read) == ("gpt-9", 1, 2, 0.5)
         assert price.provider == "openai"
 
-    @pytest.mark.parametrize("text", ["gpt-9", "gpt-9=1", "gpt-9=-1,2", "a b=1,2", "gpt-9=1,2,3,4,5"])
+    @pytest.mark.parametrize("text", ["gpt-9", "gpt-9=1", "gpt-9=-1,2", "a b=1,2", "gpt-9=1,2,3,4,5", "gpt-9=a,b"])
     def test_price_override_rejects_bad_shapes(self, text):
         with pytest.raises(ValueError):
             spend.parse_price_override(text)
@@ -485,6 +486,19 @@ class TestStream:
         assert call["usd"] > 0 and call["usd"] == pytest.approx(ledger.total_usd)
         assert meter.stats.uncounted == 1
 
+    def test_error_stream_closed_before_reading_costs_nothing(self, ledger, tmp_path):
+        """2xx 以外は各社とも課金しないので、読まずに閉じても 0 円の http_error にする。"""
+        stream = _Chunks(json.dumps({"error": {"message": _SENTINEL}}).encode())
+
+        def handler(request):
+            return httpx.Response(429, headers={"content-type": "application/json"}, stream=stream)
+
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0), _client(handler) as client:
+            response = client.send(client.build_request("POST", _ANTHROPIC, json=_body()), stream=True)
+            response.close()
+        (call,) = _calls(tmp_path)
+        assert (call["status"], call["usd"]) == ("http_error", 0)
+
 
 async def test_async_client_is_counted(ledger, tmp_path):
     async def handler(request):
@@ -529,6 +543,46 @@ class TestLedger:
         with pytest.raises(ValueError):
             spend.UsageMeter(ledger, run, max_usd=1.0)
 
+    def test_inflight_calls_are_recorded_at_exit(self, ledger, tmp_path):
+        """送ったまま決着していない呼び出しは、出るときに見積もりの額で残る。後から来た応答は二重に数えない。"""
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0) as meter:
+            call = meter._before(httpx.Request("POST", _ANTHROPIC, json=_body()))
+        (line,) = _calls(tmp_path)
+        assert (line["status"], line["usd"]) == ("inflight_at_exit", pytest.approx(call.reserved))
+        meter._settle(call, status="response", http_status=200, data=json.dumps(_anthropic_reply()).encode())
+        assert len(_calls(tmp_path)) == 1
+
+    def test_acquire_reads_the_file_again(self, tmp_path):
+        """作った後に別の実行が書いた額を、ロックを取った時点で読み直す（上書きで消さない）。"""
+        early = spend.SpendLedger(tmp_path)
+        other = spend.SpendLedger(tmp_path)
+        other.add(run="other", model="claude-haiku-4-5", usd=1.5, usage=None, status="no_usage")
+        early.acquire()
+        try:
+            assert early.total_usd == pytest.approx(1.5)
+        finally:
+            early.release()
+
+    def test_busy_lock_names_its_owner(self, tmp_path):
+        (tmp_path / "spent.lock").write_text("pid=4242 since=2026-11-16T12:00:00+00:00\n", encoding="utf-8")
+        with pytest.raises(spend.LedgerBusy) as caught:
+            spend.SpendLedger(tmp_path).acquire()
+        assert "pid 4242" in str(caught.value) and "2026-11-16T12:00:00+00:00" in str(caught.value)
+
+    def test_replace_retries_a_short_permission_error(self, ledger, monkeypatch):
+        real, failures = spend.os.replace, []
+
+        def flaky(source, target):
+            if len(failures) < 2:
+                failures.append(1)
+                raise PermissionError
+            real(source, target)
+
+        monkeypatch.setattr(spend.os, "replace", flaky)
+        monkeypatch.setattr(spend.time, "sleep", lambda _s: None)
+        ledger.add(run="r", model="claude-haiku-4-5", usd=0.1, usage=None, status="no_usage")
+        assert len(failures) == 2 and spend.SpendLedger(ledger.directory).total_usd == pytest.approx(0.1)
+
     def test_unknown_schema_is_refused(self, tmp_path):
         (tmp_path / "spent.json").write_text('{"schema": 2}', encoding="utf-8")
         with pytest.raises(ValueError):
@@ -556,6 +610,8 @@ class TestQuietFailures:
         ("raise ValueError(SENTINEL)", 1),
         ("raise spend.BudgetExceeded('上限で止めました')", 4),
         ("raise SystemExit(64)", 64),
+        ("raise SystemExit()", 0),
+        ("raise SystemExit(SENTINEL)", 1),
         ("return 0", 0),
     ])
     def test_run_tool_exit_codes_and_no_text(self, tmp_path, body, code):
@@ -583,16 +639,36 @@ class TestQuietFailures:
         assert "KeyError" in done.stdout
         assert _SENTINEL not in done.stdout + done.stderr
 
-    def test_hard_exit_releases_the_lock(self, tmp_path):
+    def test_hard_exit_releases_the_lock_and_records_inflight_calls(self, tmp_path):
         done = _run_python(f"""
+            import httpx
             from pathlib import Path
             from lab_lounge import spend
             meter = spend.UsageMeter(spend.SpendLedger(Path({str(tmp_path)!r})), "t", max_usd=1.0)
             meter.__enter__()
+            meter._before(httpx.Request("POST", {_ANTHROPIC!r}, json={{"model": "claude-haiku-4-5", "max_tokens": 5}}))
             spend.hard_exit(3)
         """, tmp_path)
         assert done.returncode == 3, done.stdout + done.stderr
         assert not (tmp_path / "spent.lock").exists()
+        assert [c["status"] for c in _calls(tmp_path)] == ["inflight_at_exit"]
+
+    def test_unraisable_errors_show_only_the_type(self, tmp_path):
+        done = _run_python(f"""
+            import gc
+            from lab_lounge import spend
+            class Leaky:
+                def __del__(self):
+                    raise ValueError({_SENTINEL!r})
+            def main():
+                Leaky()
+                gc.collect()
+                return 0
+            spend.run_tool(main, name="t")
+        """, tmp_path)
+        assert done.returncode == 0
+        assert "ValueError" in done.stdout  # 子のプロセスの出力の文字コードは環境に依るので、型の名前で見る
+        assert _SENTINEL not in done.stdout + done.stderr
 
 
 class TestCommandLine:

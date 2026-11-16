@@ -333,3 +333,11 @@ class TestCompareCommands:
     def test_missing_meta(self, pair, capsys):
         set_dir, _ = pair
         assert _cli(set_dir, "compare", "--base", "base", "--run", "nope") == 1
+
+
+@pytest.mark.parametrize("extra", [["--max-usd", "0"], ["--max-usd", "nan"], ["--max-usd", "1", "--price", "gpt-9=a,b"],
+                                   ["--max-usd", "1", "--reps", "0"]])
+def test_run_rejects_bad_arguments_before_anything(tmp_path, extra, capsys):
+    code = replay.main(["--set-dir", str(tmp_path), "run", "--profile", "dev", "--label", "x", *extra])
+    assert code == replay.EXIT_USAGE
+    assert not (tmp_path / "runs").exists()

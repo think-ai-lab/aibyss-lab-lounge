@@ -53,6 +53,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 import zlib
 from collections.abc import Callable, Iterator
@@ -225,7 +226,7 @@ PRICES: dict[str, Price] = {
 
 
 def lookup_price(model: str | None, prices: dict[str, Price]) -> Price:
-    """モデル名から価格を引く。日付の付いた版名（-20251001）と models/ の接頭辞は外して引く。
+    """モデル名から価格を引く。日付の付いた版名（-20251001、-2026-03-05）と models/ の接頭辞は外して引く。
 
     Raises:
         UnpricedModel: 表にない、またはモデルが分からない
@@ -233,7 +234,7 @@ def lookup_price(model: str | None, prices: dict[str, Price]) -> Price:
     if not model:
         raise UnpricedModel("モデルの分からない要求は送りません")
     name = model.removeprefix("models/")
-    for candidate in (name, re.sub(r"-\d{8}$", "", name)):
+    for candidate in (name, re.sub(r"-\d{8}$", "", name), re.sub(r"-\d{4}-\d{2}-\d{2}$", "", name)):
         if candidate in prices:
             return prices[candidate]
     raise UnpricedModel(f"価格表にないモデルです: {_showable(model)}")
@@ -251,7 +252,10 @@ def parse_price_override(text: str) -> tuple[str, Price]:
     name = name.strip()
     if not sep or not _SHOWABLE.fullmatch(name):
         raise ValueError("--price は model=in,out[,cache_read[,cache_write]] の形で渡してください")
-    values = [float(v) for v in numbers.split(",")]
+    try:
+        values = [float(v) for v in numbers.split(",")]
+    except ValueError:
+        raise ValueError("--price の数が読めません（model=in,out[,cache_read[,cache_write]]）") from None
     if not 2 <= len(values) <= 4 or any(v < 0 or not math.isfinite(v) for v in values):
         raise ValueError("--price の数は 2〜4 個の 0 以上の数にしてください")
     rate = Rate(values[0], values[1], values[2] if len(values) > 2 else values[0],
@@ -444,6 +448,22 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _replace_with_retry(source: Path, target: Path, attempts: int = 6) -> None:
+    """os.replace を、Windows の一時的な PermissionError のときだけ短く待って繰り返す。
+
+    WHY: ウイルス対策やエディタが一瞬ファイルを開いていると、Windows の置き換えは PermissionError になる。
+         1 回で諦めると、課金した呼び出しを記録できずに止まる（MeterFailure）。
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * 2 ** attempt)
+
+
 class SpendLedger:
     """有料の計測の支出を、ファイルに 1 呼び出しごとに書き足す。
 
@@ -498,12 +518,25 @@ class SpendLedger:
             fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             raise LedgerBusy(
-                "別の有料の実行が支出の記録を使っています（data/probe/spent.lock）。"
-                "ほかに流れていなければ、そのファイルを消してから流し直してください",
+                f"別の有料の実行が支出の記録を使っています（data/probe/spent.lock、{self._lock_owner()}）。"
+                "その実行がもう終わっていれば、そのファイルを消してから流し直してください",
             ) from None
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(f"pid={os.getpid()} since={_now()}\n")
         self._locked = True
+        # WHY 読み直す: 作ったときに読んだ値は、ロックを取るまでの間に終わった別の実行の額を含まない。
+        #      そのまま書くと、その額を上書きで消してしまう。
+        self.data = self._load()
+
+    def _lock_owner(self) -> str:
+        """ロックのファイルの持ち主（pid と時刻）を、出してよい形で返す。"""
+        try:
+            text = self.lock_path.read_text(encoding="utf-8")
+        except OSError:
+            return "持ち主は読めません"
+        pid = re.search(r"pid=(\d+)", text)
+        since = re.search(r"since=([0-9T:+\-]+)", text)
+        return f"pid {pid[1] if pid else '?'}、{since[1] if since else '?'} から"
 
     def release(self) -> None:
         """ロックのファイルを消す。自分で作ったときだけ。"""
@@ -521,7 +554,7 @@ class SpendLedger:
             json.dump(self.data, stream, ensure_ascii=False, indent=1, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, self.path)
+        _replace_with_retry(tmp, self.path)
 
     def note_override(self, model: str, price: Price) -> None:
         """--price の一時的な上書きを記録に残す。"""
@@ -750,6 +783,8 @@ class UsageMeter:
         self._lock = threading.RLock()
         self._originals: list[tuple[type, str, Any]] = []
         self._selftest_seen: dict[str, Usage | None] = {}
+        # 送ったがまだ決着していない呼び出し（id(_Call) → _Call）。打ち切りのときに見積もりで記録する。
+        self._inflight: dict[int, _Call] = {}
 
     # ── 入れる、戻す ──
 
@@ -761,7 +796,9 @@ class UsageMeter:
             _ACTIVE = self
         try:
             self.ledger.acquire()
+            # hard_exit は後に足したものから流すので、決着していない呼び出しの記録がロックを消すより先に走る。
             _EXIT_CLEANUPS.append(self.ledger.release)
+            _EXIT_CLEANUPS.append(self.settle_inflight)
             for model, price in self.overrides.items():
                 self.ledger.note_override(model, price)
             self._install()
@@ -769,8 +806,7 @@ class UsageMeter:
         except BaseException:
             self._uninstall()
             self.ledger.release()
-            with contextlib.suppress(ValueError):
-                _EXIT_CLEANUPS.remove(self.ledger.release)
+            self._forget_cleanups()
             with _ACTIVE_LOCK:
                 _ACTIVE = None
             raise
@@ -779,13 +815,29 @@ class UsageMeter:
     def __exit__(self, *exc_info: object) -> None:
         global _ACTIVE
         try:
+            self.settle_inflight()
             self._uninstall()
         finally:
             self.ledger.release()
-            with contextlib.suppress(ValueError):
-                _EXIT_CLEANUPS.remove(self.ledger.release)
+            self._forget_cleanups()
             with _ACTIVE_LOCK:
                 _ACTIVE = None
+
+    def _forget_cleanups(self) -> None:
+        for cleanup in (self.ledger.release, self.settle_inflight):
+            with contextlib.suppress(ValueError):
+                _EXIT_CLEANUPS.remove(cleanup)
+
+    def settle_inflight(self) -> None:
+        """送ったまま決着していない呼び出しを、見積もりの額で記録する（status は inflight_at_exit）。
+
+        WHY: 打ち切り（Ctrl+C、時間切れの hard_exit、上限で止めた後に残った並列の呼び出し）のとき、相手はすでに
+             受け取って課金しうる。記録しないと、次の実行の上限の判定が甘くなる。後から応答が来ても二重には数えない。
+        """
+        with self._lock:
+            pending = list(self._inflight.values())
+        for call in pending:
+            self._settle(call, status="inflight_at_exit")
 
     def _install(self) -> None:
         """入っているモジュールの Client.send / AsyncClient.send を包む。"""
@@ -903,7 +955,9 @@ class UsageMeter:
             self._pending += estimate
             self.stats.sent += 1
             self.stats.bump(provider, "sent")
-        return _Call(provider, model, price, estimate)
+            call = _Call(provider, model, price, estimate)
+            self._inflight[id(call)] = call
+        return call
 
     def _settle(self, call: _Call, *, status: str, http_status: int | None = None,
                 data: bytes | None = None, content_type: str = "") -> None:
@@ -921,13 +975,15 @@ class UsageMeter:
         assert call.price is not None
         if usage is not None:
             status, usd = "usage", cost_usd(call.price, usage)
-        elif status == "response" and http_status is not None and not 200 <= http_status < 300:
+        elif status in ("response", "stream_unfinished") and http_status is not None \
+                and not 200 <= http_status < 300:
             status, usd = "http_error", 0.0
         else:
             status = "no_usage" if status == "response" else status
             usd = call.reserved
         with self._lock:
             self._pending -= call.reserved
+            self._inflight.pop(id(call), None)
             if http_status is not None and 200 <= http_status < 300:
                 self.stats.ok_responses += 1
                 self.stats.bump(call.provider, "ok_responses")
@@ -1133,6 +1189,7 @@ def quiet_failures() -> Iterator[None]:
     import logging
 
     previous_hook, previous_thread_hook = sys.excepthook, threading.excepthook
+    previous_unraisable = sys.unraisablehook
     previous_last_resort = logging.lastResort
 
     def hook(_type: type[BaseException], exc: BaseException, _tb: object) -> None:
@@ -1142,13 +1199,19 @@ def quiet_failures() -> Iterator[None]:
         if args.exc_value is not None:
             emit(f"[失敗] スレッドで {describe_failure(args.exc_value)}")
 
+    def unraisable_hook(unraisable: Any) -> None:
+        # WHY: __del__ や後始末の中の例外は、既定では文言ごと標準エラーへ出る（本文を含みうる）。
+        emit(f"[失敗] 後始末で {getattr(unraisable.exc_type, '__name__', '例外')}")
+
     sys.excepthook, threading.excepthook = hook, thread_hook
+    sys.unraisablehook = unraisable_hook
     # WHY: root logger に handler が無いとき、logging は WARNING 以上を stderr へ素で出す（本文を含みうる）。
     logging.lastResort = None
     try:
         yield
     finally:
         sys.excepthook, threading.excepthook = previous_hook, previous_thread_hook
+        sys.unraisablehook = previous_unraisable
         logging.lastResort = previous_last_resort
 
 
@@ -1183,7 +1246,8 @@ def run_tool(main: Callable[[], int], *, name: str) -> NoReturn:
                 code = EXIT_SPEND_STOP
                 emit(f"[{name}] 止めました: {type(exc).__name__}: {exc}")
             except SystemExit as exc:
-                code = exc.code if isinstance(exc.code, int) else EXIT_FAILED
+                # sys.exit() と sys.exit(None) は正常の終わり。文言の付いた sys.exit は値を含みうるので出さずに 1 にする。
+                code = EXIT_OK if exc.code is None else exc.code if isinstance(exc.code, int) else EXIT_FAILED
             except KeyboardInterrupt:
                 code = 130
                 emit(f"[{name}] Ctrl+C で止めました")
