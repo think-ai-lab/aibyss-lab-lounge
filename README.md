@@ -438,7 +438,9 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 | `c2_probe latency` | C2 の検索の時間の分布（cold / warm）としきい値を超えた割合、予算の目安 | C2 側の埋め込みのみ |
 | `c2_probe timeouts` | 過去の実走ログの C2 のタイムアウトを、月ごと・日付の前後ごとに数える | なし |
 
-**出力の約束**: 画面と、`data/probe/` `data/replay/` の数字のファイルには、発話の本文も、モデルの答えも出しません（件数、率、時間、tokens、費用だけ）。
+**出力の約束**: 画面と、`data/probe/` `data/replay/` の数字のファイルには、発話の本文も、モデルの答えも出しません（件数、率、時間、tokens、費用、決まった形の判定の答えだけ）。
+本文やモデルの出力を含みうるファイルは、それぞれの `private/` に分けて置きます（`data/replay/private/`: リプレイのセット、確認のファイル、生の答え、WARNING のログ）。
+`private/` は人だけが開くフォルダです。Claude などの自動化には、`private/` を開かせず、直下の数字のファイルだけを読ませてください。
 モデルの返答の本文は、聴き比べ用に `probe agent` の `agent_<名前>.jsonl` だけに書きます。`data/` は gitignore 済みで、実の配信ログから作ったものを含むので、そのまま共有しないでください。
 実走ログ（`logs/runs/`）には発話が入っているので、集計の道具は先頭の形だけを読み、本文は読みません。
 
@@ -455,7 +457,7 @@ uv run --frozen --all-extras python -m lab_lounge.spend show
 ```bash
 # 1) 実走ログから、過去の発話の固定のセットを組む（画面は件数だけ。--dry-run で数えるだけ）
 uv run --frozen --all-extras python -m lab_lounge.replay_set build
-#    data/replay/review.md の、外したい行の行頭を [x] にしてから
+#    data/replay/private/review.md の、外したい行の行頭を [x] にしてから
 uv run --frozen --all-extras python -m lab_lounge.replay_set exclude
 
 # 2) 少数で単価を確かめてから、基準の回を 2 回流す

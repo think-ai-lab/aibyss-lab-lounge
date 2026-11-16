@@ -174,14 +174,14 @@ class TestReport:
 
 class TestSetHandling:
     def _write_set(self, directory, rows):
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+        (directory / "private").mkdir(parents=True, exist_ok=True)
+        (directory / "private" / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
                                              encoding="utf-8")
 
     def test_exclusions_and_synthetic_are_applied(self, tmp_path):
         rows = [_row(i) for i in range(3)]
         self._write_set(tmp_path, rows)
-        (tmp_path / "review.md").write_text("x", encoding="utf-8")
+        (tmp_path / "private" / "review.md").write_text("x", encoding="utf-8")
         (tmp_path / "exclude.txt").write_text(rows[0]["id"] + "\n", encoding="utf-8")
         synthetic = tmp_path / "synthetic.jsonl"
         synthetic.write_text(json.dumps({"id": "s001", "kind": "approval", "input": _SENTINEL, "character": None,
@@ -240,7 +240,8 @@ class TestCompare:
 def pair(tmp_path):
     """基準の回（2 回）と新しい回（1 回）を、セットと一緒に置く。"""
     rows = [_row(1), _row(2), _row(3, "intent"), _row(4, "interjection"), _row(5)]
-    (tmp_path / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
                                         encoding="utf-8")
     (tmp_path / "exclude.txt").write_text("", encoding="utf-8")
     runs = tmp_path / "runs"
@@ -286,7 +287,7 @@ class TestCompareCommands:
     def test_review_score_round_trip(self, pair, capsys):
         set_dir, rows = pair
         assert _cli(set_dir, "review", "--base", "base", "--run", "new") == 0
-        review = set_dir / "review_new_vs_base.md"
+        review = set_dir / "private" / "review_new_vs_base.md"
         text = review.read_text(encoding="utf-8")
         assert text.count("\n- [ ] ") == 3 and "callout → mention" in text
         assert _cli(set_dir, "review", "--base", "base", "--run", "new") == replay.EXIT_REFUSED
@@ -309,14 +310,14 @@ class TestCompareCommands:
         set_dir, rows = pair
         monkeypatch.setattr(replay, "MAX_WRONG", 0)
         _cli(set_dir, "review", "--base", "base", "--run", "new")
-        _mark(set_dir / "review_new_vs_base.md", {rows[2]["id"]: "o", rows[3]["id"]: "o", rows[4]["id"]: "x"})
+        _mark(set_dir / "private" / "review_new_vs_base.md", {rows[2]["id"]: "o", rows[3]["id"]: "o", rows[4]["id"]: "x"})
         assert _cli(set_dir, "score", "--base", "base", "--run", "new") == 1
         assert "FAIL (b) 誤りとした行" in capsys.readouterr().out
 
     def test_score_reports_bad_marks_by_line_number(self, pair, capsys):
         set_dir, rows = pair
         _cli(set_dir, "review", "--base", "base", "--run", "new")
-        review = set_dir / "review_new_vs_base.md"
+        review = set_dir / "private" / "review_new_vs_base.md"
         _mark(review, {rows[4]["id"]: "a"})  # [a] は挙手候補だけ
         with review.open("a", encoding="utf-8") as stream:
             stream.write(f"- [?] {rows[2]['id']} intent callout → mention | {_SENTINEL}\n")
@@ -341,3 +342,28 @@ def test_run_rejects_bad_arguments_before_anything(tmp_path, extra, capsys):
     code = replay.main(["--set-dir", str(tmp_path), "run", "--profile", "dev", "--label", "x", *extra])
     assert code == replay.EXIT_USAGE
     assert not (tmp_path / "runs").exists()
+
+
+class TestPrivateAnswers:
+    def test_only_canonical_answers_stay_in_the_numbers_file(self, tmp_path):
+        rows = [_row(1), _row(2), _row(3)]
+        answers = {rows[0]["input"]: ["granted:chisame"], rows[1]["input"]: [f"none、{_SENTINEL}って言ってたので"],
+                   rows[2]["input"]: [(None, "APITimeoutError")]}
+        run_file = replay.RunFile(tmp_path / "runs" / "t.jsonl")
+        private = replay.RunFile(tmp_path / "private" / "runs" / "t.answers.jsonl")
+        with replay_set.scripted_router(Script(answers)):
+            replay.execute(rows, run_file, reps=1, workers=1, answers=private, progress=lambda _l: None)
+        lines = {line["id"]: line for line in run_file.lines()}
+        assert lines[rows[0]["id"]]["raw"] == "granted:chisame"
+        quoted = lines[rows[1]["id"]]
+        assert quoted["raw"] is None and quoted["raw_len"] > 0 and len(quoted["raw_sha"]) == 12
+        assert _SENTINEL not in run_file.path.read_text(encoding="utf-8")
+        assert _SENTINEL in private.path.read_text(encoding="utf-8")
+        assert {a["id"] for a in private.lines()} == {rows[0]["id"], rows[1]["id"]}
+
+    def test_canonical_answers_cover_every_slug(self):
+        from lab_lounge.characters import get_all_characters
+
+        canonical = replay.canonical_answers()
+        for config in get_all_characters():
+            assert {config.slug, f"granted:{config.slug}", f"denied:{config.slug}"} <= canonical

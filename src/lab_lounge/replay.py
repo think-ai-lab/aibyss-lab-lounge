@@ -2,7 +2,7 @@
 replay.py — 判定のリプレイ（固定のセットに本物の判定の関数をかけ、答えを残して比べる）（計測の道具）
 
 責務:
-  - run:    セット（replay_set が作った data/replay/set.jsonl から除外を引いたもの + 合成の行）に、
+  - run:    セット（replay_set が作った data/replay/private/set.jsonl から除外を引いたもの + 合成の行）に、
             本物の判定の関数（check_approval / check_intent / _route_by_llm）をかけ、答えと時間を 1 行ずつ残す
   - report: 1 回の実行の、種類ごとの自己一致率（Wilson の 95% 区間）、unknown とエラーの数、混同行列、
             合成の行の正答数、当時の答えとの一致率を出す
@@ -38,12 +38,17 @@ replay.py — 判定のリプレイ（固定のセットに本物の判定の関
   2: 実行を断った（同じ名前の回がある、再開の条件が違う、確認のファイルがすでにある）
   3: score で未判定の行が残っている / 4: 上限などで止めた（spend）/ 64: コマンドラインの誤り
 
-【出力】（data/replay/runs/、gitignore 済み）
-  <名前>.jsonl:        1 判定 1 行（id、rep、attempt、生の答え、result_key、時間、エラーの型、prompt のハッシュ、
-                       応答のモデル名）。入力の本文は書かない（id でセットと結ぶ）
-  <名前>.meta.json:    commit、uv.lock のハッシュ、SDK の版、モデル、フラグ、セットのハッシュ、件数
-  <名前>.problems.log: 実行中の WARNING 以上のログ（判定の関数の警告は答えや本文の断片を含みうる）
-  review_<名前>_vs_<基準>.md と judged.jsonl（data/replay/）: 違う行の確認と、付けた印（id と答えと印だけ）
+【出力】（data/replay/、gitignore 済み）
+  数字のファイル（Claude などが読んでよい）:
+    runs/<名前>.jsonl:      1 判定 1 行（id、rep、attempt、result_key、時間、エラーの型、prompt のハッシュ、応答のモデル名）。
+                            生の答えは、決まった形（none、granted:<slug>、<slug> など）のときだけ raw に入れ、
+                            それ以外は長さとハッシュだけ（raw_len、raw_sha）。入力の本文は書かない
+    runs/<名前>.meta.json:  commit、uv.lock のハッシュ、SDK の版、モデル、フラグ、セットのハッシュ、件数
+    judged.jsonl:           付けた印（id と答えの鍵と印だけ）
+  人だけが開くファイル（private/。Claude は開かない）:
+    private/runs/<名前>.answers.jsonl:  生の答え（モデルの出力。発話を引用しうる）
+    private/runs/<名前>.problems.log:   実行中の WARNING 以上のログ（答えや本文の断片を含みうる）
+    private/review_<名前>_vs_<基準>.md: 違う行の確認（本文つき）
 
 【出力の約束】
   画面には、件数、率、表、時間、費用だけを出す。発話の本文と生の答えは出さない。
@@ -132,6 +137,32 @@ class RecordingRouter:
 
     def __exit__(self, *exc_info: object) -> None:
         router._call_router_llm = self.original
+
+
+def canonical_answers() -> set[str]:
+    """runs の数字のファイルに、そのまま書いてよい生の答え（判定の決まった形）。
+
+    WHY: 生の答えは最大 20 tokens だが、モデルが発話を引用することがある。決まった形に当てはまる答えだけを残し、
+         ほかは長さとハッシュにして、本文は private/ の answers にだけ書く。
+    """
+    from .characters import get_all_characters
+
+    slugs = {c.slug for c in get_all_characters()}
+    return {"none", "unknown", "callout", "mention", *slugs,
+            *(f"{verdict}:{slug}" for verdict in ("granted", "denied") for slug in slugs)}
+
+
+def split_answer(line: dict[str, Any], canonical: set[str]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """結果の行を、数字のファイルの行と、private の答えの行に分ける。答えが無ければ後者は None。"""
+    raw = line.get("raw")
+    public = dict(line)
+    if raw is None:
+        return public, None
+    public["raw_len"] = len(raw)
+    public["raw_sha"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    if raw not in canonical:
+        public["raw"] = None
+    return public, {"id": line["id"], "rep": line["rep"], "attempt": line["attempt"], "raw": raw}
 
 
 def run_row(row: dict[str, Any], rep: int, attempt: int) -> dict[str, Any]:
@@ -272,9 +303,11 @@ def _final_by_key(lines: Iterable[dict[str, Any]]) -> dict[tuple[str, int], dict
 
 
 def execute(rows: list[dict[str, Any]], run_file: RunFile, *, reps: int, workers: int,
-            meter: spend.UsageMeter | None = None,
+            meter: spend.UsageMeter | None = None, answers: RunFile | None = None,
             progress: Callable[[str], None] = emit) -> Counter:
     """rep 1 を全部流してから rep 2 …。失敗の行は最後に 1 回だけやり直す。済んだ (id, rep) は飛ばす（再開）。
+
+    run_file には数字の行（split_answer で生の答えを決まった形だけにしたもの）を、answers には生の答えを書く。
 
     Raises:
         spend.SpendStop: 上限などで止めた（残りの行は流さない）
@@ -283,6 +316,7 @@ def execute(rows: list[dict[str, Any]], run_file: RunFile, *, reps: int, workers
     if decision_log.is_enabled():
         raise RuntimeError("判定ログがオンのままです（リプレイの発話が次の入力に混ざる）")
     done = _final_by_key(run_file.lines())
+    canonical = canonical_answers()
     stats: Counter = Counter()
     # 提供元ごとの、エラーでなかった行の LLM 呼び出しの数（usage の拾い損ねを提供元ごとに確かめる）。
     calls_made: Counter = Counter()
@@ -294,7 +328,9 @@ def execute(rows: list[dict[str, Any]], run_file: RunFile, *, reps: int, workers
             futures = [pool.submit(run_row, row, rep, attempt) for row, rep, attempt in batch]
             try:
                 for count, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-                    line = future.result()
+                    line, answer = split_answer(future.result(), canonical)
+                    if answer is not None and answers is not None:
+                        answers.append(answer)
                     run_file.append(line)
                     stats["error" if line["error"] else "ok"] += 1
                     if meter is not None and not line["error"] and line["model"]:
@@ -524,7 +560,7 @@ def print_comparison(base: str, run: str, comparison: Comparison) -> None:
 
 
 def _review_path(set_dir: Path, base: str, run: str) -> Path:
-    return set_dir / f"review_{run}_vs_{base}.md"
+    return spend.private_dir(set_dir) / f"review_{run}_vs_{base}.md"
 
 
 def load_judged(set_dir: Path) -> dict[tuple[str, str], str]:
@@ -763,10 +799,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     emit(f"実行 {args.label}: {len(rows)} 行 × {args.reps} 回、並列 {args.workers}、上限 ${args.max_usd:.2f}"
          f"（除外 {excluded}）")
     started = time.monotonic()
-    with _captured_logs(runs / f"{args.label}.problems.log"), \
+    private_runs = spend.private_dir(set_dir) / "runs"
+    with _captured_logs(private_runs / f"{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter:
         before = ledger.run_usd(args.label)
-        stats = execute(rows, RunFile(run_path), reps=args.reps, workers=args.workers, meter=meter)
+        stats = execute(rows, RunFile(run_path), reps=args.reps, workers=args.workers, meter=meter,
+                        answers=RunFile(private_runs / f"{args.label}.answers.jsonl"))
         spent = ledger.run_usd(args.label) - before
     wire = Counter(json.loads(line).get("model_on_wire") for line in
                    ledger.calls_path.read_text(encoding="utf-8").splitlines()

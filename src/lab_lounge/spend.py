@@ -444,6 +444,23 @@ def default_spend_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "probe"
 
 
+PRIVATE_DIR_NAME = "private"
+
+
+def private_dir(directory: Path) -> Path:
+    """人だけが開くファイルの置き場所（directory/private/）を返す。
+
+    計測の道具の出力は 2 つに分ける:
+        - directory/ の直下: 数字のファイル（件数、時間、tokens、費用、決まった形の答えの鍵、meta）。
+          Claude などの自動化が読んでよい
+        - directory/private/: 実発話やモデルの返答の本文を含みうるもの（リプレイのセットと確認のファイル、
+          生の答え、WARNING のログ、Agent の返答、配信文脈の写し）。人だけが開く。Claude は開かない
+    WHY 置き場所で分ける: ファイルの名前で見分ける約束は、読む側が 1 回間違えると破れる。フォルダごと
+         開かない約束なら、ls で名前を見るだけで守れる。
+    """
+    return directory / PRIVATE_DIR_NAME
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 

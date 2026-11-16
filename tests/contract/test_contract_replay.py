@@ -33,8 +33,8 @@ def _rows() -> list[dict]:
 def replay_env(fake_llm, tmp_path, monkeypatch):
     """セットと、環境を読まない入口を用意する。"""
     set_dir = tmp_path / "replay"
-    set_dir.mkdir()
-    (set_dir / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _rows()),
+    (set_dir / "private").mkdir(parents=True)
+    (set_dir / "private" / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _rows()),
                                        encoding="utf-8")
     (set_dir / "exclude.txt").write_text("", encoding="utf-8")
     monkeypatch.setattr(preflight, "prepare_env", lambda *_args, **_kwargs: [])
@@ -64,9 +64,10 @@ def test_run_records_results_and_spend_without_text(replay_env, fake_llm, capsys
     assert (meta["rows"], meta["reps"], meta["model_on_wire"]) == (4, 2, {"claude-haiku-4-5": 8})
     spent = json.loads((spend_dir / "spent.json").read_text(encoding="utf-8"))
     assert spent["by_run"]["contract"]["calls"] == 8
+    # 数字のファイル（private/ の外）には、本文も生の答えも無い
     for path in [*set_dir.joinpath("runs").iterdir(), *spend_dir.iterdir()]:
-        if path.suffix != ".log":
-            assert _SENTINEL not in path.read_text(encoding="utf-8"), path.name
+        assert _SENTINEL not in path.read_text(encoding="utf-8"), path.name
+    assert (set_dir / "private" / "runs" / "contract.answers.jsonl").is_file()
 
 
 def test_existing_run_needs_resume_and_the_same_settings(replay_env, monkeypatch, capsys):

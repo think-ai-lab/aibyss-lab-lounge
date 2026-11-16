@@ -478,7 +478,7 @@ class TestCommandLine:
         assert "approval: 1 / 目標 100" in captured.out
         rows = replay_set.load_set(out)
         assert {r["kind"] for r in rows} == {"approval", "interjection"}
-        review = (out / "review.md").read_text(encoding="utf-8")
+        review = (out / "private" / "review.md").read_text(encoding="utf-8")
         line = next(x for x in review.splitlines() if " approval " in x)
         assert line.startswith("- [ ] ") and "⏎" in line and "\t" not in line
         assert json.loads((out / "set.meta.json").read_text(encoding="utf-8"))["kept"]["approval"] == 1
@@ -509,7 +509,7 @@ class TestCommandLine:
         ids, warning = replay_set.load_exclusions(out)
         assert ids == set() and warning is not None
 
-        review = out / "review.md"
+        review = out / "private" / "review.md"
         lines = review.read_text(encoding="utf-8").splitlines()
         target = next(i for i, x in enumerate(lines) if " approval " in x)
         excluded_id = lines[target].split()[3]
@@ -524,7 +524,7 @@ class TestCommandLine:
     def test_exclude_reports_malformed_lines_by_number(self, runlog, logs, tmp_path, monkeypatch, capsys):
         out = tmp_path / "out"
         self._build(runlog, logs, out, monkeypatch, capsys)
-        review = out / "review.md"
+        review = out / "private" / "review.md"
         lines = review.read_text(encoding="utf-8").splitlines()
         lines.append(f"- [?] 0123456789ab approval chisame | {_SENTINEL}")
         lines.append(f"- [x] {_SENTINEL} approval chisame | x")
@@ -549,7 +549,7 @@ class TestCommandLine:
         assert replay_set.main(["build", "--logs", str(logs), "--out", str(out)]) == 0
         (row,) = replay_set.load_set(out)
         assert " " in row["input"]
-        line = next(x for x in (out / "review.md").read_text(encoding="utf-8").split("\n") if x.startswith("- [ ]"))
+        line = next(x for x in (out / "private" / "review.md").read_text(encoding="utf-8").split("\n") if x.startswith("- [ ]"))
         assert " " not in line and "⏎分かれる⏎行" in line
 
     def test_context_limit_comes_from_the_production_setting(self, runlog, logs, tmp_path, monkeypatch, capsys):

@@ -3,9 +3,9 @@ replay_set.py — 判定のリプレイに使う固定のセットを作る（�
 
 責務:
   - 実走ログ（logs/runs/）から、判定（承認、挙手の候補、意図ゲート、複数名の振り分け）と callout の入力を
-    全文で組み直し、照合できた行だけを data/replay/set.jsonl へ書く
+    全文で組み直し、照合できた行だけを data/replay/private/set.jsonl へ書く
   - 判定ログ（logs/decisions/、L2_DECISION_LOG=true のときだけ書かれる）の行も同じ形で混ぜる
-  - 人が外したい行に印を付ける確認のファイル（data/replay/review.md）を作り、印を除外の一覧へ移す
+  - 人が外したい行に印を付ける確認のファイル（data/replay/private/review.md）を作り、印を除外の一覧へ移す
   - 合成の行（measure_sets/replay_synthetic.jsonl）を読む
   - 判定の種類ごとに、本物の判定の関数の呼び方と、答えを 1 つの文字列（result_key）にそろえる方法を持つ
 
@@ -24,11 +24,13 @@ replay_set.py — 判定のリプレイに使う固定のセットを作る（�
   # セットを作る（画面には件数だけ。本文は data/replay/ のファイルにだけ書く）
   uv run --frozen --all-extras python -m lab_lounge.replay_set build
 
-  # review.md の [x] を除外の一覧（data/replay/exclude.txt、id だけ）へ移す
+  # private/review.md の [x] を除外の一覧（data/replay/exclude.txt、id だけ）へ移す
   uv run --frozen --all-extras python -m lab_lounge.replay_set exclude
 
 【出力の約束】
   画面には、ファイルの数、種類ごとの件数、捨てた理由ごとの件数だけを出す。発話の本文は出さない。
+  本文を含むファイル（set.jsonl、review.md）は data/replay/private/ に置く（人だけが開く。spend.private_dir）。
+  data/replay/ の直下には、数字と id だけのファイル（set.meta.json、exclude.txt）を置く。
   判定の関数が出すログ（30 字のプレビューを含む）は捕まえて、画面へ流さない。
   例外は型と行番号だけを出す（spend.run_tool）。
 """
@@ -51,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from . import decision_log, router
-from .spend import EXIT_FAILED, EXIT_OK, EXIT_USAGE, emit, run_tool
+from .spend import EXIT_FAILED, EXIT_OK, EXIT_USAGE, emit, private_dir, run_tool
 from .transcript_buffer import TranscriptBuffer, TranscriptSegment
 
 # ─── 定数 ─────────────────────────────────────────────────────────
@@ -751,9 +753,9 @@ def review_line(row: dict[str, Any]) -> str:
 
 
 def write_outputs(rows: list[dict[str, Any]], out_dir: Path, report: BuildReport, *, seed: int) -> None:
-    """set.jsonl、set.meta.json、review.md を書く。"""
+    """private/set.jsonl、set.meta.json、private/review.md を書く。"""
     ordered = sorted(rows, key=lambda r: (KINDS.index(r["kind"]), r["date"], r["id"]))
-    _write_atomic(out_dir / "set.jsonl", "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
+    _write_atomic(private_dir(out_dir) / "set.jsonl", "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
                                                   for r in ordered))
     meta = {
         "seed": seed, "targets": TARGETS, "per_epoch": PER_EPOCH, "epoch_gap_sec": EPOCH_GAP_SEC,
@@ -763,12 +765,12 @@ def write_outputs(rows: list[dict[str, Any]], out_dir: Path, report: BuildReport
         "dropped": dict(report.dropped), "found": dict(report.found), "epochs": report.epochs,
     }
     _write_atomic(out_dir / "set.meta.json", json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True))
-    _write_atomic(out_dir / "review.md", _REVIEW_HEADER + "".join(review_line(r) + "\n" for r in ordered))
+    _write_atomic(private_dir(out_dir) / "review.md", _REVIEW_HEADER + "".join(review_line(r) + "\n" for r in ordered))
 
 
 def load_set(out_dir: Path) -> list[dict[str, Any]]:
-    """set.jsonl を読む。"""
-    path = out_dir / "set.jsonl"
+    """private/set.jsonl を読む。"""
+    path = private_dir(out_dir) / "set.jsonl"
     return [json.loads(line) for line in jsonl_lines(path.read_text(encoding="utf-8"))]
 
 
@@ -864,7 +866,8 @@ def load_exclusions(out_dir: Path) -> tuple[set[str], str | None]:
 
     WHY 警告: review.md に印を付けたのに exclude を流し忘れると、外したはずの行がリプレイに混ざる。
     """
-    exclude, review, set_path = out_dir / "exclude.txt", out_dir / "review.md", out_dir / "set.jsonl"
+    private = private_dir(out_dir)
+    exclude, review, set_path = out_dir / "exclude.txt", private / "review.md", private / "set.jsonl"
     ids = set(exclude.read_text(encoding="utf-8").split()) if exclude.is_file() else set()
     newest = max((p.stat().st_mtime for p in (review, set_path) if p.is_file()), default=None)
     if newest is not None and (not exclude.is_file() or exclude.stat().st_mtime < newest):
@@ -885,7 +888,7 @@ def build(logs_dir: Path, out_dir: Path, *, since: date = DEFAULT_SINCE, seed: i
     """
     if decision_log.is_enabled():
         raise RuntimeError("判定ログがオンのままです")
-    if (out_dir / "review.md").exists() and not force and not dry_run:
+    if (private_dir(out_dir) / "review.md").exists() and not force and not dry_run:
         raise FileExistsError("review.md がすでにあります（印を消さないよう止めました。--force で作り直し）")
     report = BuildReport()
     if context_max_chars is None:
@@ -957,7 +960,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out or default_out_dir()
 
     if args.command == "exclude":
-        review = out_dir / "review.md"
+        review = private_dir(out_dir) / "review.md"
         if not review.is_file():
             emit("review.md がありません（先に build を流してください）")
             return EXIT_FAILED
