@@ -616,7 +616,14 @@ _EXIT_CLEANUPS: list[Callable[[], None]] = []
 
 
 def last_call() -> dict[str, Any] | None:
-    """このスレッドで最後に数えた呼び出しの情報（model、model_on_wire、status、usd）を返し、消す。無ければ None。"""
+    """このスレッドで最後に数えた呼び出しの情報を返し、消す。無ければ None。
+
+    鍵: model、model_on_wire、status、usd、tokens（input / output / reasoning / cache_read / cache_creation。
+    usage を拾えなかったときは None）。
+
+    WHY tokens も返す: router と filler の raw の呼び出しは本文しか返さないので、計測の道具は呼び出しごとの
+         tokens（キャッシュの読み書きを含む）をここからしか知れない。本文には触れない。
+    """
     last = getattr(_THREAD, "last", None)
     _THREAD.last = None
     return last
@@ -880,7 +887,11 @@ class UsageMeter:
                 self.stats.uncounted += 1
             self.ledger.add(run=self.run, model=call.model, usd=usd, usage=usage, status=status,
                             model_on_wire=wire_model, http_status=http_status)
-        _THREAD.last = {"model": call.model, "model_on_wire": wire_model, "status": status, "usd": usd}
+        _THREAD.last = {"model": call.model, "model_on_wire": wire_model, "status": status, "usd": usd,
+                        "tokens": None if usage is None else {
+                            "input": usage.input, "output": usage.output, "reasoning": usage.reasoning,
+                            "cache_read": usage.cache_read,
+                            "cache_creation": usage.cache_write_5m + usage.cache_write_1h}}
 
     def _after_response(self, call: _Call, response: Any, module: Any) -> None:
         """応答を受けた後。読み終えていれば今数え、stream なら読み終えたときに数える。"""

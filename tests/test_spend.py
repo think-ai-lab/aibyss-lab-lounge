@@ -192,6 +192,7 @@ class TestMeter:
         assert other == [None]
         assert (last["model"], last["model_on_wire"], last["status"]) == (
             "claude-haiku-4-5", "claude-haiku-4-5-20251001", "usage")
+        assert last["tokens"] == {"input": 100, "output": 10, "reasoning": 0, "cache_read": 0, "cache_creation": 0}
         assert spend.last_call() is None
 
     def test_send_is_restored_even_after_an_error(self, ledger):
