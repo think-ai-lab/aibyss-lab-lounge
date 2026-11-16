@@ -1,0 +1,108 @@
+[
+  {
+    "path": "/v1/messages",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "anthropic-version",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-api-key",
+      "x-stainless-arch",
+      "x-stainless-async",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-read-timeout",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version",
+      "x-stainless-timeout"
+    ],
+    "headers": {
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    "body": {
+      "max_tokens": 4096,
+      "messages": [
+        {
+          "content": "<str>",
+          "role": "user"
+        }
+      ],
+      "model": "claude-sonnet-4-6",
+      "system": "<str>",
+      "tool_choice": {
+        "type": "any"
+      },
+      "tools": [
+        {
+          "description": "<str>",
+          "input_schema": {
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "name": "web_search_tool"
+        },
+        {
+          "description": "<str>",
+          "input_schema": {
+            "properties": {
+              "character_slug": {
+                "type": "string"
+              },
+              "question": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "character_slug",
+              "question"
+            ],
+            "type": "object"
+          },
+          "name": "ask_character_tool"
+        },
+        {
+          "description": "<str>",
+          "input_schema": {
+            "properties": {
+              "pose": {
+                "default": "<str>",
+                "description": "<str>",
+                "type": "string"
+              },
+              "response": {
+                "description": "<str>",
+                "type": "string"
+              },
+              "speed": {
+                "default": 100,
+                "description": "<str>",
+                "maximum": 200,
+                "minimum": 50,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "response"
+            ],
+            "type": "object"
+          },
+          "name": "SakuraResponse"
+        }
+      ]
+    }
+  }
+]

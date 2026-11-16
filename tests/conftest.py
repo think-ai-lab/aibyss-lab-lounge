@@ -324,3 +324,27 @@ def reset_obs_module_state():
     _reset_for_tests()
     yield
     _reset_for_tests()
+
+
+# ─── golden の更新 ─────────────────────────────────────────────────
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """--update-goldens を足す。
+
+    契約テスト（tests/contract/）の golden は、SDK が偽の LLM サーバへ送った要求の形を、中身の文字列を伏せて
+    残したもの。ふだんは golden と比べるだけで書き換えない。SDK を上げて送る形が変わったら、
+    ``pytest tests/contract --update-goldens`` で書き直し、git の差分を 1 行ずつ読んでから commit する。
+    """
+    parser.addoption(
+        "--update-goldens",
+        action="store_true",
+        default=False,
+        help="契約テストの golden を、今の送信内容で書き直す（差分は git で読む）",
+    )
+
+
+@pytest.fixture
+def update_goldens(request: pytest.FixtureRequest) -> bool:
+    """--update-goldens が付いていれば True を返す。"""
+    return bool(request.config.getoption("--update-goldens"))

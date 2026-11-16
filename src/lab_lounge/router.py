@@ -16,6 +16,8 @@ router.py — 発話ルーティング
 import logging
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -25,6 +27,7 @@ from .characters import (
     get_all_characters,
     get_default_character,
 )
+from . import decision_log
 from .llm import get_llm_timeout_config
 
 # Phase 0.5-J: filler.py と同じく google.genai を module top で eager import する。
@@ -155,6 +158,29 @@ def _detect_provider(model: str) -> str:
     return "openai"
 
 
+# _call_router_llm は失敗を握って None を返すので、呼び出し側は「なぜ None か」を知れない。
+# 判定ログ (decision_log) に例外の型を残すため、直近の失敗の型をスレッドごとに覚える。
+# WHY スレッドごと: 判定は dispatcher と背景のスレッドから並行して呼ばれうる。
+_router_call_state = threading.local()
+
+
+def _timed_router_call(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+) -> tuple[str | None, int, str | None]:
+    """_call_router_llm を呼び、(応答, 所要ミリ秒, 失敗した例外の型名) を返す。
+
+    判定ログ用。_call_router_llm の署名と戻り値は変えない (モジュールの属性を差し替えるテストと
+    互換のまま)。差し替えられた場合は、例外の型は常に None になる。
+    """
+    _router_call_state.error = None
+    t0 = time.monotonic()
+    answer = _call_router_llm(model, system_prompt, user_text)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return answer, elapsed_ms, getattr(_router_call_state, "error", None)
+
+
 def _call_router_llm(
     model: str,
     system_prompt: str,
@@ -223,9 +249,11 @@ def _call_router_llm(
             return resp.choices[0].message.content.strip().lower()
 
     except ImportError as exc:
+        _router_call_state.error = type(exc).__name__
         logger.warning("LLM ルーター: %s パッケージなし: %s", provider, exc)
         return None
     except Exception as exc:
+        _router_call_state.error = type(exc).__name__
         logger.error("LLM ルーター呼び出し失敗: %s", exc)
         return None
 
@@ -263,9 +291,18 @@ def _route_by_llm(
     )
 
     model = os.environ.get("L2_LLM_ROUTER_MODEL", _LLM_ROUTER_MODEL)
-    answer = _call_router_llm(model, system_prompt, text)
+    answer, elapsed_ms, error = _timed_router_call(model, system_prompt, text)
+
+    def _log(result) -> None:
+        """判定ログへ 1 行足す (オフなら何もしない。書けなくても判定は続く)。"""
+        decision_log.record(
+            "route", model=model, system_prompt=system_prompt, input_text=text,
+            raw=answer, result=result, elapsed_ms=elapsed_ms, error=error,
+            candidates=valid_slugs,
+        )
 
     if answer is None:
+        _log(None)
         return None
 
     # ログ強化 L-3: text preview を含めて「何の発話への応答か」を識別容易に
@@ -275,16 +312,19 @@ def _route_by_llm(
     )
 
     if answer == "none":
+        _log("none")
         return "none"
 
     for c in candidates:
         if answer == c.slug:
+            _log(c.slug)
             return c
 
     logger.warning(
         "LLM ルーター応答 %r が候補に一致しない (text=%s)。",
         answer, _text_preview(text),
     )
+    _log(None)
     return None
 
 
@@ -505,11 +545,20 @@ def _check_intent_for_character(
     )
 
     model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
-    answer = _call_router_llm(model, system_prompt, text)
+    answer, elapsed_ms, error = _timed_router_call(model, system_prompt, text)
+
+    def _finish(result: IntentResult) -> IntentResult:
+        """判定ログへ 1 行足して、結果をそのまま返す (オフなら何もしない)。"""
+        decision_log.record(
+            "intent", model=model, system_prompt=system_prompt, input_text=text,
+            raw=answer, result=result, elapsed_ms=elapsed_ms, error=error,
+            character=character_slug,
+        )
+        return result
 
     if answer is None:
         logger.warning("意図ゲート: LLM 呼び出し失敗 → unknown (fail-open)")
-        return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
+        return _finish(IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0))
 
     # ログ強化 L-3: text preview 追加で「何の発話への判定か」識別容易に
     logger.info(
@@ -518,12 +567,12 @@ def _check_intent_for_character(
     )
 
     if answer == "callout":
-        return IntentResult(intent="callout", target_slug=character_slug, confidence=1.0)
+        return _finish(IntentResult(intent="callout", target_slug=character_slug, confidence=1.0))
     if answer == "mention":
-        return IntentResult(intent="mention", target_slug=character_slug, confidence=1.0)
+        return _finish(IntentResult(intent="mention", target_slug=character_slug, confidence=1.0))
 
     logger.warning("意図ゲート: 予期しない応答 %r → unknown (fail-open)", answer)
-    return IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0)
+    return _finish(IntentResult(intent="unknown", target_slug=character_slug, confidence=0.0))
 
 
 def _load_character_interest_area(slug: str) -> str | None:
@@ -632,11 +681,20 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     )
 
     model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
-    answer = _call_router_llm(model, system_prompt, text)
+    answer, elapsed_ms, error = _timed_router_call(model, system_prompt, text)
+
+    def _finish(result: IntentResult) -> IntentResult:
+        """判定ログへ 1 行足して、結果をそのまま返す (オフなら何もしない)。"""
+        decision_log.record(
+            "interjection", model=model, system_prompt=system_prompt, input_text=text,
+            raw=answer, result=result, elapsed_ms=elapsed_ms, error=error,
+            candidates=candidate_slugs,
+        )
+        return result
 
     if answer is None:
         logger.warning("interjection_candidate: LLM 呼び出し失敗 → unknown (fail-open)")
-        return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+        return _finish(IntentResult(intent="unknown", target_slug=None, confidence=0.0))
 
     # ログ強化 L-3: text preview + 候補 slugs を追加して「何の発話に対する候補判定か」
     # 「候補から漏れた slug が無いか」を識別容易に
@@ -657,20 +715,20 @@ def _check_intent_interjection_candidate(text: str) -> IntentResult:
     logger.debug("interjection_candidate: first_token=%r", first_token)
 
     if first_token == "none":
-        return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+        return _finish(IntentResult(intent="unknown", target_slug=None, confidence=0.0))
 
     if first_token in candidate_slugs:
-        return IntentResult(
+        return _finish(IntentResult(
             intent="interjection_candidate",
             target_slug=first_token,
             confidence=1.0,
-        )
+        ))
 
     logger.warning(
         "interjection_candidate: 候補外 first_token=%r (raw=%r) → unknown",
         first_token, answer,
     )
-    return IntentResult(intent="unknown", target_slug=None, confidence=0.0)
+    return _finish(IntentResult(intent="unknown", target_slug=None, confidence=0.0))
 
 
 def check_approval(
@@ -736,11 +794,20 @@ def check_approval(
     )
 
     model = os.environ.get("L2_INTENT_GATE_MODEL", _INTENT_GATE_MODEL)
-    answer = _call_router_llm(model, system_prompt, text)
+    answer, elapsed_ms, error = _timed_router_call(model, system_prompt, text)
+
+    def _finish(result: ApprovalResult | None) -> ApprovalResult | None:
+        """判定ログへ 1 行足して、結果をそのまま返す (オフなら何もしない)。"""
+        decision_log.record(
+            "approval", model=model, system_prompt=system_prompt, input_text=text,
+            raw=answer, result=result, elapsed_ms=elapsed_ms, error=error,
+            candidates=list(candidate_slugs),
+        )
+        return result
 
     if answer is None:
         logger.warning("check_approval: LLM 呼び出し失敗 → None (fail-open: 通常処理へ)")
-        return None
+        return _finish(None)
 
     # ログ強化 L-3: text preview を追加して「ルカの何の発話に対する承認/却下判定か」
     # 識別容易に
@@ -750,7 +817,7 @@ def check_approval(
     )
 
     if answer == "none":
-        return None
+        return _finish(None)
 
     if ":" in answer:
         verdict, _, slug = answer.partition(":")
@@ -758,11 +825,11 @@ def check_approval(
         verdict = verdict.strip()
         if slug not in candidate_slugs:
             logger.warning("check_approval: 候補外 slug %r → None", slug)
-            return None
+            return _finish(None)
         if verdict == "granted":
-            return ApprovalResult(granted=True, target_slug=slug, confidence=1.0)
+            return _finish(ApprovalResult(granted=True, target_slug=slug, confidence=1.0))
         if verdict == "denied":
-            return ApprovalResult(granted=False, target_slug=slug, confidence=1.0)
+            return _finish(ApprovalResult(granted=False, target_slug=slug, confidence=1.0))
 
     logger.warning("check_approval: 予期しない応答 %r → None", answer)
-    return None
+    return _finish(None)

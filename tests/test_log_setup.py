@@ -194,12 +194,32 @@ class TestSensitiveLoggerSuppression:
         assert logging.getLogger("obsws_python.baseclient").level == logging.WARNING
         assert logging.getLogger("obsws_python.reqs").level == logging.WARNING
 
-    def test_httpx_logger_set_to_warning(self, tmp_path, monkeypatch):
-        """httpx の logger が WARNING 以上に抑制される (API URL 漏洩防止)。"""
+    @pytest.mark.parametrize("name", ["httpx", "httpcore", "httpx2", "httpcore2"])
+    def test_http_library_logger_set_to_warning(self, name, tmp_path, monkeypatch):
+        """HTTP ライブラリの logger が WARNING 以上に抑制される (API URL 漏洩防止)。
+
+        WHY httpx2 / httpcore2 も対象: openai 3.x / anthropic 2.x は httpx2 へ移る。
+        名前が違うので httpx の抑制は効かず、API の URL が INFO で流れてしまう。
+        """
         monkeypatch.setenv("L2_LOG_DIR", str(tmp_path))
-        setup_logging(session_name="test_httpx")
-        assert logging.getLogger("httpx").level == logging.WARNING
-        assert logging.getLogger("httpcore").level == logging.WARNING
+        setup_logging(session_name="test_http_lib")
+        assert logging.getLogger(name).level == logging.WARNING
+
+
+class TestHttpLibraryLoggerNamesExist:
+    """抑制の名前が、実在する logger の名前であること (綴りの違いで、抑制が黙って空振りしない)。
+
+    WHY: httpx2 / httpcore2 は、openai 3.x / anthropic 2.x の更新で入る。今の lock には無いので、
+         入っている環境 (next-lock-check の新しい lock) でだけ流れる。入っていなければ skip。
+    """
+
+    @pytest.mark.parametrize(("package", "logger_name"), [("httpx2", "httpx2"), ("httpcore2", "httpcore2")])
+    def test_library_creates_the_logger_we_suppress(self, package, logger_name):
+        from lab_lounge.log_setup import _SENSITIVE_LIBRARY_LOGGERS
+
+        pytest.importorskip(package)
+        assert logger_name in logging.root.manager.loggerDict, f"{package} を import しても logger {logger_name} が無い"
+        assert logger_name in _SENSITIVE_LIBRARY_LOGGERS
 
 
 class TestEntryPointsWithoutSetupLogging:

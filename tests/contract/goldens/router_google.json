@@ -1,0 +1,44 @@
+[
+  {
+    "path": "/v1beta/models/gemini-3.1-flash-lite:generateContent",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-goog-api-client",
+      "x-goog-api-key",
+      "x-server-timeout"
+    ],
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "<str>"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 20,
+        "temperature": 0.0
+      },
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": "<str>"
+          }
+        ],
+        "role": "user"
+      }
+    }
+  }
+]

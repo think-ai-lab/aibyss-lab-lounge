@@ -23,6 +23,8 @@ pipeline.py — 開発用テキストパイプライン
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -212,21 +214,123 @@ def run_pipeline(
 
     Returns:
         PipelineResult（publish 済みイベント一覧を含む）
+
+    終わりに 1 行 "TURN SUMMARY ..." を INFO で出す (成功でも例外でも)。基準計測で、
+    1 ターンが何を呼び、何トークン、何秒かを grep 1 回で読むための行。実発話の全文は含めない
+    (件数・名前・時間だけ)。例外はそのまま呼び出し元へ再送出する。
     """
-    return _run_pipeline_graph(
-        text,
-        stream_id=stream_id,
-        session_id=session_id,
-        trace_id=trace_id,
-        utterance_meta=utterance_meta,
-        speaker_hint=speaker_hint,
-        on_tts_chunk_ready=on_tts_chunk_ready,
-        on_pose_ready=on_pose_ready,
-        stream_context=stream_context,
-        suppress_bubble_answering=suppress_bubble_answering,
-        disable_tools=disable_tools,
-        status_manager=status_manager,
-    )
+    from .graph import begin_turn_stats, end_turn_stats
+
+    stats, token = begin_turn_stats()
+    t0 = time.monotonic()
+    outcome = "ok"
+    speaker: str | None = None
+    try:
+        result = _run_pipeline_graph(
+            text,
+            stream_id=stream_id,
+            session_id=session_id,
+            trace_id=trace_id,
+            utterance_meta=utterance_meta,
+            speaker_hint=speaker_hint,
+            on_tts_chunk_ready=on_tts_chunk_ready,
+            on_pose_ready=on_pose_ready,
+            stream_context=stream_context,
+            suppress_bubble_answering=suppress_bubble_answering,
+            disable_tools=disable_tools,
+            status_manager=status_manager,
+        )
+        speaker = result.speaker
+        return result
+    except BaseException as exc:
+        # BaseException: KeyboardInterrupt などで止まったターンも「何で終わったか」を残す。再送出する。
+        outcome = type(exc).__name__
+        raise
+    finally:
+        try:
+            end_turn_stats(token)
+        except Exception:  # noqa: BLE001
+            # reset の例外で、ターンの戻り値や、本来の例外を置き換えない。
+            pass
+        try:
+            logger.info(
+                "%s", format_turn_summary(
+                    stats, speaker=speaker, trace_id=trace_id, outcome=outcome,
+                    total_ms=int((time.monotonic() - t0) * 1000),
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            # 集計の整形で配信のターンを落とさない (ログは補助の情報)。
+            pass
+
+
+def _summary_value(value: Any, *, extra_banned: str = "") -> str:
+    """TURN SUMMARY の値を、空白も ``=`` も含まない 1 語にする (空は ``-``)。
+
+    WHY: 行は ``key=value`` を空白で区切る。話者や道具の名前、例外の型に空白や ``=`` が混ざると、
+    後で機械で読むときに行が割れる。extra_banned は、その値の中で区切りに使う文字 (道具の ``,`` と ``:``)。
+    """
+    text = re.sub(rf"[\s={re.escape(extra_banned)}]", "_", str(value)) if value is not None else ""
+    return text or "-"
+
+
+def format_turn_summary(
+    stats: Any,
+    *,
+    speaker: str | None,
+    trace_id: str,
+    outcome: str,
+    total_ms: int,
+) -> str:
+    """TurnStats を、機械で読める 1 行 (key=value を空白で区切る) に整える。
+
+    WHY 1 行 key=value: 基準計測が正規表現 1 本で読めるようにするため。値に空白を入れない
+    (道具は ``名前:回数`` をカンマで並べ、無ければ ``-``)。tokens の形は step の行
+    (``tokens=in:X/out:Y``) と同じにして、読み手を 1 つで済ませる。
+
+    集計の範囲:
+      - steps / tokens / llm_ms は本応答のモデルの分。導入セリフなど道具の中の LLM は
+        aux (呼び出し数と tokens) に分ける。協働先の Agent の分は含めない (別スレッドで走る)。
+      - llm_ms は step の所要の合計。単一ノード (path=simple) は、その 1 回の call_llm の分を
+        tokens / llm_ms に入れる (steps は 0 のまま。steps は Agent の step の数)。
+      - Agent が失敗して単一ノードへ流れた分 (path=fallback) は、本応答と混ぜずに
+        fallback=in:X/out:Y と fallback_ms に分ける。失敗した Agent の step と tokens は本応答の側に残る。
+      - handler が付かない呼び出し (common が無く、Agent に BubbleToolCallbackHandler を付けない) では、
+        steps / tokens / aux / tools は 0 や ``-`` になる。経路 (path) と話者は _run_agent が記録する。
+
+    tokens の読み方:
+      - cache_read は in の内数 (in の中の、キャッシュから読んだ分)。足し合わせない。
+      - reasoning は out の内数 (out の中の、推論に使った分)。足し合わせない。
+
+    Args:
+        stats: graph.TurnStats
+        speaker: 結果の話者 (成功時)。例外のときは None で、集計に入っている話者を使う
+        trace_id: ターンのトレース ID (他のログと突き合わせる鍵)
+        outcome: "ok" または例外の型名
+        total_ms: run_pipeline 全体の所要 (ミリ秒)
+    """
+    tools = ",".join(
+        f"{_summary_value(name, extra_banned=',:')}:{n}" for name, n in stats.tools.items()
+    ) or "-"
+    return " ".join([
+        "TURN SUMMARY",
+        f"trace={_summary_value(trace_id)}",
+        f"speaker={_summary_value(speaker or stats.speaker or '?')}",
+        f"path={_summary_value(stats.path)}",
+        f"source={_summary_value(stats.source)}",
+        f"tools={tools}",
+        f"steps={stats.steps}",
+        f"tokens=in:{stats.input_tokens}/out:{stats.output_tokens}",
+        f"reasoning={stats.reasoning_tokens}",
+        f"cache_read={stats.cache_read_tokens}",
+        f"aux={stats.aux_calls}",
+        f"aux_tokens=in:{stats.aux_input_tokens}/out:{stats.aux_output_tokens}",
+        f"llm_ms={stats.llm_ms}",
+        f"fallback=in:{stats.fallback_input_tokens}/out:{stats.fallback_output_tokens}",
+        f"fallback_ms={stats.fallback_ms}",
+        f"total_ms={total_ms}",
+        f"result={_summary_value(outcome)}",
+    ])
 
 
 def _run_pipeline_graph(

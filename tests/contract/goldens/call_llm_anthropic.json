@@ -1,0 +1,41 @@
+[
+  {
+    "path": "/v1/messages",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "anthropic-version",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-api-key",
+      "x-stainless-arch",
+      "x-stainless-async",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-read-timeout",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version",
+      "x-stainless-timeout"
+    ],
+    "headers": {
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    "body": {
+      "max_tokens": 4096,
+      "messages": [
+        {
+          "content": "<str>",
+          "role": "user"
+        }
+      ],
+      "model": "claude-haiku-4-5",
+      "system": "<str>"
+    }
+  }
+]

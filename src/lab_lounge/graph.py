@@ -24,7 +24,9 @@ import functools
 import logging
 import operator
 import os
+import threading
 import time
+from dataclasses import dataclass, field
 from typing import Annotated, Any, TypedDict
 
 from .character_status import CharacterStatus, CharacterStatusManager
@@ -413,6 +415,187 @@ def _build_agent_graph(
     return agent
 
 
+# ─── ターンの集計 (TURN SUMMARY の元) ──────────────────────────────
+
+@dataclass
+class TurnStats:
+    """1 ターン分の LLM 利用の集計。pipeline.run_pipeline が始めに置き、終わりに 1 行へ整える。
+
+    足すのは BubbleToolCallbackHandler (step / 補助 / 道具) と run_graph / _run_agent
+    (経路 / source / フォールバックの分)。協働先 (ask_character の別スレッド) の分は含めない:
+    そのスレッドには contextvars を写さないので、ここへ届かない。協働先は、その step 行で見る。
+
+    WHY lock: handler のコールバックは、Agent のスレッドと道具のスレッドの両方から呼ばれうる。
+    数字が数件ずれるとベースラインの読み違えになるので、足し算は lock で守る。
+    """
+
+    speaker: str | None = None
+    path: str | None = None          # "agent" / "simple" / "fallback"
+    source: str | None = None        # Agent の最終応答の出所 ("structured_response" / "messages")
+    tools: dict[str, int] = field(default_factory=dict)
+    steps: int = 0                   # 本応答の LLM step 数 (補助は含めない)
+    aux_calls: int = 0               # 補助 (道具の中の LLM。導入セリフなど) の呼び出し数
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    aux_input_tokens: int = 0
+    aux_output_tokens: int = 0
+    llm_ms: int = 0                  # 本応答の step の LLM 時間の合計 (単一ノードの経路ではその 1 回の時間)
+    # Agent が失敗して単一ノードへ流れたときの call_llm の分。本応答 (steps / tokens / llm_ms) とは
+    # 別に持つ: 失敗した Agent の分と混ぜると、本応答のモデルの回数と課金を読み違えるため。
+    fallback_input_tokens: int = 0
+    fallback_output_tokens: int = 0
+    fallback_ms: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add_tool(self, name: str) -> None:
+        with self._lock:
+            self.tools[name] = self.tools.get(name, 0) + 1
+
+    def add_step_start(self) -> None:
+        with self._lock:
+            self.steps += 1
+
+    def add_aux_start(self) -> None:
+        with self._lock:
+            self.aux_calls += 1
+
+    def add_step_end(self, info: dict[str, Any], latency_ms: int) -> None:
+        """本応答の step 1 回ぶん (usage は _extract_llm_usage の dict) を足す。"""
+        with self._lock:
+            self.input_tokens += info["input"] or 0
+            self.output_tokens += info["output"] or 0
+            self.reasoning_tokens += info["reasoning"] or 0
+            self.cache_read_tokens += info["cache_read"] or 0
+            self.llm_ms += max(latency_ms, 0)
+
+    def add_aux_end(self, info: dict[str, Any]) -> None:
+        with self._lock:
+            self.aux_input_tokens += info["input"] or 0
+            self.aux_output_tokens += info["output"] or 0
+
+    def add_call_llm_result(self, result: "LLMResult") -> None:
+        """単一ノードの経路の call_llm の結果を、本応答の分として足す (handler を通らないので別に足す)。"""
+        with self._lock:
+            self.input_tokens += result.input_tokens or 0
+            self.output_tokens += result.output_tokens or 0
+            self.llm_ms += max(result.latency_ms or 0, 0)
+
+    def add_fallback_result(self, result: "LLMResult") -> None:
+        """Agent の失敗後のフォールバックの call_llm の結果を、本応答とは別の項目へ足す。"""
+        with self._lock:
+            self.fallback_input_tokens += result.input_tokens or 0
+            self.fallback_output_tokens += result.output_tokens or 0
+            self.fallback_ms += max(result.latency_ms or 0, 0)
+
+
+# 今ターンの集計。run_pipeline が set し、_run_agent と handler が足す。
+# WHY contextvar: run_pipeline から Agent まで引数を通すと、シグネチャが 4 段に増える。
+# _invoke_agent_with_timeout は copy_context で走るので、Agent のスレッドからも同じ object が見える。
+_TURN_STATS: contextvars.ContextVar["TurnStats | None"] = contextvars.ContextVar(
+    "lab_lounge_turn_stats", default=None,
+)
+
+
+def begin_turn_stats() -> tuple[TurnStats, "contextvars.Token"]:
+    """今のターンの集計を置く。戻り値の token を end_turn_stats に渡して外す。"""
+    stats = TurnStats()
+    return stats, _TURN_STATS.set(stats)
+
+
+def end_turn_stats(token: "contextvars.Token") -> None:
+    """begin_turn_stats で置いた集計を外す (例外のときも呼ぶ)。"""
+    _TURN_STATS.reset(token)
+
+
+def current_turn_stats() -> "TurnStats | None":
+    """今のターンの集計 (置かれていなければ None。テストや run_pipeline 外の呼び出し)。"""
+    return _TURN_STATS.get()
+
+
+# ─── LLM 応答の usage / finish / モデル名の読み取り ───────────────────
+
+def _first_generation_message(response: Any) -> Any:
+    """LLMResult の先頭の generation から、chat message を取り出す (無ければ None)。"""
+    try:
+        return response.generations[0][0].message
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _extract_llm_usage(response: Any) -> dict[str, Any]:
+    """LLMResult から、step ログ用の tokens / finish_reason / モデル名を読み取る。
+
+    読む順:
+      1. ``generations[0][0].message.usage_metadata`` (LangChain が 3 社 + Responses API で
+         揃えた形。chat model ではほぼここにしか入らない)
+      2. 無ければ ``llm_output`` (旧形式の ``token_usage`` / ``usage``)
+
+    WHY usage_metadata を先に読むか: 以前は ``llm_output`` だけを読んでいたが、chat model
+    (特に Anthropic / Gemini) は ``llm_output`` をほぼ空で返すので、tokens がログに出なかった。
+    preflight の ``_AgentAudit.count`` も usage_metadata を読んでおり、同じ読み方に揃える。
+
+    Returns:
+        次のキーを持つ dict。値が取れなかった項目は None:
+        ``input`` / ``output`` / ``reasoning`` / ``cache_read`` / ``cache_creation`` /
+        ``finish`` / ``model``。何も読めなくても例外にはしない (ログのために配信を止めない)。
+    """
+    info: dict[str, Any] = dict.fromkeys(
+        ("input", "output", "reasoning", "cache_read", "cache_creation", "finish", "model"),
+    )
+    try:
+        message = _first_generation_message(response)
+        usage = getattr(message, "usage_metadata", None) or {}
+        if usage:
+            info["input"] = usage.get("input_tokens") or 0
+            info["output"] = usage.get("output_tokens") or 0
+            in_details = usage.get("input_token_details") or {}
+            out_details = usage.get("output_token_details") or {}
+            info["cache_read"] = in_details.get("cache_read") or 0
+            info["cache_creation"] = in_details.get("cache_creation") or 0
+            info["reasoning"] = out_details.get("reasoning") or 0
+        else:
+            llm_output = getattr(response, "llm_output", None) or {}
+            legacy = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            if legacy:
+                info["input"] = legacy.get("input_tokens") or legacy.get("prompt_tokens") or 0
+                info["output"] = legacy.get("output_tokens") or legacy.get("completion_tokens") or 0
+
+        meta = getattr(message, "response_metadata", None) or {}
+        # finish: OpenAI Chat / Gemini は finish_reason、Anthropic は stop_reason。
+        # OpenAI Responses API はどちらも持たず status ("completed" / "incomplete") のみ。
+        info["finish"] = (
+            meta.get("finish_reason") or meta.get("stop_reason") or meta.get("status")
+        )
+        # モデル名: OpenAI / Anthropic は model_name、Gemini は model_version (model_name の版もある)。
+        info["model"] = meta.get("model_name") or meta.get("model_version") or meta.get("model")
+        if info["model"] is None:
+            llm_output = getattr(response, "llm_output", None) or {}
+            info["model"] = llm_output.get("model_name")
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def _format_llm_usage(info: dict[str, Any]) -> str:
+    """_extract_llm_usage の結果を、step ログの末尾に足す ` key=value ...` へ整える。
+
+    先頭の ``tokens=in:X/out:Y`` は従来の形のまま残し (grep や既存の読み手のため)、
+    reasoning / cache / finish / model を後ろへ足す。取れなかった finish / model は ``-``。
+    tokens が 1 つも読めなかった (usage が無い) ときは tokens 関連を出さない。
+    """
+    parts = []
+    if info["input"] is not None:
+        parts.append(f"tokens=in:{info['input']}/out:{info['output']}")
+        parts.append(f"reasoning={info['reasoning'] or 0}")
+        parts.append(f"cache_read={info['cache_read'] or 0}")
+        parts.append(f"cache_creation={info['cache_creation'] or 0}")
+    parts.append(f"finish={info['finish'] or '-'}")
+    parts.append(f"model={info['model'] or '-'}")
+    return " " + " ".join(parts)
+
+
 # ─── Agent ツール呼び出し時の bubble.update ────────────────────────
 
 class BubbleToolCallbackHandler:
@@ -471,11 +654,38 @@ class BubbleToolCallbackHandler:
         # parallel_tool_calls=False で逐次実行のため、単純な counter + t0 で十分。
         self._llm_step_count = 0
         self._llm_step_t0: float | None = None
+        # 道具の run_id と、その子として走った「補助」LLM 呼び出し (run_id → 開始時刻)。
+        # 導入セリフ (ask_character の中の call_llm) は LangChain が親のコールバックを
+        # contextvars で子へ渡すため、caller の handler にも届く。道具の子として見分け、
+        # 本応答の step 番号と集計から外す (補助として別の行にする)。
+        self._tool_run_ids: set[Any] = set()
+        self._aux_t0: dict[Any, float] = {}
+        # ターンの集計 (TURN SUMMARY の元)。生成時 (= run_pipeline と同じ context) に掴んでおく。
+        # WHY: コールバックがどのスレッドから呼ばれても、同じ集計へ足せる。None なら足さない。
+        self._turn_stats = current_turn_stats()
+
+    def detach_stats(self) -> None:
+        """この handler が、以後 TurnStats へ足さないようにする。
+
+        WHY: 時間切れで _run_agent が戻っても、Agent のスレッドは裏で走り続ける (止められない)。
+        そのスレッドが後から step や tokens を足すと、すでに出した TURN SUMMARY や、次のターンの
+        数字とずれる。_run_agent が戻る (成功でも失敗でも) 前に呼んで、足し算を止める。
+        step のログ行はそのまま出る (原因調査に使うため)。
+        """
+        self._turn_stats = None
 
     # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
     def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_chain_end(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_llm_start(self, *args, **kwargs) -> None: pass  # noqa: E704
+
+    def _is_aux_call(self, parent_run_id: Any) -> bool:
+        """この LLM 呼び出しが、道具の実行の子 (= 補助) かどうか。
+
+        WHY run_id の親子で見分けるか: モデル名で見分けると、導入セリフが本応答と同じ
+        モデルのときに誤判定する。親が「道具の run」かどうかは、モデル設定に依らない。
+        """
+        return parent_run_id is not None and parent_run_id in self._tool_run_ids
 
     def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
         """Agent 内部 LLM step 開始時の境界ログ (Phase 0.5-F-6-f)。
@@ -484,13 +694,29 @@ class BubbleToolCallbackHandler:
         を呼ぶたびに発火する。tool 呼出後の継続 step (= tool 結果を統合して次の action を
         判断する LLM 呼出) もここを通る。hang 時の「どの step で停止したか」を
         ログから読み取るための強化。
+
+        道具の中で走る LLM (導入セリフ等) は「補助」として別の行に出し、step 番号を進めない。
         """
-        self._llm_step_count += 1
         # messages は list[list[BaseMessage]] (= prompt 単位の list)。総 message 数を集計
         try:
             msg_count = sum(len(m) for m in messages) if messages else 0
         except Exception:  # noqa: BLE001
             msg_count = -1
+        run_id = kwargs.get("run_id")
+        if self._is_aux_call(kwargs.get("parent_run_id")):
+            self._aux_t0[run_id] = time.monotonic()
+            stats = self._turn_stats
+            if stats is not None:
+                stats.add_aux_start()
+            logger.info(
+                "Agent 補助 LLM 開始 [character=%s] msgs=%d",
+                self._character_slug, msg_count,
+            )
+            return
+        self._llm_step_count += 1
+        stats = self._turn_stats
+        if stats is not None:
+            stats.add_step_start()
         logger.info(
             "Agent LLM step %d 開始 [character=%s] msgs=%d",
             self._llm_step_count, self._character_slug, msg_count,
@@ -500,24 +726,30 @@ class BubbleToolCallbackHandler:
     def on_llm_end(self, response, **kwargs) -> None:
         """Agent 内部 LLM step 完了時の境界ログ (Phase 0.5-F-6-f)。
 
-        `on_chat_model_start` 後に対応する完了ログ。latency_ms + token usage を出す。
+        `on_chat_model_start` 後に対応する完了ログ。latency_ms + token usage + finish +
+        モデル名を出す (読み方は _extract_llm_usage)。
         hang 時はここまで到達せず、ログ末尾が `Agent LLM step N 開始` で止まる。
+        補助 (道具の子の LLM) は run_id で見分け、「Agent 補助 LLM 完了」として出す。
         """
-        latency_ms = (
-            int((time.monotonic() - self._llm_step_t0) * 1000)
-            if self._llm_step_t0 is not None else -1
-        )
-        # token usage 取得 (LangChain LLMResult の llm_output から)
-        usage_info = ""
-        try:
-            llm_output = getattr(response, "llm_output", None) or {}
-            usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
-            if usage:
-                in_tok = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
-                out_tok = usage.get("output_tokens") or usage.get("completion_tokens", 0)
-                usage_info = f" tokens=in:{in_tok}/out:{out_tok}"
-        except Exception:  # noqa: BLE001
-            pass
+        run_id = kwargs.get("run_id")
+        aux_t0 = self._aux_t0.pop(run_id, None) if run_id is not None else None
+        is_aux = aux_t0 is not None
+        t0 = aux_t0 if is_aux else self._llm_step_t0
+        latency_ms = int((time.monotonic() - t0) * 1000) if t0 is not None else -1
+        info = _extract_llm_usage(response)
+        usage_info = _format_llm_usage(info)
+        stats = self._turn_stats
+        if stats is not None:
+            if is_aux:
+                stats.add_aux_end(info)
+            else:
+                stats.add_step_end(info, latency_ms)
+        if is_aux:
+            logger.info(
+                "Agent 補助 LLM 完了 [character=%s] latency_ms=%d%s",
+                self._character_slug, latency_ms, usage_info,
+            )
+            return
         logger.info(
             "Agent LLM step %d 完了 [character=%s] latency_ms=%d%s",
             self._llm_step_count, self._character_slug, latency_ms, usage_info,
@@ -530,6 +762,16 @@ class BubbleToolCallbackHandler:
         ようにする。timeout / retry 枯渇の原因究明用に、停止 step・step 開始からの
         経過秒・provider/model を併記する (= 「どの呼出が何秒で何の例外で落ちたか」)。
         """
+        run_id = kwargs.get("run_id")
+        aux_t0 = self._aux_t0.pop(run_id, None) if run_id is not None else None
+        if aux_t0 is not None:
+            logger.warning(
+                "Agent 補助 LLM エラー [character=%s provider=%s model=%s] "
+                "(開始から %.1fs): %s: %s",
+                self._character_slug, self._provider or "?", self._model or "?",
+                time.monotonic() - aux_t0, type(error).__name__, error,
+            )
+            return
         elapsed = (
             f"{time.monotonic() - self._llm_step_t0:.1f}s"
             if self._llm_step_t0 is not None else "unknown"
@@ -580,7 +822,16 @@ class BubbleToolCallbackHandler:
         from .events import build_bubble_update
         from .bus import publish
 
+        # 道具の run_id は、未知の道具で早く return する前に覚える。道具の中で走る LLM
+        # (導入セリフ等) を、既知かどうかに依らず「補助」として見分けるため。
+        tool_run_id = kwargs.get("run_id")
+        if tool_run_id is not None:
+            self._tool_run_ids.add(tool_run_id)
+
         tool_name = serialized.get("name", "")
+        stats = self._turn_stats
+        if stats is not None and tool_name:
+            stats.add_tool(tool_name)
         msg_key = self.TOOL_MESSAGE_KEY.get(tool_name)
         if not msg_key:
             return  # 未知のツールは無視 (fail-open)
@@ -690,6 +941,11 @@ def run_graph(
         raise RuntimeError("Graph が LLMResult を返しませんでした")
     # ログ強化 L-2: 単一ノードフォールバック経路でもキャラ識別子を出す
     logger.info("Graph 実行完了 [character=%s]", character_slug or "?")
+    stats = current_turn_stats()
+    if stats is not None:
+        stats.speaker = stats.speaker or character_slug
+        stats.path = "simple"
+        stats.add_call_llm_result(result)
     return result
 
 
@@ -956,6 +1212,13 @@ def _run_agent(
             character_slug or "?", latency_ms, source, len(response_text),
             response_text,
         )
+        if handler is not None:
+            handler.detach_stats()
+        stats = current_turn_stats()
+        if stats is not None:
+            stats.speaker = stats.speaker or character_slug
+            stats.path = "agent"
+            stats.source = source
         return LLMResult(
             text=response_text,
             model=model,
@@ -965,6 +1228,9 @@ def _run_agent(
             finish_reason="stop",
         )
     except Exception as exc:
+        # 時間切れで残った Agent のスレッドが、後から TurnStats へ足さないようにする (フォールバックの前に止める)。
+        if handler is not None:
+            handler.detach_stats()
         logger.error(
             "Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。",
             character_slug or "?", exc,
@@ -973,13 +1239,20 @@ def _run_agent(
         # ログ強化 L-3: caller_slug でログにキャラ識別を残す
         # provider は元のキャラの provider を使う (旧実装は "openai" 固定で、anthropic/
         # google キャラが timeout 時に OpenAI へ化けて口調/挙動が変わるバグだった)。
-        return call_llm(
+        stats = current_turn_stats()
+        if stats is not None:
+            stats.speaker = stats.speaker or character_slug
+            stats.path = "fallback"
+        fallback = call_llm(
             text,
             model=model,
             provider=provider,
             system_prompt=system_prompt,
             caller_slug=character_slug,
         )
+        if stats is not None:
+            stats.add_fallback_result(fallback)
+        return fallback
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -13,6 +13,8 @@ log_setup.py — ログ設定の集約
   L2_LOG_LEVEL      — ログレベル (デフォルト: "INFO")
   L2_LLM_DEBUG_HTTP — LLM SDK の HTTP 詳細 (retry 判定の status code 等) を DEBUG 出力
                       (デフォルト: "false"。実際に出すには L2_LOG_LEVEL=DEBUG も必要)
+                      注意: DEBUG では SDK が要求の中身 (= 実発話を含む本文) をログに出しうる。
+                      調査のときだけオンにし、そのログを共有・公開しない。
 
 【出力ファイル】
   {L2_LOG_DIR}/run_loop_YYYYMMDD_HHMMSS.log
@@ -20,10 +22,16 @@ log_setup.py — ログ設定の集約
 
 【機密情報抑制】
   以下の第三者ライブラリは INFO レベルでパスワード/host/port/URL を出力するため、
-  WARNING 以上のみ表示するように制限する:
-    - obsws_python  : OBS WebSocket の host/port/password を平文出力
-    - httpx         : HTTP リクエストの URL 全文を出力 (API キーが含まれる可能性)
-    - openai/anthropic/google : API リクエストの詳細
+  WARNING 以上のみ表示するように制限する (_SENSITIVE_LIBRARY_LOGGERS):
+    - obsws_python (+ .baseclient / .reqs) : OBS WebSocket の host/port/password を平文出力
+    - httpx / httpcore   : HTTP リクエストの URL 全文を出力 (API キーが含まれる可能性)
+    - httpx2 / httpcore2 : 上の後継。openai 3.x / anthropic 2.x が使う httpx の別名パッケージで、
+                           同じく URL を INFO で出す
+    - google.genai / google_genai.models : AFC 設定など
+
+  openai / anthropic の `_base_client` は上の一律抑制には含めない。リトライ行
+  (URL のパスのみ、キー非含有) が配信フリーズ調査に役立つため、_LLM_RETRY_LOGGERS で
+  INFO (L2_LLM_DEBUG_HTTP=true なら DEBUG) に個別設定する。
 """
 
 import logging
@@ -46,7 +54,9 @@ _SENSITIVE_LIBRARY_LOGGERS = (
     "obsws_python.reqs",           # RPC バージョン情報
     "httpx",                        # HTTP リクエスト URL を INFO で出力
     "httpcore",                     # httpx の下位レイヤ
-    "google_genai.models",          # AFC 設定など
+    "httpx2",                       # openai 3.x / anthropic 2.x が移る httpx の後継 (URL を INFO で出す)
+    "httpcore2",                    # httpx2 の下位レイヤ
+    "google_genai.models",         # AFC 設定など
     "google.genai",                 # 同上
 )
 

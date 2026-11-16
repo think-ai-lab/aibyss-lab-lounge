@@ -1,0 +1,114 @@
+[
+  {
+    "path": "/v1beta/models/gemini-3.1-pro-preview:generateContent",
+    "header_names": [
+      "accept",
+      "accept-encoding",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-goog-api-client",
+      "x-goog-api-key",
+      "x-server-timeout"
+    ],
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "<str>"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "generationConfig": {
+        "candidateCount": 1,
+        "maxOutputTokens": 4096,
+        "responseJsonSchema": {
+          "properties": {
+            "pose": {
+              "default": "<str>",
+              "description": "<str>",
+              "title": "Pose",
+              "type": "string"
+            },
+            "response": {
+              "description": "<str>",
+              "title": "Response",
+              "type": "string"
+            },
+            "speed": {
+              "default": 100,
+              "description": "<str>",
+              "maximum": 200,
+              "minimum": 50,
+              "title": "Speed",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "response"
+          ],
+          "title": "ChisameResponse",
+          "type": "object"
+        },
+        "responseMimeType": "application/json",
+        "temperature": 1.0
+      },
+      "safetySettings": [],
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": "<str>"
+          }
+        ]
+      },
+      "tools": [
+        {
+          "functionDeclarations": [
+            {
+              "description": "<str>",
+              "name": "web_search_tool",
+              "parameters": {
+                "properties": {
+                  "query": {
+                    "type": "STRING"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "OBJECT"
+              }
+            },
+            {
+              "description": "<str>",
+              "name": "ask_character_tool",
+              "parameters": {
+                "properties": {
+                  "character_slug": {
+                    "type": "STRING"
+                  },
+                  "question": {
+                    "type": "STRING"
+                  }
+                },
+                "required": [
+                  "character_slug",
+                  "question"
+                ],
+                "type": "OBJECT"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

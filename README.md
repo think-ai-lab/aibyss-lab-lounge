@@ -596,7 +596,7 @@ aibyss-lab-lounge/
     transcript_buffer.py  # 常時文字起こしバッファ
     skill_loader.py       # MCP スキル読み込み
     obs.py                # OBS WebSocket 立ち絵切替
-    observability.py / log_setup.py / debug.py
+    observability.py / log_setup.py / debug.py / decision_log.py
     emitter.py / run_once.py / run_loop.py   # 3 つのエントリポイント
     preflight.py          # 配信前の点検（本番経路からは呼ばれない）
     mcp_servers/          # ask_character / web_search / retrieve_memory
