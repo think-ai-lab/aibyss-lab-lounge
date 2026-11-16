@@ -6,17 +6,20 @@ test_turn_summary.py — TURN SUMMARY (TurnStats と format_turn_summary) の単
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
+import uuid
 
 from lab_lounge.graph import (
+    BubbleToolCallbackHandler,
     TurnStats,
     begin_turn_stats,
     current_turn_stats,
     end_turn_stats,
 )
 from lab_lounge.llm import LLMResult
-from lab_lounge.pipeline import format_turn_summary
+from lab_lounge.pipeline import PipelineResult, format_turn_summary, run_pipeline
 
 _INFO = {"input": 12, "output": 3, "reasoning": 2, "cache_read": 4, "cache_creation": 0,
          "finish": "stop", "model": "m"}
@@ -48,6 +51,7 @@ class TestFormat:
         assert row["tokens"] == "in:12/out:3"
         assert (row["reasoning"], row["cache_read"], row["steps"]) == ("2", "4", "1")
         assert (row["llm_ms"], row["total_ms"], row["result"]) == ("800", "1500", "ok")
+        assert (row["fallback"], row["fallback_ms"]) == ("in:0/out:0", "0")
 
     def test_empty_turn_has_placeholders_not_blanks(self):
         row = dict(re.findall(r"(\w+)=(\S+)", _line(TurnStats(), outcome="TimeoutError")))
@@ -58,10 +62,19 @@ class TestFormat:
         assert "speaker=sakura " in _line(TurnStats(speaker="mimi"), speaker="sakura")
         assert "speaker=mimi " in _line(TurnStats(speaker="mimi"))
 
-    def test_does_not_contain_utterance_text(self):
-        """実発話の全文を含めない (件数と名前と時間だけ)。tools の名前以外の自由文が入る場所が無い。"""
-        stats = TurnStats(speaker="mimi", path="agent", source="structured_response")
-        assert "こんにちは" not in _line(stats)
+    def test_values_never_contain_spaces_or_equals(self):
+        """空白や = を含む名前でも、行が割れない。空は - にする。区切りに使う , と : は道具の名前の中だけ置き換える。"""
+        stats = TurnStats(speaker="mi mi=x", path="", source=None)
+        stats.add_tool("web search=tool,v2:beta")
+
+        line = _line(stats, outcome="Weird Error=1", trace_id="t 1")
+
+        pairs = line.removeprefix("TURN SUMMARY ").split(" ")
+        assert all(re.fullmatch(r"\w+=\S+", p) for p in pairs), pairs
+        row = dict(p.split("=", 1) for p in pairs)
+        assert row["speaker"] == "mi_mi_x" and row["trace"] == "t_1" and row["result"] == "Weird_Error_1"
+        assert row["path"] == "-" and row["source"] == "-"
+        assert row["tools"] == "web_search_tool_v2_beta:1"
 
 
 class TestTurnStats:
@@ -76,6 +89,17 @@ class TestTurnStats:
         stats = TurnStats()
         stats.add_call_llm_result(LLMResult("x", "m", 20, 5, 700, "stop"))
         assert (stats.input_tokens, stats.output_tokens, stats.llm_ms) == (20, 5, 700)
+
+    def test_fallback_result_is_kept_apart_from_the_main_answer(self):
+        """Agent の失敗後のフォールバックは、本応答の tokens / llm_ms に混ざらない。"""
+        stats = TurnStats(path="fallback")
+        stats.add_step_start()  # 失敗した Agent の step
+        stats.add_fallback_result(LLMResult("x", "m", 20, 5, 700, "stop"))
+
+        assert (stats.input_tokens, stats.output_tokens, stats.llm_ms) == (0, 0, 0)
+        row = dict(re.findall(r"(\w+)=(\S+)", _line(stats)))
+        assert (row["steps"], row["tokens"]) == ("1", "in:0/out:0")
+        assert (row["fallback"], row["fallback_ms"]) == ("in:20/out:5", "700")
 
     def test_negative_latency_is_not_added(self):
         """開始が記録されていない step の latency (-1) は、合計を減らさない。"""
@@ -114,3 +138,52 @@ class TestContextVar:
         t.join()
         end_turn_stats(token)
         assert seen == [None]
+
+
+def _result_with_usage():
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, LLMResult as LCResult
+
+    message = AIMessage(content="x", usage_metadata={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15})
+    return LCResult(generations=[[ChatGeneration(message=message)]])
+
+
+class TestHandlerDetach:
+    """_run_agent が戻った後に、残った Agent のスレッドが集計へ足さない。"""
+
+    def test_detached_handler_stops_adding_but_still_logs(self, caplog):
+        caplog.set_level(logging.INFO, logger="lab_lounge.graph")
+        stats, token = begin_turn_stats()
+        try:
+            handler = BubbleToolCallbackHandler("mimi", {}, model="m", provider="openai")
+            run = uuid.uuid4()
+            handler.on_chat_model_start({}, [[1]], run_id=run, parent_run_id=None)
+            assert stats.steps == 1
+
+            handler.detach_stats()
+            handler.on_tool_start({"name": "late_tool"}, "q", run_id=uuid.uuid4())
+            handler.on_llm_end(_result_with_usage(), run_id=run)
+            handler.on_chat_model_start({}, [[1]], run_id=uuid.uuid4(), parent_run_id=None)
+        finally:
+            end_turn_stats(token)
+
+        assert (stats.steps, stats.input_tokens, stats.tools) == (1, 0, {})
+        assert any("Agent LLM step 1 完了" in r.getMessage() for r in caplog.records)  # ログ行は出る
+
+
+class TestRunPipelineRobustness:
+    def test_reset_failure_does_not_replace_the_result(self, monkeypatch, caplog):
+        """集計を外す処理の例外で、ターンの戻り値を置き換えない。TURN SUMMARY は出る。"""
+        caplog.set_level(logging.INFO, logger="lab_lounge.pipeline")
+        sentinel = PipelineResult("s", "sess", "t", "mimi", [])
+        monkeypatch.setattr("lab_lounge.pipeline._run_pipeline_graph", lambda *a, **k: sentinel)
+
+        def broken_reset(_token):
+            raise ValueError("reset failed")
+
+        monkeypatch.setattr("lab_lounge.graph.end_turn_stats", broken_reset)
+
+        result = run_pipeline("テスト", stream_id="s", session_id="sess", trace_id="t")
+
+        assert result is sentinel
+        assert any(r.getMessage().startswith("TURN SUMMARY ") for r in caplog.records)

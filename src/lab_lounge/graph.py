@@ -441,7 +441,12 @@ class TurnStats:
     cache_read_tokens: int = 0
     aux_input_tokens: int = 0
     aux_output_tokens: int = 0
-    llm_ms: int = 0                  # 本応答の step と、フォールバック / 単一ノードの LLM 時間の合計
+    llm_ms: int = 0                  # 本応答の step の LLM 時間の合計 (単一ノードの経路ではその 1 回の時間)
+    # Agent が失敗して単一ノードへ流れたときの call_llm の分。本応答 (steps / tokens / llm_ms) とは
+    # 別に持つ: 失敗した Agent の分と混ぜると、本応答のモデルの回数と課金を読み違えるため。
+    fallback_input_tokens: int = 0
+    fallback_output_tokens: int = 0
+    fallback_ms: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add_tool(self, name: str) -> None:
@@ -471,11 +476,18 @@ class TurnStats:
             self.aux_output_tokens += info["output"] or 0
 
     def add_call_llm_result(self, result: "LLMResult") -> None:
-        """単一ノード / フォールバックの call_llm の結果を足す (handler を通らないので別に足す)。"""
+        """単一ノードの経路の call_llm の結果を、本応答の分として足す (handler を通らないので別に足す)。"""
         with self._lock:
             self.input_tokens += result.input_tokens or 0
             self.output_tokens += result.output_tokens or 0
             self.llm_ms += max(result.latency_ms or 0, 0)
+
+    def add_fallback_result(self, result: "LLMResult") -> None:
+        """Agent の失敗後のフォールバックの call_llm の結果を、本応答とは別の項目へ足す。"""
+        with self._lock:
+            self.fallback_input_tokens += result.input_tokens or 0
+            self.fallback_output_tokens += result.output_tokens or 0
+            self.fallback_ms += max(result.latency_ms or 0, 0)
 
 
 # 今ターンの集計。run_pipeline が set し、_run_agent と handler が足す。
@@ -652,6 +664,16 @@ class BubbleToolCallbackHandler:
         # WHY: コールバックがどのスレッドから呼ばれても、同じ集計へ足せる。None なら足さない。
         self._turn_stats = current_turn_stats()
 
+    def detach_stats(self) -> None:
+        """この handler が、以後 TurnStats へ足さないようにする。
+
+        WHY: 時間切れで _run_agent が戻っても、Agent のスレッドは裏で走り続ける (止められない)。
+        そのスレッドが後から step や tokens を足すと、すでに出した TURN SUMMARY や、次のターンの
+        数字とずれる。_run_agent が戻る (成功でも失敗でも) 前に呼んで、足し算を止める。
+        step のログ行はそのまま出る (原因調査に使うため)。
+        """
+        self._turn_stats = None
+
     # LangChain が呼び出すがこの handler では不要なコールバック (warning 抑制用)
     def on_chain_start(self, *args, **kwargs) -> None: pass  # noqa: E704
     def on_chain_end(self, *args, **kwargs) -> None: pass  # noqa: E704
@@ -683,16 +705,18 @@ class BubbleToolCallbackHandler:
         run_id = kwargs.get("run_id")
         if self._is_aux_call(kwargs.get("parent_run_id")):
             self._aux_t0[run_id] = time.monotonic()
-            if self._turn_stats is not None:
-                self._turn_stats.add_aux_start()
+            stats = self._turn_stats
+            if stats is not None:
+                stats.add_aux_start()
             logger.info(
                 "Agent 補助 LLM 開始 [character=%s] msgs=%d",
                 self._character_slug, msg_count,
             )
             return
         self._llm_step_count += 1
-        if self._turn_stats is not None:
-            self._turn_stats.add_step_start()
+        stats = self._turn_stats
+        if stats is not None:
+            stats.add_step_start()
         logger.info(
             "Agent LLM step %d 開始 [character=%s] msgs=%d",
             self._llm_step_count, self._character_slug, msg_count,
@@ -714,11 +738,12 @@ class BubbleToolCallbackHandler:
         latency_ms = int((time.monotonic() - t0) * 1000) if t0 is not None else -1
         info = _extract_llm_usage(response)
         usage_info = _format_llm_usage(info)
-        if self._turn_stats is not None:
+        stats = self._turn_stats
+        if stats is not None:
             if is_aux:
-                self._turn_stats.add_aux_end(info)
+                stats.add_aux_end(info)
             else:
-                self._turn_stats.add_step_end(info, latency_ms)
+                stats.add_step_end(info, latency_ms)
         if is_aux:
             logger.info(
                 "Agent 補助 LLM 完了 [character=%s] latency_ms=%d%s",
@@ -804,8 +829,9 @@ class BubbleToolCallbackHandler:
             self._tool_run_ids.add(tool_run_id)
 
         tool_name = serialized.get("name", "")
-        if self._turn_stats is not None and tool_name:
-            self._turn_stats.add_tool(tool_name)
+        stats = self._turn_stats
+        if stats is not None and tool_name:
+            stats.add_tool(tool_name)
         msg_key = self.TOOL_MESSAGE_KEY.get(tool_name)
         if not msg_key:
             return  # 未知のツールは無視 (fail-open)
@@ -1186,6 +1212,8 @@ def _run_agent(
             character_slug or "?", latency_ms, source, len(response_text),
             response_text,
         )
+        if handler is not None:
+            handler.detach_stats()
         stats = current_turn_stats()
         if stats is not None:
             stats.speaker = stats.speaker or character_slug
@@ -1200,6 +1228,9 @@ def _run_agent(
             finish_reason="stop",
         )
     except Exception as exc:
+        # 時間切れで残った Agent のスレッドが、後から TurnStats へ足さないようにする (フォールバックの前に止める)。
+        if handler is not None:
+            handler.detach_stats()
         logger.error(
             "Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。",
             character_slug or "?", exc,
@@ -1220,7 +1251,7 @@ def _run_agent(
             caller_slug=character_slug,
         )
         if stats is not None:
-            stats.add_call_llm_result(fallback)
+            stats.add_fallback_result(fallback)
         return fallback
 
 

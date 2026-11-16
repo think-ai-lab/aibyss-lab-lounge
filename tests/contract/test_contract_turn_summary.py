@@ -17,14 +17,14 @@ from lab_lounge.pipeline import run_pipeline
 _COMMON = dict(stream_id="s-1", session_id="sess-1", trace_id="trace-1")
 
 
+def _lines(caplog) -> list[str]:
+    """ログの TURN SUMMARY の行を、そのままの文字列で返す。"""
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("TURN SUMMARY ")]
+
+
 def _summaries(caplog) -> list[dict[str, str]]:
     """ログの TURN SUMMARY の行を、key=value の dict にして返す。"""
-    rows = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if message.startswith("TURN SUMMARY "):
-            rows.append(dict(re.findall(r"(\w+)=(\S+)", message)))
-    return rows
+    return [dict(re.findall(r"(\w+)=(\S+)", line)) for line in _lines(caplog)]
 
 
 def _enable_real_llm(monkeypatch) -> None:
@@ -61,7 +61,12 @@ def test_one_turn_with_a_tool_call_is_summarized(agent_env, caplog, monkeypatch)
     assert row["aux"] == "1"
     assert row["aux_tokens"] == "in:12/out:3"
     assert row["result"] == "ok"
+    assert (row["fallback"], row["fallback_ms"]) == ("in:0/out:0", "0")
     assert int(row["total_ms"]) >= int(row["llm_ms"]) >= 0
+    # 実発話の全文を含めない: 発話、各キャラの応答、導入セリフのどれも、行に現れない。
+    (line,) = _lines(caplog)
+    for secret in ("さくらにも聞いてみて", "まとめ", "さくらの答え", "ミミの導入"):
+        assert secret not in line, f"行に発話が入っている: {secret}"
 
 
 def test_failed_turn_still_emits_summary_and_reraises(agent_env, caplog, monkeypatch):
@@ -83,3 +88,37 @@ def test_failed_turn_still_emits_summary_and_reraises(agent_env, caplog, monkeyp
     assert row["result"] == "RuntimeError"
     assert row["steps"] == "0"
     assert row["path"] == "-"
+
+
+def test_agent_failure_is_summarized_as_fallback_apart_from_the_main_answer(agent_env, caplog, monkeypatch):
+    """Agent が失敗して単一ノードへ流れたターン: フォールバックの分は、本応答の tokens と別の項目に出る。"""
+    _enable_real_llm(monkeypatch)
+    caplog.set_level(logging.INFO, logger="lab_lounge.pipeline")
+    mimi = get_character("mimi")
+    agent_env.llm.script(mimi.llm_model, [("http_error", {"status": 400, "message": "fake agent failure"})])
+    agent_env.llm.scene(mimi.llm_provider, "ok", text="フォールバックです")
+
+    run_pipeline("テスト", speaker_hint="mimi", **_COMMON)
+
+    (row,) = _summaries(caplog)
+    assert row["path"] == "fallback" and row["result"] == "ok"
+    assert row["steps"] == "1"                         # 失敗した Agent の step は本応答の側に残る
+    assert row["tokens"] == "in:0/out:0"               # 失敗した step は tokens を返していない
+    assert row["fallback"] == "in:12/out:3"
+    assert int(row["fallback_ms"]) >= 0
+
+
+def test_single_node_path_is_summarized_as_simple(agent_env, caplog, monkeypatch):
+    """ツールを使わない単一ノードの経路 (path=simple): その 1 回の call_llm が、本応答の tokens に入る。"""
+    _enable_real_llm(monkeypatch)
+    monkeypatch.setenv("L2_ENABLE_TOOLS", "false")
+    caplog.set_level(logging.INFO, logger="lab_lounge.pipeline")
+    mimi = get_character("mimi")
+    agent_env.llm.scene(mimi.llm_provider, "ok", text="こんにちは")
+
+    run_pipeline("テスト", speaker_hint="mimi", **_COMMON)
+
+    (row,) = _summaries(caplog)
+    assert (row["path"], row["source"], row["steps"]) == ("simple", "-", "0")
+    assert row["tokens"] == "in:12/out:3"
+    assert row["fallback"] == "in:0/out:0"
