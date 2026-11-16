@@ -54,6 +54,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+# WHY: uv や pytest は、赤いテストで 0 以外を返す。それを PowerShell の例外に変えると、表を作る前に落ちる。
+# 終了コードは Invoke-Native が自分で見る。
+$PSNativeCommandUseErrorActionPreference = $false
 
 # 表に版を出すパッケージ。LLM の SDK、LangChain の層、HTTP クライアント。
 $WatchedPackages = @(
@@ -63,6 +66,17 @@ $WatchedPackages = @(
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+
+# 相対パスは、呼んだ場所からの相対として今のうちに絶対パスへ直す。
+# WHY: 後で写しの中へ Push-Location するので、相対のままだと表やスキーマの探索が写しの中を指し、
+#      表が写しと一緒に消える。
+function Resolve-CallerPath {
+    param([string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+if ($ReportPath) { $ReportPath = Resolve-CallerPath $ReportPath }
+if ($SchemaPath) { $SchemaPath = Resolve-CallerPath $SchemaPath }
+
 if ($NoUpgrade -and $UpgradePackage.Count -gt 0) {
     Write-Host "[FAIL] -NoUpgrade と -UpgradePackage は同時に使えません" -ForegroundColor Red
     exit 1
@@ -75,11 +89,31 @@ if (-not (Test-Path -LiteralPath $SchemaPath -PathType Leaf)) {
     exit 1
 }
 
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+# WHY ミリ秒まで: 同じ秒に 2 回流しても、写しと表のパスがぶつからないように。
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) "l2-nlc-$Stamp"
 $ZipPath = "$WorkDir.zip"
 if (-not $ReportPath) {
     $ReportPath = "$WorkDir.md"
+}
+
+# 写しの venv のパスが長いと、古い Windows の上限（260 文字）に、venv の中の深いパスが当たる。
+$VenvPath = Join-Path $WorkDir ".venv"
+if ($VenvPath.Length -gt 100) {
+    Write-Host "[WARN] 写しの venv のパスが 100 文字を超えます ($($VenvPath.Length) 文字)。TEMP を短い場所にしてください: $VenvPath" -ForegroundColor Yellow
+}
+
+# commit 済みの HEAD だけを流す。作業ツリーに未 commit の変更があっても、写しには入らない。
+$dirty = & git -C $RepoRoot status --porcelain
+if ($dirty) {
+    Write-Host "[WARN] 作業ツリーに未 commit の変更があります。流すのは HEAD の中身だけで、この変更は含まれません。" -ForegroundColor Yellow
+}
+
+# 流している間だけ書き換える環境変数。呼んだシェルを汚さないよう、終わりに元へ戻す。
+$ManagedEnv = @("VIRTUAL_ENV", "PYTEST_ADDOPTS", "UV_PROJECT_ENVIRONMENT", "PYTHONPATH", "AIBYSS_SCHEMA_PATH")
+$SavedEnv = @{}
+foreach ($name in $ManagedEnv) {
+    $SavedEnv[$name] = [System.Environment]::GetEnvironmentVariable($name)
 }
 
 function Invoke-Native {
@@ -96,12 +130,12 @@ function Invoke-Native {
 function Read-LockVersions {
     <#
     .SYNOPSIS
-        uv.lock から、[[package]] の name と version を読み、名前 → 版の辞書を返す。
+        uv.lock の行から、[[package]] の name と version を読み、名前 → 版の辞書を返す。
     #>
-    param([string]$LockPath)
+    param([string[]]$Lines)
     $versions = @{}
     $name = $null
-    foreach ($line in Get-Content -LiteralPath $LockPath) {
+    foreach ($line in $Lines) {
         if ($line -eq "[[package]]") { $name = $null; continue }
         if ($line -match '^name = "(.+)"$') { $name = $Matches[1]; continue }
         if ($name -and $line -match '^version = "(.+)"$') { $versions[$name] = $Matches[1]; $name = $null }
@@ -120,7 +154,8 @@ function Read-JUnit {
     $results = [ordered]@{}
     [xml]$doc = Get-Content -LiteralPath $Path -Raw
     foreach ($case in $doc.SelectNodes("//testcase")) {
-        $file = ($case.classname -split '\.')[-1]
+        # 収集の失敗（import が壊れたなど）は classname が空で、name にモジュール名が入る。
+        $file = if ($case.classname) { ($case.classname -split '\.')[-1] } else { "(collection)" }
         $id = "$file::$($case.name)"
         $failure = $case.SelectSingleNode("failure|error")
         $skipped = $case.SelectSingleNode("skipped")
@@ -146,7 +181,7 @@ try {
 
     # 親のシェルから漏れると、写しではなく別の環境や別の設定で流れるもの。
     foreach ($name in @("VIRTUAL_ENV", "PYTEST_ADDOPTS", "UV_PROJECT_ENVIRONMENT", "PYTHONPATH")) {
-        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        [System.Environment]::SetEnvironmentVariable($name, $null)
     }
     $env:AIBYSS_SCHEMA_PATH = $SchemaPath
     $uvNet = @()
@@ -181,8 +216,10 @@ try {
             $junit = Join-Path $WorkDir "contract-$index.xml"
             Write-Host "[4/5] pytest tests/contract ($label)" -ForegroundColor Cyan
             # --no-sync: 上の sync の結果をそのまま使う。-p no:cacheprovider: 写しに .pytest_cache を作らない。
+            # --continue-on-collection-errors: import が壊れても、そのファイルだけを FAIL として表に出し、残りを流す
+            # （SDK の更新で import が壊れることこそ、この表で見たい赤の 1 つ）。
             $pytestArgs = @("run", "--frozen", "--no-sync", "--all-extras", "pytest", "tests/contract", "-q",
-                "-p", "no:cacheprovider", "--junitxml=$junit") + $runs[$label]
+                "-p", "no:cacheprovider", "--continue-on-collection-errors", "--junitxml=$junit") + $runs[$label]
             $code = Invoke-Native "uv" $pytestArgs
             # pytest の 1 は「赤いテストがある」で、表を作る。2 以上は、流れなかった（中断、収集の失敗、使い方の誤り）。
             if ($code -gt 1 -or -not (Test-Path -LiteralPath $junit)) { throw "pytest が最後まで流れませんでした (exit $code)" }
@@ -190,8 +227,12 @@ try {
         }
 
         Write-Host "[5/5] 表を作る: $ReportPath" -ForegroundColor Cyan
-        $before = Read-LockVersions (Join-Path $RepoRoot "uv.lock")
-        $after = Read-LockVersions (Join-Path $WorkDir "uv.lock")
+        # WHY git show HEAD:uv.lock: 流したのは HEAD の中身。作業ツリーの uv.lock が未 commit で違っていても、
+        # 「実リポの lock」の列は流した写しの元と同じ HEAD から読む。
+        $headLock = & git -C $RepoRoot show "HEAD:uv.lock"
+        if ($LASTEXITCODE -ne 0) { throw "git show HEAD:uv.lock が失敗しました (exit $LASTEXITCODE)" }
+        $before = Read-LockVersions $headLock
+        $after = Read-LockVersions (Get-Content -LiteralPath (Join-Path $WorkDir "uv.lock"))
         $head = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
 
         $lines = [System.Collections.Generic.List[string]]::new()
@@ -233,6 +274,9 @@ try {
     Write-Host "[FAIL] $($_.Exception.Message)" -ForegroundColor Red
     $exitCode = 1
 } finally {
+    foreach ($name in $ManagedEnv) {
+        [System.Environment]::SetEnvironmentVariable($name, $SavedEnv[$name])
+    }
     if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
     if ($KeepCopy) {
         Write-Host "写しを残しました: $WorkDir" -ForegroundColor Yellow
