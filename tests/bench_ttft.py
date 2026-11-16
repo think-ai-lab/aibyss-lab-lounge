@@ -2,6 +2,11 @@
 """
 bench_ttft.py — マルチプロバイダ TTFT / レイテンシ ベンチマーク
 
+【補助の道具】モデルを切り替えるときの目安を見るための道具で、採否の根拠にしない。
+  - 本番の Agent（ツール、構造化出力、system prompt）を通さず、短いプロンプトの TTFT だけを測る。
+    本番と同じ経路の時間は `python -m lab_lounge.probe agent`（step ごとの時間と tokens）で測る。
+  - 1 つでも失敗（[skip] を含む）があれば終了コード 1 で終わる。黙って表が欠けたまま緑にしないため。
+
 A.I.byss Suite の LLM 呼び出しレイヤ（LangChain）経由で、
 各モデルの TTFT (Time To First Token) と総生成時間を計測する。
 
@@ -107,18 +112,22 @@ TEMPERATURE = 0.7          # ※ 非対応モデルには渡さない（NO_TEMPE
 SLEEP_BETWEEN_CALLS = 2.0  # レートリミット相互干渉の回避
 WARMUP = True              # 各モデル1回ウォームアップ（集計から除外）
 
-# temperature を渡すと API が 400 を返すモデル群。
-#   - Anthropic: Opus 4.7 以降 / Fable 5 では sampling パラメータ
-#     (temperature / top_p / top_k) が API から削除された
-#   - OpenAI: gpt-5 系 reasoning モデルは temperature の変更を受け付けない
-# これらはプロバイダ既定値で計測する（temperature は TTFT にほぼ影響しないため
+# temperature を渡さないもの。プロバイダ既定値で計測する（temperature は TTFT にほぼ影響しないため
 # 比較条件としては許容、と判断）。
+#   - Anthropic の Claude 全部: 新しいモデル（Opus 4.7 以降、Fable 5 など）では sampling パラメータ
+#     (temperature / top_p / top_k) が API から削除され、渡すと 400 になる。モデルごとの境目をこの表で
+#     追うと、後継のモデルを足すたびに表の更新漏れで落ちる。Claude には一律で送らない
+#   - OpenAI: gpt-5 系 reasoning モデルは temperature の変更を受け付けない
+NO_TEMPERATURE_PROVIDERS = {"anthropic"}
 NO_TEMPERATURE_MODELS = {
-    "claude-opus-4-8",
-    "claude-fable-5",
     "gpt-5.5",
     "gpt-5.4-mini",
 }
+
+
+def sends_temperature(provider: str, model: str) -> bool:
+    """このモデルへ temperature を渡すか。Claude には渡さない。"""
+    return provider not in NO_TEMPERATURE_PROVIDERS and model not in NO_TEMPERATURE_MODELS
 
 # provider: "anthropic" | "openai" | "google"
 MODELS = [
@@ -153,10 +162,10 @@ PROMPTS = {
 
 
 def build_llm(provider: str, model: str):
-    # temperature は対応モデルにのみ渡す（非対応モデルは API が 400 を返す。
-    # 一覧と理由は NO_TEMPERATURE_MODELS のコメント参照）
+    # temperature は対応モデルにのみ渡す（Claude と非対応モデルには渡さない。
+    # 理由は NO_TEMPERATURE_PROVIDERS のコメント参照）
     sampling: dict = {}
-    if model not in NO_TEMPERATURE_MODELS:
+    if sends_temperature(provider, model):
         sampling["temperature"] = TEMPERATURE
 
     if provider == "anthropic":
@@ -292,7 +301,8 @@ def print_table(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> int:
+    """ベンチを流す。失敗（[skip]、ウォームアップの失敗、試行のエラー）が 1 つでもあれば 1、なければ 0 を返す。"""
     ap = argparse.ArgumentParser(description="multi-provider TTFT benchmark")
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--only", type=str, default="", help="モデル名の部分一致フィルタ")
@@ -312,17 +322,22 @@ def main() -> None:
 
     all_trials: list[Trial] = []
     raw_rows: list[dict] = []
+    failures = 0  # [skip]、ウォームアップの失敗、試行のエラーの合計
 
     for spec in targets:
         try:
             llm = build_llm(spec["provider"], spec["model"])
         except Exception as e:  # noqa: BLE001
             print(f"[skip] {spec['model']}: クライアント生成失敗 {e!r}")
+            failures += 1
             continue
 
         if WARMUP:
             print(f"[warmup] {spec['model']}")
-            run_trial(llm, spec["model"], "warmup", PROMPTS["greeting"])
+            warm = run_trial(llm, spec["model"], "warmup", PROMPTS["greeting"])
+            if warm.error:
+                print(f"[warmup-error] {spec['model']}: {warm.error}")
+                failures += 1
             time.sleep(SLEEP_BETWEEN_CALLS)
 
         for kind, prompt in prompts.items():
@@ -330,6 +345,7 @@ def main() -> None:
                 t = run_trial(llm, spec["model"], kind, prompt)
                 all_trials.append(t)
                 raw_rows.append(t.__dict__)
+                failures += bool(t.error)
                 status = f"err={t.error}" if t.error else f"ttft={t.ttft_ms:.0f}ms total={t.total_ms:.0f}ms"
                 print(f"[{spec['model']}] {kind} #{i + 1}: {status}")
                 time.sleep(SLEEP_BETWEEN_CALLS)
@@ -344,7 +360,11 @@ def main() -> None:
 
     print("\n===== 集計 =====")
     print_table(summarize(all_trials))
+    if failures:
+        print(f"\n失敗が {failures} 件あります（[skip]、ウォームアップ、試行のエラーの合計）。この表は欠けています")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
