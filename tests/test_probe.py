@@ -585,7 +585,9 @@ class TestHistory:
         _write_log(runs, "run_loop_20260705_120000.log", [_step(1, "mimi", 800), _total("mimi", 900)])
         # 使わない: pytest の残り（名前）、テストの目印、応答の無い回
         _write_log(runs, "run_loop_20261031_100000.log", [_step(1, "mimi", 99999), _total("mimi", 99999)])
-        _write_log(runs, "run_loop_20260610_120000.log", [_step(1, "mimi", 99999), "boom\n"])
+        # 目印は発話でない行（行頭の形がある行）だけで照らす（replay_set.test_mark_in）
+        _write_log(runs, "run_loop_20260610_120000.log", [_step(1, "mimi", 99999),
+                                                          _log_line("失敗: boom", name="lab_lounge.pipeline")])
         _write_log(runs, "run_loop_20260611_120000.log", [_total("mimi", 99999)])
         return runs
 

@@ -104,10 +104,16 @@ _EXPECTED = {
     "route": re.compile(rf"^(?:{_SLUG})$"),
 }
 
-# pytest の残りの実走ログを、中身で見分ける規則（ある本だけ使う / ある本は使わない）。
+# pytest の残りの実走ログを、中身で見分ける規則。
 # WHY: 開発中は pytest も logs/runs/ へ書いていたので、名前だけでは見分けられない。
 _REAL_RUN_MARK = "Agent LLM step 1 完了"
 _TEST_RUN_MARKS = ("invalid_char", "boom", "unknown_char")
+_TEST_MARK = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(_TEST_RUN_MARKS) + r")(?![A-Za-z0-9_])")
+# 発話の本文をそのまま含む行。テストの印はここでは照らさない（発話の中の「boom」で本物の回を落とさない）。
+_UTTERANCE_PREFIXES = ("STT 認識結果", "BG buffer 蓄積", "Agent.invoke 開始", "BG 名前ゲート", "BG: on_segment_added",
+                       *JUDGMENT_PREFIXES)
+# repr で書かれた文字列（発話の断片を含みうる）。印を照らす前に取り除く。
+_QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
 
 
 def default_out_dir() -> Path:
@@ -214,9 +220,10 @@ def row_id(kind: str, character: str | None, candidates: Iterable[str], text: st
 
 @dataclass
 class BuildReport:
-    """build の集計。画面に出してよい（数だけ）。"""
+    """build の集計。画面に出してよい（数だけ）。notes は数の読み方の注記（偏りなど）。"""
 
     files_seen: int = 0
+    notes: list[str] = field(default_factory=list)
     files_by_rule: Counter = field(default_factory=Counter)
     found: Counter = field(default_factory=Counter)
     dropped: Counter = field(default_factory=Counter)
@@ -226,15 +233,38 @@ class BuildReport:
     decision_rows: int = 0
 
 
-def select_files(runs_dir: Path, since: date, report: BuildReport) -> list[Path]:
-    """組み直しに使う実走ログを選ぶ。規則ごとに外した本数を report に数える。
+def test_mark_in(text: str) -> str | None:
+    """発話でない行に、pytest の目印（invalid_char / boom / unknown_char）があれば、その印を返す。
+
+    WHY 発話でない行だけ: 発話や判定のプレビューの中の「boom」で、本物の配信の回を丸ごと落とさないため。
+         見るのは行頭の形がある行だけで、発話を含む行（STT、BG のバッファ、Agent の入力、判定）は飛ばし、
+         ほかの行も repr で書かれた文字列を除いてから照らす。
+    """
+    for _ts, name, msg in _records(text):
+        if msg.startswith(_UTTERANCE_PREFIXES):
+            continue
+        found = _TEST_MARK.search(name) or _TEST_MARK.search(_QUOTED.sub("", msg))
+        if found:
+            return found[1]
+    return None
+
+
+def select_files(runs_dir: Path, since: date, report: BuildReport, *, require_agent: bool = True) -> list[Path]:
+    """組み直しに使う実走ログを選ぶ。規則ごとに外した本数を report.files_by_rule に数える。
 
     規則:
         - 名前の形（run_loop_YYYYMMDD_HHMMSS.log）と日付（since 以降）
         - 名前の規則: 2026-10-31 の全部と、2026-11-01 の 02:54:05 までは pytest の残り
-        - 中身の規則: 本物の配信は Agent の応答があり（Agent LLM step 1 完了）、テストの目印が無い
+        - 中身の規則: 発話でない行に pytest の目印が無い（印ごとに数える）
+        - require_agent=True なら、Agent の応答が 1 度はあった（Agent LLM step 1 完了）回だけ
+
+    Args:
+        require_agent: False にすると、Agent が 1 度も完了しなかった回も使う。
+                       WHY: Agent の時間やタイムアウトを数えるとき、最も悪い回（1 度も答えられなかった回）を落とさないため。
+                       True のときは、外れた回の数を偏りの注記として report.notes に残す
     """
     chosen = []
+    without_agent = 0
     for path in sorted(runs_dir.rglob("run_loop_*.log")):
         report.files_seen += 1
         match = _FILE_NAME.match(path.name)
@@ -249,20 +279,40 @@ def select_files(runs_dir: Path, since: date, report: BuildReport) -> list[Path]
             report.files_by_rule["名前の規則（pytest の残り）"] += 1
             continue
         content = path.read_text(encoding="utf-8", errors="replace")
-        if _REAL_RUN_MARK not in content or any(mark in content for mark in _TEST_RUN_MARKS):
-            report.files_by_rule["中身の規則（pytest の残り、または応答の無い回）"] += 1
+        mark = test_mark_in(content)
+        if mark is not None:
+            report.files_by_rule[f"中身の規則（pytest の目印 {mark}）"] += 1
             continue
+        if _REAL_RUN_MARK not in content:
+            without_agent += 1
+            if require_agent:
+                report.files_by_rule["Agent の応答が 1 度も無い回"] += 1
+                continue
         report.files_by_rule["使う"] += 1
         chosen.append(path)
+    if require_agent and without_agent:
+        report.notes.append(f"Agent の応答が 1 度も無かった回 {without_agent} 本は入っていません（最も悪い回が抜ける偏り）")
+    elif without_agent:
+        report.notes.append(f"Agent の応答が 1 度も無かった回 {without_agent} 本を含みます")
     return chosen
+
+
+def _records(text: str) -> Iterator[tuple[str, str, str]]:
+    """ログの行を (時刻, logger 名, 本文) で返す。行頭の形が無い行（複数行の続き）は飛ばす。
+
+    WHY splitlines: ログは Windows では CRLF で書かれる。JSONL と違い、本文の中の改行は repr で
+         エスケープされている（STT の行の続きは、行頭の形が無いので飛ばす）。
+    """
+    for line in text.splitlines():
+        match = _LINE.match(line)
+        if match:
+            yield match["ts"], match["name"], match["msg"]
 
 
 def _messages(text: str) -> Iterator[tuple[str, str]]:
     """ログの行を (logger 名, 本文) で返す。行頭の形が無い行（複数行の続き）は飛ばす。"""
-    for line in text.splitlines():
-        match = _LINE.match(line)
-        if match:
-            yield match["name"], match["msg"]
+    for _ts, name, msg in _records(text):
+        yield name, msg
 
 
 def _literal_str(text: str) -> str | None:
@@ -760,6 +810,8 @@ def _print_build(report: BuildReport) -> None:
     emit(f"実走ログ: {report.files_seen} 本")
     for rule, count in sorted(report.files_by_rule.items()):
         emit(f"  {rule}: {count}")
+    for note in report.notes:
+        emit(f"  注: {note}")
     emit(f"判定ログの行: {report.decision_rows}  塊: {report.epochs}")
     emit("見つけた判定: " + ", ".join(f"{k} {v}" for k, v in sorted(report.found.items())))
     emit("捨てた理由:")

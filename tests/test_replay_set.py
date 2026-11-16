@@ -275,12 +275,40 @@ class TestFiles:
         path.write_text("Agent LLM step 1 完了\n", encoding="utf-8")
         assert replay_set.select_files(logs / "runs", date(2026, 5, 8), replay_set.BuildReport()) == [path]
 
-    @pytest.mark.parametrize("text", ["応答なし\n", "Agent LLM step 1 完了\nboom\n", "Agent LLM step 1 完了 unknown_char\n"])
-    def test_content_rules(self, logs, text):
-        (logs / "runs" / "run_loop_20260601_000000.log").write_text(text, encoding="utf-8")
+    _STEP = "2026-06-01 20:00:00,000 INFO     lab_lounge.graph: Agent LLM step 1 完了 [character=mimi] latency_ms=1\n"
+
+    @pytest.mark.parametrize(("line", "mark"), [
+        ("2026-06-01 20:00:01,000 ERROR    lab_lounge.pipeline: 失敗: boom\n", "boom"),
+        ("2026-06-01 20:00:01,000 WARNING  lab_lounge.router: 未知のキャラ unknown_char\n", "unknown_char"),
+    ])
+    def test_test_marks_outside_utterances_drop_the_file(self, logs, line, mark):
+        (logs / "runs" / "run_loop_20260601_000000.log").write_text(self._STEP + line, encoding="utf-8")
         report = replay_set.BuildReport()
         assert replay_set.select_files(logs / "runs", date(2026, 5, 8), report) == []
-        assert report.files_by_rule["中身の規則（pytest の残り、または応答の無い回）"] == 1
+        assert report.files_by_rule[f"中身の規則（pytest の目印 {mark}）"] == 1
+
+    @pytest.mark.parametrize("line", [
+        "2026-06-01 20:00:01,000 INFO     lab_lounge.wake_word: BG buffer 蓄積: 'boom って言った' (segments=1 chars=8)\n",
+        "2026-06-01 20:00:01,000 INFO     lab_lounge.stt: STT 認識結果: invalid_char の話\n",
+        "2026-06-01 20:00:01,000 INFO     lab_lounge.router: check_approval 応答: 'none' (model=m candidates=['mimi'] text='boom')\n",
+        "2026-06-01 20:00:01,000 INFO     lab_lounge.dispatcher: 状態: 'boom' を受けた\n",
+        "boom で始まる続きの行\n",
+    ])
+    def test_test_marks_inside_utterances_keep_the_file(self, logs, line):
+        path = logs / "runs" / "run_loop_20260601_000000.log"
+        path.write_text(self._STEP + line, encoding="utf-8")
+        assert replay_set.select_files(logs / "runs", date(2026, 5, 8), replay_set.BuildReport()) == [path]
+
+    def test_runs_without_agent_are_dropped_with_a_note_or_kept_on_request(self, logs):
+        path = logs / "runs" / "run_loop_20260601_000000.log"
+        path.write_text("2026-06-01 20:00:01,000 INFO     lab_lounge.run_loop: 開始\n", encoding="utf-8")
+        report = replay_set.BuildReport()
+        assert replay_set.select_files(logs / "runs", date(2026, 5, 8), report) == []
+        assert report.files_by_rule["Agent の応答が 1 度も無い回"] == 1
+        assert "入っていません" in report.notes[0]
+        kept = replay_set.BuildReport()
+        assert replay_set.select_files(logs / "runs", date(2026, 5, 8), kept, require_agent=False) == [path]
+        assert "含みます" in kept.notes[0]
 
 
 # ─── 判定ログと選び方 ────────────────────────────────────────────
