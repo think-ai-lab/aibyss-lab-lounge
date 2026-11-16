@@ -548,9 +548,9 @@ class SpendLedger:
         line = {"ts": ts, "run": run, "model": model, "model_on_wire": model_on_wire, "status": status,
                 "http_status": http_status, "usd": round(usd, 9),
                 "tokens": None if usage is None else {
-                    "input": usage.input, "output": usage.output, "reasoning": usage.reasoning,
-                    "cache_read": usage.cache_read, "cache_write_5m": usage.cache_write_5m,
-                    "cache_write_1h": usage.cache_write_1h,
+                    "input": usage.input, "input_total": usage.prompt_tokens, "output": usage.output,
+                    "reasoning": usage.reasoning, "cache_read": usage.cache_read,
+                    "cache_write_5m": usage.cache_write_5m, "cache_write_1h": usage.cache_write_1h,
                 }}
         self.directory.mkdir(parents=True, exist_ok=True)
         with self.calls_path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -581,13 +581,24 @@ class SpendLedger:
 
 @dataclass
 class MeterStats:
-    """包みが見た呼び出しの数。画面に出してよい（数だけ）。"""
+    """包みが見た呼び出しの数。画面に出してよい（数だけ）。
+
+    by_provider は提供元（anthropic / openai / google）ごとの sent / counted / ok_responses。
+    WHY 提供元ごと: 1 社だけが httpx を通らない（google-genai の非同期は aiohttp を使いうる）と、全体では
+         拾えているように見えたまま、その社だけ上限にもかからず数えられない。
+    """
 
     sent: int = 0
     counted: int = 0
     uncounted: int = 0
     http_errors: int = 0
     ok_responses: int = 0
+    by_provider: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def bump(self, provider: str, key: str) -> None:
+        """提供元ごとの数を 1 つ足す。"""
+        counts = self.by_provider.setdefault(provider, {"sent": 0, "counted": 0, "ok_responses": 0})
+        counts[key] += 1
 
 
 @dataclass
@@ -615,11 +626,35 @@ _THREAD = threading.local()
 _EXIT_CLEANUPS: list[Callable[[], None]] = []
 
 
+def provider_of(model: str, prices: dict[str, Price] | None = None) -> str:
+    """モデル名の提供元（anthropic / openai / google）を、価格表から返す。
+
+    Raises:
+        UnpricedModel: 価格表に無い
+    """
+    return lookup_price(model, PRICES if prices is None else prices).provider
+
+
+def tokens_of(usage: Usage) -> dict[str, int]:
+    """Usage を、計測の道具が表に出す tokens の dict にする。
+
+    入力は 2 つの名前で区別する:
+        - input_uncached: キャッシュに当たらなかった入力（Anthropic の input_tokens と同じ意味）
+        - input_total:    入力の合計（input_uncached + cache_read + cache_creation。LangChain の usage_metadata の
+                          input_tokens と同じ意味）
+    WHY 2 つ: 「in」の意味が SDK と LangChain で違い、キャッシュの効果を比べるときに混ざるため。
+    input は input_uncached と同じ値（前からの名前。新しいコードは名前の付いた方を使う）。
+    """
+    creation = usage.cache_write_5m + usage.cache_write_1h
+    return {"input_uncached": usage.input, "input_total": usage.prompt_tokens, "input": usage.input,
+            "output": usage.output, "reasoning": usage.reasoning, "cache_read": usage.cache_read,
+            "cache_creation": creation}
+
+
 def last_call() -> dict[str, Any] | None:
     """このスレッドで最後に数えた呼び出しの情報を返し、消す。無ければ None。
 
-    鍵: model、model_on_wire、status、usd、tokens（input / output / reasoning / cache_read / cache_creation。
-    usage を拾えなかったときは None）。
+    鍵: model、model_on_wire、provider、status、usd、tokens（tokens_of の dict。usage を拾えなかったときは None）。
 
     WHY tokens も返す: router と filler の raw の呼び出しは本文しか返さないので、計測の道具は呼び出しごとの
          tokens（キャッシュの読み書きを含む）をここからしか知れない。本文には触れない。
@@ -810,19 +845,32 @@ class UsageMeter:
 
     # ── 呼び出しごと ──
 
-    def check_capture(self, expected_calls: int) -> None:
-        """呼び出し側が「有料の呼び出しを expected_calls 回した」と分かっている時点で呼ぶ。
+    def check_capture(self, expected_calls: int | dict[str, int]) -> None:
+        """呼び出し側が「有料の呼び出しをこれだけした」と分かっている時点で呼ぶ。
 
-        包みが 1 回も見ていない（SDK が別の HTTP クライアントを使った）なら止める。
+        Args:
+            expected_calls: 提供元ごとの回数（{"anthropic": 3, "google": 2}。provider_of で引く）。
+                            int なら提供元を問わない全体の回数（提供元の分かる呼び出し側は dict を使う）
+
+        包みがその提供元の usage を 1 件も拾えていない（SDK が別の HTTP クライアントを使った）なら止める。
 
         Raises:
             UsageCaptureLost
         """
         with self._lock:
-            if expected_calls > 0 and self.stats.counted == 0:
-                raise UsageCaptureLost(
-                    f"{expected_calls} 回呼んだのに usage を 1 件も拾えていません（包みが見たのは {self.stats.sent} 回）",
-                )
+            if isinstance(expected_calls, int):
+                if expected_calls > 0 and self.stats.counted == 0:
+                    raise UsageCaptureLost(
+                        f"{expected_calls} 回呼んだのに usage を 1 件も拾えていません（包みが見たのは {self.stats.sent} 回）",
+                    )
+                return
+            for provider, expected in sorted(expected_calls.items()):
+                counts = self.stats.by_provider.get(provider, {})
+                if expected > 0 and counts.get("counted", 0) == 0:
+                    raise UsageCaptureLost(
+                        f"{_showable(provider)} を {expected} 回呼んだのに usage を 1 件も拾えていません"
+                        f"（包みが見たのは {counts.get('sent', 0)} 回）",
+                    )
 
     def _before(self, request: Any) -> _Call | None:
         """送る前の判定と予約。生成の API でなければ None。"""
@@ -839,8 +887,10 @@ class UsageMeter:
         assert model is not None
         estimate = estimate_usd(price, size, _max_output(body) or self.assumed_max_output)
         with self._lock:
-            if self.stats.ok_responses >= _ZERO_USAGE_LIMIT and self.stats.counted == 0:
-                raise UsageCaptureLost(f"2xx の応答が {self.stats.ok_responses} 回続いたのに usage を拾えていません")
+            counts = self.stats.by_provider.get(provider, {})
+            if counts.get("ok_responses", 0) >= _ZERO_USAGE_LIMIT and counts.get("counted", 0) == 0:
+                raise UsageCaptureLost(
+                    f"{provider} の 2xx の応答が {counts['ok_responses']} 回続いたのに usage を拾えていません")
             spent_total = self.ledger.total_usd + self._pending
             spent_run = self.ledger.run_usd(self.run) + self._pending
             room = min(self.ledger.total_cap_usd - spent_total, self.max_usd - spent_run)
@@ -852,6 +902,7 @@ class UsageMeter:
                 )
             self._pending += estimate
             self.stats.sent += 1
+            self.stats.bump(provider, "sent")
         return _Call(provider, model, price, estimate)
 
     def _settle(self, call: _Call, *, status: str, http_status: int | None = None,
@@ -879,19 +930,18 @@ class UsageMeter:
             self._pending -= call.reserved
             if http_status is not None and 200 <= http_status < 300:
                 self.stats.ok_responses += 1
+                self.stats.bump(call.provider, "ok_responses")
             if status == "usage":
                 self.stats.counted += 1
+                self.stats.bump(call.provider, "counted")
             elif status == "http_error":
                 self.stats.http_errors += 1
             else:
                 self.stats.uncounted += 1
             self.ledger.add(run=self.run, model=call.model, usd=usd, usage=usage, status=status,
                             model_on_wire=wire_model, http_status=http_status)
-        _THREAD.last = {"model": call.model, "model_on_wire": wire_model, "status": status, "usd": usd,
-                        "tokens": None if usage is None else {
-                            "input": usage.input, "output": usage.output, "reasoning": usage.reasoning,
-                            "cache_read": usage.cache_read,
-                            "cache_creation": usage.cache_write_5m + usage.cache_write_1h}}
+        _THREAD.last = {"model": call.model, "model_on_wire": wire_model, "provider": call.provider,
+                        "status": status, "usd": usd, "tokens": None if usage is None else tokens_of(usage)}
 
     def _after_response(self, call: _Call, response: Any, module: Any) -> None:
         """応答を受けた後。読み終えていれば今数え、stream なら読み終えたときに数える。"""

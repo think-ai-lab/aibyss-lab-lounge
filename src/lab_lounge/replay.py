@@ -284,10 +284,10 @@ def execute(rows: list[dict[str, Any]], run_file: RunFile, *, reps: int, workers
         raise RuntimeError("判定ログがオンのままです（リプレイの発話が次の入力に混ざる）")
     done = _final_by_key(run_file.lines())
     stats: Counter = Counter()
-    calls_made = 0
+    # 提供元ごとの、エラーでなかった行の LLM 呼び出しの数（usage の拾い損ねを提供元ごとに確かめる）。
+    calls_made: Counter = Counter()
 
     def run_batch(batch: list[tuple[dict[str, Any], int, int]], title: str) -> None:
-        nonlocal calls_made
         if not batch:
             return
         with RecordingRouter(), concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -297,14 +297,15 @@ def execute(rows: list[dict[str, Any]], run_file: RunFile, *, reps: int, workers
                     line = future.result()
                     run_file.append(line)
                     stats["error" if line["error"] else "ok"] += 1
-                    calls_made += 0 if line["error"] else line["calls"]
+                    if meter is not None and not line["error"] and line["model"]:
+                        calls_made[spend.provider_of(line["model"], meter.prices)] += line["calls"]
                     if count % 50 == 0 or count == len(batch):
                         progress(f"{title}: {count} / {len(batch)}")
             except BaseException:
                 pool.shutdown(wait=True, cancel_futures=True)
                 raise
         if meter is not None:
-            meter.check_capture(calls_made)
+            meter.check_capture(dict(calls_made))
 
     for rep in range(1, reps + 1):
         run_batch([(row, rep, 1) for row in rows if (row["id"], rep) not in done], f"rep {rep}")

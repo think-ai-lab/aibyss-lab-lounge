@@ -181,7 +181,9 @@ class TestMeter:
         assert _SENTINEL not in captured.out + captured.err
 
     def test_last_call_is_per_thread_and_cleared(self, ledger):
-        with spend.UsageMeter(ledger, "unit", max_usd=1.0),                 _client(lambda r: httpx.Response(200, json=_anthropic_reply())) as client:
+        reply = _anthropic_reply(cache_read_input_tokens=40, cache_creation_input_tokens=5)
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0), \
+                _client(lambda r: httpx.Response(200, json=reply)) as client:
             spend.last_call()
             client.post(_ANTHROPIC, json=_body())
             other: list = []
@@ -192,8 +194,12 @@ class TestMeter:
         assert other == [None]
         assert (last["model"], last["model_on_wire"], last["status"]) == (
             "claude-haiku-4-5", "claude-haiku-4-5-20251001", "usage")
-        assert last["tokens"] == {"input": 100, "output": 10, "reasoning": 0, "cache_read": 0, "cache_creation": 0}
+        assert last["provider"] == "anthropic"
+        assert last["tokens"] == {"input_uncached": 100, "input_total": 145, "input": 100, "output": 10,
+                                  "reasoning": 0, "cache_read": 40, "cache_creation": 5}
         assert spend.last_call() is None
+        (call,) = _calls(ledger.directory)
+        assert (call["tokens"]["input"], call["tokens"]["input_total"]) == (100, 145)
 
     def test_send_is_restored_even_after_an_error(self, ledger):
         before = (httpx.Client.__dict__["send"], httpx.AsyncClient.__dict__["send"])
@@ -283,6 +289,49 @@ class TestMeter:
         assert len(seen) == 3
         assert {c["status"] for c in _calls(tmp_path)} == {"no_usage"}
         assert ledger.total_usd > 0  # 拾えなかった分は見積もりで数える
+
+    def test_capture_is_checked_per_provider(self, ledger):
+        """1 社だけ usage を拾えないとき、全体では拾えていても、その社の確かめで止まる。"""
+        google = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+
+        def handler(request):
+            if "googleapis" in str(request.url):
+                return httpx.Response(200, json={"candidates": []})
+            return httpx.Response(200, json=_anthropic_reply())
+
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0) as meter, _client(handler) as client:
+            client.post(_ANTHROPIC, json=_body())
+            client.post(google, json={"contents": []})
+            meter.check_capture(2)  # 全体の数では見逃す
+            meter.check_capture({"anthropic": 1})
+            with pytest.raises(spend.UsageCaptureLost) as caught:
+                meter.check_capture({"anthropic": 1, "google": 1})
+            assert "google" in str(caught.value)
+            with pytest.raises(spend.UsageCaptureLost):
+                meter.check_capture({"openai": 1})  # 1 回も包みを通っていない社
+        assert meter.stats.by_provider["anthropic"] == {"sent": 1, "counted": 1, "ok_responses": 1}
+        assert meter.stats.by_provider["google"] == {"sent": 1, "counted": 0, "ok_responses": 1}
+
+    def test_zero_usage_limit_is_per_provider(self, ledger):
+        google = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+
+        def handler(request):
+            if "googleapis" in str(request.url):
+                return httpx.Response(200, json={"candidates": []})
+            return httpx.Response(200, json=_anthropic_reply())
+
+        with spend.UsageMeter(ledger, "unit", max_usd=1.0), _client(handler) as client:
+            client.post(_ANTHROPIC, json=_body())
+            for _ in range(3):
+                client.post(google, json={"contents": []})
+            with pytest.raises(spend.UsageCaptureLost):
+                client.post(google, json={"contents": []})
+            client.post(_ANTHROPIC, json=_body())  # 拾えている社は止めない
+
+    def test_provider_of(self):
+        assert spend.provider_of("gemini-3.1-flash-lite") == "google"
+        with pytest.raises(spend.UnpricedModel):
+            spend.provider_of("nope-1")
 
     def test_check_capture_stops_when_nothing_was_seen(self, ledger):
         with spend.UsageMeter(ledger, "unit", max_usd=1.0) as meter:
