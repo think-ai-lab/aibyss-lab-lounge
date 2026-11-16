@@ -13,6 +13,8 @@ log_setup.py — ログ設定の集約
   L2_LOG_LEVEL      — ログレベル (デフォルト: "INFO")
   L2_LLM_DEBUG_HTTP — LLM SDK の HTTP 詳細 (retry 判定の status code 等) を DEBUG 出力
                       (デフォルト: "false"。実際に出すには L2_LOG_LEVEL=DEBUG も必要)
+                      注意: DEBUG では SDK が要求の中身 (= 実発話を含む本文) をログに出しうる。
+                      調査のときだけオンにし、そのログを共有・公開しない。
 
 【出力ファイル】
   {L2_LOG_DIR}/run_loop_YYYYMMDD_HHMMSS.log

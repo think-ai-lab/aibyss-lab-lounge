@@ -206,6 +206,22 @@ class TestSensitiveLoggerSuppression:
         assert logging.getLogger(name).level == logging.WARNING
 
 
+class TestHttpLibraryLoggerNamesExist:
+    """抑制の名前が、実在する logger の名前であること (綴りの違いで、抑制が黙って空振りしない)。
+
+    WHY: httpx2 / httpcore2 は、openai 3.x / anthropic 2.x の更新で入る。今の lock には無いので、
+         入っている環境 (next-lock-check の新しい lock) でだけ流れる。入っていなければ skip。
+    """
+
+    @pytest.mark.parametrize(("package", "logger_name"), [("httpx2", "httpx2"), ("httpcore2", "httpcore2")])
+    def test_library_creates_the_logger_we_suppress(self, package, logger_name):
+        from lab_lounge.log_setup import _SENSITIVE_LIBRARY_LOGGERS
+
+        pytest.importorskip(package)
+        assert logger_name in logging.root.manager.loggerDict, f"{package} を import しても logger {logger_name} が無い"
+        assert logger_name in _SENSITIVE_LIBRARY_LOGGERS
+
+
 class TestEntryPointsWithoutSetupLogging:
     """setup_logging を通らない入口でも、第三者ライブラリの機密ログを出さない。
 
