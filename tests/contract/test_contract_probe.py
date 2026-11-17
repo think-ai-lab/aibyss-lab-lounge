@@ -192,8 +192,11 @@ def test_agent_measures_steps_tools_and_cache_fields_without_text(agent_probe_en
     captured = capsys.readouterr()
     lines = _metrics(out_dir)
     assert len(lines) == 8
-    assert [(x["character"], x["i"], x["cold"]) for x in lines][:3] == [
-        ("mimi", 0, True), ("mimi", 1, False), ("chisame", 0, True)]
+    # 発話の番号ごとに、キャラを交互に流す（時間帯の差が後のキャラに偏らないように）。
+    assert [(x["character"], x["i"], x["cold"]) for x in lines][:5] == [
+        ("mimi", 0, True), ("chisame", 0, True), ("sakura", 0, True), ("octamaid", 0, True), ("mimi", 1, False)]
+    assert [x["first_in_process"] for x in lines] == [True] + [False] * 7
+    assert [x["first_for_provider"] for x in lines][:4] == [True, True, True, False]  # openai, google, anthropic, openai
     first = lines[0]
     assert (first["error"], first["source"], first["tools_fired"]) == (None, "structured_response", ["web_search_tool"])
     assert len(first["steps"]) >= 2 and first["steps"][0]["tool_calls"] == ["web_search_tool"]
@@ -312,10 +315,12 @@ def test_raw_stops_when_one_provider_was_never_metered(probe_env, monkeypatch):
     """google の呼び出しが成功したのに、HTTP の層が 1 件も数えていなければ、止める（全体では別の社が数えていても）。"""
     out_dir, spend_dir, synthetic, utterances = probe_env
 
-    def fake_group(group, ledger, label, **_kwargs):
-        return [probe.Sample(group.name, 0, "u01", "gemini-3.1-flash-lite", None, 10, None, 0.0, {}, "google")]
+    def fake_rounds(groups, ledger, label, *, after_round=None, **_kwargs):
+        samples = [probe.Sample(groups[0].name, 0, "u01", "gemini-3.1-flash-lite", None, 10, None, 0.0, {}, "google")]
+        after_round(samples)
+        return {groups[0].name: samples}
 
-    monkeypatch.setattr(probe, "measure_group", fake_group)
+    monkeypatch.setattr(probe, "measure_rounds", fake_rounds)
     with pytest.raises(spend.UsageCaptureLost):
         _run(probe_env, "--only", "filler")
 

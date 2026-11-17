@@ -319,11 +319,15 @@ class Sample:
     usd: float
     tokens: dict[str, int] = field(default_factory=dict)
     provider: str | None = None
+    # プロセスの最初の呼び出し / その提供元の最初の呼び出し。DNS、TLS、SDK の読み込みなどを払うので、分布から外して見られるよう印を残す。
+    first_in_process: bool = False
+    first_for_provider: bool = False
 
     def line(self) -> dict[str, Any]:
         return {"group": self.group, "i": self.index, "input_id": self.input_id, "model": self.model,
                 "provider": self.provider, "model_on_wire": label_of(self.model_on_wire), "elapsed_ms": self.elapsed_ms,
-                "error": self.error, "usd": round(self.usd, 9), "tokens": self.tokens}
+                "error": self.error, "usd": round(self.usd, 9), "tokens": self.tokens,
+                "first_in_process": self.first_in_process, "first_for_provider": self.first_for_provider}
 
 
 @dataclass
@@ -429,28 +433,51 @@ def build_groups(*, n: int, only: str, interjection: list[RouterItem], approval:
     return groups
 
 
-def measure_group(group: RawGroup, ledger: spend.SpendLedger, label: str, *, gap_sec: float,
-                  sink: Callable[[Sample], None], sleep: Callable[[float], None] = time.sleep) -> list[Sample]:
-    """グループの呼び出しを順に流し、1 回ごとに Sample を sink へ渡す。
+def measure_rounds(groups: list[RawGroup], ledger: spend.SpendLedger, label: str, *, gap_sec: float,
+                   sink: Callable[[Sample], None], collected: dict[str, list[Sample]] | None = None,
+                   after_round: Callable[[list[Sample]], None] | None = None,
+                   sleep: Callable[[float], None] = time.sleep) -> dict[str, list[Sample]]:
+    """グループを 1 回ずつ交互に流す（入力の番号ごとに、全グループを 1 周）。1 回ごとに Sample を sink へ渡す。
 
+    WHY 交互: グループを 1 つずつ最後まで流すと、30 分ほどの間に API の混み具合が変わったとき、その差が
+         後のグループに偏り、モデルの差と見分けられない。交互なら、時間帯の差が全グループに均等にかかる。
     費用は、呼び出しの前後の支出の記録の差（SDK の再試行の分も入る）。tokens とモデル名は、最後に数えた
     HTTP の応答（spend.last_call）から取る。並列にしない: 時間の分布に自分の並列が混ざらないように。
+
+    Args:
+        collected:   グループ名 → Sample。途中で止まっても、そこまでの集計を呼び出し側が作れるように、外から渡せる
+        after_round: 1 周ごとに、その周の Sample を渡して呼ぶ（usage の拾い損ねの確かめなど）
     """
-    samples: list[Sample] = []
-    for index, (input_id, call) in enumerate(group.calls):
-        if index and gap_sec > 0:
-            sleep(gap_sec)
-        spend.last_call()  # 前の呼び出しの名残を消す
-        before = ledger.run_usd(label)
-        outcome = call()
-        usd = ledger.run_usd(label) - before
-        wire = spend.last_call() or {}
-        tokens = {key: int((wire.get("tokens") or {}).get(key, 0)) for key in _TOKEN_KEYS}
-        sample = Sample(group.name, index, input_id, outcome.model, wire.get("model_on_wire"), outcome.elapsed_ms,
-                        outcome.error, usd, tokens, provider_for(outcome.model, wire))
-        samples.append(sample)
-        sink(sample)
-    return samples
+    collected = {} if collected is None else collected
+    seen_providers: set[str] = set()
+    first = True
+    for index in range(max((len(g.calls) for g in groups), default=0)):
+        round_samples: list[Sample] = []
+        for group in groups:
+            if index >= len(group.calls):
+                continue
+            if not first and gap_sec > 0:
+                sleep(gap_sec)
+            input_id, call = group.calls[index]
+            spend.last_call()  # 前の呼び出しの名残を消す
+            before = ledger.run_usd(label)
+            outcome = call()
+            usd = ledger.run_usd(label) - before
+            wire = spend.last_call() or {}
+            tokens = {key: int((wire.get("tokens") or {}).get(key, 0)) for key in _TOKEN_KEYS}
+            provider = provider_for(outcome.model, wire)
+            sample = Sample(group.name, index, input_id, outcome.model, wire.get("model_on_wire"), outcome.elapsed_ms,
+                            outcome.error, usd, tokens, provider, first_in_process=first,
+                            first_for_provider=bool(provider) and provider not in seen_providers)
+            first = False
+            if provider:
+                seen_providers.add(provider)
+            collected.setdefault(group.name, []).append(sample)
+            round_samples.append(sample)
+            sink(sample)
+        if after_round is not None:
+            after_round(round_samples)
+    return collected
 
 
 def provider_for(model: str | None, wire: dict[str, Any] | None = None,
@@ -579,12 +606,14 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     with prevent_sleep(), _captured_logs(out_dir / f"raw_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             replay.RecordingRouter(), RecordingFiller():
-        for group in groups:
-            samples = measure_group(group, ledger, args.label, gap_sec=args.gap_sec,
-                                    sink=lambda sample: writer.append(sample.line()))
-            calls_by_provider.update(expected_by_provider(samples, meter.prices))
+        def after_round(round_samples: list[Sample]) -> None:
+            calls_by_provider.update(expected_by_provider(round_samples, meter.prices))
             meter.check_capture(dict(calls_by_provider))
-            summaries[group.name] = summarize(samples)
+
+        collected = measure_rounds(groups, ledger, args.label, gap_sec=args.gap_sec,
+                                   sink=lambda sample: writer.append(sample.line()), after_round=after_round)
+        for group in groups:
+            summaries[group.name] = summarize(collected.get(group.name, []))
             print_summary(group.name, summaries[group.name])
     meta["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
     meta["summary"] = summaries
@@ -919,6 +948,19 @@ def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: Ag
     return line, body
 
 
+def mark_first_calls(line: dict[str, Any], first_in_process: bool, seen_providers: set[str]) -> None:
+    """プロセスの最初の呼び出し、その提供元の最初の呼び出しに印を付ける（seen_providers を更新する）。
+
+    WHY: DNS、TLS、SDK の読み込みを払うのは、プロセスの最初の呼び出し（と提供元ごとの最初）だけ。
+         キャラごとの cold（キャラの 1 本目）とは別に印を残し、cold の数字から取り除いて見られるようにする。
+    """
+    provider = line.get("provider")
+    line["first_in_process"] = first_in_process
+    line["first_for_provider"] = bool(provider) and provider not in seen_providers
+    if provider:
+        seen_providers.add(provider)
+
+
 def check_steps_were_metered(line: dict[str, Any]) -> None:
     """LLM の step が終わっているのに、HTTP の層が 1 件も数えていないなら、止める。
 
@@ -1098,11 +1140,16 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     with prevent_sleep(), _captured_logs(out_dir / f"agent_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             canned_tools(lengths, fires):
-        for slug in characters:
-            lines: list[dict[str, Any]] = []
-            for index, utterance in enumerate(utterances):
-                if index and args.gap_sec > 0:
+        # 発話の番号ごとに、キャラを交互に流す（WHY: 全体で 30 分ほどかかる間の API の混み具合の変化が、後のキャラに
+        # 偏って、モデルやキャラの差と見分けられなくなるのを避ける）。cold はキャラごとの最初の 1 回（index == 0）。
+        lines_by_slug: dict[str, list[dict[str, Any]]] = {slug: [] for slug in characters}
+        seen_providers: set[str] = set()
+        first_in_process = True
+        for index, utterance in enumerate(utterances):
+            for slug in characters:
+                if not first_in_process and args.gap_sec > 0:
                     time.sleep(args.gap_sec)
+                lines = lines_by_slug[slug]
                 try:
                     line, body = measure_agent_call(slug, utterance, index, settings, ledger, args.label)
                 except AgentTimeout as timeout:
@@ -1111,16 +1158,19 @@ def _cmd_agent(args: argparse.Namespace) -> int:
                                             "category": utterance.category, "cold": index == 0, "error": "Timeout",
                                             "total_ms": None, "steps": [], "tools": [], "tools_fired": [],
                                             "source": None, "model": None, "usd": 0.0}
+                    mark_first_calls(line, first_in_process, seen_providers)
                     metrics.append(line)
                     full.append({**line, "response": ""})
                     lines.append(line)
-                    summaries[slug] = summarize_agent(lines)
+                    summaries.update({s: summarize_agent(ls) for s, ls in lines_by_slug.items() if ls})
                     meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=True,
                                 summary=summaries)
                     _write_json(meta_path, meta)
                     emit(f"[時間切れ] {slug} の {utterance.id} が {settings.timeout_sec:.0f} 秒を超えました。"
                          f"記録して終えます（取り残したスレッドの課金を止めるため）")
                     spend.hard_exit(EXIT_FAILED)
+                mark_first_calls(line, first_in_process, seen_providers)
+                first_in_process = False
                 lines.append(line)
                 metrics.append(line)
                 full.append({**line, "response": body})
@@ -1128,7 +1178,9 @@ def _cmd_agent(args: argparse.Namespace) -> int:
                     calls_by_provider[line["provider"]] += 1
                 check_steps_were_metered(line)
             meter.check_capture(dict(calls_by_provider))
-            summaries[slug] = summarize_agent(lines)
+            emit(f"  発話 {index + 1} / {len(utterances)} 済み")
+        for slug in characters:
+            summaries[slug] = summarize_agent(lines_by_slug[slug])
             print_agent_summary(slug, summaries[slug])
     meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=False, summary=summaries,
                 tools_fired_total=dict(fires))

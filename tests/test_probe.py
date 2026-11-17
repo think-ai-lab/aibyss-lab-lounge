@@ -202,7 +202,7 @@ class TestMeasureGroup:
 
         group = probe.RawGroup("g", [(f"id{i}", call(i)) for i in range(3)])
         sink: list[probe.Sample] = []
-        samples = probe.measure_group(group, ledger, "unit", gap_sec=2.0, sink=sink.append, sleep=gaps.append)
+        samples = probe.measure_rounds([group], ledger, "unit", gap_sec=2.0, sink=sink.append, sleep=gaps.append)["g"]
         assert seen == [0, 1, 2] and gaps == [2.0, 2.0]
         assert [s.elapsed_ms for s in samples] == [100, 101, 102] and sink == samples
 
@@ -217,8 +217,8 @@ class TestMeasureGroup:
                                              "cache_creation": 7}}
             return probe.Outcome("claude-haiku-4-5", 50, None)
 
-        (sample,) = probe.measure_group(probe.RawGroup("g", [("x", run)]), ledger, "unit", gap_sec=0,
-                                        sink=lambda _s: None)
+        (sample,) = probe.measure_rounds([probe.RawGroup("g", [("x", run)])], ledger, "unit", gap_sec=0,
+                                         sink=lambda _s: None)["g"]
         assert sample.usd == pytest.approx(0.002) and sample.model_on_wire == "claude-haiku-4-5-20251001"
         assert sample.tokens == {"input_total": 22, "input_uncached": 10, "output": 2, "reasoning": 0, "cache_read": 5,
                                  "cache_creation": 7}
@@ -228,13 +228,13 @@ class TestMeasureGroup:
         spend._THREAD.last = {"model": "x", "model_on_wire": "stale", "status": "usage", "usd": 1.0,
                               "tokens": {"input_total": 99, "input_uncached": 99}}
         group = probe.RawGroup("g", [("x", lambda: probe.Outcome(None, None, "NoCall"))])
-        (sample,) = probe.measure_group(group, ledger, "unit", gap_sec=0, sink=lambda _s: None)
+        (sample,) = probe.measure_rounds([group], ledger, "unit", gap_sec=0, sink=lambda _s: None)["g"]
         assert sample.model_on_wire is None and sample.tokens["input_total"] == 0
 
     def test_sample_line_has_no_text(self):
         sample = probe.Sample("g", 0, "s001", "m", "w", 10, None, 0.1, {"input_total": 1})
-        assert set(sample.line()) == {"group", "i", "input_id", "model", "provider", "model_on_wire", "elapsed_ms", "error",
-                                      "usd", "tokens"}
+        assert set(sample.line()) == {"group", "i", "input_id", "model", "provider", "model_on_wire", "elapsed_ms",
+                                      "error", "first_in_process", "first_for_provider", "usd", "tokens"}
 
 
 class TestSummarize:
@@ -808,3 +808,68 @@ class TestTokensAndLabels:
                                                             "model_name": "m " + _SENTINEL})
         recorder.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run)
         assert _SENTINEL not in json.dumps(recorder.steps)
+
+
+class TestInterleaving:
+    def _group(self, name, model, count, log):
+        def call(i):
+            def run():
+                log.append((name, i))
+                return probe.Outcome(model, 10, None)
+            return run
+        return probe.RawGroup(name, [(f"{name}{i}", call(i)) for i in range(count)])
+
+    def test_groups_take_turns_by_input_number(self, tmp_path):
+        log: list = []
+        groups = [self._group("a", "claude-haiku-4-5", 3, log), self._group("b", "gpt-5.4-mini", 3, log)]
+        probe.measure_rounds(groups, spend.SpendLedger(tmp_path / "s"), "unit", gap_sec=0, sink=lambda _s: None)
+        assert log == [("a", 0), ("b", 0), ("a", 1), ("b", 1), ("a", 2), ("b", 2)]
+
+    def test_groups_of_different_lengths_and_the_gap_between_every_call(self, tmp_path):
+        log, gaps = [], []
+        groups = [self._group("a", "claude-haiku-4-5", 1, log), self._group("b", "gpt-5.4-mini", 2, log)]
+        collected = probe.measure_rounds(groups, spend.SpendLedger(tmp_path / "s"), "unit", gap_sec=2.0,
+                                         sink=lambda _s: None, sleep=gaps.append)
+        assert log == [("a", 0), ("b", 0), ("b", 1)] and gaps == [2.0, 2.0]
+        assert {name: len(samples) for name, samples in collected.items()} == {"a": 1, "b": 2}
+
+    def test_after_round_is_called_once_per_round_with_that_rounds_samples(self, tmp_path):
+        log, rounds = [], []
+        groups = [self._group("a", "claude-haiku-4-5", 2, log), self._group("b", "gpt-5.4-mini", 2, log)]
+        probe.measure_rounds(groups, spend.SpendLedger(tmp_path / "s"), "unit", gap_sec=0, sink=lambda _s: None,
+                             after_round=lambda samples: rounds.append([s.group for s in samples]))
+        assert rounds == [["a", "b"], ["a", "b"]]
+
+    def test_first_call_marks(self, tmp_path):
+        log: list = []
+        groups = [self._group("a", "claude-haiku-4-5", 2, log), self._group("b", "gpt-5.4-mini", 2, log),
+                  self._group("c", "claude-haiku-4-5", 1, log)]
+        collected = probe.measure_rounds(groups, spend.SpendLedger(tmp_path / "s"), "unit", gap_sec=0,
+                                         sink=lambda _s: None)
+        flat = [(s.group, s.index, s.first_in_process, s.first_for_provider)
+                for index in range(2) for name in "abc" for s in collected.get(name, []) if s.index == index]
+        assert flat == [("a", 0, True, True), ("b", 0, False, True), ("c", 0, False, False),
+                        ("a", 1, False, False), ("b", 1, False, False)]
+
+    def test_collected_survives_a_stop_in_the_middle(self, tmp_path):
+        log: list = []
+        collected: dict = {}
+        group = self._group("a", "claude-haiku-4-5", 3, log)
+
+        def stop(samples):
+            if len(collected["a"]) == 2:
+                raise spend.BudgetExceeded("上限")
+
+        with pytest.raises(spend.BudgetExceeded):
+            probe.measure_rounds([group], spend.SpendLedger(tmp_path / "s"), "unit", gap_sec=0, sink=lambda _s: None,
+                                 collected=collected, after_round=stop)
+        assert len(collected["a"]) == 2  # 止まるまでの分は、外から渡した入れ物に残る
+
+    def test_mark_first_calls_for_the_agent_lines(self):
+        seen: set[str] = set()
+        one, two, three = {"provider": "openai"}, {"provider": "openai"}, {"provider": "google"}
+        probe.mark_first_calls(one, True, seen)
+        probe.mark_first_calls(two, False, seen)
+        probe.mark_first_calls(three, False, seen)
+        assert [(x["first_in_process"], x["first_for_provider"]) for x in (one, two, three)] == [
+            (True, True), (False, False), (False, True)]
