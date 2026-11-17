@@ -232,7 +232,7 @@ class TestMeasureGroup:
 
     def test_sample_line_has_no_text(self):
         sample = probe.Sample("g", 0, "s001", "m", "w", 10, None, 0.1, {"input": 1})
-        assert set(sample.line()) == {"group", "i", "input_id", "model", "model_on_wire", "elapsed_ms", "error",
+        assert set(sample.line()) == {"group", "i", "input_id", "model", "provider", "model_on_wire", "elapsed_ms", "error",
                                       "usd", "tokens"}
 
 
@@ -717,3 +717,29 @@ class TestInnerTimeoutIsNotTheWallClock:
         utterance = probe.Utterance("u01", "greeting", "{name}、こんにちは")
         line, body = probe.measure_agent_call("sakura", utterance, 0, settings, ledger, "unit")
         assert line["error"] == "TimeoutError" and body == "" and _SENTINEL not in json.dumps(line)
+
+
+class TestProviderCapture:
+    def _s(self, model, error=None, provider=None):
+        return probe.Sample("g", 0, "x", model, None, 10, error, 0.0, {}, provider)
+
+    def test_counts_successful_calls_by_provider_from_the_requested_model(self):
+        samples = [self._s("claude-haiku-4-5"), self._s("claude-haiku-4-5"), self._s("gpt-5.4-mini"),
+                   self._s("gemini-3.1-flash-lite", error="NoText"), self._s(None)]
+        assert probe.expected_by_provider(samples) == {"anthropic": 2, "openai": 1}
+
+    def test_an_unpriced_model_is_not_counted_instead_of_crashing(self):
+        assert probe.expected_by_provider([self._s("some-unknown-model")]) == {}
+
+    def test_provider_for_prefers_what_the_http_layer_saw(self):
+        assert probe.provider_for("gpt-5.4-mini", {"provider": "google"}) == "google"
+        assert probe.provider_for("gpt-5.4-mini", {}) == "openai"
+        assert probe.provider_for(None, None) is None
+
+    def test_a_step_without_any_counted_http_call_stops(self):
+        step = {"error": None}
+        with pytest.raises(spend.UsageCaptureLost):
+            probe.check_steps_were_metered({"character": "mimi", "steps": [step], "http_calls": 0})
+        probe.check_steps_were_metered({"character": "mimi", "steps": [step], "http_calls": 1})
+        probe.check_steps_were_metered({"character": "mimi", "steps": [], "http_calls": 0})  # step が無いなら対象外
+        probe.check_steps_were_metered({"character": "mimi", "steps": [{"error": "APIError"}], "http_calls": 0})

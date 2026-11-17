@@ -318,11 +318,12 @@ class Sample:
     error: str | None
     usd: float
     tokens: dict[str, int] = field(default_factory=dict)
+    provider: str | None = None
 
     def line(self) -> dict[str, Any]:
         return {"group": self.group, "i": self.index, "input_id": self.input_id, "model": self.model,
-                "model_on_wire": self.model_on_wire, "elapsed_ms": self.elapsed_ms, "error": self.error,
-                "usd": round(self.usd, 9), "tokens": self.tokens}
+                "provider": self.provider, "model_on_wire": self.model_on_wire, "elapsed_ms": self.elapsed_ms,
+                "error": self.error, "usd": round(self.usd, 9), "tokens": self.tokens}
 
 
 @dataclass
@@ -435,10 +436,41 @@ def measure_group(group: RawGroup, ledger: spend.SpendLedger, label: str, *, gap
         wire = spend.last_call() or {}
         tokens = {key: int((wire.get("tokens") or {}).get(key, 0)) for key in _TOKEN_KEYS}
         sample = Sample(group.name, index, input_id, outcome.model, wire.get("model_on_wire"), outcome.elapsed_ms,
-                        outcome.error, usd, tokens)
+                        outcome.error, usd, tokens, provider_for(outcome.model, wire))
         samples.append(sample)
         sink(sample)
     return samples
+
+
+def provider_for(model: str | None, wire: dict[str, Any] | None = None,
+                 prices: dict[str, spend.Price] | None = None) -> str | None:
+    """呼び出しの提供元（anthropic / openai / google）。HTTP の層が見た値を先に、無ければ要求のモデル名から引く。
+
+    価格表に無いモデルは None（呼び出しの前に UnpricedModel で止まるので、通常は起きない）。
+    """
+    if wire and isinstance(wire.get("provider"), str):
+        return wire["provider"]
+    if not model:
+        return None
+    try:
+        return spend.provider_of(model, prices)
+    except spend.UnpricedModel:
+        return None
+
+
+def expected_by_provider(samples: list[Sample], prices: dict[str, spend.Price] | None = None) -> Counter:
+    """成功した呼び出しの数を、提供元ごとに数える（meter.check_capture へ渡す）。
+
+    WHY 提供元ごと: 全体で数えると、1 社の usage が丸ごと拾えていなくても、ほかの社が拾えていれば気づけない
+         （たとえば google の SDK だけが別の HTTP クライアントを使った場合）。
+    要求のモデル名から引く（HTTP の層が見た値に頼ると、層が見なかった呼び出しの provider が空になり、数え落とす）。
+    """
+    counts: Counter = Counter()
+    for sample in samples:
+        provider = provider_for(sample.model, None, prices)
+        if not sample.error and provider:
+            counts[provider] += 1
+    return counts
 
 
 def summarize(samples: list[Sample]) -> dict[str, Any]:
@@ -531,15 +563,15 @@ def _cmd_raw(args: argparse.Namespace) -> int:
          f"（入力 挙手の候補 {pools['interjection']} / 承認 {pools['approval']} / filler {pools['filler']} 本をめぐる）")
     writer = replay.RunFile(run_path)
     summaries: dict[str, dict[str, Any]] = {}
-    calls_made = 0
+    calls_by_provider: Counter = Counter()
     with prevent_sleep(), _captured_logs(out_dir / f"raw_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             replay.RecordingRouter(), RecordingFiller():
         for group in groups:
             samples = measure_group(group, ledger, args.label, gap_sec=args.gap_sec,
                                     sink=lambda sample: writer.append(sample.line()))
-            calls_made += sum(1 for s in samples if not s.error)
-            meter.check_capture(calls_made)
+            calls_by_provider.update(expected_by_provider(samples, meter.prices))
+            meter.check_capture(dict(calls_by_provider))
             summaries[group.name] = summarize(samples)
             print_summary(group.name, summaries[group.name])
     meta["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
@@ -872,6 +904,22 @@ def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: Ag
     return line, body
 
 
+def check_steps_were_metered(line: dict[str, Any]) -> None:
+    """LLM の step が終わっているのに、HTTP の層が 1 件も数えていないなら、止める。
+
+    WHY: 使った SDK が httpx / httpx2 以外の HTTP クライアントを使うと、費用も上限も効かないまま課金が進む。
+         1 回の呼び出しの中で、step（LLM の応答）があるのに HTTP の呼び出しが 0 なら、その場で気づける。
+
+    Raises:
+        spend.UsageCaptureLost
+    """
+    done = [step for step in line.get("steps", []) if not step.get("error")]
+    if done and line.get("http_calls", 0) == 0:
+        raise spend.UsageCaptureLost(
+            f"{spend._showable(line.get('character'))} の呼び出しで LLM の step が {len(done)} 回終わったのに、"
+            "HTTP の層が 1 件も数えていません（費用と上限が効いていません）")
+
+
 def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
     """1 キャラの集計。時間は成功した呼び出しだけ、cold は最初の 1 回、warm は 2 回目以降。"""
     ok = [line for line in lines if not line["error"] and line["total_ms"] is not None]
@@ -1024,7 +1072,7 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     full, metrics = replay.RunFile(run_path), replay.RunFile(out_dir / f"agent_{args.label}.metrics.jsonl")
     summaries: dict[str, dict[str, Any]] = {}
     fires: Counter = Counter()
-    done = 0
+    calls_by_provider: Counter = Counter()
     with prevent_sleep(), _captured_logs(out_dir / f"agent_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             canned_tools(lengths, fires):
@@ -1054,8 +1102,10 @@ def _cmd_agent(args: argparse.Namespace) -> int:
                 lines.append(line)
                 metrics.append(line)
                 full.append({**line, "response": body})
-                done += 0 if line["error"] else 1
-            meter.check_capture(done)
+                if not line["error"] and line.get("provider"):
+                    calls_by_provider[line["provider"]] += 1
+                check_steps_were_metered(line)
+            meter.check_capture(dict(calls_by_provider))
             summaries[slug] = summarize_agent(lines)
             print_agent_summary(slug, summaries[slug])
     meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=False, summary=summaries,

@@ -304,3 +304,32 @@ def test_agent_budget_stop_sends_nothing(agent_probe_env):
                     "--gap-sec", "0", "--out-dir", str(out_dir), "--spend-dir", str(spend_dir),
                     "--utterances", str(utterances)])
     assert agent.llm.requests_for() == []
+
+
+# ─── 提供元ごとの拾い損ねの確かめ ─────────────────────────────────
+
+def test_raw_stops_when_one_provider_was_never_metered(probe_env, monkeypatch):
+    """google の呼び出しが成功したのに、HTTP の層が 1 件も数えていなければ、止める（全体では別の社が数えていても）。"""
+    out_dir, spend_dir, synthetic, utterances = probe_env
+
+    def fake_group(group, ledger, label, **_kwargs):
+        return [probe.Sample(group.name, 0, "u01", "gemini-3.1-flash-lite", None, 10, None, 0.0, {}, "google")]
+
+    monkeypatch.setattr(probe, "measure_group", fake_group)
+    with pytest.raises(spend.UsageCaptureLost):
+        _run(probe_env, "--only", "filler")
+
+
+def test_agent_stops_when_steps_ended_but_no_http_call_was_counted(agent_probe_env, monkeypatch):
+    def fake_call(slug, utterance, index, settings, ledger, label):
+        line = {"i": index, "character": slug, "utterance_id": utterance.id, "category": utterance.category,
+                "cold": index == 0, "provider": "anthropic", "model": "claude-haiku-4-5", "error": None,
+                "total_ms": 5, "steps": [{"ms": 3, "input_total": 1, "output": 1, "reasoning": 0, "cache_read": 0,
+                                          "cache_creation": 0, "error": None, "tool_calls": [], "finish": "stop",
+                                          "model": "m"}],
+                "tools": [], "tools_fired": [], "source": "structured_response", "usd": 0.0, "http_calls": 0}
+        return line, ""
+
+    monkeypatch.setattr(probe, "measure_agent_call", fake_call)
+    with pytest.raises(spend.UsageCaptureLost):
+        _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1")
