@@ -92,3 +92,58 @@ def test_a_failed_warmup_alone_is_a_failure(monkeypatch, tmp_path):
         return _failed(llm, model, kind, prompt) if kind == "warmup" else _ok(llm, model, kind, prompt)
 
     assert _run_main(monkeypatch, tmp_path, build=lambda p, m: object(), trial=trial) == 1
+
+
+_REAL_RUN_TRIAL = bench_ttft.run_trial  # _run_main が差し替える前の本物
+
+
+class _Chunk:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Stream:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def stream(self, _messages):
+        yield from self.chunks
+
+
+def test_a_trial_with_no_visible_text_is_a_failure_not_a_crash():
+    """考えるだけで終わった試行（TTFT なし）は、失敗として数える。成功に数えると表の書式が落ちる。"""
+    thinking_only = _Stream([_Chunk([{"type": "thinking", "thinking": "..."}]), _Chunk([])])
+    trial = bench_ttft.run_trial(thinking_only, "m", "greeting", "p")
+    assert trial.error == "NoVisibleText" and trial.ttft_ms is None and trial.first_chunk_ms is not None
+    rows = bench_ttft.summarize([trial, bench_ttft.Trial("m", "greeting", 100.0, 90.0, 500.0, 10)])
+    bench_ttft.print_table(rows)  # None を含んでも落ちない
+    assert (rows[0]["n_ok"], rows[0]["n_err"]) == (1, 1)
+
+
+def test_visible_text_gives_a_ttft():
+    trial = bench_ttft.run_trial(_Stream([_Chunk([{"type": "thinking"}]), _Chunk("こんにちは")]), "m", "g", "p")
+    assert trial.error == "" and trial.ttft_ms is not None and trial.out_chars == 5
+
+
+def test_main_survives_a_no_visible_text_trial_and_still_prints_the_table(monkeypatch, tmp_path, capsys):
+    def trial(llm, model, kind, prompt):
+        return _REAL_RUN_TRIAL(_Stream([_Chunk([{"type": "thinking"}])]), model, kind, prompt)
+
+    assert _run_main(monkeypatch, tmp_path, build=lambda p, m: object(), trial=trial) == 1
+    out = capsys.readouterr().out
+    assert "===== 集計 =====" in out and "NoVisibleText" in out
+
+
+def test_the_csv_keeps_the_trials_done_before_a_crash(monkeypatch, tmp_path):
+    calls = []
+
+    def trial(llm, model, kind, prompt):
+        calls.append(kind)
+        if len(calls) == 3:  # ウォームアップ 1 + 試行 1 の後（2 試行目で落ちる）
+            raise KeyboardInterrupt
+        return _ok(llm, model, kind, prompt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(monkeypatch, tmp_path, build=lambda p, m: object(), trial=trial)
+    lines = (tmp_path / "out.csv").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 + 1  # 見出し + 完了した 1 試行

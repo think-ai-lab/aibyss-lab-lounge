@@ -243,6 +243,10 @@ def run_trial(llm, model: str, prompt_kind: str, prompt: str) -> Trial:
                     ttft = (now - t0) * 1000
                 chars += len(text)
         total = (time.perf_counter() - t0) * 1000
+        if ttft is None:
+            # 見える文字が 1 つも来ずに終わった（考えるだけで上限に達した、など）。TTFT が無い試行を成功に数えると、
+            # 表の書式や中央値が None で落ちて、集計が全部失われる。失敗として数える。
+            return Trial(model, prompt_kind, None, first_chunk, total, chars, error="NoVisibleText")
         return Trial(model, prompt_kind, ttft, first_chunk, total, chars)
     except Exception as e:  # noqa: BLE001
         return Trial(model, prompt_kind, None, None, None, 0, error=repr(e))
@@ -301,6 +305,33 @@ def print_table(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+class CsvSink:
+    """生データ CSV を、1 試行ごとに書いて flush する。最初の試行まで、ファイルは作らない。
+
+    WHY 1 試行ごと: 最後にまとめて書くと、途中で落ちた（例外、Ctrl+C）ときに、それまでの測定が全部失われる。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._file = None
+        self._writer = None
+
+    def __enter__(self) -> "CsvSink":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._file is not None:
+            self._file.close()
+
+    def write(self, trial: "Trial") -> None:
+        if self._file is None:
+            self._file = open(self.path, "w", newline="", encoding="utf-8")  # noqa: SIM115 - __exit__ で閉じる
+            self._writer = csv.DictWriter(self._file, fieldnames=list(trial.__dict__.keys()))
+            self._writer.writeheader()
+        self._writer.writerow(trial.__dict__)
+        self._file.flush()
+
+
 def main() -> int:
     """ベンチを流す。失敗（[skip]、ウォームアップの失敗、試行のエラー）が 1 つでもあれば 1、なければ 0 を返す。"""
     ap = argparse.ArgumentParser(description="multi-provider TTFT benchmark")
@@ -321,9 +352,23 @@ def main() -> int:
     check_keys({m["provider"] for m in targets})
 
     all_trials: list[Trial] = []
-    raw_rows: list[dict] = []
-    failures = 0  # [skip]、ウォームアップの失敗、試行のエラーの合計
+    # 生データ CSV は 1 試行ごとに書く（途中で落ちても、そこまでの分が残る）。
+    with CsvSink(args.csv) as sink:
+        failures = run_all(targets, prompts, args.trials, all_trials, sink)  # [skip]、ウォームアップ、試行のエラーの合計
+    if all_trials:
+        print(f"\n生データ: {args.csv}")
 
+    print("\n===== 集計 =====")
+    print_table(summarize(all_trials))
+    if failures:
+        print(f"\n失敗が {failures} 件あります（[skip]、ウォームアップ、試行のエラーの合計）。この表は欠けています")
+        return 1
+    return 0
+
+
+def run_all(targets: list[dict], prompts: dict[str, str], trials: int, all_trials: list, sink: CsvSink) -> int:
+    """全モデル × 全プロンプトを流し、失敗の数（[skip]、ウォームアップ、試行のエラーの合計）を返す。"""
+    failures = 0
     for spec in targets:
         try:
             llm = build_llm(spec["provider"], spec["model"])
@@ -341,29 +386,15 @@ def main() -> int:
             time.sleep(SLEEP_BETWEEN_CALLS)
 
         for kind, prompt in prompts.items():
-            for i in range(args.trials):
+            for i in range(trials):
                 t = run_trial(llm, spec["model"], kind, prompt)
                 all_trials.append(t)
-                raw_rows.append(t.__dict__)
+                sink.write(t)
                 failures += bool(t.error)
                 status = f"err={t.error}" if t.error else f"ttft={t.ttft_ms:.0f}ms total={t.total_ms:.0f}ms"
                 print(f"[{spec['model']}] {kind} #{i + 1}: {status}")
                 time.sleep(SLEEP_BETWEEN_CALLS)
-
-    # 生データ CSV
-    if raw_rows:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(raw_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(raw_rows)
-        print(f"\n生データ: {args.csv}")
-
-    print("\n===== 集計 =====")
-    print_table(summarize(all_trials))
-    if failures:
-        print(f"\n失敗が {failures} 件あります（[skip]、ウォームアップ、試行のエラーの合計）。この表は欠けています")
-        return 1
-    return 0
+    return failures
 
 
 if __name__ == "__main__":
