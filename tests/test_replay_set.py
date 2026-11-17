@@ -407,6 +407,17 @@ class TestSelect:
         assert len(chosen) == target
         assert (report.undecided[name], report.informative[name]) == (expected_undecided, target - expected_undecided)
 
+    def test_callout_keeps_a_share_for_rows_from_wake(self, monkeypatch):
+        """意図ゲートの答えが callout の行（決めた行）と、wake と組の Agent の行（当時の答えなし）を 7 対 3 で取る。"""
+        monkeypatch.setitem(replay_set.TARGETS, "callout", 10)
+        gate = [dict(self._row(i, epoch=f"g#{i}", hist="callout", kind="intent"), character="mimi") for i in range(20)]
+        wake = [dict(self._row(100 + i, epoch=f"w#{i}", hist=None, kind="intent"), character="mimi") for i in range(20)]
+        report = replay_set.BuildReport()
+        chosen = replay_set.select_rows(gate + wake, report, seed=5)
+        assert len(chosen) == 10
+        assert (report.informative["callout"], report.undecided["callout"]) == (7, 3)
+        assert sum(r["hist_key"] is None for r in chosen) == 3
+
     def test_shortfalls_are_filled_from_the_other_side(self, monkeypatch):
         monkeypatch.setitem(replay_set.TARGETS, "interjection", 10)
         few_undecided = [self._row(i, epoch=f"d#{i}", hist="sakura", kind="interjection") for i in range(20)]

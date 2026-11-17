@@ -75,7 +75,9 @@ EPOCH_GAP_SEC = 30.0
 # 区分ごとに、「何も決めなかった行」（当時の答えが none / unknown）に取っておく割合。足りなければある分だけ。
 # WHY: 本番で一番多いのは「誰も手を挙げない」「挙手中の無関係な発話」。決めた行だけを集めると、新しいモデルが
 #      余計に手を挙げる、関係ない発話で許可する、という変化に気づけない。
-UNDECIDED_SHARE = {"approval": 0.3, "interjection": 0.5, "route": 0.3}
+#      callout の「決めなかった行」は、wake と組の Agent の発話（当時の意図ゲートの答えが無い行）。枠が無いと、
+#      callout は意図ゲートがオンだった回の行だけで埋まり、ゲートがオフの回（本番の既定）の呼びかけが入らない。
+UNDECIDED_SHARE = {"approval": 0.3, "interjection": 0.5, "route": 0.3, "callout": 0.3}
 
 # wake の行と Agent.invoke の行を組にする期限（秒）。wake の直後に応答が始まるので、これより後は別の呼び出し。
 WAKE_PAIR_SEC = 30.0
