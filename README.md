@@ -491,7 +491,9 @@ uv run --frozen --all-extras python -m lab_lounge.probe history --label past
 
 - `probe agent` は、本番の組み立て（人格、配信文脈、日時の system prompt、道具のスキーマ）のまま、道具だけを長さを固定した定型の応答に差し替えます（外の検索や記憶、他キャラの発話を呼ばないので、本応答の LLM の時間だけが測れます）。
   配信文脈は最初の回の写し（`data/probe/private/stream_context_snapshot.md`）を、後の回も使います。取り直すなら `--refresh-snapshot`。`L2_ENABLE_TOOLS` が無効だと、本番は Agent を通らないので断ります。
-- 時間切れ（`L2_AGENT_INVOKE_TIMEOUT_SEC`）に当たったら、記録してからプロセスごと終えます（取り残したスレッドの課金を止めるため）。
+- 時間切れ（`L2_AGENT_INVOKE_TIMEOUT_SEC`）に当たったら、記録してからプロセスごと終えます（取り残したスレッドの課金を止めるため）。`agent.invoke` の中（SDK など）が自分で投げたタイムアウトは、普通の失敗として記録して続けます。
+- 全体で 30 分ほどかかるので、キャラ（と `raw` のグループ）は、発話の番号ごとに交互に流します（API の混み具合の変化が後のキャラに偏らないように）。`cold` はキャラごとの 1 本目で、DNS や TLS を払うプロセスの最初の呼び出し、提供元ごとの最初の呼び出しには、別に `first_in_process` / `first_for_provider` の印が付きます。
+- tokens の入力は 2 つの名前で区別します: `in_total`（キャッシュの読み書きを含む合計。LangChain の `input_tokens` と同じ意味）と `in_uncached`（キャッシュに当たらなかった入力。Anthropic の `input_tokens` と同じ意味）。`cache_read` / `cache_creation` と並べて、キャッシュの効果を比べます。usage を拾えない提供元が 1 社でもあれば、止まります（提供元ごとに確かめています）。
 
 **食べ比べ**（後継のモデルを、同じ発話で比べる流れ）:
 
@@ -513,8 +515,8 @@ uv run --frozen --all-extras python -m lab_lounge.c2_probe latency --profile dev
 uv run --frozen --all-extras python -m lab_lounge.c2_probe timeouts --label past
 ```
 
-- `latency` は、本番の retriever と同じ形の要求（`GET /retrieve?q=..&k=..`、`GET /retrieve/recent?k=..`、リクエストごとに新しい接続）を、`L2_C2_URL`（と、あれば `L2_C2_URL_READONLY`）へ送ります。読むだけです。時間切れは 10 秒と長めにして分布を見ます。1 周目を cold、2 周目以降を warm とし、warm の p99 を収める最小の値（100 ms 刻み）を予算の目安として出します。
-- `timeouts` の分母は検索の呼び出し数、分子は retriever ごとのタイムアウトの行数なので、比は確率ではありません（出力の注記にも書いてあります）。
+- `latency` は、本番の retriever と同じ形の要求（`GET /retrieve?q=..&k=..`、`GET /retrieve/recent?k=..`、リクエストごとに新しい接続）を、`L2_C2_URL`（と、あれば `L2_C2_URL_READONLY`）へ送ります。読むだけです。時間切れは 10 秒と長めにして分布を見ます。1 周目を cold、2 周目以降を warm とし、warm の p99 を収める最小の値（100 ms 刻み）を予算の目安として出します（失敗は時間切れまで待った 1 件として数え、warm の失敗が 1% を超えるときは目安を出さずに理由を出します）。`localhost` と `127.0.0.1` の比べは別の問いなので `host_compare` と呼びます。送り先が loopback でなければ、ホスト名は画面にも meta にも出さず `remote` とポートだけにします。本番の設定に合わせて、`L2_USE_C2_RECENT` が true でない、または `L2_C2_RECENT_SCOPE=session` のときは `/retrieve/recent` を測らず（理由を出します）、`L2_USE_C2_RETRIEVER` が true でなければ、本番は C2 を使わないと警告します。
+- `timeouts` の分母は検索の呼び出し数、分子は retriever ごとのタイムアウトの行数なので、比は確率ではありません（出力の注記にも書いてあります）。Agent が 1 度も答えなかった回（最も悪い回）も含め、含めた本数を注記に出します（`probe history` も同じ）。
 
 **終了コード**（`probe` / `c2_probe` / `replay`）: 0 正常、1 失敗（呼び出しの失敗、時間切れ、承認の反転）、2 断った（同じ名前の回がある、入力が無い、ツールが無効）、3 前提サービスなし（`c2_probe latency` の /health）、4 上限・価格表にないモデル・usage の拾い損ねで止めた、64 コマンドラインの誤り。
 
