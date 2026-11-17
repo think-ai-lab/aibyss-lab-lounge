@@ -322,7 +322,7 @@ class Sample:
 
     def line(self) -> dict[str, Any]:
         return {"group": self.group, "i": self.index, "input_id": self.input_id, "model": self.model,
-                "provider": self.provider, "model_on_wire": self.model_on_wire, "elapsed_ms": self.elapsed_ms,
+                "provider": self.provider, "model_on_wire": label_of(self.model_on_wire), "elapsed_ms": self.elapsed_ms,
                 "error": self.error, "usd": round(self.usd, 9), "tokens": self.tokens}
 
 
@@ -335,7 +335,18 @@ class Outcome:
     error: str | None
 
 
-_TOKEN_KEYS = ("input", "output", "reasoning", "cache_read", "cache_creation")
+# tokens の鍵。入力は 2 つの名前で区別する（SDK と LangChain で「入力」の意味が違い、キャッシュの効果を比べるときに混ざるため）:
+#   input_total:    入力の合計（キャッシュの読み書きを含む。LangChain の usage_metadata の input_tokens と同じ意味）
+#   input_uncached: キャッシュに当たらなかった入力（Anthropic の API の input_tokens と同じ意味）
+_TOKEN_KEYS = ("input_total", "input_uncached", "output", "reasoning", "cache_read", "cache_creation")
+
+
+def label_of(value: object) -> str | None:
+    """提供元から来た短い文字列（モデル名、finish）を、記録と画面へ出してよい形にする。
+
+    WHY: 値は API の応答から来る。空白や長い文字列は、本文が紛れ込みうるので、長さだけにする（spend._showable）。
+    """
+    return spend._showable(value) if isinstance(value, str) and value else None
 
 _filler_capture = threading.local()
 
@@ -477,9 +488,9 @@ def summarize(samples: list[Sample]) -> dict[str, Any]:
     """グループの集計。時間は成功した呼び出しだけで数える（失敗の待ち時間が分布を歪めないように）。"""
     ok = [s for s in samples if not s.error and s.elapsed_ms is not None]
     times = [float(s.elapsed_ms) for s in ok if s.elapsed_ms is not None]
-    total = {key: sum(s.tokens.get(key, 0) for s in samples) for key in _TOKEN_KEYS}
+    total = {key: sum(s.tokens.get(key, 0) for s in samples) for key in _TOKEN_KEYS}  # 合計（失敗の分は 0）
     models = Counter(s.model for s in samples if s.model)
-    wire = Counter(s.model_on_wire for s in samples if s.model_on_wire)
+    wire = Counter(label_of(s.model_on_wire) for s in samples if s.model_on_wire)
     return {
         "n": len(samples), "failed": len(samples) - len(ok),
         "p50": percentile(times, 0.5), "p90": percentile(times, 0.9), "max": max(times) if times else None,
@@ -495,8 +506,9 @@ def print_summary(name: str, summary: dict[str, Any]) -> None:
     t = summary["tokens"]
     emit(f"  {name}: モデル {models}（応答 {wire}）  n={summary['n']} 失敗={summary['failed']}  "
          f"p50={_ms(summary['p50'])}ms p90={_ms(summary['p90'])}ms 最大={_ms(summary['max'])}ms  "
-         f"tokens in={t['input']} out={t['output']} reasoning={t['reasoning']} "
-         f"cache_read={t['cache_read']} cache_creation={t['cache_creation']}  ${summary['usd']:.4f}")
+         f"tokens 合計 in_total={t['input_total']} in_uncached={t['input_uncached']} out={t['output']} "
+         f"reasoning={t['reasoning']} cache_read={t['cache_read']} cache_creation={t['cache_creation']}  "
+         f"${summary['usd']:.4f}")
 
 
 def raw_meta(label: str, args: argparse.Namespace, *, pools: dict[str, int], inputs_sha: str) -> dict[str, Any]:
@@ -694,12 +706,15 @@ def make_recorder() -> Any:
             message = _first_generation_message(response)
             calls = [_safe_tool_name(call.get("name")) for call in (getattr(message, "tool_calls", None) or [])
                      if isinstance(call, dict)]
+            cache_read, cache_creation = int(info["cache_read"] or 0), int(info["cache_creation"] or 0)
+            input_total = int(info["input"] or 0)  # LangChain の input_tokens は、キャッシュの読み書きを含む合計
             self.steps.append({
                 "n": len(self.steps) + 1,
                 "ms": None if started is None else int((time.monotonic() - started) * 1000),
-                **{key: int(info[key] or 0) for key in _TOKEN_KEYS},
-                "finish": info["finish"] if isinstance(info["finish"], str) else None,
-                "model": info["model"] if isinstance(info["model"], str) else None,
+                "input_total": input_total, "input_uncached": max(0, input_total - cache_read - cache_creation),
+                "output": int(info["output"] or 0), "reasoning": int(info["reasoning"] or 0),
+                "cache_read": cache_read, "cache_creation": cache_creation,
+                "finish": label_of(info["finish"]), "model": label_of(info["model"]),
                 "tool_calls": calls, "error": None,
             })
 
@@ -888,7 +903,7 @@ def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: Ag
             summary = _summarize_agent_result(result)
             body = response_text(result)
             # source が structured_response でないとき（本番はメッセージの本文へ落ちる）は、失敗にせず source に出す。
-            line.update(source=summary["source"], response_chars=summary["response_len"], finish=summary["finish"],
+            line.update(source=summary["source"], response_chars=summary["response_len"], finish=label_of(summary["finish"]),
                         tools_fired=[_safe_tool_name(name) for name in summary["tools"]])
     except AgentTimeout as exc:
         line["error"] = "Timeout"
@@ -927,7 +942,8 @@ def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
     warm = [float(line["total_ms"]) for line in ok if not line["cold"]]
     steps = [step for line in ok for step in line["steps"]]
     step_ms = [float(step["ms"]) for step in steps if step["ms"] is not None and not step["error"]]
-    tokens = {key: sum(step[key] for line in lines for step in line["steps"]) for key in _TOKEN_KEYS}
+    # tokens は成功した呼び出しだけで足す（1 回あたりの表示を、成功の数で割れるように。失敗の分の費用は usd に入る）。
+    tokens = {key: sum(step[key] for line in ok for step in line["steps"]) for key in _TOKEN_KEYS}
     fired: Counter = Counter()
     for line in ok:
         fired.update(line["tools_fired"])
@@ -939,8 +955,9 @@ def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
         "tools_fired": dict(fired), "source": dict(Counter(line["source"] for line in lines if line["source"])),
         "usd": sum(line.get("usd", 0.0) for line in lines),
         "models": dict(Counter(line["model"] for line in lines if line["model"])),
-        "model_on_wire": dict(Counter(step["model"] for line in lines for step in line["steps"] if step["model"])),
-        "finish": dict(Counter(line["finish"] for line in lines if line["finish"])),
+        "model_on_wire": dict(Counter(label_of(step["model"]) for line in lines for step in line["steps"]
+                                      if step["model"])),
+        "finish": dict(Counter(label_of(line["finish"]) for line in lines if line["finish"])),
     }
 
 
@@ -950,14 +967,19 @@ def print_agent_summary(slug: str, summary: dict[str, Any]) -> None:
     wire = "/".join(spend._showable(m) for m in sorted(summary["model_on_wire"])) or "-"
     n_ok = max(summary["n"] - summary["failed"], 1)
     t = summary["tokens"]
+
+    def per(total: int) -> int:
+        return round(total / n_ok)
+
     fired = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["tools_fired"].items())) or "なし"
     source = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["source"].items())) or "-"
     emit(f"  {slug}: モデル {models}（応答 {wire}）  n={summary['n']} 失敗={summary['failed']}  "
          f"cold={_ms(summary['cold_ms'])}ms  warm p50={_ms(summary['warm_p50'])}ms p90={_ms(summary['warm_p90'])}ms "
          f"最大={_ms(summary['warm_max'])}ms  step p50={_ms(summary['step_p50'])}ms p90={_ms(summary['step_p90'])}ms")
     emit(f"      steps 平均 {summary['steps_mean'] if summary['steps_mean'] is None else round(summary['steps_mean'], 2)}  "
-         f"tokens/回 in={t['input'] // n_ok} out={t['output'] // n_ok} reasoning={t['reasoning'] // n_ok} "
-         f"cache_read={t['cache_read'] // n_ok} cache_creation={t['cache_creation'] // n_ok}  "
+         f"tokens/回（成功 {n_ok} 回の平均）in_total={per(t['input_total'])} in_uncached={per(t['input_uncached'])} "
+         f"out={per(t['output'])} reasoning={per(t['reasoning'])} cache_read={per(t['cache_read'])} "
+         f"cache_creation={per(t['cache_creation'])}  "
          f"道具 {fired}  source {source}  ${summary['usd']:.4f}")
 
 

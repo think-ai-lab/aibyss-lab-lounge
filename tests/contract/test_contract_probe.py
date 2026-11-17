@@ -79,8 +79,8 @@ def test_raw_measures_every_group_without_text(probe_env, fake_llm, capsys):
     }
     assert all(line["error"] is None and line["elapsed_ms"] is not None for line in lines)
     # tokens は HTTP の層の写し。3 社とも拾えて、費用が付く。
-    assert all(line["tokens"]["input"] > 0 and line["tokens"]["output"] > 0 and line["usd"] > 0 for line in lines)
-    assert all(set(line["tokens"]) == {"input", "output", "reasoning", "cache_read", "cache_creation"} for line in lines)
+    assert all(line["tokens"]["input_total"] > 0 and line["tokens"]["input_uncached"] > 0 and line["tokens"]["output"] > 0 and line["usd"] > 0 for line in lines)
+    assert all(set(line["tokens"]) == {"input_total", "input_uncached", "output", "reasoning", "cache_read", "cache_creation"} for line in lines)
     assert all(line["model_on_wire"] for line in lines)
 
     meta = json.loads((out_dir / "raw_contract.meta.json").read_text(encoding="utf-8"))
@@ -201,7 +201,7 @@ def test_agent_measures_steps_tools_and_cache_fields_without_text(agent_probe_en
     for line in lines:
         assert line["total_ms"] is not None and line["build_ms"] is not None and line["usd"] > 0
         for step in line["steps"]:
-            assert step["input"] > 0 and step["output"] > 0 and step["ms"] is not None and step["model"]
+            assert step["input_total"] > 0 and step["input_uncached"] > 0 and step["output"] > 0 and step["ms"] is not None and step["model"]
             assert {"reasoning", "cache_read", "cache_creation", "finish"} <= set(step)
     assert "response" not in first
     # 道具は定型の応答で、スキーマは本物のまま: 2 回目の要求に定型の応答が載り、1 回目の要求に 3 つの道具の名前がある。

@@ -213,32 +213,33 @@ class TestMeasureGroup:
             ledger.add(run="unit", model="claude-haiku-4-5", usd=0.002, usage=None, status="no_usage")
             spend._THREAD.last = {"model": "claude-haiku-4-5", "model_on_wire": "claude-haiku-4-5-20251001",
                                   "status": "usage", "usd": 0.002,
-                                  "tokens": {"input": 10, "output": 2, "reasoning": 0, "cache_read": 5,
+                                  "tokens": {"input_total": 22, "input_uncached": 10, "output": 2, "reasoning": 0, "cache_read": 5,
                                              "cache_creation": 7}}
             return probe.Outcome("claude-haiku-4-5", 50, None)
 
         (sample,) = probe.measure_group(probe.RawGroup("g", [("x", run)]), ledger, "unit", gap_sec=0,
                                         sink=lambda _s: None)
         assert sample.usd == pytest.approx(0.002) and sample.model_on_wire == "claude-haiku-4-5-20251001"
-        assert sample.tokens == {"input": 10, "output": 2, "reasoning": 0, "cache_read": 5, "cache_creation": 7}
+        assert sample.tokens == {"input_total": 22, "input_uncached": 10, "output": 2, "reasoning": 0, "cache_read": 5,
+                                 "cache_creation": 7}
 
     def test_a_stale_last_call_is_not_reused(self, tmp_path):
         ledger = self._ledger(tmp_path)
         spend._THREAD.last = {"model": "x", "model_on_wire": "stale", "status": "usage", "usd": 1.0,
-                              "tokens": {"input": 99}}
+                              "tokens": {"input_total": 99, "input_uncached": 99}}
         group = probe.RawGroup("g", [("x", lambda: probe.Outcome(None, None, "NoCall"))])
         (sample,) = probe.measure_group(group, ledger, "unit", gap_sec=0, sink=lambda _s: None)
-        assert sample.model_on_wire is None and sample.tokens["input"] == 0
+        assert sample.model_on_wire is None and sample.tokens["input_total"] == 0
 
     def test_sample_line_has_no_text(self):
-        sample = probe.Sample("g", 0, "s001", "m", "w", 10, None, 0.1, {"input": 1})
+        sample = probe.Sample("g", 0, "s001", "m", "w", 10, None, 0.1, {"input_total": 1})
         assert set(sample.line()) == {"group", "i", "input_id", "model", "provider", "model_on_wire", "elapsed_ms", "error",
                                       "usd", "tokens"}
 
 
 class TestSummarize:
     def _sample(self, ms, error=None, usd=0.001, **tokens):
-        return probe.Sample("g", 0, "x", "m", "w", ms, error, usd, {"input": 1, "output": 1, **tokens})
+        return probe.Sample("g", 0, "x", "m", "w", ms, error, usd, {"input_total": 1, "output": 1, **tokens})
 
     def test_times_use_successes_only(self):
         samples = [self._sample(100), self._sample(200), self._sample(90000, error="APITimeoutError")]
@@ -397,8 +398,9 @@ class TestRecorder:
             meta={"stop_reason": "tool_use", "model_name": "claude-haiku-4-5-20251001"}), run_id=run)
         (step,) = recorder.steps
         assert step["n"] == 1 and step["ms"] is not None and step["error"] is None
-        assert (step["input"], step["output"], step["reasoning"], step["cache_read"], step["cache_creation"]) == (
-            100, 20, 5, 60, 30)
+        # LangChain の input_tokens は合計（キャッシュの読み書きを含む）。キャッシュ外はそこから引く。
+        assert (step["input_total"], step["input_uncached"], step["output"], step["reasoning"], step["cache_read"],
+                step["cache_creation"]) == (100, 10, 20, 5, 60, 30)
         assert (step["finish"], step["model"], step["tool_calls"]) == (
             "tool_use", "claude-haiku-4-5-20251001", ["web_search_tool"])
         assert _SENTINEL not in json.dumps(recorder.steps)
@@ -412,7 +414,7 @@ class TestRecorder:
                             run_id=second)
         recorder.on_llm_end(self._response(usage={"input_tokens": 2, "output_tokens": 2, "total_tokens": 4}),
                             run_id=first)
-        assert [s["input"] for s in recorder.steps] == [1, 2] and not recorder._llm_open
+        assert [s["input_total"] for s in recorder.steps] == [1, 2] and not recorder._llm_open
 
     def test_error_step_keeps_only_the_type(self):
         recorder = probe.make_recorder()
@@ -427,7 +429,7 @@ class TestRecorder:
         run = uuid.uuid4()
         recorder.on_chat_model_start({}, [[]], run_id=run)
         recorder.on_llm_end(self._response(), run_id=run)
-        assert recorder.steps[0]["input"] == 0 and recorder.steps[0]["cache_read"] == 0
+        assert recorder.steps[0]["input_total"] == 0 and recorder.steps[0]["cache_read"] == 0
 
     def test_tool_name_and_time_are_recorded_and_odd_names_are_hidden(self):
         recorder = probe.make_recorder()
@@ -510,7 +512,7 @@ class TestInvokeAgent:
 
 class TestSummarizeAgent:
     def _line(self, ms, *, cold=False, error=None, steps=2, tools=(), usd=0.01, source="structured_response"):
-        step = {"ms": 100, "input": 10, "output": 5, "reasoning": 1, "cache_read": 4, "cache_creation": 2,
+        step = {"ms": 100, "input_total": 16, "input_uncached": 10, "output": 5, "reasoning": 1, "cache_read": 4, "cache_creation": 2,
                 "finish": "stop", "model": "m-wire", "error": None, "tool_calls": []}
         return {"cold": cold, "error": error, "total_ms": ms, "steps": [step] * steps, "tools_fired": list(tools),
                 "source": source, "usd": usd, "model": "m", "finish": "stop"}
@@ -743,3 +745,66 @@ class TestProviderCapture:
         probe.check_steps_were_metered({"character": "mimi", "steps": [step], "http_calls": 1})
         probe.check_steps_were_metered({"character": "mimi", "steps": [], "http_calls": 0})  # step が無いなら対象外
         probe.check_steps_were_metered({"character": "mimi", "steps": [{"error": "APIError"}], "http_calls": 0})
+
+
+class TestTokensAndLabels:
+    def _line(self, *, error=None, total=100, uncached=40, cache_read=50, cache_creation=10):
+        step = {"ms": 5, "input_total": total, "input_uncached": uncached, "output": 7, "reasoning": 0,
+                "cache_read": cache_read, "cache_creation": cache_creation, "finish": "stop", "model": "m",
+                "error": None, "tool_calls": []}
+        return {"cold": False, "error": error, "total_ms": 10, "steps": [step], "tools_fired": [], "source": "x",
+                "usd": 0.0, "model": "m", "finish": "stop"}
+
+    def test_the_two_input_names_mean_total_and_not_cached(self):
+        recorder = probe.make_recorder()
+        run = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run)
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        message = AIMessage(content="x", usage_metadata={
+            "input_tokens": 1000, "output_tokens": 5, "total_tokens": 1005,
+            "input_token_details": {"cache_read": 700, "cache_creation": 100}})
+        recorder.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run)
+        (step,) = recorder.steps
+        assert step["input_total"] == 1000 and step["input_uncached"] == 200  # 1000 - 700 - 100
+        assert step["input_total"] == step["input_uncached"] + step["cache_read"] + step["cache_creation"]
+
+    def test_per_call_tokens_use_only_the_successful_calls(self, capsys):
+        lines = [self._line(), self._line(), self._line(error="APIError", total=9999, uncached=9999)]
+        summary = probe.summarize_agent(lines)
+        assert summary["tokens"]["input_total"] == 200 and summary["tokens"]["input_uncached"] == 80
+        probe.print_agent_summary("mimi", summary)
+        out = capsys.readouterr().out
+        assert "成功 2 回の平均" in out and "in_total=100" in out and "in_uncached=40" in out
+        assert "cache_read=50" in out and "cache_creation=10" in out
+
+    def test_raw_summary_names_both_input_counts(self, capsys):
+        sample = probe.Sample("g", 0, "x", "m", "w", 10, None, 0.0,
+                              {"input_total": 12, "input_uncached": 2, "output": 1, "reasoning": 0, "cache_read": 10,
+                               "cache_creation": 0})
+        probe.print_summary("g", probe.summarize([sample]))
+        out = capsys.readouterr().out
+        assert "in_total=12" in out and "in_uncached=2" in out and "合計" in out
+
+    @pytest.mark.parametrize("value, expected", [
+        ("end_turn", "end_turn"), ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+        ("answer with spaces " + _SENTINEL, None), (None, None), ("", None), (5, None)])
+    def test_provider_supplied_labels_are_shown_only_when_they_look_like_names(self, value, expected):
+        shown = probe.label_of(value)
+        if expected is None and isinstance(value, str) and value:
+            assert shown is not None and _SENTINEL not in shown and shown.startswith("<")
+        else:
+            assert shown == expected
+
+    def test_a_step_with_an_odd_finish_or_model_is_stored_as_a_length(self):
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        recorder = probe.make_recorder()
+        run = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run)
+        message = AIMessage(content="x", response_metadata={"stop_reason": "has space " + _SENTINEL,
+                                                            "model_name": "m " + _SENTINEL})
+        recorder.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run)
+        assert _SENTINEL not in json.dumps(recorder.steps)
