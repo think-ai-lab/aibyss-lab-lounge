@@ -6,6 +6,10 @@ bench_ttft.py — マルチプロバイダ TTFT / レイテンシ ベンチマ�
   - 本番の Agent（ツール、構造化出力、system prompt）を通さず、短いプロンプトの TTFT だけを測る。
     本番と同じ経路の時間は `python -m lab_lounge.probe agent`（step ごとの時間と tokens）で測る。
   - 1 つでも失敗（[skip] を含む）があれば終了コード 1 で終わる。黙って表が欠けたまま緑にしないため。
+  - **支出の記録（lab_lounge.spend）と上限の外**で動く。呼び出しの数は `--trials` × プロンプト × モデルで決まり、
+    費用は記録されない。試す前に `--only` と `--trials` で絞る。価格表（spend prices）に無いモデルも流れる。
+  - 継承した LLM の接続先（ANTHROPIC_BASE_URL など）は、最初に環境から外す（本番と別の相手を測らないため）。
+    `.env` がそれらを指定していれば、終了コード 2 で止まる。
 
 A.I.byss Suite の LLM 呼び出しレイヤ（LangChain）経由で、
 各モデルの TTFT (Time To First Token) と総生成時間を計測する。
@@ -51,6 +55,7 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # .env 読み込み
@@ -249,7 +254,33 @@ def run_trial(llm, model: str, prompt_kind: str, prompt: str) -> Trial:
             return Trial(model, prompt_kind, None, first_chunk, total, chars, error="NoVisibleText")
         return Trial(model, prompt_kind, ttft, first_chunk, total, chars)
     except Exception as e:  # noqa: BLE001
-        return Trial(model, prompt_kind, None, None, None, 0, error=repr(e))
+        return Trial(model, prompt_kind, None, None, None, 0, error=describe_error(e))
+
+
+def describe_error(exc: BaseException) -> str:
+    """例外を、型の名前と（あれば）HTTP の状態だけで表す。
+
+    WHY: repr(e) は、API が返したメッセージ（要求の断片や鍵の一部を含みうる）をそのまま CSV と画面へ出す。
+         プロンプトは今は固定の合成の文だが、将来の取り違えに備えて、型と状態だけに絞る。
+    """
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return type(exc).__name__ + (f"({status})" if isinstance(status, int) else "")
+
+
+def clean_inherited_endpoints(env_path: str | None) -> None:
+    """継承した LLM の接続先（ANTHROPIC_BASE_URL など）を環境から外す。lab_lounge が無い環境では警告だけ。
+
+    WHY: ツールなどから起動すると接続先を継承していることがあり、本番と別の相手を測ってしまう。
+         `.env` がそれらを指定していれば、clean_llm_env が終了コード 2 で止める。
+    """
+    try:
+        from lab_lounge.preflight import clean_llm_env
+    except ImportError:
+        print("[env] lab_lounge が import できないので、継承した接続先は外していません")
+        return
+    candidates = [env_path] if env_path else [
+        os.path.join(os.getcwd(), ".env"), os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")]
+    clean_llm_env([Path(path) for path in candidates if path and os.path.exists(path)])
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +373,7 @@ def main() -> int:
     ap.add_argument("--env", type=str, default="", help=".env ファイルのパス（省略時は自動探索）")
     args = ap.parse_args()
 
+    clean_inherited_endpoints(args.env or None)
     load_env(args.env or None)
 
     targets = [m for m in MODELS if args.only.lower() in m["model"].lower()]
@@ -373,7 +405,7 @@ def run_all(targets: list[dict], prompts: dict[str, str], trials: int, all_trial
         try:
             llm = build_llm(spec["provider"], spec["model"])
         except Exception as e:  # noqa: BLE001
-            print(f"[skip] {spec['model']}: クライアント生成失敗 {e!r}")
+            print(f"[skip] {spec['model']}: クライアント生成失敗 {describe_error(e)}")
             failures += 1
             continue
 

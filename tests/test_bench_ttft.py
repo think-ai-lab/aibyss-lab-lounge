@@ -53,6 +53,7 @@ def _run_main(monkeypatch, tmp_path, *, build, trial):
     monkeypatch.setattr(sys, "argv", ["bench_ttft.py", "--only", "haiku", "--trials", "2", "--prompt", "greeting",
                                       "--csv", str(tmp_path / "out.csv")])
     monkeypatch.setattr(bench_ttft, "load_env", lambda _path=None: None)
+    monkeypatch.setattr(bench_ttft, "clean_inherited_endpoints", lambda _path=None: None)
     monkeypatch.setattr(bench_ttft, "check_keys", lambda _providers: None)
     monkeypatch.setattr(bench_ttft.time, "sleep", lambda _s: None)
     monkeypatch.setattr(bench_ttft, "build_llm", build)
@@ -147,3 +148,68 @@ def test_the_csv_keeps_the_trials_done_before_a_crash(monkeypatch, tmp_path):
         _run_main(monkeypatch, tmp_path, build=lambda p, m: object(), trial=trial)
     lines = (tmp_path / "out.csv").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1 + 1  # 見出し + 完了した 1 試行
+
+
+_MARK = "SENTINEL-bench-5b7e"
+
+
+class _ApiError(Exception):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_errors_are_shown_by_type_and_status_only():
+    assert bench_ttft.describe_error(_ApiError(_MARK, 429)) == "_ApiError(429)"
+    assert bench_ttft.describe_error(ValueError(_MARK)) == "ValueError"
+    trial = bench_ttft.run_trial(_Boom(), "m", "g", _MARK)
+    assert trial.error == "_ApiError(500)" and _MARK not in repr(trial)
+
+
+class _Boom:
+    def stream(self, _messages):
+        raise _ApiError(_MARK, 500)
+        yield  # pragma: no cover
+
+
+def test_skip_line_has_no_exception_message(monkeypatch, tmp_path, capsys):
+    def build(provider, model):
+        raise _ApiError(_MARK, 401)
+
+    assert _run_main(monkeypatch, tmp_path, build=build, trial=_ok) == 1
+    out = capsys.readouterr().out
+    assert "_ApiError(401)" in out and _MARK not in out
+
+
+def test_inherited_endpoints_are_removed_before_anything_else(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://example.invalid")
+    bench_ttft.clean_inherited_endpoints(None)
+    import os
+
+    assert "ANTHROPIC_BASE_URL" not in os.environ
+    assert "ANTHROPIC_BASE_URL" in capsys.readouterr().out  # 外した変数名は知らせる（値は出さない）
+
+
+def test_an_env_file_that_sets_an_endpoint_stops_the_run(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("ANTHROPIC_BASE_URL=http://example.invalid\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as stopped:
+        bench_ttft.clean_inherited_endpoints(str(env))
+    assert stopped.value.code == 2
+
+
+def test_main_cleans_the_environment_before_loading_env(monkeypatch, tmp_path):
+    order = []
+    monkeypatch.setattr(sys, "argv", ["bench_ttft.py", "--only", "haiku", "--trials", "1", "--prompt", "greeting",
+                                      "--csv", str(tmp_path / "o.csv")])
+    monkeypatch.setattr(bench_ttft, "clean_inherited_endpoints", lambda _p=None: order.append("clean"))
+    monkeypatch.setattr(bench_ttft, "load_env", lambda _p=None: order.append("load"))
+    monkeypatch.setattr(bench_ttft, "check_keys", lambda _p: None)
+    monkeypatch.setattr(bench_ttft.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bench_ttft, "build_llm", lambda p, m: object())
+    monkeypatch.setattr(bench_ttft, "run_trial", _ok)
+    assert bench_ttft.main() == 0 and order == ["clean", "load"]
+
+
+def test_the_header_says_it_is_outside_the_spend_record():
+    assert "支出の記録" in bench_ttft.__doc__ and "外" in bench_ttft.__doc__
