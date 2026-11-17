@@ -367,3 +367,40 @@ class TestPrivateAnswers:
         canonical = replay.canonical_answers()
         for config in get_all_characters():
             assert {config.slug, f"granted:{config.slug}", f"denied:{config.slug}"} <= canonical
+
+
+class TestPrerequisites:
+    def _put(self, set_dir, label, reps, keys_by_rep, rows):
+        runs = set_dir / "runs"
+        (runs / f"{label}.meta.json").write_text(json.dumps({"reps": reps, "set_sha": "x", "rows": len(rows)}),
+                                                 encoding="utf-8")
+        (runs / f"{label}.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in _lines_for(rows, keys_by_rep)), encoding="utf-8")
+
+    def test_incomplete_run_fails_compare_and_score(self, pair, capsys):
+        set_dir, rows = pair
+        self._put(set_dir, "partial", 1, {1: ["none", "granted:chisame", "callout", "mimi", None]}, rows)
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "partial") == 1
+        assert "FAIL (前提) 全部の行に結果がある" in capsys.readouterr().out
+        assert _cli(set_dir, "score", "--base", "base", "--run", "partial") == 1
+
+    def test_error_heavy_run_fails(self, pair, capsys):
+        set_dir, rows = pair
+        self._put(set_dir, "broken", 1, {1: ["error:APITimeoutError"] * 4 + ["none"]}, rows)
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "broken") == 1
+        out = capsys.readouterr().out
+        assert "FAIL (前提) エラーの行: 4 / 上限 3" in out
+        # 失敗だらけでも違う行は 0 になる。前提が無いと合格に見えていた
+        assert "違う行: 0" in out
+
+    def test_flips_that_do_not_repeat_in_rep_two_are_shown(self, pair, capsys):
+        set_dir, rows = pair
+        self._put(set_dir, "twice", 2, {1: ["none", "denied:chisame", "callout", "mimi", "none"],
+                                        2: ["none", "granted:chisame", "callout", "mimi", "none"]}, rows)
+        assert _cli(set_dir, "compare", "--base", "base", "--run", "twice") == 1
+        assert "基準と同じに戻った反転 1" in capsys.readouterr().out
+
+    def test_run_errors_limit(self):
+        lines = [{"id": f"r{i}", "rep": 1, "attempt": 2, "error": "X" if i < 4 else None} for i in range(10)]
+        assert replay.run_errors(lines, 10) == (4, 3)
+        assert replay.run_errors(lines, 1000) == (4, 10)

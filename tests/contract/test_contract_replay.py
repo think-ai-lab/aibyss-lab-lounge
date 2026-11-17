@@ -99,3 +99,12 @@ def test_budget_stop_leaves_partial_results_and_spend(replay_env, fake_llm):
     with pytest.raises(spend.BudgetExceeded):
         _run(set_dir, spend_dir, synthetic, "--max-usd", "0.0000001")
     assert fake_llm.requests_for("anthropic") == []
+
+
+def test_run_with_many_errors_exits_nonzero(replay_env, fake_llm, capsys):
+    """失敗だらけの回は、終了コードで気づける（比べる基準に使わない）。"""
+    set_dir, spend_dir, synthetic = replay_env
+    fake_llm.scene("anthropic", "http_error", status=500, message=_SENTINEL)
+    assert _run(set_dir, spend_dir, synthetic) == 1
+    out = capsys.readouterr().out
+    assert "エラーで終わった判定が 8 件（上限 3）" in out and _SENTINEL not in out

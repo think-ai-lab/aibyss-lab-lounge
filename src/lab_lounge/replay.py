@@ -34,7 +34,8 @@ replay.py — 判定のリプレイ（固定のセットに本物の判定の関
   uv run --frozen --all-extras python -m lab_lounge.replay score   --base <基準> --run <名前>
 
 【終了コード】
-  0: 正常（compare は反転なし、score は全部 PASS）/ 1: 失敗（compare は反転あり、score は FAIL）
+  0: 正常（compare は反転なしで前提も PASS、score は全部 PASS）
+  1: 失敗（run はエラーの判定が上限を超えた、compare は反転ありか前提が FAIL、score は FAIL）
   2: 実行を断った（同じ名前の回がある、再開の条件が違う、確認のファイルがすでにある）
   3: score で未判定の行が残っている / 4: 上限などで止めた（spend）/ 64: コマンドラインの誤り
 
@@ -468,6 +469,12 @@ MAX_WRONG = 3
 MAX_WRONG_CALLOUT_TO_MENTION = 1
 MAX_EXTRA_UNKNOWN = 3
 
+# 合格の前提: 比べる 2 つの回が、セットの全部の行の結果を持ち、エラーが基準 + 3 行以下（または全体の 1% 以下）。
+# WHY: エラーの行と結果の無い行は比べられないので、反転も誤りも数えられない。前提が無いと、失敗だらけの回や
+#      途中で止まった回ほど「違う行が少ない」ように見え、合格になってしまう。
+MAX_EXTRA_ERRORS = 3
+MAX_ERROR_RATE = 0.01
+
 # review のファイルの印。o: 新しい答えが正しい / x: 新しい答えが誤り / a: 別の候補も妥当（挙手候補だけ）/ 空白: 未判定
 _MARKS = {" ": None, "o": "correct", "x": "wrong", "a": "alternative"}
 _REVIEW_LINE = re.compile(r"^- \[(?P<mark>.)\] (?P<id>\S+) (?P<kind>\S+) (?P<base>\S+) → (?P<new>\S+) \| ")
@@ -491,10 +498,14 @@ class Diff:
 class Comparison:
     """基準の回（rep 1）と新しい回（rep 1）の比べ（数と結果の鍵だけ）。"""
 
+    rows: int = 0
     compared: int = 0
     unstable: int = 0
     flips: int = 0
     flips_unstable: int = 0
+    flips_not_repeated: int = 0
+    missing_base: int = 0
+    missing_run: int = 0
     unknown_base: int = 0
     unknown_run: int = 0
     errors_base: int = 0
@@ -510,18 +521,23 @@ def _is_flip(base: str, new: str) -> bool:
 
 
 def compare_runs(rows: list[dict[str, Any]], base_lines: list[dict[str, Any]], run_lines: list[dict[str, Any]],
-                 *, base_reps: int) -> Comparison:
-    """基準の回と新しい回を比べる。
+                 *, base_reps: int, run_reps: int = 1) -> Comparison:
+    """基準の回と新しい回を、セットの全部の行で比べる。
 
     基準は base の rep 1。base の rep 1 と rep 2 で答えが揺れた行は「揺れる行」として数え、反転の数から外す
     （temperature 0 でも揺れる行の違いは、変更のせいとは言えないため）。エラーの行は比べずに数だけ数える。
+    結果の無い行（途中で止まった、セットが変わった）は、基準と新しい回のそれぞれで数える（合格の前提に使う）。
+    新しい回に rep 2 があれば、反転のうち rep 2 では基準と同じ答えに戻った行も別に数えて見せる（数え方は変えない）。
     """
     base, run = _final_by_key(base_lines), _final_by_key(run_lines)
-    result = Comparison()
+    result = Comparison(rows=len(rows))
     for row in rows:
         first = base.get((row["id"], 1), {}).get("result_key")
         second = base.get((row["id"], 2), {}).get("result_key") if base_reps >= 2 else None
         new = run.get((row["id"], 1), {}).get("result_key")
+        new_second = run.get((row["id"], 2), {}).get("result_key") if run_reps >= 2 else None
+        result.missing_base += first is None
+        result.missing_run += new is None
         if first is None or new is None:
             result.missing += 1
             continue
@@ -542,8 +558,23 @@ def compare_runs(rows: list[dict[str, Any]], base_lines: list[dict[str, Any]], r
                 result.flips_unstable += 1
             else:
                 result.flips += 1
+                result.flips_not_repeated += new_second == first
         result.diffs.append(Diff(row, first, new, unstable))
     return result
+
+
+def prerequisites(comparison: Comparison) -> list[tuple[str, str, str]]:
+    """合格の前提ごとの (名前, 値, PASS / FAIL) を返す。満たさなければ、ほかの基準によらず合格にしない。"""
+    error_limit = max(comparison.errors_base + MAX_EXTRA_ERRORS, math.floor(comparison.rows * MAX_ERROR_RATE))
+    complete = comparison.missing_base == 0 and comparison.missing_run == 0
+    return [
+        ("(前提) 全部の行に結果がある",
+         f"結果の無い行 基準 {comparison.missing_base} / 新しい回 {comparison.missing_run}（セット {comparison.rows} 行）",
+         "PASS" if complete else "FAIL"),
+        ("(前提) エラーの行", f"{comparison.errors_run} / 上限 {error_limit}（基準 {comparison.errors_base} + "
+         f"{MAX_EXTRA_ERRORS}、または全体の {MAX_ERROR_RATE:.0%}）",
+         "PASS" if comparison.errors_run <= error_limit else "FAIL"),
+    ]
 
 
 def print_comparison(base: str, run: str, comparison: Comparison) -> None:
@@ -551,12 +582,15 @@ def print_comparison(base: str, run: str, comparison: Comparison) -> None:
     emit(f"{run} を {base} と比べる: 比べた {comparison.compared} 行（基準で揺れる行 {comparison.unstable}、"
          f"結果の無い行 {comparison.missing}）")
     emit(f"承認の反転（granted ⇔ denied、揺れない行）: {comparison.flips}"
-         f"（揺れる行の反転 {comparison.flips_unstable} は別に数える）")
+         f"（揺れる行の反転 {comparison.flips_unstable} は別に数える。新しい回の rep 2 では基準と同じに戻った反転 "
+         f"{comparison.flips_not_repeated}）")
     emit(f"unknown: {comparison.unknown_base} → {comparison.unknown_run}  "
          f"エラー: {comparison.errors_base} → {comparison.errors_run}")
     emit(f"違う行: {len(comparison.diffs)}")
     for transition, count in sorted(comparison.transitions.items()):
         emit(f"  {transition}: {count}")
+    for name, value, verdict in prerequisites(comparison):
+        emit(f"  {verdict} {name}: {value}")
 
 
 def _review_path(set_dir: Path, base: str, run: str) -> Path:
@@ -673,6 +707,7 @@ def verdicts(comparison: Comparison, result: Score) -> list[tuple[str, str, str]
         return "未確定" if needs_marks and pending else "PASS"
 
     return [
+        *prerequisites(comparison),
         ("(a) 承認の反転（揺れない行）", f"{comparison.flips} / 上限 {MAX_FLIPS}", judge(comparison.flips <= MAX_FLIPS)),
         ("(b) 誤りとした行", f"{result.wrong} / 上限 {MAX_WRONG}（うち揺れる行 {result.wrong_unstable}）",
          judge(result.wrong <= MAX_WRONG, needs_marks=True)),
@@ -709,11 +744,11 @@ def _load_pair(args: argparse.Namespace) -> tuple[Path, Comparison] | None:
         metas[label] = json.loads(path.read_text(encoding="utf-8"))
     rows, _, _ = load_rows(set_dir, args.synthetic)
     base_lines, run_lines = RunFile(runs / f"{args.base}.jsonl").lines(), RunFile(runs / f"{args.run}.jsonl").lines()
-    ran = {line["id"] for line in base_lines} & {line["id"] for line in run_lines}
-    rows = [row for row in rows if row["id"] in ran]
     if metas[args.base].get("set_sha") != metas[args.run].get("set_sha"):
-        emit("[警告] 2 つの回のセットのハッシュが違います（共通の行だけを比べます）")
-    return set_dir, compare_runs(rows, base_lines, run_lines, base_reps=int(metas[args.base]["reps"]))
+        emit("[警告] 2 つの回のセットのハッシュが違います（結果の無い行は前提で FAIL になります）")
+    # 今のセットの全部の行で比べる（両方の回にある行だけに絞ると、途中で止まった回が合格に見える）。
+    return set_dir, compare_runs(rows, base_lines, run_lines, base_reps=int(metas[args.base]["reps"]),
+                                 run_reps=int(metas[args.run]["reps"]))
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
@@ -721,7 +756,8 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     if loaded is None:
         return EXIT_FAILED
     print_comparison(args.base, args.run, loaded[1])
-    return EXIT_FAILED if loaded[1].flips > MAX_FLIPS else EXIT_OK
+    failed = loaded[1].flips > MAX_FLIPS or any(v == "FAIL" for _, _, v in prerequisites(loaded[1]))
+    return EXIT_FAILED if failed else EXIT_OK
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
@@ -818,8 +854,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
          f"今回 ${spent:.4f}（1 件あたり ${spent / judged if judged else 0:.5f}）、"
          f"usage を拾えず見積もりで数えた呼び出し {meter.stats.uncounted}")
     emit("応答のモデル名: " + ", ".join(f"{spend._showable(k)} {v}" for k, v in sorted(wire.items(), key=str)))
-    print_report(make_report(args.label, rows, RunFile(run_path).lines(), args.reps))
+    lines = RunFile(run_path).lines()
+    print_report(make_report(args.label, rows, lines, args.reps))
+    errors, limit = run_errors(lines, len(rows) * args.reps)
+    if errors > limit:
+        emit(f"[失敗] エラーで終わった判定が {errors} 件（上限 {limit}）。この回は比べる基準に使えません")
+        return EXIT_FAILED
     return EXIT_OK
+
+
+def run_errors(lines: list[dict[str, Any]], pairs: int) -> tuple[int, int]:
+    """やり直しの後もエラー（NoCall を含む）で終わった (id, rep) の数と、許す上限を返す。
+
+    上限は MAX_EXTRA_ERRORS と、全体の MAX_ERROR_RATE の大きい方。WHY: 失敗の多い回は判定を測っていないので、
+    終了コードで気づけるようにする（比べるときの前提と同じ線）。
+    """
+    errors = sum(1 for line in _final_by_key(lines).values() if line["error"])
+    return errors, max(MAX_EXTRA_ERRORS, math.floor(pairs * MAX_ERROR_RATE))
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
