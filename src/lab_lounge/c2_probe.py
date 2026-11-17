@@ -175,15 +175,15 @@ def load_queries(path: Path | None = None) -> list[Query]:
     """合成の問い合わせを読む。形: ``{"id": "q01", "query": "...", "shape": "short|long", "likely": "hit|miss"}``。
 
     Raises:
-        ValueError: ファイルが無い、形が違う、id が重なる（行番号だけを知らせる。本文は出さない）
+        MeasureInputError: ファイルが無い、形が違う、id が重なる（行番号だけを知らせる。本文は出さない）
     """
     path = path or default_queries_path()
     if not path.is_file():
-        raise ValueError(f"問い合わせ（{path.name}）がありません")
+        raise probe.MeasureInputError(f"問い合わせ（{path.name}）がありません")
     items: list[Query] = []
     bad: list[int] = []
     seen: set[str] = set()
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(probe.read_text_checked(path).split("\n"), start=1):
         if not line.strip():
             continue
         try:
@@ -200,9 +200,9 @@ def load_queries(path: Path | None = None) -> list[Query]:
         seen.add(item["id"])
         items.append(Query(item["id"], item["query"], item["shape"], item["likely"]))
     if bad:
-        raise ValueError(f"問い合わせの形が違います（{path.name} の {', '.join(map(str, bad))} 行目）")
+        raise probe.MeasureInputError(f"問い合わせの形が違います（{path.name} の {', '.join(map(str, bad))} 行目）")
     if not items:
-        raise ValueError(f"問い合わせ（{path.name}）が空です")
+        raise probe.MeasureInputError(f"問い合わせ（{path.name}）が空です")
     return items
 
 
@@ -321,7 +321,7 @@ def _cmd_latency(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
     try:
         queries = load_queries(args.queries)
-    except ValueError as exc:  # 自分の読み込みの例外。文言は行番号と名前だけ
+    except probe.MeasureInputError as exc:  # 自分で作った文言（行番号と名前だけ）
         emit(f"[断りました] {exc}")
         return EXIT_REFUSED
 

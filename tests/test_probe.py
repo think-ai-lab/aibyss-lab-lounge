@@ -636,3 +636,46 @@ class TestHistory:
         assert '"Agent LLM step %d 完了 [character=%s] latency_ms=%d%s"' in source
         assert '"Agent 実行完了 [character=%s]: latency_ms=%d source=%s text_len=%d text=%r"' in source
         assert '"Agent 実行失敗 [character=%s]: %s。単一ノードにフォールバック。"' in source
+
+
+# ─── 入力のエラー ────────────────────────────────────────────────
+
+class TestMeasureInputError:
+    def test_it_is_a_value_error_with_only_our_own_wording(self):
+        assert issubclass(probe.MeasureInputError, ValueError)
+
+    def test_a_file_that_is_not_utf8_is_reported_by_name_only(self, tmp_path):
+        path = tmp_path / "agent_utterances.jsonl"
+        path.write_bytes(_SENTINEL.encode() + bytes([0xFF, 0xFE]))
+        with pytest.raises(probe.MeasureInputError) as caught:
+            probe.load_utterances(path)
+        assert "agent_utterances.jsonl" in str(caught.value) and _SENTINEL not in str(caught.value)
+
+    def test_a_synthetic_file_that_is_not_utf8_is_refused_cleanly(self, tmp_path, capsys):
+        bad = tmp_path / "replay_synthetic.jsonl"
+        bad.write_bytes(_SENTINEL.encode() + bytes([0xFF, 0xFE]))
+        code = probe.main(["raw", "--profile", "dev", "--label", "x", "--max-usd", "1", "--out-dir", str(tmp_path),
+                           "--synthetic", str(bad), "--utterances", str(_utterances(tmp_path))])
+        out = capsys.readouterr().out
+        assert code == probe.EXIT_REFUSED and "断りました" in out and _SENTINEL not in out
+
+    def test_line_and_paragraph_separators_inside_a_text_do_not_split_a_row(self, tmp_path):
+        text = "{name}、" + chr(0x2028) + "続き" + chr(0x85) + "さらに"
+        items = probe.load_utterances(_utterances(tmp_path, [text, "{name}、二つ目"]))
+        assert [i.id for i in items] == ["u01", "u02"] and items[0].text == text
+
+    def test_a_crlf_file_is_read(self, tmp_path):
+        path = _utterances(tmp_path)
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        assert len(probe.load_utterances(path)) == 2
+
+    def test_only_our_own_errors_are_printed(self, tmp_path, monkeypatch, capsys):
+        def boom(_path):
+            raise ValueError(_SENTINEL)  # 自分の文言ではない ValueError（入力の断片を含みうる）
+
+        monkeypatch.setattr(probe, "load_utterances", boom)
+        with pytest.raises(ValueError):
+            probe.main(["raw", "--profile", "dev", "--label", "x", "--max-usd", "1", "--out-dir", str(tmp_path),
+                        "--synthetic", str(_synthetic(tmp_path)), "--utterances", str(tmp_path / "u.jsonl")])
+        captured = capsys.readouterr()
+        assert _SENTINEL not in captured.out + captured.err

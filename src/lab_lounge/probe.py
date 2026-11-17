@@ -186,6 +186,22 @@ def digest(parts: Any) -> str:
 
 # ─── 入力（合成） ────────────────────────────────────────────────
 
+class MeasureInputError(ValueError):
+    """計測の入力（合成の行、引数）の形が違う。
+
+    WHY 専用の型: 画面へ出してよい文言は、自分で作ったもの（ファイル名と行番号だけ）に限る。ValueError 全般を
+         捕まえて出すと、JSON や変換の例外（入力の断片を含みうる）まで画面へ出てしまう。この型だけを捕まえて出す。
+    """
+
+
+def read_text_checked(path: Path) -> str:
+    """UTF-8 のファイルを読む。読めなければ、ファイル名だけを含む MeasureInputError にする。"""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise MeasureInputError(f"{path.name} を読めません（開けない、または UTF-8 でない）") from None
+
+
 @dataclass(frozen=True)
 class RouterItem:
     """判定の入力 1 件。本文は計測の間だけメモリにある。"""
@@ -211,14 +227,19 @@ def load_router_pool(path: Path | None) -> tuple[list[RouterItem], list[RouterIt
     背景の発話の全部にかかるので、呼びかけを含む発話も入力としてふさわしい。
 
     Raises:
-        ValueError: 合成の行の形が違う、または種類が足りない（行番号と名前だけを知らせる）
+        MeasureInputError: 合成の行の形が違う、または種類が足りない（行番号と名前だけを知らせる）
     """
-    rows = replay_set.load_synthetic(path)
+    try:
+        rows = replay_set.load_synthetic(path)
+    except UnicodeDecodeError:
+        raise MeasureInputError("合成の行を読めません（UTF-8 でない）") from None
+    except ValueError as exc:  # replay_set 自身の文言（ファイル名と行番号だけ）
+        raise MeasureInputError(str(exc)) from None
     interjection = [RouterItem(r["id"], r["input"], ()) for r in rows if r["kind"] in ("interjection", "intent")]
     approval = [RouterItem(r["id"], r["input"], tuple(r["candidates"])) for r in rows
                 if r["kind"] == "approval" and r["candidates"]]
     if not interjection or not approval:
-        raise ValueError("合成の行に、挙手の候補（interjection / intent）か承認（approval）の入力がありません")
+        raise MeasureInputError("合成の行に、挙手の候補（interjection / intent）か承認（approval）の入力がありません")
     return interjection, approval
 
 
@@ -228,15 +249,16 @@ def load_utterances(path: Path | None = None) -> list[Utterance]:
     形: ``{"id": "u01", "category": "greeting|explain|deep|search|collab", "text": "{name}、..."}``
 
     Raises:
-        ValueError: ファイルが無い、形が違う行がある、id が重なる、未知の置き換え（行番号だけを知らせる。本文は出さない）
+        MeasureInputError: ファイルが無い、形が違う行がある、id が重なる、未知の置き換え（行番号だけを知らせる。本文は出さない）
     """
     path = path or default_utterances_path()
     if not path.is_file():
-        raise ValueError(f"計測の発話（{path.name}）がありません")
+        raise MeasureInputError(f"計測の発話（{path.name}）がありません")
     items: list[Utterance] = []
     bad: list[int] = []
     seen: set[str] = set()
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    # WHY split("\n"): JSONL は \n だけで区切る。splitlines は本文の U+2028 などでも割り、1 件が壊れる。
+    for number, line in enumerate(read_text_checked(path).split("\n"), start=1):
         if not line.strip():
             continue
         try:
@@ -254,9 +276,9 @@ def load_utterances(path: Path | None = None) -> list[Utterance]:
         seen.add(item["id"])
         items.append(Utterance(item["id"], item["category"], item["text"]))
     if bad:
-        raise ValueError(f"計測の発話の形が違います（{path.name} の {', '.join(map(str, bad))} 行目）")
+        raise MeasureInputError(f"計測の発話の形が違います（{path.name} の {', '.join(map(str, bad))} 行目）")
     if not items:
-        raise ValueError(f"計測の発話（{path.name}）が空です")
+        raise MeasureInputError(f"計測の発話（{path.name}）が空です")
     return items
 
 
@@ -266,7 +288,7 @@ def wake_word(slug: str) -> str:
 
     word = get_character(slug).wake_word
     if not word:
-        raise ValueError(f"キャラクター {slug} に wake_word がありません")
+        raise MeasureInputError(f"キャラクター {slug} に wake_word がありません")
     return word
 
 
@@ -485,7 +507,7 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     try:
         interjection, approval = load_router_pool(args.synthetic) if args.only != "filler" else ([], [])
         utterances = load_utterances(args.utterances) if args.only != "router" else []
-    except ValueError as exc:  # 自分の読み込みの例外。文言は行番号と名前だけ
+    except MeasureInputError as exc:  # 自分で作った文言（行番号と名前だけ）
         emit(f"[断りました] {exc}")
         return EXIT_REFUSED
 
@@ -890,13 +912,13 @@ def parse_tool_chars(texts: list[str]) -> dict[str, int]:
     """``--tool-chars web_search=800`` の列を、既定に重ねた長さの表にする。
 
     Raises:
-        ValueError: 名前が道具にない、または長さが 1 以上の整数でない
+        MeasureInputError: 名前が道具にない、または長さが 1 以上の整数でない
     """
     lengths = dict(DEFAULT_TOOL_CHARS)
     for text in texts:
         name, _, value = text.partition("=")
         if name not in lengths or not value.isdecimal() or int(value) < 1:
-            raise ValueError("--tool-chars は 道具名=文字数（web_search / retrieve_memory / ask_character）の形にしてください")
+            raise MeasureInputError("--tool-chars は 道具名=文字数（web_search / retrieve_memory / ask_character）の形にしてください")
         lengths[name] = int(value)
     return lengths
 
@@ -905,13 +927,13 @@ def parse_llm_override(text: str | None) -> tuple[str, str] | None:
     """``--llm anthropic:claude-sonnet-4-6`` を (provider, model) にする。
 
     Raises:
-        ValueError: provider:model の形でない、または provider が違う
+        MeasureInputError: provider:model の形でない、または provider が違う
     """
     if not text:
         return None
     provider, _, model = text.partition(":")
     if provider not in ("openai", "anthropic", "google") or not model:
-        raise ValueError("--llm は provider:model（provider は openai / anthropic / google）の形にしてください")
+        raise MeasureInputError("--llm は provider:model（provider は openai / anthropic / google）の形にしてください")
     return provider, model
 
 
@@ -952,7 +974,7 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     try:
         lengths = parse_tool_chars(args.tool_chars)
         llm_override = parse_llm_override(args.llm)
-    except ValueError as exc:  # 自分の検査の文言（入力の値は含まない）
+    except MeasureInputError as exc:  # 自分で作った文言（入力の値は含まない）
         emit(str(exc))
         return EXIT_USAGE
     out_dir = args.out_dir or spend.default_spend_dir()
@@ -962,7 +984,7 @@ def _cmd_agent(args: argparse.Namespace) -> int:
         return EXIT_REFUSED
     try:
         utterances = load_utterances(args.utterances)
-    except ValueError as exc:
+    except MeasureInputError as exc:
         emit(f"[断りました] {exc}")
         return EXIT_REFUSED
     if args.limit:

@@ -378,3 +378,30 @@ class TestTimeouts:
         assert 'logger.warning("RecentC2Retriever タイムアウト (timeout_s=%s)", self._timeout_s)' in source
         memory = Path(retriever.__file__).with_name("mcp_servers").joinpath("retrieve_memory.py").read_text(encoding="utf-8")
         assert '"記憶検索実行: %r (top_k=%d, stream_id=%s)"' in memory
+
+
+class TestQueryInputErrors:
+    def test_a_file_that_is_not_utf8_is_reported_by_name_only(self, tmp_path):
+        path = tmp_path / "c2_queries.jsonl"
+        path.write_bytes(_SENTINEL.encode() + bytes([0xFF, 0xFE]))
+        with pytest.raises(probe.MeasureInputError) as caught:
+            c2_probe.load_queries(path)
+        assert "c2_queries.jsonl" in str(caught.value) and _SENTINEL not in str(caught.value)
+
+    def test_separators_inside_a_query_do_not_split_a_row(self, tmp_path):
+        row = {"id": "q01", "query": "深海" + chr(0x2028) + "魚", "shape": "short", "likely": "hit"}
+        path = tmp_path / "q.jsonl"
+        path.write_text(json.dumps(row, ensure_ascii=False) + chr(10), encoding="utf-8")
+        assert c2_probe.load_queries(path)[0].text == row["query"]
+
+    def test_bad_queries_are_refused_without_printing_other_errors(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(preflight, "prepare_env", lambda *_a, **_k: [])
+
+        def boom(_path=None):
+            raise ValueError(_SENTINEL)
+
+        monkeypatch.setattr(c2_probe, "load_queries", boom)
+        with pytest.raises(ValueError):
+            c2_probe.main(["latency", "--profile", "dev", "--label", "z", "--out-dir", str(tmp_path)])
+        captured = capsys.readouterr()
+        assert _SENTINEL not in captured.out + captured.err
