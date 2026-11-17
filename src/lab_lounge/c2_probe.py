@@ -475,9 +475,11 @@ def _cmd_timeouts(args: argparse.Namespace) -> int:
     if not runs_dir.is_dir():
         emit(f"実走ログの場所がありません: {runs_dir.name}")
         return EXIT_FAILED
-    paths, by_rule = probe.select_run_logs(runs_dir, args.since)
+    paths, by_rule, notes = probe.select_run_logs(runs_dir, args.since)
     emit(f"実走ログ: 使う {by_rule.get('使う', 0)} 本（" + "、".join(
         f"{rule} {count}" for rule, count in sorted(by_rule.items()) if rule != "使う") + "）")
+    for note in notes:
+        emit(f"注: {note}")
     if not paths:
         emit("使える実走ログがありません")
         return EXIT_FAILED
@@ -488,7 +490,7 @@ def _cmd_timeouts(args: argparse.Namespace) -> int:
     probe._write_json(out_dir / f"c2_timeouts_{args.label}.json", {
         "tool": "c2_timeouts", "label": args.label, "generated": datetime.now(UTC).isoformat(timespec="seconds"),
         "since": args.since.isoformat(), "cutoff_day": CUTOFF_DAY, "files": {"used": len(paths), "by_rule": dict(by_rule)},
-        "counts": stats, "note": TIMEOUT_NOTE,
+        "counts": stats, "note": TIMEOUT_NOTE, "selection_notes": notes,
     })
     emit(f"書き出し: c2_timeouts_{args.label}.json")
     return EXIT_OK

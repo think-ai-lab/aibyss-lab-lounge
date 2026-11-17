@@ -590,17 +590,20 @@ class TestHistory:
         # 目印は発話でない行（行頭の形がある行）だけで照らす（replay_set.test_mark_in）
         _write_log(runs, "run_loop_20260610_120000.log", [_step(1, "mimi", 99999),
                                                           _log_line("失敗: boom", name="lab_lounge.pipeline")])
-        _write_log(runs, "run_loop_20260611_120000.log", [_total("mimi", 99999)])
+        # Agent が 1 度も step を完了しなかった回も、時間の数字には含める（最も悪い回を落とさない）
+        _write_log(runs, "run_loop_20260611_120000.log", [_total("sakura", 30000)])
         return runs
 
     def test_selects_like_the_replay_set_and_counts_by_month(self, tmp_path):
         runs = self._runs(tmp_path)
-        paths, by_rule = probe.select_run_logs(runs, date(2026, 5, 8))
-        assert by_rule["使う"] == 3 and sum(by_rule.values()) == 6
+        paths, by_rule, notes = probe.select_run_logs(runs, date(2026, 5, 8))
+        assert by_rule["使う"] == 4 and sum(by_rule.values()) == 6
+        assert any("1 度も無かった回 1 本を含みます" in note for note in notes)
         stats = probe.history_stats(paths)
         assert sorted(stats["totals"][("mimi", "2026-06")]) == [2500.0, 4500.0]
         assert sorted(stats["steps"][("mimi", "2026-06")]) == [1000.0, 2000.0, 3000.0]
-        assert stats["totals"][("sakura", "2026-06")] == [700.0] and stats["failed"][("mimi", "2026-06")] == 1
+        assert sorted(stats["totals"][("sakura", "2026-06")]) == [700.0, 30000.0]
+        assert stats["failed"][("mimi", "2026-06")] == 1
         assert max(stats["totals"][("mimi", "2026-07")]) == 900.0  # 使わない回の 99999 は入らない
 
     def test_report_marks_months_before_the_format_and_empty_months(self):
@@ -625,7 +628,8 @@ class TestHistory:
         saved = json.loads((out_dir / "history_t.json").read_text(encoding="utf-8"))
         assert _SENTINEL not in json.dumps(saved) and saved["formats_since"]["step"] == "2026-05-11"
         assert saved["table"]["mimi"]["2026-06"]["steps"]["n"] == 3
-        assert saved["files"]["used"] == 3
+        assert saved["files"]["used"] == 4 and any("含みます" in note for note in saved["notes"])
+        assert "注: " in captured.out
 
     def test_no_logs_is_a_failure(self, tmp_path, capsys):
         (tmp_path / "runs").mkdir()

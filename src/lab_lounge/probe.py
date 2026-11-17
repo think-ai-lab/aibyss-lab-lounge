@@ -1298,15 +1298,18 @@ def default_runs_dir() -> Path:
     return replay_set.default_logs_dir() / "runs"
 
 
-def select_run_logs(runs_dir: Path, since: date) -> tuple[list[Path], Counter]:
-    """計測に使う実走ログを選ぶ（replay_set と同じ規則: pytest の残りを除き、本物の配信の回だけ）。
+def select_run_logs(runs_dir: Path, since: date) -> tuple[list[Path], Counter, list[str]]:
+    """計測に使う実走ログを選ぶ（replay_set と同じ規則で pytest の残りを除く。Agent の完了は求めない）。
+
+    WHY Agent の完了を求めない: 時間やタイムアウトを数えるとき、Agent が 1 度も答えられなかった回は、
+         最も悪い回であることが多い。落とすと、数字が実際より良く見える。含めた本数は注記に出す。
 
     Returns:
-        (ファイル, 規則ごとの本数)。本数は画面に出してよい
+        (ファイル, 規則ごとの本数, 偏りの注記)。本数と注記は画面に出してよい
     """
     report = replay_set.BuildReport()
-    paths = replay_set.select_files(runs_dir, since, report)
-    return paths, report.files_by_rule
+    paths = replay_set.select_files(runs_dir, since, report, require_agent=False)
+    return paths, report.files_by_rule, list(report.notes)
 
 
 def log_month(path: Path) -> str | None:
@@ -1419,9 +1422,11 @@ def _cmd_history(args: argparse.Namespace) -> int:
     if not runs_dir.is_dir():
         emit(f"実走ログの場所がありません: {runs_dir.name}")
         return EXIT_FAILED
-    paths, by_rule = select_run_logs(runs_dir, args.since)
+    paths, by_rule, notes = select_run_logs(runs_dir, args.since)
     emit(f"実走ログ: 使う {by_rule.get('使う', 0)} 本（" + "、".join(
         f"{rule} {count}" for rule, count in sorted(by_rule.items()) if rule != "使う") + "）")
+    for note in notes:
+        emit(f"注: {note}")
     if not paths:
         emit("使える実走ログがありません")
         return EXIT_FAILED
@@ -1434,7 +1439,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
         "tool": "history", "label": args.label, "generated": datetime.now(UTC).isoformat(timespec="seconds"),
         "since": args.since.isoformat(), "files": {"used": len(paths), "by_rule": dict(by_rule)},
         "formats_since": LOG_FORMATS_SINCE, "months": months, "table": table,
-        "notes": ["全体 = Agent 実行完了の latency_ms（_run_agent の開始から完了まで）、step = Agent LLM step N 完了の latency_ms",
+        "notes": [*notes, "全体 = Agent 実行完了の latency_ms（_run_agent の開始から完了まで）、step = Agent LLM step N 完了の latency_ms",
                   "月は実走ログのファイル名の日付。書式なし = その書式のログが出る前の月、データなし = 書式はあるが該当の行が 0 件"],
     })
     emit(f"書き出し: history_{args.label}.json")

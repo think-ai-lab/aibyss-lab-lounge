@@ -345,7 +345,7 @@ def _runs(tmp_path):
 
 class TestTimeouts:
     def test_counts_by_month_and_around_the_cutoff(self, tmp_path):
-        paths, _ = probe.select_run_logs(_runs(tmp_path), date(2026, 5, 8))
+        paths, _, _ = probe.select_run_logs(_runs(tmp_path), date(2026, 5, 8))
         stats = c2_probe.timeouts_stats(paths)
         assert stats["month:2026-10"] == {"tool_calls": 5, "timeout_c2": 3, "timeout_c2_0.6s": 2 + 1,
                                           "timeout_recent": 1, "timeout_recent_0.6s": 1, "http_error": 1}
@@ -405,3 +405,18 @@ class TestQueryInputErrors:
             c2_probe.main(["latency", "--profile", "dev", "--label", "z", "--out-dir", str(tmp_path)])
         captured = capsys.readouterr()
         assert _SENTINEL not in captured.out + captured.err
+
+
+class TestTimeoutsIncludeRunsThatNeverAnswered:
+    def test_a_run_without_any_agent_answer_is_counted_and_noted(self, tmp_path, capsys):
+        runs = _runs(tmp_path)
+        # Agent が 1 度も答えなかった回（最も悪い回）。タイムアウトの行だけがある。
+        (runs / "run_loop_20261025_090000.log").write_text(
+            _log_line("C2Retriever タイムアウト (timeout_s=0.6)") * 4, encoding="utf-8")
+        out_dir = tmp_path / "out"
+        assert c2_probe.main(["timeouts", "--label", "t", "--logs-dir", str(runs), "--out-dir", str(out_dir)]) == 0
+        out = capsys.readouterr().out
+        assert "注: Agent の応答が 1 度も無かった回 1 本を含みます" in out
+        saved = json.loads((out_dir / "c2_timeouts_t.json").read_text(encoding="utf-8"))
+        assert saved["counts"]["side:before"]["timeout_c2"] == 3 + 4
+        assert any("含みます" in note for note in saved["selection_notes"])
