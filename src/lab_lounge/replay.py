@@ -92,7 +92,12 @@ _ENV_IN_META = ("L2_LLM_ROUTER_MODEL", "L2_INTENT_GATE_MODEL", "L2_USE_LLM_ROUTE
 _SDKS = ("anthropic", "openai", "google-genai", "httpx", "httpx2")
 
 # 再開のときに一致を求める meta の鍵。
-_RESUME_KEYS = ("uv_lock_sha", "models", "set_sha", "env")
+_RESUME_KEYS = ("uv_lock_sha", "models", "set_sha", "env", "judge_code_sha", "reps", "canary")
+
+# 判定の system prompt を組み立てるファイル。版の見分けに、中身のハッシュを meta に残す。
+# WHY: commit だけでは、作業中の変更（dirty）や、キャラの担当エリア（skills/characters/*.md）の書き換えで
+#      プロンプトが変わったことが分からない。再開で、違うプロンプトの行が 1 つの回に混ざらないようにする。
+_JUDGE_SOURCES = ("router.py", "characters.py")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -245,11 +250,43 @@ def _git_commit() -> str | None:
     return done.stdout.strip() or None
 
 
+def judge_code_sha() -> str:
+    """判定の system prompt を組み立てるファイル（router.py、characters.py、skills/characters/*.md）のハッシュ。"""
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    paths = [package / name for name in _JUDGE_SOURCES]
+    paths += sorted((package / "skills" / "characters").glob("*.md"))
+    for path in paths:
+        if path.is_file():
+            digest.update(path.relative_to(package).as_posix().encode("utf-8") + b"\0" + path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def _git_dirty() -> bool | None:
+    """追跡中のファイルに commit していない変更があるか。git が答えなければ None。"""
+    try:
+        done = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"],
+                              cwd=_REPO_ROOT, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(done.stdout.strip()) if done.returncode == 0 else None
+
+
+def prompt_shas(rows: list[dict[str, Any]], lines: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """種類ごとの、実際に使われた system prompt のハッシュの一覧。"""
+    kinds = {row["id"]: row["kind"] for row in rows}
+    found: dict[str, set[str]] = defaultdict(set)
+    for line in lines:
+        if line.get("prompt_sha") and line["id"] in kinds:
+            found[kinds[line["id"]]].add(line["prompt_sha"])
+    return {kind: sorted(shas) for kind, shas in sorted(found.items())}
+
+
 def _file_sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16] if path.is_file() else None
 
 
-def build_meta(label: str, rows: list[dict[str, Any]], *, reps: int, excluded: int) -> dict[str, Any]:
+def build_meta(label: str, rows: list[dict[str, Any]], *, reps: int, excluded: int, canary: int = 0) -> dict[str, Any]:
     """実行の meta。値は設定と版と数だけ（本文なし）。"""
     versions = {}
     for name in _SDKS:
@@ -259,13 +296,15 @@ def build_meta(label: str, rows: list[dict[str, Any]], *, reps: int, excluded: i
             versions[name] = None
     return {
         "label": label, "started": datetime.now(UTC).isoformat(timespec="seconds"), "commit": _git_commit(),
+        "dirty": _git_dirty(), "judge_code_sha": judge_code_sha(),
         "uv_lock_sha": _file_sha(_REPO_ROOT / "uv.lock"), "sdk": versions,
+        # 判定の関数と同じ式で読む（既定を写さない。router のモジュールの値が変われば、ここも変わる）。
         "models": {
-            "router": os.environ.get("L2_LLM_ROUTER_MODEL", "claude-haiku-4-5"),
-            "intent_gate": os.environ.get("L2_INTENT_GATE_MODEL", "claude-haiku-4-5"),
+            "router": os.environ.get("L2_LLM_ROUTER_MODEL", router._LLM_ROUTER_MODEL),
+            "intent_gate": os.environ.get("L2_INTENT_GATE_MODEL", router._INTENT_GATE_MODEL),
         },
         "env": {name: os.environ.get(name) for name in _ENV_IN_META},
-        "set_sha": set_sha(rows), "rows": len(rows), "reps": reps, "excluded": excluded,
+        "set_sha": set_sha(rows), "rows": len(rows), "reps": reps, "canary": canary, "excluded": excluded,
         "by_bucket": dict(Counter(replay_set.bucket(r) for r in rows)),
     }
 
@@ -282,7 +321,7 @@ class RunFile:
     def lines(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []
-        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [json.loads(line) for line in replay_set.jsonl_lines(self.path.read_text(encoding="utf-8"))]
 
     def append(self, line: dict[str, Any]) -> None:
         with self._lock:
@@ -602,10 +641,9 @@ def load_judged(set_dir: Path) -> dict[tuple[str, str], str]:
     path = set_dir / "judged.jsonl"
     judged: dict[tuple[str, str], str] = {}
     if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                item = json.loads(line)
-                judged[(item["id"], item["new"])] = item["mark"]
+        for line in replay_set.jsonl_lines(path.read_text(encoding="utf-8")):
+            item = json.loads(line)
+            judged[(item["id"], item["new"])] = item["mark"]
     return judged
 
 
@@ -746,6 +784,11 @@ def _load_pair(args: argparse.Namespace) -> tuple[Path, Comparison] | None:
     base_lines, run_lines = RunFile(runs / f"{args.base}.jsonl").lines(), RunFile(runs / f"{args.run}.jsonl").lines()
     if metas[args.base].get("set_sha") != metas[args.run].get("set_sha"):
         emit("[警告] 2 つの回のセットのハッシュが違います（結果の無い行は前提で FAIL になります）")
+    base_prompts, run_prompts = metas[args.base].get("prompt_shas", {}), metas[args.run].get("prompt_shas", {})
+    changed = sorted(kind for kind in set(base_prompts) | set(run_prompts)
+                     if base_prompts.get(kind) != run_prompts.get(kind))
+    if changed:
+        emit(f"system prompt が基準と違う種類: {', '.join(changed)}")
     # 今のセットの全部の行で比べる（両方の回にある行だけに絞ると、途中で止まった回が合格に見える）。
     return set_dir, compare_runs(rows, base_lines, run_lines, base_reps=int(metas[args.base]["reps"]),
                                  run_reps=int(metas[args.run]["reps"]))
@@ -818,8 +861,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         emit(f"[警告] {warning}")
     if args.canary:
         rows = canary_rows(rows, args.canary)
-    meta = build_meta(args.label, rows, reps=args.reps, excluded=excluded)
-    if args.resume and meta_path.is_file():
+    meta = build_meta(args.label, rows, reps=args.reps, excluded=excluded, canary=args.canary)
+    if args.resume and not meta_path.is_file():
+        emit(f"再開できません（実行 {args.label} の meta がありません）")
+        return EXIT_REFUSED
+    if args.resume:
         previous = json.loads(meta_path.read_text(encoding="utf-8"))
         changed = [key for key in _RESUME_KEYS if previous.get(key) != meta.get(key)]
         if changed:
@@ -842,10 +888,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         stats = execute(rows, RunFile(run_path), reps=args.reps, workers=args.workers, meter=meter,
                         answers=RunFile(private_runs / f"{args.label}.answers.jsonl"))
         spent = ledger.run_usd(args.label) - before
-    wire = Counter(json.loads(line).get("model_on_wire") for line in
-                   ledger.calls_path.read_text(encoding="utf-8").splitlines()
-                   if json.loads(line).get("run") == args.label)
+    calls = [json.loads(line) for line in replay_set.jsonl_lines(ledger.calls_path.read_text(encoding="utf-8"))] \
+        if ledger.calls_path.is_file() else []
+    wire = Counter(call.get("model_on_wire") for call in calls if call.get("run") == args.label)
     meta["model_on_wire"] = {str(k): v for k, v in wire.items()}
+    meta["prompt_shas"] = prompt_shas(rows, RunFile(run_path).lines())
+    mixed = [kind for kind, shas in meta["prompt_shas"].items() if len(shas) > 1]
+    if mixed:
+        emit(f"[警告] 1 つの回の中で、system prompt が 2 つ以上あります: {', '.join(mixed)}")
     meta["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
 
@@ -926,6 +976,12 @@ def main(argv: list[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return EXIT_OK if exc.code == 0 else EXIT_USAGE
+    # 回の名前はファイルの名前になるので、短く安全な形に限る（../ で data/ の外へ書かせない）。
+    for name in ("label", "base", "run"):
+        value = getattr(args, name, None)
+        if value is not None and not spend._RUN_NAME.fullmatch(value):
+            emit(f"--{name} は、英数字と _.- で 64 字までにしてください")
+            return EXIT_USAGE
     if args.command == "run":
         if args.reps < 1 or args.workers < 1 or args.canary < 0:
             emit("--reps と --workers は 1 以上、--canary は 0 以上にしてください")

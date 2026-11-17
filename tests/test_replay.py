@@ -404,3 +404,30 @@ class TestPrerequisites:
         lines = [{"id": f"r{i}", "rep": 1, "attempt": 2, "error": "X" if i < 4 else None} for i in range(10)]
         assert replay.run_errors(lines, 10) == (4, 3)
         assert replay.run_errors(lines, 1000) == (4, 10)
+
+
+@pytest.mark.parametrize("args", [
+    ["run", "--profile", "dev", "--label", "../escape", "--max-usd", "1"],
+    ["report", "--run", r"..\x"],
+    ["compare", "--base", "a b", "--run", "x"],
+    ["score", "--base", "x", "--run", "x" * 65],
+])
+def test_run_names_are_checked_before_use_as_paths(tmp_path, args):
+    assert replay.main(["--set-dir", str(tmp_path), *args]) == replay.EXIT_USAGE
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_compare_names_kinds_whose_prompt_changed(pair, capsys):
+    set_dir, _ = pair
+    for label, sha in (("base", "aaa"), ("new", "bbb")):
+        path = set_dir / "runs" / f"{label}.meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["prompt_shas"] = {"approval": [sha], "intent": ["same"]}
+        path.write_text(json.dumps(meta), encoding="utf-8")
+    _cli(set_dir, "compare", "--base", "base", "--run", "new")
+    assert "system prompt が基準と違う種類: approval" in capsys.readouterr().out
+
+
+def test_judge_code_sha_is_stable():
+    assert replay.judge_code_sha() == replay.judge_code_sha()
+    assert len(replay.judge_code_sha()) == 16

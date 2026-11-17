@@ -108,3 +108,33 @@ def test_run_with_many_errors_exits_nonzero(replay_env, fake_llm, capsys):
     assert _run(set_dir, spend_dir, synthetic) == 1
     out = capsys.readouterr().out
     assert "エラーで終わった判定が 8 件（上限 3）" in out and _SENTINEL not in out
+
+
+def test_meta_ties_the_run_to_the_code_and_prompts(replay_env):
+    from lab_lounge import router
+
+    set_dir, spend_dir, synthetic = replay_env
+    assert _run(set_dir, spend_dir, synthetic, "--reps", "1") == 0
+    meta = json.loads((set_dir / "runs" / "contract.meta.json").read_text(encoding="utf-8"))
+    assert len(meta["judge_code_sha"]) == 16 and "dirty" in meta
+    assert meta["models"]["router"] == router._LLM_ROUTER_MODEL
+    assert set(meta["prompt_shas"]) == {"approval", "intent", "interjection", "route"}
+    assert all(len(shas) == 1 for shas in meta["prompt_shas"].values())
+
+
+@pytest.mark.parametrize("extra", [["--reps", "2"], ["--canary", "2"]])
+def test_resume_requires_the_same_reps_and_canary(replay_env, capsys, extra):
+    set_dir, spend_dir, synthetic = replay_env
+    assert _run(set_dir, spend_dir, synthetic, "--reps", "1") == 0
+    resumed = ["--reps", "1", *extra] if extra[0] == "--canary" else extra
+    assert _run(set_dir, spend_dir, synthetic, "--resume", *resumed) == replay.EXIT_REFUSED
+    assert "再開できません" in capsys.readouterr().out
+
+
+def test_resume_without_meta_is_refused(replay_env, fake_llm, capsys):
+    set_dir, spend_dir, synthetic = replay_env
+    (set_dir / "runs").mkdir()
+    (set_dir / "runs" / "contract.jsonl").write_text("", encoding="utf-8")
+    assert _run(set_dir, spend_dir, synthetic, "--resume") == replay.EXIT_REFUSED
+    assert "meta がありません" in capsys.readouterr().out
+    assert fake_llm.requests == []
