@@ -220,14 +220,19 @@ class Sample:
     ok: bool
     error: str | None
     results: int | None
+    first_in_process: bool = False  # プロセスの最初の要求（DNS や接続の準備を払うのはここだけ）
 
     @property
     def phase(self) -> str:
+        """cold（1 周目）/ warm（2 周目以降）/ host_compare（localhost と 127.0.0.1 の比べ。別の問いなので cold と呼ばない）。"""
+        if "@" in self.group:
+            return "host_compare"
         return "cold" if self.pass_no == 1 else "warm"
 
     def line(self) -> dict[str, Any]:
         return {"group": self.group, "kind": self.kind, "query_id": self.query_id, "pass": self.pass_no,
-                "ms": round(self.elapsed_ms, 1), "ok": self.ok, "error": self.error, "results": self.results}
+                "phase": self.phase, "ms": round(self.elapsed_ms, 1), "ok": self.ok, "error": self.error,
+                "results": self.results, "first_in_process": self.first_in_process}
 
 
 def get_once(target: Target, kind: str, query: Query, k: int, timeout_sec: float, group: str, pass_no: int) -> Sample:
@@ -286,10 +291,24 @@ def summarize(samples: list[Sample]) -> dict[str, Any]:
             "errors": dict(Counter(s.error for s in samples if s.error))}
 
 
-def budget_hint(warm_ok_ms: list[float]) -> int | None:
-    """warm の 99% が収まる最小の値（100 ms 刻みで切り上げ）。データが無ければ None。"""
-    p99 = probe.percentile(warm_ok_ms, 0.99)
-    return None if p99 is None else int(math.ceil(p99 / 100.0) * 100) or 100
+def budget_hint(warm_ok_ms: list[float], failed: int = 0,
+                timeout_ms: float = DEFAULT_TIMEOUT_SEC * 1000) -> tuple[int | None, str | None]:
+    """warm の 99% が収まる最小の値（100 ms 刻みで切り上げ）と、出さなかった理由を返す。
+
+    失敗（時間切れ、接続の失敗）は、待たされた側から見れば時間切れまで待った 1 件なので、timeout_ms として数える。
+    失敗が 1% を超えるときは、p99 が時間切れの値そのものになり目安にならないので、目安を出さない。
+
+    Returns:
+        (目安の ms または None, None の理由または None)
+    """
+    total = len(warm_ok_ms) + failed
+    if total == 0:
+        return None, None
+    if failed / total > 0.01:
+        return None, f"warm の失敗が 1% を超えた（{total} 件中 {failed} 件）ので、目安を出しません"
+    p99 = probe.percentile([*warm_ok_ms, *([timeout_ms] * failed)], 0.99)
+    assert p99 is not None
+    return int(math.ceil(p99 / 100.0) * 100) or 100, None
 
 
 def _fmt(value: float | None) -> str:
@@ -308,6 +327,33 @@ def _selected_targets(args: argparse.Namespace, found: list[Target]) -> list[Tar
     return [t for t in found if t.role in wanted]
 
 
+def report_latency(samples: list[Sample], timeout_ms: float,
+                   retrievers: int) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """分布と予算の目安を画面へ出し、(集計, 目安) を返す。途中で止まった回の集計にも使う。"""
+    summaries: dict[str, dict[str, Any]] = {}
+    hints: dict[str, dict[str, Any]] = {}
+    for group in sorted({s.group for s in samples}):
+        for kind in ("retrieve", "recent"):
+            for phase in ("cold", "warm", "host_compare"):
+                chosen = [s for s in samples if (s.group, s.kind, s.phase) == (group, kind, phase)]
+                if not chosen:
+                    continue
+                key = f"{group}/{kind}/{phase}"
+                summaries[key] = summarize(chosen)
+                print_summary(group, kind, phase, summaries[key])
+            warm = [s for s in samples if (s.group, s.kind, s.phase) == (group, kind, "warm")]
+            if warm:
+                hint, reason = budget_hint([s.elapsed_ms for s in warm if s.ok], sum(1 for s in warm if not s.ok),
+                                           timeout_ms)
+                hints[f"{group}/{kind}"] = {"ms": hint, "reason": reason}
+                if hint is not None:
+                    emit(f"  予算の目安 {group}/{kind}: warm の p99 を収める最小 {hint} ms（100 ms 刻み）。"
+                         f"retriever {retrievers} 本が順に最悪の時間を使うと {hint * retrievers} ms")
+                elif reason:
+                    emit(f"  予算の目安 {group}/{kind}: {reason}")
+    return summaries, hints
+
+
 def _cmd_latency(args: argparse.Namespace) -> int:
     from .preflight import prepare_env
 
@@ -316,7 +362,8 @@ def _cmd_latency(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     out_dir = args.out_dir or spend.default_spend_dir()
     run_path = out_dir / f"c2_latency_{args.label}.jsonl"
-    if run_path.exists():
+    meta_path = out_dir / f"c2_latency_{args.label}.meta.json"
+    if run_path.exists() or meta_path.exists():
         emit(f"実行 {args.label} はすでにあります（別の名前で --label）")
         return EXIT_REFUSED
     try:
@@ -339,17 +386,40 @@ def _cmd_latency(args: argparse.Namespace) -> int:
         return EXIT_MISSING_SERVICE
 
     k = args.k or sub_top_k()
+    retrievers = c2_retriever_count()
     writer = replay.RunFile(run_path)
     emit(f"c2 latency {args.label}: 送り先 " + "、".join(f"{t.label} {t.shown}" for t in targets)
          + f"、問い合わせ {len(queries)} 本 × {args.passes} 周、k={k}、時間切れ {args.timeout_sec:.0f} 秒")
 
     samples: list[Sample] = []
+    meta: dict[str, Any] = {
+        "tool": "c2_latency", "label": args.label, "started": datetime.now(UTC).isoformat(timespec="seconds"),
+        "commit": probe.git_commit(), "profile": args.profile,
+        "targets": [{"label": t.label, "host": t.host, "port": t.port} for t in targets],
+        "queries": {"n": len(queries), "sha": probe.digest([(q.id, q.text, q.shape, q.likely) for q in queries])},
+        "passes": args.passes, "k": k, "timeout_sec": args.timeout_sec, "thresholds_ms": list(THRESHOLDS_MS),
+        "host_compare": not args.no_host_compare, "retrievers_per_search": retrievers,
+        "notes": ["cold = 1 周目（その問い合わせが初めて）、warm = 2 周目以降、host_compare = localhost と 127.0.0.1 の比べ",
+                  "リクエストごとに新しい httpx.Client（本番と同じ）",
+                  "first_in_process の要求だけが DNS や接続の準備を払う（記録の行に印がある）"],
+        "status": "running",
+    }
+    probe._write_json(meta_path, meta)  # 最初に書く（途中で止まっても、設定と止まった理由が残る）
 
     def record(sample: Sample) -> None:
+        sample.first_in_process = not samples
         samples.append(sample)
         writer.append(sample.line())
 
-    with probe.prevent_sleep():
+    def finish_meta(status: str) -> dict[str, Any]:
+        if status != "complete":
+            emit("途中までの集計（止まった回）:")
+        summaries, hints = report_latency(samples, args.timeout_sec * 1000, retrievers)
+        # C2 が埋め込み（有料）を呼ぶ /retrieve の数。支出の記録の外なので、数だけを残す。
+        return {"summary": summaries, "budget_hint_ms": hints,
+                "embedding_calls_estimate": sum(1 for s in samples if s.kind == "retrieve")}
+
+    with probe.record_outcome(meta, meta_path, finish_meta), probe.prevent_sleep():
         # 周 → 問い合わせ → 送り先の順に交互に送る（時刻の偏りが送り先の差に出ないように）。
         for pass_no in range(1, args.passes + 1):
             for query in queries:
@@ -360,39 +430,6 @@ def _cmd_latency(args: argparse.Namespace) -> int:
         if not args.no_host_compare:
             _compare_hosts(targets, queries, k, args.timeout_sec, record)
 
-    summaries: dict[str, dict[str, Any]] = {}
-    hints: dict[str, int | None] = {}
-    for group in sorted({s.group for s in samples}):
-        for kind in ("retrieve", "recent"):
-            for phase in ("cold", "warm"):
-                chosen = [s for s in samples if (s.group, s.kind, s.phase) == (group, kind, phase)]
-                if not chosen:
-                    continue
-                key = f"{group}/{kind}/{phase}"
-                summaries[key] = summarize(chosen)
-                print_summary(group, kind, phase, summaries[key])
-            if "@" not in group:
-                warm_ok = [s.elapsed_ms for s in samples if (s.group, s.kind, s.phase, s.ok) == (group, kind, "warm", True)]
-                if warm_ok:
-                    hints[f"{group}/{kind}"] = budget_hint(warm_ok)
-    retrievers = c2_retriever_count()
-    for key, hint in hints.items():
-        if hint is not None:
-            emit(f"  予算の目安 {key}: warm の p99 を収める最小 {hint} ms（100 ms 刻み）。"
-                 f"retriever {retrievers} 本が順に最悪の時間を使うと {hint * retrievers} ms")
-    meta = {
-        "tool": "c2_latency", "label": args.label, "generated": datetime.now(UTC).isoformat(timespec="seconds"),
-        "commit": probe.git_commit(), "profile": args.profile,
-        "targets": [{"label": t.label, "host": t.host, "port": t.port} for t in targets],
-        "queries": {"n": len(queries), "sha": probe.digest([(q.id, q.text, q.shape, q.likely) for q in queries])},
-        "passes": args.passes, "k": k, "timeout_sec": args.timeout_sec, "thresholds_ms": list(THRESHOLDS_MS),
-        "host_compare": not args.no_host_compare, "retrievers_per_search": retrievers,
-        # C2 が埋め込み（有料）を呼ぶ /retrieve の数。支出の記録の外なので、数だけを残す。
-        "embedding_calls_estimate": sum(1 for s in samples if s.kind == "retrieve"),
-        "summary": summaries, "budget_hint_ms": hints,
-        "notes": ["cold = 1 周目（その問い合わせが初めて）、warm = 2 周目以降", "リクエストごとに新しい httpx.Client（本番と同じ）"],
-    }
-    probe._write_json(out_dir / f"c2_latency_{args.label}.meta.json", meta)
     failed = sum(1 for s in samples if not s.ok)
     emit(f"合計 {len(samples)} 要求、失敗 {failed}、C2 の埋め込みの呼び出し（概算）{meta['embedding_calls_estimate']}")
     return EXIT_OK

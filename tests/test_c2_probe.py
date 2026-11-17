@@ -200,7 +200,7 @@ class TestSummary:
 
     @pytest.mark.parametrize("values, hint", [([120.0] * 100, 200), ([100.0] * 100, 100), ([650.0, 100.0], 700), ([], None)])
     def test_budget_hint_rounds_p99_up_to_100(self, values, hint):
-        assert c2_probe.budget_hint(values) == hint
+        assert c2_probe.budget_hint(values)[0] == hint
 
 
 class TestLatencyCommand:
@@ -420,3 +420,76 @@ class TestTimeoutsIncludeRunsThatNeverAnswered:
         saved = json.loads((out_dir / "c2_timeouts_t.json").read_text(encoding="utf-8"))
         assert saved["counts"]["side:before"]["timeout_c2"] == 3 + 4
         assert any("含みます" in note for note in saved["selection_notes"])
+
+
+class TestBudgetHintWithFailures:
+    def test_failures_count_as_the_full_timeout(self):
+        # 200 件中 1 件の失敗（0.5%）: p99 は 200 件目に近い。失敗は 10000 ms として並ぶ。
+        hint, reason = c2_probe.budget_hint([120.0] * 199, failed=1, timeout_ms=10000)
+        assert reason is None and hint == 200  # 99% 点（198 番目）までは 120 ms
+
+    def test_exactly_one_percent_failures_still_gives_a_hint_and_the_failure_is_the_tail(self):
+        # 100 件中 1 件（ちょうど 1%）: 目安は出す。失敗の 1 件は p99 の外（最後の 1%）に並ぶ。
+        hint, reason = c2_probe.budget_hint([120.0] * 99, failed=1, timeout_ms=10000)
+        assert (hint, reason) == (200, None)
+        # 失敗が p99 の内側に入る件数（2 件 / 150 = 1.3%）は、目安を出さない側へ倒れる。
+        assert c2_probe.budget_hint([120.0] * 148, failed=2, timeout_ms=10000)[0] is None
+
+    def test_more_than_one_percent_failures_gives_no_hint_and_says_why(self):
+        hint, reason = c2_probe.budget_hint([120.0] * 97, failed=3, timeout_ms=10000)
+        assert hint is None and "1% を超えた" in reason and "3 件" in reason
+
+    def test_nothing_measured(self):
+        assert c2_probe.budget_hint([]) == (None, None)
+
+
+class TestHostCompareIsNotCold:
+    def test_phase_names(self):
+        def sample(group, pass_no):
+            return c2_probe.Sample(group, "retrieve", "q", pass_no, 1.0, True, None, 1)
+
+        assert sample("prod(primary)", 1).phase == "cold" and sample("prod(primary)", 2).phase == "warm"
+        assert sample("prod(primary)@localhost", 1).phase == "host_compare"
+
+    def test_the_report_prints_it_under_its_own_name(self, capsys):
+        samples = [c2_probe.Sample("dev(primary)@localhost", "retrieve", "q", 1, 5.0, True, None, 1),
+                   c2_probe.Sample("dev(primary)", "retrieve", "q", 1, 5.0, True, None, 1)]
+        summaries, hints = c2_probe.report_latency(samples, 10000.0, 2)
+        out = capsys.readouterr().out
+        assert "dev(primary)@localhost retrieve host_compare" in out and "@localhost retrieve cold" not in out
+        assert "dev(primary)@localhost/retrieve/host_compare" in summaries and hints == {}
+
+
+class TestLatencyMetaOnStop:
+    def test_meta_is_written_first_and_updated_with_the_partial_summary(self, c2_env, fake_c2, monkeypatch, capsys):
+        server = fake_c2()
+        monkeypatch.setenv("L2_C2_URL", server.url)
+        out_dir = c2_env / "out"
+        seen = {}
+        original = c2_probe.get_once
+        calls = []
+
+        def interrupting(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                seen["first"] = json.loads((out_dir / "c2_latency_c2t.meta.json").read_text(encoding="utf-8"))["status"]
+            if len(calls) == 4:
+                raise KeyboardInterrupt
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(c2_probe, "get_once", interrupting)
+        with pytest.raises(KeyboardInterrupt):
+            _latency(c2_env, "--passes", "2")
+        assert seen["first"] == "running"
+        meta = json.loads((out_dir / "c2_latency_c2t.meta.json").read_text(encoding="utf-8"))
+        assert meta["status"] == "aborted" and meta["finished"] and meta["summary"]
+        assert meta["embedding_calls_estimate"] == 2 and "途中までの集計" in capsys.readouterr().out
+        assert _latency(c2_env, "--passes", "1") == c2_probe.EXIT_REFUSED  # 同じ名前は、止まった回でも断る
+
+    def test_the_first_request_in_the_process_is_marked(self, c2_env, fake_c2, monkeypatch):
+        monkeypatch.setenv("L2_C2_URL", fake_c2().url)
+        assert _latency(c2_env, "--passes", "1") == 0
+        lines = [json.loads(line) for line in
+                 (c2_env / "out" / "c2_latency_c2t.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [x["first_in_process"] for x in lines] == [True] + [False] * (len(lines) - 1)
+        assert {x["phase"] for x in lines} == {"cold"}
