@@ -89,9 +89,8 @@ def test_raw_measures_every_group_without_text(probe_env, fake_llm, capsys):
     assert set(meta["summary"]) == set(by_group)
     spent = json.loads((spend_dir / "spent.json").read_text(encoding="utf-8"))
     assert spent["by_run"]["contract"]["calls"] == 18
-    for path in [*out_dir.iterdir(), *spend_dir.iterdir()]:
-        if path.suffix != ".log":
-            assert _SENTINEL not in path.read_text(encoding="utf-8"), path.name
+    for path in [p for p in [*out_dir.iterdir(), *spend_dir.iterdir()] if p.is_file()]:
+        assert _SENTINEL not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_filler_inputs_use_the_wake_words(probe_env, fake_llm):
@@ -113,6 +112,9 @@ def test_failed_calls_are_counted_and_exit_1(probe_env, fake_llm, capsys):
     out = capsys.readouterr().out
     assert "失敗=3" in out and _SENTINEL not in out
     assert all(line["error"] for line in _lines(probe_env[0]))
+    # 例外の文言を含みうる WARNING のログは、人だけが開く private/ へ。直下には置かない。
+    assert (probe_env[0] / "private" / "raw_contract.problems.log").is_file()
+    assert not list(probe_env[0].glob("*.log"))
 
 
 def test_existing_label_is_refused(probe_env, capsys):
@@ -216,10 +218,11 @@ def test_agent_measures_steps_tools_and_cache_fields_without_text(agent_probe_en
     assert "[ルカからの発言]" in body_text and "ミミ様" in body_text and _CONTEXT_SENTINEL in body_text
     # 画面と数字のファイルには、発話も返答も配信文脈も出ない。返答は 1 つのファイルだけ。
     assert all(token not in captured.out + captured.err for token in (_SENTINEL, _ANSWER_SENTINEL, _CONTEXT_SENTINEL))
-    assert _ANSWER_SENTINEL in (out_dir / "agent_agt.jsonl").read_text(encoding="utf-8")
-    for path in [*out_dir.iterdir(), *spend_dir.iterdir()]:
-        if path.suffix == ".log" or path.name in ("agent_agt.jsonl", "stream_context_snapshot.md"):
-            continue
+    private = out_dir / "private"
+    assert _ANSWER_SENTINEL in (private / "agent_agt.jsonl").read_text(encoding="utf-8")
+    assert sorted(p.name for p in private.iterdir() if p.suffix != ".log") == ["agent_agt.jsonl", "stream_context_snapshot.md"]
+    # 直下（数字のファイル）には、本文も返答も配信文脈も無い。private/ の中身（人だけが開く）は対象外。
+    for path in [p for p in [*out_dir.iterdir(), *spend_dir.iterdir()] if p.is_file()]:
         text = path.read_text(encoding="utf-8")
         assert all(token not in text for token in (_SENTINEL, _ANSWER_SENTINEL, _CONTEXT_SENTINEL)), path.name
     meta = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))

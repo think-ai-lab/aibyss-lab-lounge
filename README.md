@@ -439,9 +439,9 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 | `c2_probe timeouts` | 過去の実走ログの C2 のタイムアウトを、月ごと・日付の前後ごとに数える | なし |
 
 **出力の約束**: 画面と、`data/probe/` `data/replay/` の数字のファイルには、発話の本文も、モデルの答えも出しません（件数、率、時間、tokens、費用、決まった形の判定の答えだけ）。
-本文やモデルの出力を含みうるファイルは、それぞれの `private/` に分けて置きます（`data/replay/private/`: リプレイのセット、確認のファイル、生の答え、WARNING のログ）。
+本文やモデルの出力を含みうるファイルは、それぞれの `private/` に分けて置きます（`data/replay/private/`: リプレイのセット、確認のファイル、生の答え、WARNING のログ。`data/probe/private/`: Agent の返答の本文、WARNING のログ、配信文脈の写し）。
 `private/` は人だけが開くフォルダです。Claude などの自動化には、`private/` を開かせず、直下の数字のファイルだけを読ませてください。
-モデルの返答の本文は、聴き比べ用に `probe agent` の `agent_<名前>.jsonl` だけに書きます。`data/` は gitignore 済みで、実の配信ログから作ったものを含むので、そのまま共有しないでください。
+モデルの返答の本文は、聴き比べ用に `probe agent` の `data/probe/private/agent_<名前>.jsonl` だけに書きます（直下の `agent_<名前>.metrics.jsonl` は同じ行から本文を除いたもの）。`data/` は gitignore 済みで、実の配信ログから作ったものを含むので、そのまま共有しないでください。
 実走ログ（`logs/runs/`）には発話が入っているので、集計の道具は先頭の形だけを読み、本文は読みません。
 
 **流す前に**: `src/lab_lounge/measure_sets/` の合成の行（リプレイの期待値つきの行、計測の発話、C2 の問い合わせ）を、自分の公開してよい文面で用意します（`probe` と `c2_probe` は、無ければ何も送らずに断ります。`replay` は、無ければ合成の行なしで流します）。
@@ -486,7 +486,7 @@ uv run --frozen --all-extras python -m lab_lounge.probe history --label past
 ```
 
 - `probe agent` は、本番の組み立て（人格、配信文脈、日時の system prompt、道具のスキーマ）のまま、道具だけを長さを固定した定型の応答に差し替えます（外の検索や記憶、他キャラの発話を呼ばないので、本応答の LLM の時間だけが測れます）。
-  配信文脈は最初の回の写し（`data/probe/stream_context_snapshot.md`）を、後の回も使います。取り直すなら `--refresh-snapshot`。`L2_ENABLE_TOOLS` が無効だと、本番は Agent を通らないので断ります。
+  配信文脈は最初の回の写し（`data/probe/private/stream_context_snapshot.md`）を、後の回も使います。取り直すなら `--refresh-snapshot`。`L2_ENABLE_TOOLS` が無効だと、本番は Agent を通らないので断ります。
 - 時間切れ（`L2_AGENT_INVOKE_TIMEOUT_SEC`）に当たったら、記録してからプロセスごと終えます（取り残したスレッドの課金を止めるため）。
 
 **食べ比べ**（後継のモデルを、同じ発話で比べる流れ）:
@@ -497,7 +497,7 @@ uv run --frozen --all-extras python -m lab_lounge.probe history --label past
    uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label try_new --llm anthropic:<新しいモデル> --max-usd 3.0
    ```
 3. `data/probe/agent_baseline.metrics.jsonl` と `agent_try_new.metrics.jsonl`（数字だけ）で、step ごとの時間、tokens、`cache_read` / `cache_creation`、費用を比べる。画面にもキャラごとの cold / warm の p50 / p90 と費用が出ます。
-4. 声の聴き比べは、`agent_<名前>.jsonl` の返答の本文を、同じ発話 id で並べて読む（本文はここにだけあります）。
+4. 声の聴き比べは、`private/agent_<名前>.jsonl` の返答の本文を、同じ発話 id で並べて読む（本文はここにだけあります）。
 5. 判定（挙手の候補と承認）のモデルを変えるときは、`replay` の基準と比べて反転が 0 であることも見る。
 
 **C2 の検索の時間**:

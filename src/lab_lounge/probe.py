@@ -40,14 +40,16 @@ probe.py — 本応答と判定まわりの時間と費用の物差し（計測�
   4: 上限、価格表にないモデル、usage の拾い損ねで止めた（spend）/ 64: コマンドラインの誤り / 130: Ctrl+C
 
 【出力】（data/probe/、gitignore 済み）
-  raw_<名前>.jsonl:        1 呼び出し 1 行（グループ、入力の id、モデル、時間、失敗の型、費用、tokens）。本文なし
-  raw_<名前>.meta.json:    commit、uv.lock のハッシュ、SDK の版、モデル、入力の数とハッシュ
-  raw_<名前>.problems.log: 実行中の WARNING 以上のログ（例外の文言を含みうるので Claude は開かない）
-  history_<名前>.json:         月ごとの時間の表（数字だけ）
-  agent_<名前>.jsonl:          1 呼び出し 1 行（数字 + 返答の本文）。返答の本文はこのファイルだけに書く（Claude は開かない）
-  agent_<名前>.metrics.jsonl:  上から本文を除いたもの（数字だけ）
-  agent_<名前>.meta.json:      commit、モデル、配信文脈と人格のハッシュ、集計
-  stream_context_snapshot.md:  最初の回の配信文脈の写し。後の回も同じものを使う（--refresh-snapshot で取り直す）
+  直下（数字のファイル。自動化が読んでよい）:
+    raw_<名前>.jsonl:            1 呼び出し 1 行（グループ、入力の id、モデル、時間、失敗の型、費用、tokens）。本文なし
+    raw_<名前>.meta.json:        commit、uv.lock のハッシュ、SDK の版、モデル、入力の数とハッシュ
+    history_<名前>.json:         月ごとの時間の表
+    agent_<名前>.metrics.jsonl:  1 呼び出し 1 行（step ごとの時間と tokens、道具、費用）。本文なし
+    agent_<名前>.meta.json:      commit、モデル、配信文脈と人格のハッシュ、集計
+  private/（本文やモデルの出力を含みうる。人だけが開く。Claude は開かない）:
+    agent_<名前>.jsonl:          metrics に返答の本文を足したもの。返答の本文はこのファイルだけに書く
+    raw_<名前>.problems.log, agent_<名前>.problems.log: 実行中の WARNING 以上のログ（例外の文言を含みうる）
+    stream_context_snapshot.md:  最初の回の配信文脈の写し。後の回も同じものを使う（--refresh-snapshot で取り直す）
 
 【出力の約束】
   画面には、件数、時間、tokens、費用だけを出す。発話の本文と、モデルの答えは出さず、ファイルにも書かない。
@@ -571,8 +573,9 @@ def _cmd_raw(args: argparse.Namespace) -> int:
         emit("--label は英数字と _.- で 64 字までにしてください")
         return EXIT_USAGE
     out_dir = args.out_dir or spend.default_spend_dir()
+    private = spend.private_dir(out_dir)  # 本文を含みうるログは、人だけが開く private/ へ
     run_path = out_dir / f"raw_{args.label}.jsonl"
-    if run_path.exists():
+    if run_path.exists() or (out_dir / f"raw_{args.label}.meta.json").exists():
         emit(f"実行 {args.label} はすでにあります（別の名前で --label）")
         return EXIT_REFUSED
     try:
@@ -603,7 +606,7 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     writer = replay.RunFile(run_path)
     summaries: dict[str, dict[str, Any]] = {}
     calls_by_provider: Counter = Counter()
-    with prevent_sleep(), _captured_logs(out_dir / f"raw_{args.label}.problems.log"), \
+    with prevent_sleep(), _captured_logs(private / f"raw_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             replay.RecordingRouter(), RecordingFiller():
         def after_round(round_samples: list[Sample]) -> None:
@@ -1095,8 +1098,10 @@ def _cmd_agent(args: argparse.Namespace) -> int:
         emit(str(exc))
         return EXIT_USAGE
     out_dir = args.out_dir or spend.default_spend_dir()
-    run_path = out_dir / f"agent_{args.label}.jsonl"
-    if run_path.exists():
+    private = spend.private_dir(out_dir)
+    run_path = private / f"agent_{args.label}.jsonl"
+    metrics_path = out_dir / f"agent_{args.label}.metrics.jsonl"
+    if run_path.exists() or metrics_path.exists() or (out_dir / f"agent_{args.label}.meta.json").exists():
         emit(f"実行 {args.label} はすでにあります（別の名前で --label）")
         return EXIT_REFUSED
     try:
@@ -1120,7 +1125,7 @@ def _cmd_agent(args: argparse.Namespace) -> int:
         emit("[警告] L2_ENABLE_RAG が無効で、retrieve_memory は道具に入りません（本番と同じ設定です）")
 
     stream_context, context_meta = resolve_stream_context(
-        out_dir / "stream_context_snapshot.md", refresh=args.refresh_snapshot, load_live=load_stream_context)
+        private / "stream_context_snapshot.md", refresh=args.refresh_snapshot, load_live=load_stream_context)
     settings = AgentSettings(stream_context, graph._get_agent_invoke_timeout(), graph._get_agent_recursion_limit(),
                              llm_override)
     meta = agent_meta(args.label, args, characters=characters, settings=settings, context_meta=context_meta,
@@ -1133,11 +1138,11 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     emit(f"agent {args.label}: {len(characters)} キャラ × {len(utterances)} 発話、上限 ${args.max_usd:.2f}、"
          f"時間切れ {settings.timeout_sec:.0f} 秒、recursion_limit {settings.recursion_limit}、"
          f"配信文脈 {context_meta['origin']}（{context_meta['chars']} 字）")
-    full, metrics = replay.RunFile(run_path), replay.RunFile(out_dir / f"agent_{args.label}.metrics.jsonl")
+    full, metrics = replay.RunFile(run_path), replay.RunFile(metrics_path)
     summaries: dict[str, dict[str, Any]] = {}
     fires: Counter = Counter()
     calls_by_provider: Counter = Counter()
-    with prevent_sleep(), _captured_logs(out_dir / f"agent_{args.label}.problems.log"), \
+    with prevent_sleep(), _captured_logs(private / f"agent_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             canned_tools(lengths, fires):
         # 発話の番号ごとに、キャラを交互に流す（WHY: 全体で 30 分ほどかかる間の API の混み具合の変化が、後のキャラに
