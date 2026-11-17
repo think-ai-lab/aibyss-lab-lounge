@@ -560,6 +560,54 @@ def raw_meta(label: str, args: argparse.Namespace, *, pools: dict[str, int], inp
     }
 
 
+@contextlib.contextmanager
+def record_outcome(meta: dict[str, Any], meta_path: Path, on_finish: Callable[[str], dict[str, Any]]) -> Iterator[None]:
+    """with の本体が終わった（正常、上限などの止まり、想定外のエラー）ときに、meta へ状態と集計を書く。
+
+    status: complete / stopped:<上限などの型> / aborted（Ctrl+C、想定外のエラー）。on_finish(status) の戻り値は meta へ足す
+    （同じ鍵があれば、そちらが勝つ）。WHY: meta を最後にしか書かないと、途中で止まった回は meta の無い記録だけが残る。
+    プロセスごと終える経路（hard_exit）は finally を通らないので、その前に呼び出し側が書く。
+    """
+    status = "aborted"
+    try:
+        yield
+        status = "complete"
+    except spend.SpendStop as stop:
+        status = f"stopped:{type(stop).__name__}"
+        raise
+    finally:
+        meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), status=status)
+        try:
+            meta.update(on_finish(status))
+        except Exception as exc:  # noqa: BLE001 - 集計の失敗で、止まった本当の理由（上限など）を隠さない
+            meta["summary_error"] = type(exc).__name__
+        _write_json(meta_path, meta)
+
+
+def reservation_hint(models: dict[str, str], prices: dict[str, spend.Price] | None = None) -> list[str]:
+    """送る前の予約（--max-usd に収まるか見る額）の目安を、モデルごとに 1 行で返す。
+
+    予約は、入力（本文の bytes/2 tokens）と最大出力（agent は L2_LLM_MAX_OUTPUT_TOKENS、既定 4096）を使い切る前提の
+    多めの見積もり。ここでは出力の分だけを出す（入力は本文の大きさ次第）。--max-usd は、これが 1 回分は入る余裕を
+    持って決める（さもないと、実際には足りているのに、次の 1 回を送る前に止まる）。
+    """
+    from .llm import get_llm_max_output_tokens
+
+    max_out = get_llm_max_output_tokens() or spend.DEFAULT_ASSUMED_MAX_OUTPUT
+    table = spend.PRICES if prices is None else prices
+    lines = []
+    for name, spec in models.items():
+        model = spec.partition(":")[2] or spec
+        try:
+            rate = spend.lookup_price(model, table).rate
+        except spend.UnpricedModel:
+            lines.append(f"{name}: {spend._showable(model)} は価格表にありません（送る前に止まります）")
+            continue
+        lines.append(f"{name}: {spend._showable(model)} 最大出力 {max_out} tokens × ${rate.output:g}/100万 = "
+                     f"約 ${max_out * rate.output / 1e6:.3f}（1 回の予約の出力の分）")
+    return lines
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as stream:
@@ -604,23 +652,39 @@ def _cmd_raw(args: argparse.Namespace) -> int:
     emit(f"raw {args.label}: {len(groups)} グループ × n={args.n}、上限 ${args.max_usd:.2f}"
          f"（入力 挙手の候補 {pools['interjection']} / 承認 {pools['approval']} / filler {pools['filler']} 本をめぐる）")
     writer = replay.RunFile(run_path)
+    meta_path = out_dir / f"raw_{args.label}.meta.json"
+    # meta は最初に書き、終わり（止まったときも）に更新する。WHY: 途中で止まる（上限、Ctrl+C、想定外のエラー）と、
+    # meta の無い jsonl だけが残り、どの設定で何が済んだか分からなくなる。
+    meta["status"] = "running"
+    _write_json(meta_path, meta)
     summaries: dict[str, dict[str, Any]] = {}
+    collected: dict[str, list[Sample]] = {}
     calls_by_provider: Counter = Counter()
-    with prevent_sleep(), _captured_logs(private / f"raw_{args.label}.problems.log"), \
-            spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
-            replay.RecordingRouter(), RecordingFiller():
-        def after_round(round_samples: list[Sample]) -> None:
-            calls_by_provider.update(expected_by_provider(round_samples, meter.prices))
-            meter.check_capture(dict(calls_by_provider))
+    status = "aborted"
+    try:
+        with prevent_sleep(), _captured_logs(private / f"raw_{args.label}.problems.log"), \
+                spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
+                replay.RecordingRouter(), RecordingFiller():
+            def after_round(round_samples: list[Sample]) -> None:
+                calls_by_provider.update(expected_by_provider(round_samples, meter.prices))
+                meter.check_capture(dict(calls_by_provider))
 
-        collected = measure_rounds(groups, ledger, args.label, gap_sec=args.gap_sec,
-                                   sink=lambda sample: writer.append(sample.line()), after_round=after_round)
+            measure_rounds(groups, ledger, args.label, gap_sec=args.gap_sec, collected=collected,
+                           sink=lambda sample: writer.append(sample.line()), after_round=after_round)
+        status = "complete"
+    except spend.SpendStop as stop:
+        status = f"stopped:{type(stop).__name__}"
+        raise
+    finally:
         for group in groups:
-            summaries[group.name] = summarize(collected.get(group.name, []))
-            print_summary(group.name, summaries[group.name])
-    meta["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
-    meta["summary"] = summaries
-    _write_json(out_dir / f"raw_{args.label}.meta.json", meta)
+            if collected.get(group.name):
+                summaries[group.name] = summarize(collected[group.name])
+        if status != "complete":
+            emit("途中までの集計（止まった回）:")
+        for name, summary in summaries.items():
+            print_summary(name, summary)
+        meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), status=status, summary=summaries)
+        _write_json(meta_path, meta)
     total = sum(s["usd"] for s in summaries.values())
     failed = sum(s["failed"] for s in summaries.values())
     emit(f"合計 ${total:.4f}、失敗 {failed}、usage を拾えず見積もりで数えた呼び出し {meter.stats.uncounted}")
@@ -1131,7 +1195,8 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     meta = agent_meta(args.label, args, characters=characters, settings=settings, context_meta=context_meta,
                       lengths=lengths, utterances=utterances)
     meta_path = out_dir / f"agent_{args.label}.meta.json"
-    _write_json(meta_path, meta)
+    meta["status"] = "running"
+    _write_json(meta_path, meta)  # 最初に書く（途中で止まっても、設定と止まった理由が残る）
 
     overrides = dict(spend.parse_price_override(text) for text in args.price)
     ledger = spend.SpendLedger(args.spend_dir or spend.default_spend_dir())
@@ -1142,12 +1207,29 @@ def _cmd_agent(args: argparse.Namespace) -> int:
     summaries: dict[str, dict[str, Any]] = {}
     fires: Counter = Counter()
     calls_by_provider: Counter = Counter()
-    with prevent_sleep(), _captured_logs(private / f"agent_{args.label}.problems.log"), \
+    lines_by_slug: dict[str, list[dict[str, Any]]] = {slug: [] for slug in characters}
+    for hint in reservation_hint(meta["models"]):
+        emit(f"  予約の目安 {hint}")
+
+    def finish_meta(status: str) -> dict[str, Any]:
+        """終わり（止まったときも）の集計。止まったときは、途中までの集計も画面へ出す。"""
+        for name, lines in lines_by_slug.items():
+            if lines:
+                summaries[name] = summarize_agent(lines)
+        if status not in ("complete", "timeout"):
+            emit("途中までの集計（止まった回）:")
+            for name, summary in summaries.items():
+                print_agent_summary(name, summary)
+        timed_out = meta.get("timed_out", False)
+        return {"summary": summaries, "tools_fired_total": dict(fires), "timed_out": timed_out,
+                **({"status": "timeout"} if timed_out else {})}
+
+    with record_outcome(meta, meta_path, finish_meta), \
+            prevent_sleep(), _captured_logs(private / f"agent_{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter, \
             canned_tools(lengths, fires):
         # 発話の番号ごとに、キャラを交互に流す（WHY: 全体で 30 分ほどかかる間の API の混み具合の変化が、後のキャラに
         # 偏って、モデルやキャラの差と見分けられなくなるのを避ける）。cold はキャラごとの最初の 1 回（index == 0）。
-        lines_by_slug: dict[str, list[dict[str, Any]]] = {slug: [] for slug in characters}
         seen_providers: set[str] = set()
         first_in_process = True
         for index, utterance in enumerate(utterances):
@@ -1167,8 +1249,9 @@ def _cmd_agent(args: argparse.Namespace) -> int:
                     metrics.append(line)
                     full.append({**line, "response": ""})
                     lines.append(line)
-                    summaries.update({s: summarize_agent(ls) for s, ls in lines_by_slug.items() if ls})
-                    meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=True,
+                    meta["timed_out"] = True
+                    finish_meta("timeout")  # hard_exit は finally を通らないので、ここで meta を書く
+                    meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), status="timeout",
                                 summary=summaries)
                     _write_json(meta_path, meta)
                     emit(f"[時間切れ] {slug} の {utterance.id} が {settings.timeout_sec:.0f} 秒を超えました。"
@@ -1187,9 +1270,6 @@ def _cmd_agent(args: argparse.Namespace) -> int:
         for slug in characters:
             summaries[slug] = summarize_agent(lines_by_slug[slug])
             print_agent_summary(slug, summaries[slug])
-    meta.update(finished=datetime.now(UTC).isoformat(timespec="seconds"), timed_out=False, summary=summaries,
-                tools_fired_total=dict(fires))
-    _write_json(meta_path, meta)
     failed = sum(s["failed"] for s in summaries.values())
     emit(f"合計 ${sum(s['usd'] for s in summaries.values()):.4f}、失敗 {failed}、"
          f"道具の発火（定型の応答を返した数）{dict(fires)}、usage を拾えず見積もりで数えた呼び出し {meter.stats.uncounted}")

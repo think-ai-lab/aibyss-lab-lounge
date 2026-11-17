@@ -291,7 +291,7 @@ def test_timeout_is_recorded_before_exiting(agent_probe_env, monkeypatch, capsys
     (line,) = _metrics(out_dir)
     assert line["error"] == "Timeout" and line["character"] == "sakura"
     meta = json.loads((out_dir / "agent_agt.meta.json").read_text(encoding="utf-8"))
-    assert meta["timed_out"] is True and meta["summary"]["sakura"]["failed"] == 1
+    assert meta["timed_out"] is True and meta["status"] == "timeout" and meta["summary"]["sakura"]["failed"] == 1
     out = capsys.readouterr().out
     assert "時間切れ" in out and _SENTINEL not in out
 
@@ -332,7 +332,7 @@ def test_agent_stops_when_steps_ended_but_no_http_call_was_counted(agent_probe_e
     def fake_call(slug, utterance, index, settings, ledger, label):
         line = {"i": index, "character": slug, "utterance_id": utterance.id, "category": utterance.category,
                 "cold": index == 0, "provider": "anthropic", "model": "claude-haiku-4-5", "error": None,
-                "total_ms": 5, "steps": [{"ms": 3, "input_total": 1, "output": 1, "reasoning": 0, "cache_read": 0,
+                "total_ms": 5, "steps": [{"ms": 3, "input_total": 1, "input_uncached": 1, "output": 1, "reasoning": 0, "cache_read": 0,
                                           "cache_creation": 0, "error": None, "tool_calls": [], "finish": "stop",
                                           "model": "m"}],
                 "tools": [], "tools_fired": [], "source": "structured_response", "usd": 0.0, "http_calls": 0}
@@ -341,3 +341,83 @@ def test_agent_stops_when_steps_ended_but_no_http_call_was_counted(agent_probe_e
     monkeypatch.setattr(probe, "measure_agent_call", fake_call)
     with pytest.raises(spend.UsageCaptureLost):
         _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1")
+
+
+# ─── 止まった回の meta と集計 ─────────────────────────────────────
+
+def _read_meta(out_dir, name):
+    return json.loads((out_dir / name).read_text(encoding="utf-8"))
+
+
+def test_raw_stop_leaves_a_meta_with_the_partial_summary(probe_env, monkeypatch, capsys):
+    out_dir, spend_dir, synthetic, utterances = probe_env
+
+    def stopping(groups, ledger, label, *, sink, collected, **_kwargs):
+        sample = probe.Sample(groups[0].name, 0, "s001", "claude-haiku-4-5", "claude-haiku-4-5", 12, None, 0.001,
+                              dict.fromkeys(probe._TOKEN_KEYS, 1), "anthropic")
+        collected.setdefault(groups[0].name, []).append(sample)
+        sink(sample)
+        raise spend.BudgetExceeded("上限で止めました: 数字だけの文言")
+
+    monkeypatch.setattr(probe, "measure_rounds", stopping)
+    with pytest.raises(spend.BudgetExceeded):
+        _run(probe_env, "--only", "router")
+    meta = _read_meta(out_dir, "raw_contract.meta.json")
+    assert meta["status"] == "stopped:BudgetExceeded" and meta["finished"] and meta["summary"]
+    assert list(meta["summary"]) == ["router:interjection"] and meta["summary"]["router:interjection"]["n"] == 1
+    assert "途中までの集計" in capsys.readouterr().out
+    assert len(_lines(out_dir)) == 1
+    # 同じ名前は、途中で止まった回でも断る（記録を混ぜないため）
+    assert _run(probe_env, "--only", "router") == probe.EXIT_REFUSED
+
+
+def test_raw_meta_is_written_first_as_running(probe_env, monkeypatch):
+    out_dir = probe_env[0]
+    seen = {}
+
+    def peek(groups, ledger, label, **_kwargs):
+        seen["status"] = _read_meta(out_dir, "raw_contract.meta.json")["status"]
+        return {}
+
+    monkeypatch.setattr(probe, "measure_rounds", peek)
+    _run(probe_env, "--only", "router")
+    assert seen["status"] == "running" and _read_meta(out_dir, "raw_contract.meta.json")["status"] == "complete"
+
+
+def test_agent_stop_keeps_the_calls_done_so_far(agent_probe_env, monkeypatch, capsys):
+    _agent, out_dir, _spend_dir, _utterances, _context = agent_probe_env
+    real = probe.measure_agent_call
+    calls = []
+
+    def stop_on_third(slug, utterance, index, settings, ledger, label):
+        calls.append(slug)
+        if len(calls) == 3:
+            raise spend.BudgetExceeded("上限")
+        return real(slug, utterance, index, settings, ledger, label)
+
+    monkeypatch.setattr(probe, "measure_agent_call", stop_on_third)
+    with pytest.raises(spend.BudgetExceeded):
+        _agent_run(agent_probe_env)
+    meta = _read_meta(out_dir, "agent_agt.meta.json")
+    assert meta["status"] == "stopped:BudgetExceeded" and meta["timed_out"] is False
+    assert sorted(meta["summary"]) == ["chisame", "mimi"] and len(_metrics(out_dir)) == 2
+    assert "途中までの集計" in capsys.readouterr().out
+    assert _agent_run(agent_probe_env) == probe.EXIT_REFUSED
+
+
+def test_agent_ctrl_c_is_recorded_as_aborted(agent_probe_env, monkeypatch):
+    _agent, out_dir, _spend_dir, _utterances, _context = agent_probe_env
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(probe, "measure_agent_call", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1")
+    assert _read_meta(out_dir, "agent_agt.meta.json")["status"] == "aborted"
+
+
+def test_agent_screen_shows_the_reservation_per_character_model(agent_probe_env, capsys):
+    assert _agent_run(agent_probe_env, "--characters", "sakura", "--limit", "1") == 0
+    out = capsys.readouterr().out
+    assert "予約の目安 sakura:" in out and "最大出力 4096 tokens" in out
