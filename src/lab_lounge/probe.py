@@ -778,7 +778,7 @@ def invoke_agent(agent: Any, tagged_text: str, recorder: Any, *, timeout_sec: fl
     contextvars は呼び出し元のものを引き継ぐ（本番と同じ）。
 
     Raises:
-        AgentTimeout: timeout_sec を超えた
+        AgentTimeout: timeout_sec を超えて、まだ終わっていない（agent.invoke が自分で投げたタイムアウトは含まない）
     """
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     context = contextvars.copy_context()
@@ -787,6 +787,11 @@ def invoke_agent(agent: Any, tagged_text: str, recorder: Any, *, timeout_sec: fl
     try:
         return future.result(timeout=timeout_sec)
     except concurrent.futures.TimeoutError:
+        # WHY done() を見る: 3.11 以降、組み込みの TimeoutError と concurrent.futures.TimeoutError は同じ型。
+        #      SDK の中の別のタイムアウト（agent.invoke が投げた例外）を、壁時計の時間切れと取り違えて
+        #      プロセスごと止めると、残りのキャラの計測が失われる。終わっていれば、中身の例外は普通の失敗として返す。
+        if future.done():
+            return future.result(timeout=0)
         raise AgentTimeout(f"{timeout_sec:.0f} 秒") from None
     finally:
         executor.shutdown(wait=False)

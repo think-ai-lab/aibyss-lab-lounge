@@ -679,3 +679,41 @@ class TestMeasureInputError:
                         "--synthetic", str(_synthetic(tmp_path)), "--utterances", str(tmp_path / "u.jsonl")])
         captured = capsys.readouterr()
         assert _SENTINEL not in captured.out + captured.err
+
+
+class TestInnerTimeoutIsNotTheWallClock:
+    """agent.invoke の中（SDK など）が自分で投げた TimeoutError は、壁時計の時間切れではない。"""
+
+    class _Agent:
+        def __init__(self, error=None, result=None):
+            self.error, self.result = error, result
+
+        def invoke(self, payload, config):
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    def test_a_timeout_raised_inside_the_agent_comes_back_as_it_is(self):
+        agent = self._Agent(error=TimeoutError("inner"))
+        with pytest.raises(TimeoutError) as caught:
+            probe.invoke_agent(agent, "x", object(), timeout_sec=5, recursion_limit=25)
+        assert not isinstance(caught.value, probe.AgentTimeout)
+
+    def test_the_wall_clock_timeout_is_still_detected(self):
+        release = threading.Event()
+
+        class Slow(self._Agent):
+            def invoke(self, payload, config):
+                release.wait(5)
+
+        with pytest.raises(probe.AgentTimeout):
+            probe.invoke_agent(Slow(), "x", object(), timeout_sec=0.05, recursion_limit=25)
+        release.set()
+
+    def test_measure_records_it_as_an_ordinary_failure_and_goes_on(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(graph, "_build_agent_graph", lambda *a, **k: self._Agent(error=TimeoutError(_SENTINEL)))
+        ledger = spend.SpendLedger(tmp_path / "spend")
+        settings = probe.AgentSettings(None, 5.0, 25)
+        utterance = probe.Utterance("u01", "greeting", "{name}、こんにちは")
+        line, body = probe.measure_agent_call("sakura", utterance, 0, settings, ledger, "unit")
+        assert line["error"] == "TimeoutError" and body == "" and _SENTINEL not in json.dumps(line)
