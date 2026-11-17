@@ -151,7 +151,7 @@ class TestTargets:
 
     def test_shown_never_has_credentials_or_path(self):
         target = c2_probe.Target("primary", "http://user:secret@example.test:9000/prefix")
-        assert "secret" not in target.shown and "user" not in target.shown and target.shown == "example.test:9000"
+        assert "secret" not in target.shown and "user" not in target.shown and target.shown == "remote:9000"
 
     def test_with_host_swaps_only_the_name(self):
         assert c2_probe.Target("primary", "http://127.0.0.1:8100").with_host("localhost").url == "http://localhost:8100"
@@ -493,3 +493,78 @@ class TestLatencyMetaOnStop:
                  (c2_env / "out" / "c2_latency_c2t.jsonl").read_text(encoding="utf-8").splitlines()]
         assert [x["first_in_process"] for x in lines] == [True] + [False] * (len(lines) - 1)
         assert {x["phase"] for x in lines} == {"cold"}
+
+
+class TestRemoteHostsAreNotShown:
+    def test_loopback_is_shown_and_others_are_just_remote(self):
+        local = c2_probe.Target("primary", "http://127.0.0.1:8100")
+        remote = c2_probe.Target("readonly", "http://sensitive-internal-name.example:8100")
+        assert (local.shown, local.shown_host) == ("127.0.0.1:8100", "127.0.0.1")
+        assert (remote.shown, remote.shown_host) == ("remote:8100", "remote")
+        assert remote.label == "prod(readonly)"  # 役割とポートの呼び名は残る
+
+    def test_the_screen_and_meta_never_show_a_remote_host_name(self, c2_env, fake_c2, monkeypatch, capsys):
+        server = fake_c2()
+        monkeypatch.setenv("L2_C2_URL", server.url)
+        monkeypatch.setenv("L2_C2_URL_READONLY", "http://sensitive-internal-name.example:8100")
+        monkeypatch.setattr(c2_probe, "check_health", lambda target, timeout_sec=2.0: (
+            "ConnectTimeout" if not target.is_loopback else None))
+        assert _latency(c2_env) == 3
+        out = capsys.readouterr().out
+        assert "sensitive-internal-name" not in out and "remote:8100" in out
+
+    def test_meta_has_remote_for_a_non_loopback_target(self, c2_env, monkeypatch):
+        remote = FakeC2()
+        try:
+            monkeypatch.setenv("L2_C2_URL", remote.url)
+            monkeypatch.setattr(c2_probe.Target, "is_loopback", property(lambda self: False))
+            assert _latency(c2_env, "--passes", "1") == 0
+        finally:
+            remote.close()
+        meta = json.loads((c2_env / "out" / "c2_latency_c2t.meta.json").read_text(encoding="utf-8"))
+        assert [t["host"] for t in meta["targets"]] == ["remote"]
+
+
+class TestProductionSettings:
+    def test_recent_is_not_measured_when_production_does_not_call_it(self, c2_env, fake_c2, monkeypatch, capsys):
+        server = fake_c2()
+        monkeypatch.setenv("L2_C2_URL", server.url)
+        monkeypatch.setenv("L2_USE_C2_RECENT", "false")
+        assert _latency(c2_env, "--passes", "1") == 0
+        assert {path for path, _ in server.requests} == {"/retrieve"}
+        out = capsys.readouterr().out
+        assert "L2_USE_C2_RECENT が true でない" in out
+        meta = json.loads((c2_env / "out" / "c2_latency_c2t.meta.json").read_text(encoding="utf-8"))
+        assert meta["recent_measured"] is False and "L2_USE_C2_RECENT" in meta["recent_skipped_reason"]
+
+    def test_recent_with_session_scope_is_not_measured_because_production_adds_a_stream_id(
+            self, c2_env, fake_c2, monkeypatch, capsys):
+        server = fake_c2()
+        monkeypatch.setenv("L2_C2_URL", server.url)
+        monkeypatch.setenv("L2_C2_RECENT_SCOPE", "Session ")
+        assert _latency(c2_env, "--passes", "1") == 0
+        assert {path for path, _ in server.requests} == {"/retrieve"}
+        assert "session" in capsys.readouterr().out
+
+    def test_recent_is_measured_with_the_default_global_scope(self, c2_env, fake_c2, monkeypatch):
+        server = fake_c2()
+        monkeypatch.setenv("L2_C2_URL", server.url)
+        assert _latency(c2_env, "--passes", "1") == 0
+        assert {path for path, _ in server.requests} == {"/retrieve", "/retrieve/recent"}
+
+    def test_warns_when_production_does_not_use_c2_at_all(self, c2_env, fake_c2, monkeypatch, capsys):
+        monkeypatch.setenv("L2_C2_URL", fake_c2().url)
+        assert _latency(c2_env, "--passes", "1") == 0
+        assert "L2_USE_C2_RETRIEVER が true でない" in capsys.readouterr().out
+        monkeypatch.setenv("L2_USE_C2_RETRIEVER", "true")
+        assert _latency(c2_env, "--passes", "1", label="c2u") == 0
+        assert "L2_USE_C2_RETRIEVER" not in capsys.readouterr().out
+
+    def test_the_rules_follow_the_production_source(self):
+        from pathlib import Path
+
+        graph_source = Path(retriever.__file__).with_name("graph.py").read_text(encoding="utf-8")
+        assert 'use_c2 = os.environ.get("L2_USE_C2_RETRIEVER", "false").lower() == "true"' in graph_source
+        assert 'use_recent = os.environ.get("L2_USE_C2_RECENT", "true").lower() == "true"' in graph_source
+        assert 'recent_scope = os.environ.get("L2_C2_RECENT_SCOPE", "global").strip().lower()' in graph_source
+        assert 'if recent_scope == "session":' in graph_source

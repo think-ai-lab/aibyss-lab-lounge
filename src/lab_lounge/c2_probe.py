@@ -106,9 +106,18 @@ class Target:
         return f"{_PORT_ROLES.get(self.port or 0, 'other')}({self.role})"
 
     @property
+    def is_loopback(self) -> bool:
+        return self.host in (*_LOOPBACK_NAMES, "::1")
+
+    @property
+    def shown_host(self) -> str:
+        """画面と meta へ出してよいホスト名。loopback 以外は、社内のホスト名や IP を出さず "remote" にする。"""
+        return self.host if self.is_loopback else "remote"
+
+    @property
     def shown(self) -> str:
-        """画面へ出してよい形（ホストとポートだけ）。"""
-        return f"{self.host}:{self.port}" if self.port else self.host
+        """画面へ出してよい形（loopback ならホストとポート、それ以外は remote とポートだけ）。"""
+        return f"{self.shown_host}:{self.port}" if self.port else self.shown_host
 
     def with_host(self, host: str) -> Target:
         """ホスト名だけを差し替えた送り先（localhost と 127.0.0.1 の比較用）。"""
@@ -147,8 +156,30 @@ def request_for(kind: str, query: str, k: int) -> tuple[str, dict[str, str | int
     raise ValueError(f"知らない道: {kind}")
 
 
+def c2_enabled() -> bool:
+    """本番の記憶検索が C2 を使う設定か（L2_USE_C2_RETRIEVER。graph._build_retriever_from_env と同じ読み方）。"""
+    return os.environ.get("L2_USE_C2_RETRIEVER", "false").lower() == "true"
+
+
+def recent_plan() -> tuple[bool, str | None]:
+    """/retrieve/recent を測るか、測らないならその理由を返す（本番の組み立て、graph._build_retriever_from_env と同じ規則）。
+
+    - L2_USE_C2_RECENT が true でない: 本番は RecentC2Retriever を作らない
+    - L2_C2_RECENT_SCOPE=session: 本番は stream_id を付けて呼ぶ（無ければ作らない）。計測の要求には stream_id が
+      無く、形が違うので測らない
+    """
+    if os.environ.get("L2_USE_C2_RECENT", "true").lower() != "true":
+        return False, "L2_USE_C2_RECENT が true でないので、本番は /retrieve/recent を呼びません"
+    if os.environ.get("L2_C2_RECENT_SCOPE", "global").strip().lower() == "session":
+        return False, "L2_C2_RECENT_SCOPE=session では本番は stream_id を付けて呼ぶので、/retrieve/recent は測りません"
+    return True, None
+
+
 def c2_retriever_count() -> int:
-    """1 回の記憶検索で順に呼ばれる C2 の retriever の数（graph._build_retriever_from_env の組み立てと同じ）。"""
+    """1 回の記憶検索で順に呼ばれる C2 の retriever の数の上限（graph._build_retriever_from_env の組み立てと同じ）。
+
+    session スコープの recent は stream_id があるときだけ加わるので、上限として数える。
+    """
     count = 1  # C2Retriever(primary)
     if os.environ.get("L2_USE_C2_RECENT", "true").lower() == "true":
         count += 1
@@ -385,6 +416,11 @@ def _cmd_latency(args: argparse.Namespace) -> int:
         emit("何も送らずに止めました。C2 を起動してから流し直してください（この道具はサービスを起動しません）")
         return EXIT_MISSING_SERVICE
 
+    if not c2_enabled():
+        emit("[警告] L2_USE_C2_RETRIEVER が true でないので、本番の記憶検索は C2 を使いません（この計測は本番の予算には効きません）")
+    measure_recent, recent_reason = recent_plan()
+    if not measure_recent:
+        emit(f"[注] {recent_reason}")
     k = args.k or sub_top_k()
     retrievers = c2_retriever_count()
     writer = replay.RunFile(run_path)
@@ -395,10 +431,11 @@ def _cmd_latency(args: argparse.Namespace) -> int:
     meta: dict[str, Any] = {
         "tool": "c2_latency", "label": args.label, "started": datetime.now(UTC).isoformat(timespec="seconds"),
         "commit": probe.git_commit(), "profile": args.profile,
-        "targets": [{"label": t.label, "host": t.host, "port": t.port} for t in targets],
+        "targets": [{"label": t.label, "host": t.shown_host, "port": t.port} for t in targets],
         "queries": {"n": len(queries), "sha": probe.digest([(q.id, q.text, q.shape, q.likely) for q in queries])},
         "passes": args.passes, "k": k, "timeout_sec": args.timeout_sec, "thresholds_ms": list(THRESHOLDS_MS),
         "host_compare": not args.no_host_compare, "retrievers_per_search": retrievers,
+        "c2_enabled_in_production": c2_enabled(), "recent_measured": measure_recent, "recent_skipped_reason": recent_reason,
         "notes": ["cold = 1 周目（その問い合わせが初めて）、warm = 2 周目以降、host_compare = localhost と 127.0.0.1 の比べ",
                   "リクエストごとに新しい httpx.Client（本番と同じ）",
                   "first_in_process の要求だけが DNS や接続の準備を払う（記録の行に印がある）"],
@@ -425,7 +462,7 @@ def _cmd_latency(args: argparse.Namespace) -> int:
             for query in queries:
                 for target in targets:
                     record(get_once(target, "retrieve", query, k, args.timeout_sec, target.label, pass_no))
-                    if target.role == "primary":  # 本番は readonly に対して recent を呼ばない
+                    if target.role == "primary" and measure_recent:  # 本番は readonly に対して recent を呼ばない
                         record(get_once(target, "recent", query, k, args.timeout_sec, target.label, pass_no))
         if not args.no_host_compare:
             _compare_hosts(targets, queries, k, args.timeout_sec, record)
