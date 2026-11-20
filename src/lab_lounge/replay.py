@@ -272,14 +272,63 @@ def _git_dirty() -> bool | None:
     return bool(done.stdout.strip()) if done.returncode == 0 else None
 
 
+_GROUP_SEP = "|"
+
+
+def prompt_group(row: dict[str, Any]) -> str:
+    """system prompt が同じになるはずの行のまとまりの鍵: ``種類|キャラ|候補の並び``。
+
+    WHY 種類だけでは足りない: 意図ゲートのプロンプトには対象キャラの slug が、承認と振り分けのプロンプトには
+         候補の名前が入る。種類ごとに数えると、正しい動きでもプロンプトが複数になり、本物の変化（同じ鍵の中で
+         プロンプトが変わった）と見分けられない。
+    """
+    return _GROUP_SEP.join([row["kind"], row.get("character") or "", ",".join(row.get("candidates") or [])])
+
+
+def group_label(key: str) -> str:
+    """画面に出す形（slug だけで本文を含まない）: ``intent[mimi]`` / ``approval[chisame]`` / ``interjection``。"""
+    kind, _, rest = key.partition(_GROUP_SEP)
+    character, _, candidates = rest.partition(_GROUP_SEP)
+    detail = character or candidates
+    return f"{kind}[{detail}]" if detail else kind
+
+
 def prompt_shas(rows: list[dict[str, Any]], lines: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """種類ごとの、実際に使われた system prompt のハッシュの一覧。"""
-    kinds = {row["id"]: row["kind"] for row in rows}
+    """(種類, キャラ, 候補の並び) ごとの、実際に使われた system prompt のハッシュの一覧。鍵は prompt_group。"""
+    groups = {row["id"]: prompt_group(row) for row in rows}
     found: dict[str, set[str]] = defaultdict(set)
     for line in lines:
-        if line.get("prompt_sha") and line["id"] in kinds:
-            found[kinds[line["id"]]].add(line["prompt_sha"])
-    return {kind: sorted(shas) for kind, shas in sorted(found.items())}
+        if line.get("prompt_sha") and line["id"] in groups:
+            found[groups[line["id"]]].add(line["prompt_sha"])
+    return {key: sorted(shas) for key, shas in sorted(found.items())}
+
+
+def by_kind(shas: dict[str, list[str]]) -> dict[str, list[str]]:
+    """prompt_shas を種類ごとにまとめ直す（古い meta は鍵が種類だけ。新しい鍵の ``種類|…`` は先頭の種類で束ねる）。"""
+    merged: dict[str, set[str]] = defaultdict(set)
+    for key, values in shas.items():
+        merged[key.partition(_GROUP_SEP)[0]].update(values)
+    return {kind: sorted(values) for kind, values in sorted(merged.items())}
+
+
+def changed_prompt_groups(base: dict[str, list[str]], run: dict[str, list[str]]) -> list[str]:
+    """基準と違う system prompt のまとまりを、画面に出す名前で返す。
+
+    どちらも新しい形（鍵に ``|`` がある）なら (種類, キャラ, 候補) ごとに比べる。片方が古い形（種類だけの鍵）なら、
+    種類ごとにまとめて比べる（古い run の meta を読めなくしないため。キャラ違いの差は種類の中に混ざるが、
+    同じ設定の run どうしなら集合が一致する）。
+    """
+    fine = all(_GROUP_SEP in key for key in (*base, *run))
+    if fine:
+        keys = sorted(set(base) | set(run))
+        return [group_label(key) for key in keys if base.get(key) != run.get(key)]
+    base, run = by_kind(base), by_kind(run)
+    return sorted(kind for kind in set(base) | set(run) if base.get(kind) != run.get(kind))
+
+
+def mixed_prompt_groups(shas: dict[str, list[str]]) -> list[str]:
+    """1 つの回の中で、同じまとまりの system prompt が 2 つ以上あるものの名前（警告に使う）。"""
+    return [group_label(key) for key, values in shas.items() if len(values) > 1]
 
 
 def _file_sha(path: Path) -> str | None:
@@ -785,8 +834,7 @@ def _load_pair(args: argparse.Namespace) -> tuple[Path, Comparison] | None:
     if metas[args.base].get("set_sha") != metas[args.run].get("set_sha"):
         emit("[警告] 2 つの回のセットのハッシュが違います（結果の無い行は前提で FAIL になります）")
     base_prompts, run_prompts = metas[args.base].get("prompt_shas", {}), metas[args.run].get("prompt_shas", {})
-    changed = sorted(kind for kind in set(base_prompts) | set(run_prompts)
-                     if base_prompts.get(kind) != run_prompts.get(kind))
+    changed = changed_prompt_groups(base_prompts, run_prompts)
     if changed:
         emit(f"system prompt が基準と違う種類: {', '.join(changed)}")
     # 今のセットの全部の行で比べる（両方の回にある行だけに絞ると、途中で止まった回が合格に見える）。
@@ -893,9 +941,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     wire = Counter(call.get("model_on_wire") for call in calls if call.get("run") == args.label)
     meta["model_on_wire"] = {str(k): v for k, v in wire.items()}
     meta["prompt_shas"] = prompt_shas(rows, RunFile(run_path).lines())
-    mixed = [kind for kind, shas in meta["prompt_shas"].items() if len(shas) > 1]
+    mixed = mixed_prompt_groups(meta["prompt_shas"])
     if mixed:
-        emit(f"[警告] 1 つの回の中で、system prompt が 2 つ以上あります: {', '.join(mixed)}")
+        emit(f"[警告] 1 つの回の中で、同じ（種類, キャラ, 候補）の system prompt が 2 つ以上あります: {', '.join(mixed)}")
     meta["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
 

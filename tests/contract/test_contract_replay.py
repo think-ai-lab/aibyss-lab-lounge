@@ -118,7 +118,9 @@ def test_meta_ties_the_run_to_the_code_and_prompts(replay_env):
     meta = json.loads((set_dir / "runs" / "contract.meta.json").read_text(encoding="utf-8"))
     assert len(meta["judge_code_sha"]) == 16 and "dirty" in meta
     assert meta["models"]["router"] == router._LLM_ROUTER_MODEL
-    assert set(meta["prompt_shas"]) == {"approval", "intent", "interjection", "route"}
+    # 鍵は 種類|キャラ|候補の並び。1 つのまとまりの中の system prompt は 1 つ
+    assert {key.partition("|")[0] for key in meta["prompt_shas"]} == {"approval", "intent", "interjection", "route"}
+    assert "intent|mimi|" in meta["prompt_shas"]
     assert all(len(shas) == 1 for shas in meta["prompt_shas"].values())
 
 
@@ -138,3 +140,21 @@ def test_resume_without_meta_is_refused(replay_env, fake_llm, capsys):
     assert _run(set_dir, spend_dir, synthetic, "--resume") == replay.EXIT_REFUSED
     assert "meta がありません" in capsys.readouterr().out
     assert fake_llm.requests == []
+
+
+def test_intents_for_two_characters_do_not_raise_the_mixed_prompt_warning(replay_env, capsys):
+    set_dir, spend_dir, synthetic = replay_env
+    rows = []
+    for i, character in enumerate(["mimi", "chisame", "sakura"]):
+        text = f"{_SENTINEL}-intent-{i}"
+        rows.append({"id": replay_set.row_id("intent", character, [], text), "kind": "intent", "input": text,
+                     "character": character, "candidates": [], "source": "runlog", "expected": None, "alt_ok": [],
+                     "hist_raw": "mention", "hist_key": None, "epoch": f"e#{i}", "date": "2026-06-01"})
+    (set_dir / "private" / "set.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                                       encoding="utf-8")
+    assert _run(set_dir, spend_dir, synthetic, "--reps", "1") == 0
+    out = capsys.readouterr().out
+    assert "system prompt が 2 つ以上" not in out and _SENTINEL not in out
+    meta = json.loads((set_dir / "runs" / "contract.meta.json").read_text(encoding="utf-8"))
+    assert sorted(meta["prompt_shas"]) == ["intent|chisame|", "intent|mimi|", "intent|sakura|"]
+    assert all(len(shas) == 1 for shas in meta["prompt_shas"].values())

@@ -431,3 +431,91 @@ def test_compare_names_kinds_whose_prompt_changed(pair, capsys):
 def test_judge_code_sha_is_stable():
     assert replay.judge_code_sha() == replay.judge_code_sha()
     assert len(replay.judge_code_sha()) == 16
+
+
+# ─── system prompt のまとまり（種類 × キャラ × 候補の並び） ───────────────────
+
+def _grp_row(kind, character=None, candidates=(), text="x"):
+    return {"id": f"{kind}-{character}-{','.join(candidates)}-{text}", "kind": kind, "character": character,
+            "candidates": list(candidates)}
+
+
+def _grp_line(row, sha):
+    return {"id": row["id"], "prompt_sha": sha}
+
+
+class TestPromptGroups:
+    def test_the_key_is_kind_character_and_candidate_order(self):
+        assert replay.prompt_group(_grp_row("intent", "mimi")) == "intent|mimi|"
+        assert replay.prompt_group(_grp_row("approval", None, ["chisame", "mimi"])) == "approval||chisame,mimi"
+        assert replay.prompt_group(_grp_row("approval", None, ["mimi", "chisame"])) == "approval||mimi,chisame"
+        assert replay.prompt_group(_grp_row("interjection")) == "interjection||"
+
+    def test_labels_show_slugs_only(self):
+        assert replay.group_label("intent|mimi|") == "intent[mimi]"
+        assert replay.group_label("approval||chisame") == "approval[chisame]"
+        assert replay.group_label("interjection||") == "interjection"
+
+    def test_intents_for_different_characters_are_not_a_mixed_prompt(self):
+        rows = [_grp_row("intent", "mimi", text="a"), _grp_row("intent", "mimi", text="b"),
+                _grp_row("intent", "chisame", text="c")]
+        lines = [_grp_line(rows[0], "sha-mimi"), _grp_line(rows[1], "sha-mimi"), _grp_line(rows[2], "sha-chisame")]
+        shas = replay.prompt_shas(rows, lines)
+        assert shas == {"intent|chisame|": ["sha-chisame"], "intent|mimi|": ["sha-mimi"]}
+        assert replay.mixed_prompt_groups(shas) == []  # 種類ごとだと 2 つになり、警告が出ていた
+
+    def test_approvals_with_different_candidates_are_not_mixed_either(self):
+        rows = [_grp_row("approval", None, ["chisame"]), _grp_row("approval", None, ["mimi", "sakura"])]
+        shas = replay.prompt_shas(rows, [_grp_line(rows[0], "a"), _grp_line(rows[1], "b")])
+        assert replay.mixed_prompt_groups(shas) == []
+
+    def test_two_prompts_in_the_same_group_are_warned(self):
+        rows = [_grp_row("intent", "mimi", text="a"), _grp_row("intent", "mimi", text="b")]
+        shas = replay.prompt_shas(rows, [_grp_line(rows[0], "one"), _grp_line(rows[1], "two")])
+        assert replay.mixed_prompt_groups(shas) == ["intent[mimi]"]
+
+    def test_lines_without_a_row_or_a_hash_are_skipped(self):
+        row = _grp_row("intent", "mimi")
+        shas = replay.prompt_shas([row], [{"id": "unknown", "prompt_sha": "x"}, {"id": row["id"], "prompt_sha": None}])
+        assert shas == {}
+
+
+class TestChangedPromptGroups:
+    def test_new_form_compares_per_group(self):
+        base = {"intent|mimi|": ["a"], "intent|chisame|": ["b"]}
+        assert replay.changed_prompt_groups(base, dict(base)) == []
+        assert replay.changed_prompt_groups(base, {"intent|mimi|": ["a"], "intent|chisame|": ["c"]}) == [
+            "intent[chisame]"]
+
+    def test_a_group_that_appears_or_disappears_is_a_change(self):
+        assert replay.changed_prompt_groups({"intent|mimi|": ["a"]}, {}) == ["intent[mimi]"]
+
+    def test_an_old_form_meta_is_still_readable_against_a_new_one(self):
+        old = {"approval": ["a"], "intent": ["m", "c"]}  # 種類だけの鍵（古い meta）
+        same = {"approval||chisame": ["a"], "intent|mimi|": ["m"], "intent|chisame|": ["c"]}
+        assert replay.changed_prompt_groups(old, same) == []
+        changed = {"approval||chisame": ["a"], "intent|mimi|": ["m2"], "intent|chisame|": ["c"]}
+        assert replay.changed_prompt_groups(old, changed) == ["intent"]
+
+    def test_two_old_form_metas_compare_by_kind_as_before(self):
+        assert replay.changed_prompt_groups({"approval": ["a"], "intent": ["s"]},
+                                            {"approval": ["b"], "intent": ["s"]}) == ["approval"]
+
+    def test_empty_metas(self):
+        assert replay.changed_prompt_groups({}, {}) == []
+
+    def test_by_kind_merges_the_new_keys(self):
+        assert replay.by_kind({"intent|mimi|": ["a"], "intent|chisame|": ["b"], "approval||x": ["c"]}) == {
+            "approval": ["c"], "intent": ["a", "b"]}
+
+
+def test_compare_says_which_group_changed_in_new_form_metas(pair, capsys):
+    set_dir, _ = pair
+    for label, sha in (("base", "aaa"), ("new", "bbb")):
+        path = set_dir / "runs" / f"{label}.meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["prompt_shas"] = {"intent|mimi|": ["same"], "intent|chisame|": [sha]}
+        path.write_text(json.dumps(meta), encoding="utf-8")
+    _cli(set_dir, "compare", "--base", "base", "--run", "new")
+    out = capsys.readouterr().out
+    assert "system prompt が基準と違う種類: intent[chisame]" in out and "intent[mimi]" not in out
