@@ -104,7 +104,7 @@ _ENV_IN_META = ("L2_LLM_ROUTER_MODEL", "L2_INTENT_GATE_MODEL", "L2_LLM_FILLER_MO
 
 
 def measure_sets_dir() -> Path:
-    """合成の行（commit する）の置き場所。"""
+    """合成の行の置き場所。git の管理外で、使う人が手元に用意する（README の「流す前に」）。"""
     return Path(__file__).resolve().parent / "measure_sets"
 
 
@@ -372,9 +372,9 @@ class RecordingFiller:
         original = self.original
 
         def call(model: str, system_prompt: str, user_text: str) -> str | None:
-            start = time.monotonic()
+            start = spend.stopwatch()
             answer = original(model, system_prompt, user_text)
-            elapsed = int((time.monotonic() - start) * 1000)
+            elapsed = int((spend.stopwatch() - start) * 1000)
             _filler_capture.outcome = Outcome(model, elapsed, None if answer else "NoText")
             return answer
 
@@ -794,7 +794,7 @@ def make_recorder() -> Any:
             self._tool_open: dict[Any, tuple[str, float]] = {}
 
         def on_chat_model_start(self, serialized: Any, messages: Any, *, run_id: Any, **_kwargs: Any) -> None:
-            self._llm_open[run_id] = time.monotonic()
+            self._llm_open[run_id] = spend.stopwatch()
 
         def on_llm_end(self, response: Any, *, run_id: Any, **_kwargs: Any) -> None:
             started = self._llm_open.pop(run_id, None)
@@ -806,7 +806,7 @@ def make_recorder() -> Any:
             input_total = int(info["input"] or 0)  # LangChain の input_tokens は、キャッシュの読み書きを含む合計
             self.steps.append({
                 "n": len(self.steps) + 1,
-                "ms": None if started is None else int((time.monotonic() - started) * 1000),
+                "ms": None if started is None else int((spend.stopwatch() - started) * 1000),
                 "input_total": input_total, "input_uncached": max(0, input_total - cache_read - cache_creation),
                 "output": int(info["output"] or 0), "reasoning": int(info["reasoning"] or 0),
                 "cache_read": cache_read, "cache_creation": cache_creation,
@@ -818,7 +818,7 @@ def make_recorder() -> Any:
             started = self._llm_open.pop(run_id, None)
             self.steps.append({
                 "n": len(self.steps) + 1,
-                "ms": None if started is None else int((time.monotonic() - started) * 1000),
+                "ms": None if started is None else int((spend.stopwatch() - started) * 1000),
                 **dict.fromkeys(_TOKEN_KEYS, 0), "finish": None, "model": None, "tool_calls": [],
                 "error": type(error).__name__,
             })
@@ -831,11 +831,11 @@ def make_recorder() -> Any:
 
         def on_tool_start(self, serialized: Any, input_str: str, *, run_id: Any, **kwargs: Any) -> None:
             name = (serialized or {}).get("name") if isinstance(serialized, dict) else None
-            self._tool_open[run_id] = (_safe_tool_name(name or kwargs.get("name")), time.monotonic())
+            self._tool_open[run_id] = (_safe_tool_name(name or kwargs.get("name")), spend.stopwatch())
 
         def _tool_done(self, run_id: Any, error: BaseException | None) -> None:
-            name, started = self._tool_open.pop(run_id, ("<不明>", time.monotonic()))
-            self.tools.append({"name": name, "ms": int((time.monotonic() - started) * 1000),
+            name, started = self._tool_open.pop(run_id, ("<不明>", spend.stopwatch()))
+            self.tools.append({"name": name, "ms": int((spend.stopwatch() - started) * 1000),
                                "error": None if error is None else type(error).__name__})
 
         def on_tool_end(self, output: Any, *, run_id: Any, **_kwargs: Any) -> None:
@@ -981,20 +981,20 @@ def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: Ag
     }
     recorder = make_recorder()
     body = ""
-    started = time.monotonic()
+    started = spend.stopwatch()
     try:
         prompt = _agent_prompt(character, settings.stream_context)
         agent = graph._build_agent_graph(provider, model, prompt, character_slug=slug)
-        line["build_ms"] = int((time.monotonic() - started) * 1000)
+        line["build_ms"] = int((spend.stopwatch() - started) * 1000)
         if agent is None:
             line["error"] = "NoAgent"
         else:
-            invoked = time.monotonic()
+            invoked = spend.stopwatch()
             try:
                 result = invoke_agent(agent, tag_speaker(expand_utterance(utterance.text, slug)), recorder,
                                       timeout_sec=settings.timeout_sec, recursion_limit=settings.recursion_limit)
             finally:
-                line["total_ms"] = int((time.monotonic() - invoked) * 1000)
+                line["total_ms"] = int((spend.stopwatch() - invoked) * 1000)
                 line["steps"], line["tools"] = recorder.steps, recorder.tools
             summary = _summarize_agent_result(result)
             body = response_text(result)
@@ -1003,12 +1003,14 @@ def measure_agent_call(slug: str, utterance: Utterance, index: int, settings: Ag
                         tools_fired=[_safe_tool_name(name) for name in summary["tools"]])
     except AgentTimeout as exc:
         line["error"] = "Timeout"
+        line["tools_fired"] = tools_returned(line)  # Agent の結果が無いので、コールバックの記録から
         exc.line = line  # finally が費用を書き足した後の同じ行を、呼び出し側が記録する
         raise
     except spend.SpendStop:
         raise
     except Exception as exc:  # noqa: BLE001 - 失敗の型だけを残す（文言には本文が入りうる）
         line["error"] = type(exc).__name__
+        line["tools_fired"] = tools_returned(line)  # Agent の結果が無いので、コールバックの記録から
     finally:
         line["usd"] = ledger.run_usd(label) - usd_before
         line["http_calls"] = ledger.data["by_run"].get(label, {}).get("calls", 0) - calls_before
@@ -1044,9 +1046,24 @@ def check_steps_were_metered(line: dict[str, Any]) -> None:
             "HTTP の層が 1 件も数えていません（費用と上限が効いていません）")
 
 
+def tools_returned(line: dict[str, Any]) -> list[str]:
+    """その回で道具が定型の応答を返した、道具の名前の列。失敗の回は、失敗の前に返した分を返す。
+
+    成功の回は、Agent の結果から数えた tools_fired をそのまま使う。失敗の回は Agent の結果が無いので、
+    コールバックが記録した道具（tools）のうち、エラーの無いものを使う（成功の回では、両者は同じ名前と順番になる）。
+    tools_fired を後から足した行と、足す前に書いた古い行の、どちらにも使える。
+
+    WHY: 失敗の回の道具を数えないと、「道具の結果を受けた次の step で止まる」ような失敗の形が、集計から消える。
+    """
+    if line.get("tools_fired"):
+        return list(line["tools_fired"])
+    return [entry["name"] for entry in line.get("tools") or [] if not entry.get("error")]
+
+
 def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
     """1 キャラの集計。時間は成功した呼び出しだけ、cold は最初の 1 回、warm は 2 回目以降。"""
     ok = [line for line in lines if not line["error"] and line["total_ms"] is not None]
+    failed_lines = [line for line in lines if line["error"] or line["total_ms"] is None]
     cold = [float(line["total_ms"]) for line in ok if line["cold"]]
     warm = [float(line["total_ms"]) for line in ok if not line["cold"]]
     steps = [step for line in ok for step in line["steps"]]
@@ -1056,12 +1073,15 @@ def summarize_agent(lines: list[dict[str, Any]]) -> dict[str, Any]:
     fired: Counter = Counter()
     for line in ok:
         fired.update(line["tools_fired"])
+    # 失敗の回の道具は分けて数える（WHY: 成功の回の数の意味は変えずに、失敗の前に道具を呼んでいたことを見えるようにする）。
+    fired_failed = Counter(name for line in failed_lines for name in tools_returned(line))
     return {
-        "n": len(lines), "failed": len(lines) - len(ok), "cold_ms": cold[0] if cold else None,
+        "n": len(lines), "failed": len(failed_lines), "cold_ms": cold[0] if cold else None,
         "warm_p50": percentile(warm, 0.5), "warm_p90": percentile(warm, 0.9), "warm_max": max(warm) if warm else None,
         "step_p50": percentile(step_ms, 0.5), "step_p90": percentile(step_ms, 0.9),
         "steps_mean": (len(steps) / len(ok)) if ok else None, "tokens": tokens,
-        "tools_fired": dict(fired), "source": dict(Counter(line["source"] for line in lines if line["source"])),
+        "tools_fired": dict(fired), "tools_fired_failed": dict(fired_failed),
+        "source": dict(Counter(line["source"] for line in lines if line["source"])),
         "usd": sum(line.get("usd", 0.0) for line in lines),
         "models": dict(Counter(line["model"] for line in lines if line["model"])),
         "model_on_wire": dict(Counter(label_of(step["model"]) for line in lines for step in line["steps"]
@@ -1081,6 +1101,10 @@ def print_agent_summary(slug: str, summary: dict[str, Any]) -> None:
         return round(total / n_ok)
 
     fired = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["tools_fired"].items())) or "なし"
+    fired_failed = " ".join(f"{spend._showable(k)}×{v}"
+                            for k, v in sorted(summary.get("tools_fired_failed", {}).items()))
+    if fired_failed:
+        fired += f"（失敗の回 {fired_failed}）"
     source = " ".join(f"{spend._showable(k)}×{v}" for k, v in sorted(summary["source"].items())) or "-"
     emit(f"  {slug}: モデル {models}（応答 {wire}）  n={summary['n']} 失敗={summary['failed']}  "
          f"cold={_ms(summary['cold_ms'])}ms  warm p50={_ms(summary['warm_p50'])}ms p90={_ms(summary['warm_p90'])}ms "

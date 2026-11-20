@@ -720,3 +720,29 @@ def test_production_modules_do_not_import_the_measuring_tools():
             if last in _TOOL_MODULES and (name.startswith(("lab_lounge", ".")) or name == last):
                 offenders.append(f"{path.relative_to(package).as_posix()}: {name}")
     assert offenders == []
+
+
+class TestStopwatch:
+    """計測の道具の時計（spend.stopwatch）。"""
+
+    def test_it_ticks_finer_than_a_millisecond(self):
+        """次の値に変わるまでの間が 1 ms 未満（Windows の time.monotonic() は約 15.6 ms ごとにしか進まない）。
+
+        WHY 5 回の最小: 2 つの呼び出しの間にスレッドが OS に止められると、1 回だけ間が延びることがある。
+        """
+        gaps = []
+        for _ in range(5):
+            start = spend.stopwatch()
+            while (now := spend.stopwatch()) == start:
+                pass
+            gaps.append(now - start)
+        assert 0 < min(gaps) < 0.001
+
+    def test_the_measuring_tools_do_not_go_back_to_the_coarse_clock(self):
+        """計測の道具は、経過時間を spend.stopwatch() で測る（開始と終了で時計を混ぜない）。
+
+        spend.py は時計の置き場所で、WHY に time.monotonic の名前が出るので対象から外す。
+        """
+        package = _REPO_ROOT / "src" / "lab_lounge"
+        for stem in sorted(_TOOL_MODULES - {"spend"}):
+            assert "time.monotonic(" not in (package / f"{stem}.py").read_text(encoding="utf-8"), stem

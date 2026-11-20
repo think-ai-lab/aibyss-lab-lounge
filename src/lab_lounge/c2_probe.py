@@ -44,7 +44,6 @@ import json
 import math
 import os
 import re
-import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -274,7 +273,7 @@ def get_once(target: Target, kind: str, query: Query, k: int, timeout_sec: float
     import httpx
 
     path, params = request_for(kind, query.text, k)
-    started = time.monotonic()
+    started = spend.stopwatch()
     results: int | None = None
     error: str | None = None
     try:
@@ -285,7 +284,7 @@ def get_once(target: Target, kind: str, query: Query, k: int, timeout_sec: float
         results = len(data.get("results", [])) if isinstance(data, dict) else 0
     except Exception as exc:  # noqa: BLE001 - 失敗の型だけを残す
         error = type(exc).__name__
-    elapsed = (time.monotonic() - started) * 1000
+    elapsed = (spend.stopwatch() - started) * 1000
     return Sample(group, kind, query.id, pass_no, elapsed, error is None, error, results)
 
 

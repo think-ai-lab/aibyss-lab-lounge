@@ -620,10 +620,10 @@ class TestSynthetic:
         with pytest.raises(ValueError):
             replay_set.load_synthetic(self._write(tmp_path, self._base(), self._base()))
 
-    def test_committed_rows_load(self):
-        """commit した合成の行（measure_sets/）が、読み込みの形に合っている。"""
+    def test_local_rows_load(self):
+        """手元に置いた合成の行（measure_sets/、git の管理外）が、読み込みの形に合っている。"""
         if not replay_set.default_synthetic_path().is_file():
-            pytest.skip("合成の行がまだ無い")
+            pytest.skip("合成の行が手元に無い（git の管理外なので、clone しただけでは無い）")
         assert len(replay_set.load_synthetic()) > 0
 
 

@@ -725,6 +725,76 @@ class TestInnerTimeoutIsNotTheWallClock:
         assert line["error"] == "TimeoutError" and body == "" and _SENTINEL not in json.dumps(line)
 
 
+class TestToolsOfFailedCalls:
+    """失敗した回でも、失敗の前に定型の応答を返した道具を数える（成功の回の数とは分けて出す）。"""
+
+    class _ToolThenFail:
+        """道具を 1 回呼んだことをコールバックへ知らせてから、失敗する Agent。"""
+
+        def __init__(self, error):
+            self.error = error
+
+        def invoke(self, payload, config):
+            (recorder,) = config["callbacks"]
+            run = uuid.uuid4()
+            recorder.on_tool_start({"name": "retrieve_memory_tool"}, "", run_id=run)
+            recorder.on_tool_end("", run_id=run)
+            raise self.error
+
+    def test_a_failed_call_keeps_the_tools_that_returned_before_the_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(graph, "_build_agent_graph", lambda *a, **k: self._ToolThenFail(RuntimeError(_SENTINEL)))
+        ledger = spend.SpendLedger(tmp_path / "spend")
+        settings = probe.AgentSettings(None, 5.0, 25)
+        utterance = probe.Utterance("u01", "explain", "{name}、教えて")
+        line, body = probe.measure_agent_call("mimi", utterance, 1, settings, ledger, "unit")
+        assert line["error"] == "RuntimeError" and body == ""
+        assert line["tools_fired"] == ["retrieve_memory_tool"]
+        assert _SENTINEL not in json.dumps(line)
+
+    def test_a_wall_clock_timeout_also_keeps_them(self, tmp_path, monkeypatch):
+        release = threading.Event()
+
+        class ToolThenHang:
+            def invoke(self, payload, config):
+                (recorder,) = config["callbacks"]
+                run = uuid.uuid4()
+                recorder.on_tool_start({"name": "ask_character_tool"}, "", run_id=run)
+                recorder.on_tool_end("", run_id=run)
+                release.wait(5)
+
+        monkeypatch.setattr(graph, "_build_agent_graph", lambda *a, **k: ToolThenHang())
+        ledger = spend.SpendLedger(tmp_path / "spend")
+        settings = probe.AgentSettings(None, 0.3, 25)
+        utterance = probe.Utterance("u01", "collab", "{name}、聞いて")
+        try:
+            with pytest.raises(probe.AgentTimeout) as caught:
+                probe.measure_agent_call("mimi", utterance, 1, settings, ledger, "unit")
+        finally:
+            release.set()
+        assert caught.value.line["error"] == "Timeout"
+        assert caught.value.line["tools_fired"] == ["ask_character_tool"]
+
+    def test_the_summary_counts_them_apart_from_the_successful_calls(self, capsys):
+        ok = {"cold": False, "error": None, "total_ms": 10, "steps": [], "tools": [],
+              "tools_fired": ["web_search_tool"], "source": "x", "usd": 0.0, "model": "m", "finish": "stop"}
+        # 直す前に書いた行の形（失敗の回は tools_fired が空で、コールバックの記録 tools だけがある）
+        failed = {**ok, "error": "APITimeoutError", "total_ms": 80000, "tools_fired": [],
+                  "tools": [{"name": "retrieve_memory_tool", "ms": 1, "error": None},
+                            {"name": "web_search_tool", "ms": 1, "error": "ToolException"}]}
+        summary = probe.summarize_agent([ok, failed])
+        assert summary["tools_fired"] == {"web_search_tool": 1}  # 成功の回の数の意味は変えない
+        assert summary["tools_fired_failed"] == {"retrieve_memory_tool": 1}  # エラーで終わった道具は数えない
+        probe.print_agent_summary("mimi", summary)
+        assert "道具 web_search_tool×1（失敗の回 retrieve_memory_tool×1）" in capsys.readouterr().out
+
+    def test_the_summary_line_stays_the_same_without_failed_tools(self, capsys):
+        ok = {"cold": False, "error": None, "total_ms": 10, "steps": [], "tools": [],
+              "tools_fired": [], "source": "x", "usd": 0.0, "model": "m", "finish": "stop"}
+        probe.print_agent_summary("mimi", probe.summarize_agent([ok]))
+        out = capsys.readouterr().out
+        assert "道具 なし  source" in out and "失敗の回" not in out
+
+
 class TestProviderCapture:
     def _s(self, model, error=None, provider=None):
         return probe.Sample("g", 0, "x", model, None, 10, error, 0.0, {}, provider)

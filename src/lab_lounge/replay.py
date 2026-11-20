@@ -68,7 +68,6 @@ import os
 import re
 import subprocess
 import threading
-import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -129,9 +128,9 @@ class RecordingRouter:
         original = self.original
 
         def call(model: str, system_prompt: str, user_text: str) -> str | None:
-            start = time.monotonic()
+            start = spend.stopwatch()
             answer = original(model, system_prompt, user_text)
-            elapsed = int((time.monotonic() - start) * 1000)
+            elapsed = int((spend.stopwatch() - start) * 1000)
             records = getattr(_capture, "records", None)
             if records is not None:
                 records.append(CallRecord(answer, elapsed, getattr(router._router_call_state, "error", None),
@@ -928,7 +927,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ledger = spend.SpendLedger(args.spend_dir or spend.default_spend_dir())
     emit(f"実行 {args.label}: {len(rows)} 行 × {args.reps} 回、並列 {args.workers}、上限 ${args.max_usd:.2f}"
          f"（除外 {excluded}）")
-    started = time.monotonic()
+    started = spend.stopwatch()
     private_runs = spend.private_dir(set_dir) / "runs"
     with _captured_logs(private_runs / f"{args.label}.problems.log"), \
             spend.UsageMeter(ledger, args.label, max_usd=args.max_usd, overrides=overrides) as meter:
@@ -948,7 +947,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
 
     judged = stats["ok"] + stats["error"]
-    emit(f"判定 {judged} 件（エラー {stats['error']}）、{time.monotonic() - started:.0f} 秒、"
+    emit(f"判定 {judged} 件（エラー {stats['error']}）、{spend.stopwatch() - started:.0f} 秒、"
          f"今回 ${spent:.4f}（1 件あたり ${spent / judged if judged else 0:.5f}）、"
          f"usage を拾えず見積もりで数えた呼び出し {meter.stats.uncounted}")
     emit("応答のモデル名: " + ", ".join(f"{spend._showable(k)} {v}" for k, v in sorted(wire.items(), key=str)))

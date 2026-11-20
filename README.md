@@ -494,6 +494,8 @@ uv run --frozen --all-extras python -m lab_lounge.probe history --label past
 - 時間切れ（`L2_AGENT_INVOKE_TIMEOUT_SEC`）に当たったら、記録してからプロセスごと終えます（取り残したスレッドの課金を止めるため）。`agent.invoke` の中（SDK など）が自分で投げたタイムアウトは、普通の失敗として記録して続けます。
 - 全体で 30 分ほどかかるので、キャラ（と `raw` のグループ）は、発話の番号ごとに交互に流します（API の混み具合の変化が後のキャラに偏らないように）。`cold` はキャラごとの 1 本目で、DNS や TLS を払うプロセスの最初の呼び出し、提供元ごとの最初の呼び出しには、別に `first_in_process` / `first_for_provider` の印が付きます。
 - tokens の入力は 2 つの名前で区別します: `in_total`（キャッシュの読み書きを含む合計。LangChain の `input_tokens` と同じ意味）と `in_uncached`（キャッシュに当たらなかった入力。Anthropic の `input_tokens` と同じ意味）。`cache_read` / `cache_creation` と並べて、キャッシュの効果を比べます。usage を拾えない提供元が 1 社でもあれば、止まります（提供元ごとに確かめています）。
+- 道具の欄は、成功の回で定型の応答を返した道具の数です。失敗の回でも、失敗の前に返した道具は「（失敗の回 …）」として分けて出します（「道具の結果を受けた次の step で止まる」といった失敗の形を、集計から落とさないため）。
+- 時間は `time.perf_counter()` で測ります（`spend.stopwatch()`）。Windows の Python 3.12 の `time.monotonic()` は約 15.6 ms ごとにしか進まず、数百 ms の判定や C2 の検索の時間では誤差が目立つためです。
 
 **食べ比べ**（後継のモデルを、同じ発話で比べる流れ）:
 

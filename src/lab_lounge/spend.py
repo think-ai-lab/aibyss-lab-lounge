@@ -1165,6 +1165,19 @@ def _wrap_async(original: Callable[..., Any], module: Any) -> Callable[..., Any]
     return send
 
 
+# ─── 時計（計測の道具に共通） ─────────────────────────────────
+
+def stopwatch() -> float:
+    """経過時間を測るための時計の値（秒）。値そのものに意味はなく、2 つの値の差だけを使う。
+
+    WHY perf_counter: Windows の Python 3.12 では、time.monotonic() が OS のタイマーの刻み（約 15.6 ms）でしか
+         進まず、数百 ms の呼び出しを測ると誤差が目立つ。perf_counter は 1 µs より細かく刻む。
+    WHY 1 か所に置く: 計測の道具（probe、c2_probe、replay）の時間は、すべてこの関数で測る。開始と終了で
+         別の時計を混ぜる取り違えを防ぎ、テストで刻みの細かさを確かめられるようにする。
+    """
+    return time.perf_counter()
+
+
 # ─── 本文を出さない後始末（計測の道具に共通） ─────────────────────
 
 def _showable(value: object) -> str:
