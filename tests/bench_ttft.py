@@ -2,6 +2,15 @@
 """
 bench_ttft.py — マルチプロバイダ TTFT / レイテンシ ベンチマーク
 
+【補助の道具】モデルを切り替えるときの目安を見るための道具で、採否の根拠にしない。
+  - 本番の Agent（ツール、構造化出力、system prompt）を通さず、短いプロンプトの TTFT だけを測る。
+    本番と同じ経路の時間は `python -m lab_lounge.probe agent`（step ごとの時間と tokens）で測る。
+  - 1 つでも失敗（[skip] を含む）があれば終了コード 1 で終わる。黙って表が欠けたまま緑にしないため。
+  - **支出の記録（lab_lounge.spend）と上限の外**で動く。呼び出しの数は `--trials` × プロンプト × モデルで決まり、
+    費用は記録されない。試す前に `--only` と `--trials` で絞る。価格表（spend prices）に無いモデルも流れる。
+  - 継承した LLM の接続先（ANTHROPIC_BASE_URL など）は、最初に環境から外す（本番と別の相手を測らないため）。
+    `.env` がそれらを指定していれば、終了コード 2 で止まる。
+
 A.I.byss Suite の LLM 呼び出しレイヤ（LangChain）経由で、
 各モデルの TTFT (Time To First Token) と総生成時間を計測する。
 
@@ -46,6 +55,7 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # .env 読み込み
@@ -107,18 +117,22 @@ TEMPERATURE = 0.7          # ※ 非対応モデルには渡さない（NO_TEMPE
 SLEEP_BETWEEN_CALLS = 2.0  # レートリミット相互干渉の回避
 WARMUP = True              # 各モデル1回ウォームアップ（集計から除外）
 
-# temperature を渡すと API が 400 を返すモデル群。
-#   - Anthropic: Opus 4.7 以降 / Fable 5 では sampling パラメータ
-#     (temperature / top_p / top_k) が API から削除された
-#   - OpenAI: gpt-5 系 reasoning モデルは temperature の変更を受け付けない
-# これらはプロバイダ既定値で計測する（temperature は TTFT にほぼ影響しないため
+# temperature を渡さないもの。プロバイダ既定値で計測する（temperature は TTFT にほぼ影響しないため
 # 比較条件としては許容、と判断）。
+#   - Anthropic の Claude 全部: 新しいモデル（Opus 4.7 以降、Fable 5 など）では sampling パラメータ
+#     (temperature / top_p / top_k) が API から削除され、渡すと 400 になる。モデルごとの境目をこの表で
+#     追うと、後継のモデルを足すたびに表の更新漏れで落ちる。Claude には一律で送らない
+#   - OpenAI: gpt-5 系 reasoning モデルは temperature の変更を受け付けない
+NO_TEMPERATURE_PROVIDERS = {"anthropic"}
 NO_TEMPERATURE_MODELS = {
-    "claude-opus-4-8",
-    "claude-fable-5",
     "gpt-5.5",
     "gpt-5.4-mini",
 }
+
+
+def sends_temperature(provider: str, model: str) -> bool:
+    """このモデルへ temperature を渡すか。Claude には渡さない。"""
+    return provider not in NO_TEMPERATURE_PROVIDERS and model not in NO_TEMPERATURE_MODELS
 
 # provider: "anthropic" | "openai" | "google"
 MODELS = [
@@ -153,10 +167,10 @@ PROMPTS = {
 
 
 def build_llm(provider: str, model: str):
-    # temperature は対応モデルにのみ渡す（非対応モデルは API が 400 を返す。
-    # 一覧と理由は NO_TEMPERATURE_MODELS のコメント参照）
+    # temperature は対応モデルにのみ渡す（Claude と非対応モデルには渡さない。
+    # 理由は NO_TEMPERATURE_PROVIDERS のコメント参照）
     sampling: dict = {}
-    if model not in NO_TEMPERATURE_MODELS:
+    if sends_temperature(provider, model):
         sampling["temperature"] = TEMPERATURE
 
     if provider == "anthropic":
@@ -234,9 +248,39 @@ def run_trial(llm, model: str, prompt_kind: str, prompt: str) -> Trial:
                     ttft = (now - t0) * 1000
                 chars += len(text)
         total = (time.perf_counter() - t0) * 1000
+        if ttft is None:
+            # 見える文字が 1 つも来ずに終わった（考えるだけで上限に達した、など）。TTFT が無い試行を成功に数えると、
+            # 表の書式や中央値が None で落ちて、集計が全部失われる。失敗として数える。
+            return Trial(model, prompt_kind, None, first_chunk, total, chars, error="NoVisibleText")
         return Trial(model, prompt_kind, ttft, first_chunk, total, chars)
     except Exception as e:  # noqa: BLE001
-        return Trial(model, prompt_kind, None, None, None, 0, error=repr(e))
+        return Trial(model, prompt_kind, None, None, None, 0, error=describe_error(e))
+
+
+def describe_error(exc: BaseException) -> str:
+    """例外を、型の名前と（あれば）HTTP の状態だけで表す。
+
+    WHY: repr(e) は、API が返したメッセージ（要求の断片や鍵の一部を含みうる）をそのまま CSV と画面へ出す。
+         プロンプトは今は固定の合成の文だが、将来の取り違えに備えて、型と状態だけに絞る。
+    """
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return type(exc).__name__ + (f"({status})" if isinstance(status, int) else "")
+
+
+def clean_inherited_endpoints(env_path: str | None) -> None:
+    """継承した LLM の接続先（ANTHROPIC_BASE_URL など）を環境から外す。lab_lounge が無い環境では警告だけ。
+
+    WHY: ツールなどから起動すると接続先を継承していることがあり、本番と別の相手を測ってしまう。
+         `.env` がそれらを指定していれば、clean_llm_env が終了コード 2 で止める。
+    """
+    try:
+        from lab_lounge.preflight import clean_llm_env
+    except ImportError:
+        print("[env] lab_lounge が import できないので、継承した接続先は外していません")
+        return
+    candidates = [env_path] if env_path else [
+        os.path.join(os.getcwd(), ".env"), os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")]
+    clean_llm_env([Path(path) for path in candidates if path and os.path.exists(path)])
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +336,35 @@ def print_table(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+class CsvSink:
+    """生データ CSV を、1 試行ごとに書いて flush する。最初の試行まで、ファイルは作らない。
+
+    WHY 1 試行ごと: 最後にまとめて書くと、途中で落ちた（例外、Ctrl+C）ときに、それまでの測定が全部失われる。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._file = None
+        self._writer = None
+
+    def __enter__(self) -> "CsvSink":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._file is not None:
+            self._file.close()
+
+    def write(self, trial: "Trial") -> None:
+        if self._file is None:
+            self._file = open(self.path, "w", newline="", encoding="utf-8")  # noqa: SIM115 - __exit__ で閉じる
+            self._writer = csv.DictWriter(self._file, fieldnames=list(trial.__dict__.keys()))
+            self._writer.writeheader()
+        self._writer.writerow(trial.__dict__)
+        self._file.flush()
+
+
+def main() -> int:
+    """ベンチを流す。失敗（[skip]、ウォームアップの失敗、試行のエラー）が 1 つでもあれば 1、なければ 0 を返す。"""
     ap = argparse.ArgumentParser(description="multi-provider TTFT benchmark")
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--only", type=str, default="", help="モデル名の部分一致フィルタ")
@@ -301,6 +373,7 @@ def main() -> None:
     ap.add_argument("--env", type=str, default="", help=".env ファイルのパス（省略時は自動探索）")
     args = ap.parse_args()
 
+    clean_inherited_endpoints(args.env or None)
     load_env(args.env or None)
 
     targets = [m for m in MODELS if args.only.lower() in m["model"].lower()]
@@ -311,40 +384,50 @@ def main() -> None:
     check_keys({m["provider"] for m in targets})
 
     all_trials: list[Trial] = []
-    raw_rows: list[dict] = []
-
-    for spec in targets:
-        try:
-            llm = build_llm(spec["provider"], spec["model"])
-        except Exception as e:  # noqa: BLE001
-            print(f"[skip] {spec['model']}: クライアント生成失敗 {e!r}")
-            continue
-
-        if WARMUP:
-            print(f"[warmup] {spec['model']}")
-            run_trial(llm, spec["model"], "warmup", PROMPTS["greeting"])
-            time.sleep(SLEEP_BETWEEN_CALLS)
-
-        for kind, prompt in prompts.items():
-            for i in range(args.trials):
-                t = run_trial(llm, spec["model"], kind, prompt)
-                all_trials.append(t)
-                raw_rows.append(t.__dict__)
-                status = f"err={t.error}" if t.error else f"ttft={t.ttft_ms:.0f}ms total={t.total_ms:.0f}ms"
-                print(f"[{spec['model']}] {kind} #{i + 1}: {status}")
-                time.sleep(SLEEP_BETWEEN_CALLS)
-
-    # 生データ CSV
-    if raw_rows:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(raw_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(raw_rows)
+    # 生データ CSV は 1 試行ごとに書く（途中で落ちても、そこまでの分が残る）。
+    with CsvSink(args.csv) as sink:
+        failures = run_all(targets, prompts, args.trials, all_trials, sink)  # [skip]、ウォームアップ、試行のエラーの合計
+    if all_trials:
         print(f"\n生データ: {args.csv}")
 
     print("\n===== 集計 =====")
     print_table(summarize(all_trials))
+    if failures:
+        print(f"\n失敗が {failures} 件あります（[skip]、ウォームアップ、試行のエラーの合計）。この表は欠けています")
+        return 1
+    return 0
+
+
+def run_all(targets: list[dict], prompts: dict[str, str], trials: int, all_trials: list, sink: CsvSink) -> int:
+    """全モデル × 全プロンプトを流し、失敗の数（[skip]、ウォームアップ、試行のエラーの合計）を返す。"""
+    failures = 0
+    for spec in targets:
+        try:
+            llm = build_llm(spec["provider"], spec["model"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[skip] {spec['model']}: クライアント生成失敗 {describe_error(e)}")
+            failures += 1
+            continue
+
+        if WARMUP:
+            print(f"[warmup] {spec['model']}")
+            warm = run_trial(llm, spec["model"], "warmup", PROMPTS["greeting"])
+            if warm.error:
+                print(f"[warmup-error] {spec['model']}: {warm.error}")
+                failures += 1
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+        for kind, prompt in prompts.items():
+            for i in range(trials):
+                t = run_trial(llm, spec["model"], kind, prompt)
+                all_trials.append(t)
+                sink.write(t)
+                failures += bool(t.error)
+                status = f"err={t.error}" if t.error else f"ttft={t.ttft_ms:.0f}ms total={t.total_ms:.0f}ms"
+                print(f"[{spec['model']}] {kind} #{i + 1}: {status}")
+                time.sleep(SLEEP_BETWEEN_CALLS)
+    return failures
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

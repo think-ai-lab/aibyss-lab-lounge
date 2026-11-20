@@ -422,6 +422,108 @@ PASS 36 / FAIL 1 / WARN 2 / SKIP 1 / 本応答の tokens in=52310 out=840
 
 **確かめないもの**: マイク、音声の再生、OBS の表示は人の確認が要る。STT（`L2_USE_REAL_STT` の経路とモデルの読み込み）、ウェイクワード、VAD、挙手の状態機械は流さない。C2 への書き込みと V2 の受信も確かめない（publish までを見る）。協働は既定で 1 組だけで、2 人目への連続した振りは通らない。
 
+### 5. 計測の道具 — リプレイ、probe、c2_probe、spend
+
+モデルや SDK、設定を変えたときに、「判定が変わったか」「速さと費用が変わったか」を数字で言うための道具です。
+どれも配信の本流から呼ばれず（消しても配信の挙動は変わらない）、`python -m lab_lounge.<名前>` で流します。
+**有料の道具（LLM を呼ぶもの）は、`--max-usd` で上限を渡し、送る前の見積もりが上限を超えるなら 1 件も送らずに止まります。**
+見積もりは多め（入力は本文の bytes / 2 tokens、出力は最大出力まで出たとみなす）なので、`--max-usd` は「予約が 1 回分は入る余裕」を持たせて決めます
+（足りないと、実際には余っていても次の 1 回を送る前に止まります）。1 回分の目安は、`probe agent` が始めに画面へ出す「予約の目安」（キャラごとのモデルの
+最大出力 × 出力単価）。Agent は 1 回の呼び出しで複数の step を送るので、全体の見込みは「予約の目安 × step 数 × 呼び出し数」より低く収まります。
+止まった回（上限、Ctrl+C など）も、`meta.json` に状態（`status`）と、そこまでの集計が残ります。同じ名前では流し直せないので、別の `--label` で流します。
+
+| 道具 | 測るもの | 課金 |
+|---|---|---|
+| `spend` | 価格表と、支出の記録（`data/probe/spent.json`）の要約 | なし |
+| `replay_set` / `replay` | 判定（挙手の候補、承認、呼びかけと言及、複数名の振り分け）の答えの変化 | あり |
+| `probe raw` | 判定と filler の LLM 呼び出しの時間（p50 / p90 / 最大）、失敗、tokens、費用 | あり |
+| `probe agent` | 本番と同じ Agent の全体の時間、step ごとの時間と tokens（キャッシュの読み書きを含む）、道具の発火、費用 | あり |
+| `probe history` | 過去の実走ログの、キャラごと・月ごとの Agent の時間（数字だけ） | なし |
+| `c2_probe latency` | C2 の検索の時間の分布（cold / warm）としきい値を超えた割合、予算の目安 | C2 側の埋め込みのみ |
+| `c2_probe timeouts` | 過去の実走ログの C2 のタイムアウトを、月ごと・日付の前後ごとに数える | なし |
+
+**出力の約束**: 画面と、`data/probe/` `data/replay/` の数字のファイルには、発話の本文も、モデルの答えも出しません（件数、率、時間、tokens、費用、決まった形の判定の答えだけ）。
+本文やモデルの出力を含みうるファイルは、それぞれの `private/` に分けて置きます（`data/replay/private/`: リプレイのセット、確認のファイル、生の答え、WARNING のログ。`data/probe/private/`: Agent の返答の本文、WARNING のログ、配信文脈の写し）。
+`private/` は人だけが開くフォルダです。Claude などの自動化には、`private/` を開かせず、直下の数字のファイルだけを読ませてください。
+モデルの返答の本文は、聴き比べ用に `probe agent` の `data/probe/private/agent_<名前>.jsonl` だけに書きます（直下の `agent_<名前>.metrics.jsonl` は同じ行から本文を除いたもの）。`data/` は gitignore 済みで、実の配信ログから作ったものを含むので、そのまま共有しないでください。
+実走ログ（`logs/runs/`）には発話が入っているので、集計の道具は先頭の形だけを読み、本文は読みません。
+
+**流す前に**: `src/lab_lounge/measure_sets/` の合成の行（リプレイの期待値つきの行、計測の発話、C2 の問い合わせ）を、自分の公開してよい文面で用意します（`probe` と `c2_probe` は、無ければ何も送らずに断ります。`replay` は、無ければ合成の行なしで流します）。
+
+```bash
+# 価格表（出典の URL と確認日つき）と、支出の記録
+uv run --frozen --all-extras python -m lab_lounge.spend prices
+uv run --frozen --all-extras python -m lab_lounge.spend show
+```
+
+**判定のリプレイ**（モデルや判定の変更の前後で、答えが変わった行を数える）:
+
+```bash
+# 1) 実走ログから、過去の発話の固定のセットを組む（画面は件数だけ。--dry-run で数えるだけ）
+uv run --frozen --all-extras python -m lab_lounge.replay_set build
+#    data/replay/private/review.md の、外したい行の行頭を [x] にしてから
+uv run --frozen --all-extras python -m lab_lounge.replay_set exclude
+
+# 2) 少数で単価を確かめてから、基準の回を 2 回流す
+uv run --frozen --all-extras python -m lab_lounge.replay run --profile dev --label canary --canary 5 --reps 1 --max-usd 0.05
+uv run --frozen --all-extras python -m lab_lounge.replay run --profile dev --label base --reps 2 --max-usd 1.0
+
+# 3) 変更の後に同じセットを流し、基準と比べる。違う行だけを確認のファイルへ書き、印を付けて採点する
+uv run --frozen --all-extras python -m lab_lounge.replay run --profile dev --label after --reps 1 --max-usd 1.0
+uv run --frozen --all-extras python -m lab_lounge.replay compare --base base --run after   # 承認の反転があれば終了コード 1
+uv run --frozen --all-extras python -m lab_lounge.replay review  --base base --run after
+uv run --frozen --all-extras python -m lab_lounge.replay score   --base base --run after
+```
+
+**速さと費用**（`probe`。LLM の呼び出しは `--max-usd` の上限つき）:
+
+```bash
+# まず 1 キャラ 1 本で、道具の欄、モデル、費用を確かめる
+uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label canary --characters mimi --limit 1 --max-usd 0.2
+
+# 判定と filler（6 グループ × n=30）、Agent（4 キャラ × 計測の発話、呼び出しの間 2 秒）
+uv run --frozen --all-extras python -m lab_lounge.probe raw   --profile dev --label baseline --max-usd 1.0
+uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label baseline --max-usd 3.0
+
+# 過去の実走ログの月ごとの時間（課金なし。数字は data/probe/history_<名前>.json にも書く）
+uv run --frozen --all-extras python -m lab_lounge.probe history --label past
+```
+
+- `probe agent` は、本番の組み立て（人格、配信文脈、日時の system prompt、道具のスキーマ）のまま、道具だけを長さを固定した定型の応答に差し替えます（外の検索や記憶、他キャラの発話を呼ばないので、本応答の LLM の時間だけが測れます）。
+  配信文脈は最初の回の写し（`data/probe/private/stream_context_snapshot.md`）を、後の回も使います。取り直すなら `--refresh-snapshot`。`L2_ENABLE_TOOLS` が無効だと、本番は Agent を通らないので断ります。
+- 時間切れ（`L2_AGENT_INVOKE_TIMEOUT_SEC`）に当たったら、記録してからプロセスごと終えます（取り残したスレッドの課金を止めるため）。`agent.invoke` の中（SDK など）が自分で投げたタイムアウトは、普通の失敗として記録して続けます。
+- 全体で 30 分ほどかかるので、キャラ（と `raw` のグループ）は、発話の番号ごとに交互に流します（API の混み具合の変化が後のキャラに偏らないように）。`cold` はキャラごとの 1 本目で、DNS や TLS を払うプロセスの最初の呼び出し、提供元ごとの最初の呼び出しには、別に `first_in_process` / `first_for_provider` の印が付きます。
+- tokens の入力は 2 つの名前で区別します: `in_total`（キャッシュの読み書きを含む合計。LangChain の `input_tokens` と同じ意味）と `in_uncached`（キャッシュに当たらなかった入力。Anthropic の `input_tokens` と同じ意味）。`cache_read` / `cache_creation` と並べて、キャッシュの効果を比べます。usage を拾えない提供元が 1 社でもあれば、止まります（提供元ごとに確かめています）。
+- 道具の欄は、成功の回で定型の応答を返した道具の数です。失敗の回でも、失敗の前に返した道具は「（失敗の回 …）」として分けて出します（「道具の結果を受けた次の step で止まる」といった失敗の形を、集計から落とさないため）。
+- 時間は `time.perf_counter()` で測ります（`spend.stopwatch()`）。Windows の Python 3.12 の `time.monotonic()` は約 15.6 ms ごとにしか進まず、数百 ms の判定や C2 の検索の時間では誤差が目立つためです。
+
+**食べ比べ**（後継のモデルを、同じ発話で比べる流れ）:
+
+1. 基準の回を流しておく（上の `baseline`）。
+2. 新しいモデルを 1 行で足して、同じ発話で `agent` を流す。`--llm provider:model` で、4 キャラ全員をそのモデルに差し替えられます。モデルが価格表（`spend prices`）に無ければ、送らずに止まるので、先に価格を確かめて表へ足します（一時的な上書きは `--price model=入力,出力[,キャッシュ読み[,キャッシュ書き]]`、使ったことは記録に残ります）。
+   ```bash
+   uv run --frozen --all-extras python -m lab_lounge.probe agent --profile dev --label try_new --llm anthropic:<新しいモデル> --max-usd 3.0
+   ```
+3. `data/probe/agent_baseline.metrics.jsonl` と `agent_try_new.metrics.jsonl`（数字だけ）で、step ごとの時間、tokens、`cache_read` / `cache_creation`、費用を比べる。画面にもキャラごとの cold / warm の p50 / p90 と費用が出ます。
+4. 声の聴き比べは、`private/agent_<名前>.jsonl` の返答の本文を、同じ発話 id で並べて読む（本文はここにだけあります）。
+5. 判定（挙手の候補と承認）のモデルを変えるときは、`replay` の基準と比べて反転が 0 であることも見る。
+
+**C2 の検索の時間**:
+
+```bash
+# 前提: C2 を起動しておく（この道具は起動しない）。最初に /health を見て、届かなければ何も送らず終了コード 3
+uv run --frozen --all-extras python -m lab_lounge.c2_probe latency --profile dev --label first
+# 過去の実走ログのタイムアウト。2026-10-31（接続先を 127.0.0.1 に直した日）の前後も分ける
+uv run --frozen --all-extras python -m lab_lounge.c2_probe timeouts --label past
+```
+
+- `latency` は、本番の retriever と同じ形の要求（`GET /retrieve?q=..&k=..`、`GET /retrieve/recent?k=..`、リクエストごとに新しい接続）を、`L2_C2_URL`（と、あれば `L2_C2_URL_READONLY`）へ送ります。読むだけです。時間切れは 10 秒と長めにして分布を見ます。1 周目を cold、2 周目以降を warm とし、warm の p99 を収める最小の値（100 ms 刻み）を予算の目安として出します（失敗は時間切れまで待った 1 件として数え、warm の失敗が 1% を超えるときは目安を出さずに理由を出します）。`localhost` と `127.0.0.1` の比べは別の問いなので `host_compare` と呼びます。送り先が loopback でなければ、ホスト名は画面にも meta にも出さず `remote` とポートだけにします。本番の設定に合わせて、`L2_USE_C2_RECENT` が true でない、または `L2_C2_RECENT_SCOPE=session` のときは `/retrieve/recent` を測らず（理由を出します）、`L2_USE_C2_RETRIEVER` が true でなければ、本番は C2 を使わないと警告します。
+- `timeouts` の分母は検索の呼び出し数、分子は retriever ごとのタイムアウトの行数なので、比は確率ではありません（出力の注記にも書いてあります）。Agent が 1 度も答えなかった回（最も悪い回）も含め、含めた本数を注記に出します（`probe history` も同じ）。
+
+**終了コード**（`probe` / `c2_probe` / `replay`）: 0 正常、1 失敗（呼び出しの失敗、時間切れ、承認の反転）、2 断った（同じ名前の回がある、入力が無い、ツールが無効）、3 前提サービスなし（`c2_probe latency` の /health）、4 上限・価格表にないモデル・usage の拾い損ねで止めた、64 コマンドラインの誤り。
+
+**補助の道具**: `tests/bench_ttft.py` は、モデルを切り替えるときの TTFT の目安を見る道具で、採否の根拠にしません（Agent を通さない短いプロンプトだけを測ります）。Claude のモデルには temperature を送らず、`[skip]` を含む失敗が 1 つでもあれば終了コード 1 で終わります。
+
 ---
 
 ## 主要サブシステム
@@ -599,6 +701,11 @@ aibyss-lab-lounge/
     observability.py / log_setup.py / debug.py / decision_log.py
     emitter.py / run_once.py / run_loop.py   # 3 つのエントリポイント
     preflight.py          # 配信前の点検（本番経路からは呼ばれない）
+    spend.py              # 有料の計測の価格表・支出の記録・上限（本番経路からは呼ばれない）
+    replay_set.py         # 判定のリプレイのセット（実走ログから組み直し、確認のファイル）
+    replay.py             # 判定のリプレイ（本物の判定の関数をセットにかけ、集計して基準の回と比べる）
+    probe.py              # 判定・filler・Agent の時間と費用の物差し、実走ログの月ごとの時間（本番経路からは呼ばれない）
+    c2_probe.py           # C2（記憶検索）の時間の分布と、実走ログのタイムアウトの数え上げ（本番経路からは呼ばれない）
     mcp_servers/          # ask_character / web_search / retrieve_memory
     system_prompts/       # キャラ別システムプロンプト
   tests/
